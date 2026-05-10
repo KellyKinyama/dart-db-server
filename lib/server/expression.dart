@@ -17,6 +17,67 @@ class LiteralExpr extends Expr {
   Object? eval(Map<String, Object?> row) => value;
 }
 
+/// A bind-parameter placeholder, e.g. `?`, `?3`, `:name`, `@name`, `$x`.
+///
+/// Bindings are not stored on the AST itself — that would defeat the
+/// point of preparing once and re-binding. Instead the executor pushes
+/// a [BindScope] onto [BindParamExpr.scopeStack] before running a
+/// statement, and BindParamExpr.eval looks up its value there. Pushing
+/// is done by `Database` and the prepared-statement runner; nesting is
+/// safe because Dart is single-threaded within an isolate and execution
+/// inside [Database] is serialized through its RW lock.
+class BindParamExpr extends Expr {
+  /// 1-based positional index, or null for named.
+  final int? index;
+
+  /// Named-parameter name (without the leading sigil), or null for positional.
+  final String? name;
+
+  /// Original source spelling, kept for diagnostics: '?', '?3', ':foo', '@x'.
+  final String spelling;
+
+  BindParamExpr({this.index, this.name, required this.spelling})
+      : assert((index == null) != (name == null),
+            'Exactly one of index/name must be set');
+
+  static final List<BindScope> scopeStack = <BindScope>[];
+
+  @override
+  Object? eval(Map<String, Object?> row) {
+    if (scopeStack.isEmpty) {
+      throw StateError(
+          'Bind parameter $spelling used but no bindings are active. '
+          'Use Database.prepare(sql).execute(params) to bind.');
+    }
+    final scope = scopeStack.last;
+    if (index != null) return scope.lookupPositional(index!, spelling);
+    return scope.lookupNamed(name!, spelling);
+  }
+}
+
+/// One frame of bindings active during a prepared-statement execution.
+class BindScope {
+  final List<Object?> positional;
+  final Map<String, Object?> named;
+
+  BindScope({this.positional = const [], this.named = const {}});
+
+  Object? lookupPositional(int index, String spelling) {
+    if (index < 1 || index > positional.length) {
+      throw StateError('Positional parameter $spelling out of range '
+          '(have ${positional.length} bindings)');
+    }
+    return positional[index - 1];
+  }
+
+  Object? lookupNamed(String name, String spelling) {
+    if (!named.containsKey(name)) {
+      throw StateError('Named parameter $spelling not bound');
+    }
+    return named[name];
+  }
+}
+
 class ColumnExpr extends Expr {
   final String? table; // optional qualifier (table.column)
   final String name;

@@ -11,6 +11,11 @@ enum TokType {
   keyword,
   op,
   punct, // ( ) , ; .
+  // Bind-parameter placeholder. text is the literal source spelling:
+  //   '?'        -> anonymous positional (auto-numbered 1.. left-to-right)
+  //   '?<digits>'-> explicit positional, e.g. '?3'
+  //   ':name', '@name', '$name' -> named
+  param,
   eof,
 }
 
@@ -194,6 +199,7 @@ const Set<String> _keywords = {
   'WITHOUT',
   'STRICT',
   'MATCH',
+  'COLLATE',
 };
 
 class Lexer {
@@ -412,6 +418,28 @@ class Lexer {
     if ('(),;.'.contains(c)) {
       _pos++;
       return Token(TokType.punct, c, start);
+    }
+    if (c == '?') {
+      _pos++;
+      // Optional digits for explicit numbering: ?12
+      final ds = _pos;
+      while (_pos < src.length && _isDigit(src[_pos])) {
+        _pos++;
+      }
+      return Token(TokType.param, '?${src.substring(ds, _pos)}', start);
+    }
+    if (c == ':' || c == '@' || c == '\$') {
+      // Named parameter: leading sigil + identifier characters.
+      _pos++;
+      final ns = _pos;
+      while (_pos < src.length && _isIdentCont(src[_pos])) {
+        _pos++;
+      }
+      if (ns == _pos) {
+        throw FormatException(
+            'Empty named-parameter at $start (expected $c<name>)');
+      }
+      return Token(TokType.param, '$c${src.substring(ns, _pos)}', start);
     }
     throw FormatException('Unexpected character "$c" at $start');
   }

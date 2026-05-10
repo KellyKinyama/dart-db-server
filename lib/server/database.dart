@@ -7,12 +7,15 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
+import 'dart:typed_data';
 
 import 'concurrency.dart';
 import 'expression.dart';
 import 'parser.dart';
+import 'prepared.dart';
 import 'result.dart';
 import 'schema.dart';
+import 'sqlite_format.dart';
 import 'statement.dart';
 import 'table.dart';
 
@@ -144,6 +147,37 @@ class Database {
       results.add(await executeStmt(s));
     }
     return results;
+  }
+
+  /// Parse [sql] once and return a reusable [PreparedStatement]. Bind
+  /// parameters in the SQL (`?`, `?N`, `:name`, `@name`, `$name`) are
+  /// substituted at `.execute(...)` time, so the statement can be run
+  /// many times with different bindings without re-parsing.
+  ///
+  /// This is the recommended way to embed user-supplied values in
+  /// queries — it eliminates the need for ad-hoc string concatenation
+  /// and therefore the entire SQL-injection attack surface.
+  PreparedStatement prepare(String sql) {
+    final p = Parser.fromString(sql);
+    final stmt = p.parseStatement();
+    return PreparedStatement.internal(
+      db: this,
+      stmt: stmt,
+      sql: sql,
+      positionalCount: p.paramCount,
+      namedParams: Set.unmodifiable(p.namedParams),
+    );
+  }
+
+  /// One-shot convenience: prepare [sql], bind [positional]/[named],
+  /// run once, and return the result. Use [prepare] directly if you
+  /// want to reuse the statement.
+  Future<QueryResult> executeWith(
+    String sql, {
+    List<Object?> positional = const [],
+    Map<String, Object?> named = const {},
+  }) {
+    return prepare(sql).execute(positional: positional, named: named);
   }
 
   Future<QueryResult> executeStmt(Statement stmt) async {
@@ -326,8 +360,10 @@ class Database {
       }
       throw StateError('Table ${s.name} already exists');
     }
-    final t =
-        Table(s.name, s.columns, constraints: s.constraints, strict: s.strict);
+    final t = Table(s.name, s.columns,
+        constraints: s.constraints,
+        strict: s.strict,
+        withoutRowid: s.withoutRowid);
     _tables[s.name] = t;
     // Auto-create unique indexes for column-level PK/UNIQUE.
     for (final c in s.columns) {
@@ -469,8 +505,13 @@ class Database {
 
   QueryResult _createIndex(CreateIndexStmt s) {
     final t = _requireTable(s.table);
+    final hasNonBinary = s.collations.any((c) => c.toUpperCase() != 'BINARY');
     t.createIndex(IndexDef(s.indexName, s.column,
-        unique: s.unique, whereSql: s.whereSql, exprSql: s.exprSql));
+        unique: s.unique,
+        whereSql: s.whereSql,
+        exprSql: s.exprSql,
+        columns: s.columns.length > 1 ? s.columns : null,
+        collations: hasNonBinary ? s.collations : null));
     return QueryResult.message('Index ${s.indexName} created');
   }
 
@@ -1928,6 +1969,11 @@ class Database {
       final p = _classifyConjunct(t, c);
       if (p != null) candidates.add(p);
     }
+    // Multi-column index plans: when a contiguous prefix of a multi-column
+    // index has every column equality-constrained, build a single composite
+    // probe (full match) or prefix scan (partial match). These are added on
+    // top of the per-conjunct candidates and almost always win.
+    candidates.addAll(_classifyMultiColumnPlans(t, conjuncts));
     if (candidates.isEmpty) return null;
 
     // Pick the candidate with the lowest estimated hits. Tie-break on
@@ -1970,6 +2016,64 @@ class Database {
     return out;
   }
 
+  /// Build composite-key plans for multi-column indexes. Walks every
+  /// non-expression, non-partial multi-column index on [t]; for each,
+  /// scans [conjuncts] for `col = literal` predicates that constrain a
+  /// contiguous leading prefix of the index. When the entire index is
+  /// equality-bound, emits a full composite probe; when only a leading
+  /// prefix is bound, emits a [_IndexPlan.prefix] scan.
+  List<_IndexPlan> _classifyMultiColumnPlans(Table t, List<Expr> conjuncts) {
+    final out = <_IndexPlan>[];
+    // Map column-name (lowercase) -> equality literal value, taking the
+    // first one we see per column.
+    final eqByCol = <String, Object>{};
+    for (final c in conjuncts) {
+      if (c is! BinaryExpr || c.op != '=') continue;
+      final (col, key, _) = _columnLiteralPair(c);
+      if (col == null || key == null) continue;
+      eqByCol.putIfAbsent(col.toLowerCase(), () => key);
+    }
+    if (eqByCol.isEmpty) return out;
+
+    for (final def in t.indexDefs.values) {
+      if (def.exprSql != null || def.whereSql != null) continue;
+      if (def.columns.length < 2) continue;
+      // Determine the longest leading prefix of def.columns that's
+      // entirely equality-bound.
+      final parts = <Object>[];
+      for (final cn in def.columns) {
+        final v = eqByCol[cn.toLowerCase()];
+        if (v == null) break;
+        parts.add(v);
+      }
+      if (parts.isEmpty) continue;
+      // Cardinality estimate: use ANALYZE stats if present, else assume
+      // sqrt(N) per equality column (more selective the longer the prefix).
+      final perCol = _estimateEqualityHits(t, def.columns.first);
+      final divisor = math.pow(2, parts.length - 1).toInt();
+      final est = (perCol / divisor).ceil().clamp(1, t.rows.length);
+      if (parts.length == def.columns.length) {
+        // Full key probe \u2014 single composite key into the SplayTreeMap.
+        out.add(_IndexPlan.equality(
+          table: t.name,
+          index: def.name,
+          column: def.columns.join(','),
+          equalityKey: CompositeIndexKey(parts),
+          estHits: est,
+        ));
+      } else {
+        out.add(_IndexPlan.prefix(
+          table: t.name,
+          index: def.name,
+          column: def.columns.take(parts.length).join(','),
+          prefixKey: parts,
+          estHits: est,
+        ));
+      }
+    }
+    return out;
+  }
+
   /// Try to interpret [conjunct] as `<indexed_column> <op> <constant>` and
   /// return an [_IndexPlan]. Returns null when the conjunct can't be
   /// rewritten as an index probe/range against [t].
@@ -1982,6 +2086,10 @@ class Database {
         if (col == null) return null;
         final idx = _findIndexForColumn(t, col);
         if (idx == null) return null;
+        // Multi-column indexes need a composite key; per-conjunct
+        // classification can't build one. Defer to the multi-column
+        // planner pass instead of emitting a wrong single-key plan.
+        if (idx.columns.length > 1) return null;
         if (key == null) return null;
         final effOp = flipped ? _flipComparison(op) : op;
         if (effOp == '=') {
@@ -2045,6 +2153,7 @@ class Database {
       final col = (conjunct.value as ColumnExpr).name;
       final idx = _findIndexForColumn(t, col);
       if (idx == null) return null;
+      if (idx.columns.length > 1) return null;
       final lo = _evalConst(conjunct.low);
       final hi = _evalConst(conjunct.high);
       if (lo == null || hi == null) return null;
@@ -2066,6 +2175,7 @@ class Database {
       final col = (conjunct.value as ColumnExpr).name;
       final idx = _findIndexForColumn(t, col);
       if (idx == null) return null;
+      if (idx.columns.length > 1) return null;
       final keys = <Object>[];
       for (final v in conjunct.values) {
         if (!_isConstExpr(v)) return null;
@@ -2113,10 +2223,23 @@ class Database {
 
   IndexDef? _findIndexForColumn(Table t, String column) {
     final lc = column.toLowerCase();
+    // Single-column indexes are the cheapest and unambiguous match.
     for (final d in t.indexDefs.values) {
       if (d.exprSql == null &&
           d.whereSql == null &&
+          d.columns.length == 1 &&
           d.column.toLowerCase() == lc) {
+        return d;
+      }
+    }
+    // Fallback: a multi-column index whose LEADING column matches. The
+    // executor handles this via a prefix scan over the composite-key
+    // SplayTreeMap (see [_executeIndexPlan]).
+    for (final d in t.indexDefs.values) {
+      if (d.exprSql == null &&
+          d.whereSql == null &&
+          d.columns.length > 1 &&
+          d.columns.first.toLowerCase() == lc) {
         return d;
       }
     }
@@ -2153,23 +2276,56 @@ class Database {
   List<int> _executeIndexPlan(Table t, _IndexPlan plan) {
     final idx = t.indexes[plan.index];
     if (idx == null) return const [];
+    final def = t.indexDefs[plan.index];
+    // Apply per-column collations to probe values so they match the
+    // normalized form that `_buildIndexKey` stored.
+    Object? coll0(Object? v) => def == null ? v : def.collate(0, v);
+    // Prefix scan over a composite-key (multi-column) index: collect
+    // every entry whose key shares the requested leading components.
+    if (plan.prefixKey != null) {
+      final prefixRaw = plan.prefixKey!;
+      final prefix = <Object?>[
+        for (var i = 0; i < prefixRaw.length; i++)
+          def == null ? prefixRaw[i] : def.collate(i, prefixRaw[i])
+      ];
+      final out = <int>[];
+      for (final entry in idx.entries) {
+        final k = entry.key;
+        if (k is! CompositeIndexKey) continue;
+        if (k.parts.length < prefix.length) continue;
+        var match = true;
+        for (var i = 0; i < prefix.length; i++) {
+          if (CompositeIndexKey.compareValues(k.parts[i], prefix[i]) != 0) {
+            match = false;
+            break;
+          }
+        }
+        if (match) out.addAll(entry.value);
+      }
+      return out;
+    }
     if (plan.equalityKeys != null) {
       final out = <int>[];
       for (final k in plan.equalityKeys!) {
-        final hits = idx[k];
+        final ck = coll0(k);
+        if (ck == null) continue;
+        final hits = idx[ck];
         if (hits != null) out.addAll(hits);
       }
       return out;
     }
+    // Single-key equality is encoded as range with lo==hi; check upstream.
+    final lo = plan.lo == null ? null : coll0(plan.lo);
+    final hi = plan.hi == null ? null : coll0(plan.hi);
     final out = <int>[];
     for (final entry in idx.entries) {
       final k = entry.key;
-      if (plan.lo != null) {
-        final c = sqlCompare(k, plan.lo!);
+      if (lo != null) {
+        final c = sqlCompare(k, lo);
         if (plan.loInclusive ? c < 0 : c <= 0) continue;
       }
-      if (plan.hi != null) {
-        final c = sqlCompare(k, plan.hi!);
+      if (hi != null) {
+        final c = sqlCompare(k, hi);
         if (plan.hiInclusive ? c > 0 : c >= 0) break;
       }
       out.addAll(entry.value);
@@ -3773,34 +3929,139 @@ class Database {
   // ATTACH DATABASE
   // ---------------------------------------------------------------------------
 
-  /// Load tables from the JSON-serialised database at [s.path] into this
-  /// database, namespacing each table as `alias.tablename`.
+  /// Load tables from the database at [s.path] into this database,
+  /// namespacing each table as `alias.tablename`. The file may be either
+  /// our JSON format or a SQLite-format binary file (auto-detected by
+  /// the 16-byte magic header).
   QueryResult _attachDatabase(AttachDatabaseStmt s) {
     if (_attached.containsKey(s.alias)) {
       throw StateError('Database "${s.alias}" is already attached');
     }
     _attached[s.alias] = s.path;
     final f = File(s.path);
-    if (f.existsSync()) {
-      final raw = f.readAsStringSync();
-      if (raw.trim().isNotEmpty) {
-        final data = jsonDecode(raw);
-        Map<String, Object?> tables;
-        if (data is Map && data['__schema__'] == 2) {
-          tables = (data['tables'] as Map).cast<String, Object?>();
-        } else {
-          tables = (data as Map).cast<String, Object?>();
+    if (f.existsSync() && f.lengthSync() > 0) {
+      final bytes = f.readAsBytesSync();
+      const magic = [
+        0x53, 0x51, 0x4c, 0x69, 0x74, 0x65, 0x20, 0x66, // 'SQLite f'
+        0x6f, 0x72, 0x6d, 0x61, 0x74, 0x20, 0x33, 0x00, // 'ormat 3\0'
+      ];
+      var isSqlite = bytes.length >= 16;
+      if (isSqlite) {
+        for (var i = 0; i < 16; i++) {
+          if (bytes[i] != magic[i]) {
+            isSqlite = false;
+            break;
+          }
         }
-        tables.forEach((tname, tjson) {
-          final m = (tjson as Map).cast<String, Object?>();
-          m['name'] ??= tname;
-          final t = Table.fromJson(m);
-          t.name = '${s.alias}.${t.name}';
-          _tables[t.name] = t;
-        });
+      }
+      if (isSqlite) {
+        _attachSqliteFile(s.alias, s.path, bytes);
+      } else {
+        final raw = String.fromCharCodes(bytes).trim();
+        if (raw.isNotEmpty) {
+          final data = jsonDecode(raw);
+          Map<String, Object?> tables;
+          if (data is Map && data['__schema__'] == 2) {
+            tables = (data['tables'] as Map).cast<String, Object?>();
+          } else {
+            tables = (data as Map).cast<String, Object?>();
+          }
+          tables.forEach((tname, tjson) {
+            final m = (tjson as Map).cast<String, Object?>();
+            m['name'] ??= tname;
+            final t = Table.fromJson(m);
+            t.name = '${s.alias}.${t.name}';
+            _tables[t.name] = t;
+          });
+        }
       }
     }
     return QueryResult.message('Database "${s.alias}" attached');
+  }
+
+  /// Load every user table from a SQLite-format file under the namespace
+  /// `alias.tablename`. Tables are read into in-memory `Table` objects;
+  /// writes through SQL go to memory only (no propagation back to the
+  /// SQLite file), matching the read-only semantics of attaching.
+  void _attachSqliteFile(String alias, String path, Uint8List bytes) {
+    final walFile = File('$path-wal');
+    final walBytes = walFile.existsSync() ? walFile.readAsBytesSync() : null;
+    final fmt = walBytes != null
+        ? SqliteFile.fromBytesWithWal(bytes, walBytes)
+        : SqliteFile.fromBytes(bytes);
+    final schema = fmt.readSchema();
+    final tableSchemas = schema.where((s) => s.type == 'table').toList();
+    for (final ts in tableSchemas) {
+      if (ts.sql == null) continue;
+      if (ts.name == 'sqlite_sequence' || ts.name == 'sqlite_stat1') continue;
+      // Parse the CREATE TABLE in isolation so we can build a Table
+      // without touching the local namespace, then rename it under
+      // `alias.`.
+      Table tbl;
+      try {
+        final stmt = Parser.fromString(ts.sql!).parseStatement();
+        if (stmt is! CreateTableStmt) continue;
+        tbl = Table(stmt.name, stmt.columns,
+            constraints: stmt.constraints,
+            strict: stmt.strict,
+            withoutRowid: stmt.withoutRowid);
+      } catch (_) {
+        continue;
+      }
+      // Restore rows, applying the WITHOUT ROWID column-order remap.
+      final isWor = fmt.isWithoutRowid(ts.name);
+      final pkIdx = tbl.columns
+          .indexWhere((c) => c.primaryKey && c.type == DataType.integer);
+      List<int>? onDiskToDeclared;
+      if (isWor) {
+        final pkCols = <int>[];
+        for (var i = 0; i < tbl.columns.length; i++) {
+          if (tbl.columns[i].primaryKey) pkCols.add(i);
+        }
+        if (pkCols.isEmpty) {
+          for (final con in tbl.constraints) {
+            if (con is PrimaryKeyConstraint) {
+              for (final n in con.columns) {
+                final idx = tbl.columns
+                    .indexWhere((c) => c.name.toLowerCase() == n.toLowerCase());
+                if (idx >= 0) pkCols.add(idx);
+              }
+              break;
+            }
+          }
+        }
+        final pkSet = pkCols.toSet();
+        onDiskToDeclared = <int>[
+          ...pkCols,
+          for (var i = 0; i < tbl.columns.length; i++)
+            if (!pkSet.contains(i)) i,
+        ];
+      }
+      for (final row in fmt.readTable(ts.name)) {
+        var src = row.values;
+        if (onDiskToDeclared != null && src.length == tbl.columns.length) {
+          final remapped = List<Object?>.filled(tbl.columns.length, null);
+          for (var k = 0; k < src.length; k++) {
+            remapped[onDiskToDeclared[k]] = src[k];
+          }
+          src = remapped;
+        }
+        final values = List<Object?>.from(src);
+        while (values.length < tbl.columns.length) {
+          values.add(null);
+        }
+        if (values.length > tbl.columns.length) {
+          values.removeRange(tbl.columns.length, values.length);
+        }
+        if (!isWor && pkIdx >= 0 && values[pkIdx] == null) {
+          values[pkIdx] = row.rowid;
+        }
+        tbl.rows.add(values);
+      }
+      _rebuildIndexes(tbl);
+      tbl.name = '$alias.${tbl.name}';
+      _tables[tbl.name] = tbl;
+    }
   }
 
   QueryResult _detachDatabase(DetachDatabaseStmt s) {
@@ -3893,10 +4154,19 @@ class Database {
       final tbl = e.value;
       stat.rows.add([e.key, null, tbl.rows.length.toString()]);
 
+      // Identify the auto-created INTEGER-PRIMARY-KEY shadow index so we
+      // can skip it: SQLite has no real on-disk index for that case.
+      final pkIntCol = tbl.columns.firstWhere(
+          (c) => c.primaryKey && c.type == DataType.integer,
+          orElse: () => const ColumnDef('', DataType.any));
+      final pkShadowName =
+          pkIntCol.name.isEmpty ? null : '${e.key}__${pkIntCol.name}';
+
       // Sample per-index distinct counts.
       final distinct = <String, int>{};
       for (final idxDef in tbl.indexDefs.values) {
         if (idxDef.exprSql != null || idxDef.whereSql != null) continue;
+        if (idxDef.name == pkShadowName) continue;
         final col = idxDef.column;
         final keys = <Object>{};
         final colIdx = tbl.columns
@@ -3992,9 +4262,25 @@ class Database {
       };
 
   Future<void> _load() async {
-    final raw = await File(path!).readAsString();
-    if (raw.trim().isEmpty) return;
-    final data = jsonDecode(raw);
+    // Sniff the first 16 bytes: a real SQLite file starts with the
+    // literal "SQLite format 3\x00" magic. If we see it, hand off to
+    // importSqlite (which also picks up a `-wal` companion).
+    final raw = await File(path!).readAsBytes();
+    if (raw.isEmpty) return;
+    if (raw.length >= 16) {
+      const magic = 'SQLite format 3';
+      var isSqlite = raw[15] == 0;
+      for (var i = 0; isSqlite && i < magic.length; i++) {
+        if (raw[i] != magic.codeUnitAt(i)) isSqlite = false;
+      }
+      if (isSqlite) {
+        await importSqlite(path!);
+        return;
+      }
+    }
+    final text = String.fromCharCodes(raw);
+    if (text.trim().isEmpty) return;
+    final data = jsonDecode(text);
     if (data is Map && data['__schema__'] == 2) {
       final tables = (data['tables'] as Map).cast<String, Object?>();
       for (final e in tables.entries) {
@@ -4015,6 +4301,599 @@ class Database {
   }
 
   Future<void> flush() => _persist();
+
+  // ---------------------------------------------------------------------------
+  // SQLite file-format import/export
+  // ---------------------------------------------------------------------------
+
+  /// Write every local table (excluding `sqlite_*` shadow tables) to a real
+  /// SQLite-format database file at [path]. The resulting file is readable
+  /// by `package:sqlite3` and the official `sqlite3` CLI, including all
+  /// rows and any non-expression, non-partial single-column indexes.
+  ///
+  /// Columns whose declared type is `BLOB` keep their bytes; everything
+  /// else is stored using SQLite's natural serial types (INT / REAL / TEXT
+  /// / NULL). Booleans are stored as 0/1 integers.
+  Future<void> exportSqlite(String path,
+      {int pageSize = 4096, bool includeIndexes = true}) async {
+    final tables = <SqliteWriteTable>[];
+    final indexes = <SqliteWriteIndex>[];
+    for (final entry in _tables.entries) {
+      final name = entry.key;
+      // Skip namespaced (attached) and shadow tables.
+      if (name.contains('.')) continue;
+      final t = entry.value;
+      // WITHOUT ROWID tables are stored as INDEX B-trees keyed by the
+      // PK record. We need on-disk column order: PK columns (in their
+      // declared PK order) first, then the remaining columns in declared
+      // order. Row values get permuted to match, and we sidestep all the
+      // INTEGER-PRIMARY-KEY rowid-promotion logic.
+      if (t.withoutRowid) {
+        final pkOrder = _withoutRowidColumnOrder(t);
+        if (pkOrder == null) {
+          throw StateError(
+              'Cannot export WITHOUT ROWID table ${t.name}: no PRIMARY KEY');
+        }
+        final reorderedRows = <List<Object?>>[
+          for (final r in t.rows)
+            [for (final ci in pkOrder) _toSqliteValue(r[ci])]
+        ];
+        tables.add(SqliteWriteTable(
+          name: name,
+          createSql: _renderCreateTable(t),
+          rows: reorderedRows,
+          withoutRowid: true,
+        ));
+        if (!includeIndexes) continue;
+        // Secondary indexes on a WITHOUT ROWID table: each entry is
+        // (indexed-col values..., PK-col values...). Per SQLite, PK
+        // columns already present in the index key are NOT appended
+        // again. The auto-created PK shadow index is the table itself,
+        // so skip any IndexDef whose columns exactly match the PK.
+        final pkCols = pkOrder; // already PK-first
+        final pkColCount = _pkColumnCount(t);
+        final pkColIdxs = pkCols.take(pkColCount).toList();
+        final pkColNamesLower =
+            pkColIdxs.map((i) => t.columns[i].name.toLowerCase()).toSet();
+        for (final ix in t.indexDefs.values) {
+          // Expression-index branch (WITHOUT ROWID): single-key entry is
+          // [exprValue, ...PK columns].
+          if (ix.exprSql != null) {
+            final exprFn = _compileIndexExpression(ix.exprSql!);
+            final partialPred = _compilePartialPredicate(ix.whereSql);
+            final entries = <List<Object?>>[];
+            for (final r in t.rows) {
+              if (partialPred != null && !partialPred(t, r)) continue;
+              entries.add([
+                _toSqliteValue(exprFn(t, r)),
+                for (final ci in pkColIdxs) _toSqliteValue(r[ci]),
+              ]);
+            }
+            final whereTail =
+                ix.whereSql == null ? '' : ' WHERE ${ix.whereSql}';
+            indexes.add(SqliteWriteIndex(
+              name: ix.name,
+              tableName: name,
+              createSql: 'CREATE ${ix.unique ? "UNIQUE " : ""}INDEX ${ix.name} '
+                  'ON $name(${ix.exprSql})$whereTail',
+              entries: entries,
+            ));
+            continue;
+          }
+          // Resolve indexed columns to row indices.
+          final keyIdxs = <int>[];
+          final keyNamesLower = <String>{};
+          var ok = true;
+          for (final cn in ix.columns) {
+            final i = t.columns
+                .indexWhere((c) => c.name.toLowerCase() == cn.toLowerCase());
+            if (i < 0) {
+              ok = false;
+              break;
+            }
+            keyIdxs.add(i);
+            keyNamesLower.add(cn.toLowerCase());
+          }
+          if (!ok) continue;
+          // Skip the auto-PK shadow index (matches PK exactly).
+          if (keyNamesLower.length == pkColNamesLower.length &&
+              keyNamesLower.containsAll(pkColNamesLower)) {
+            continue;
+          }
+          // Append PK columns NOT already in the index key.
+          final trailingPkIdxs = [
+            for (final pi in pkColIdxs)
+              if (!keyNamesLower.contains(t.columns[pi].name.toLowerCase())) pi
+          ];
+          final partialPred = _compilePartialPredicate(ix.whereSql);
+          final entries = <List<Object?>>[];
+          for (final r in t.rows) {
+            if (partialPred != null && !partialPred(t, r)) continue;
+            entries.add([
+              for (final ci in keyIdxs) _toSqliteValue(r[ci]),
+              for (final ci in trailingPkIdxs) _toSqliteValue(r[ci]),
+            ]);
+          }
+          final colList = _renderIndexColumnList(ix);
+          final whereTail = ix.whereSql == null ? '' : ' WHERE ${ix.whereSql}';
+          indexes.add(SqliteWriteIndex(
+            name: ix.name,
+            tableName: name,
+            createSql: 'CREATE ${ix.unique ? "UNIQUE " : ""}INDEX ${ix.name} '
+                'ON $name($colList)$whereTail',
+            entries: entries,
+          ));
+        }
+        continue;
+      }
+      // SQLite's INTEGER PRIMARY KEY is an alias for the rowid: the
+      // column value MUST be stored as the rowid (and as NULL in the
+      // record) or the engine reads rowid back as the id and disagrees
+      // with the stored value, breaking integrity.
+      final pkIdx = t.columns
+          .indexWhere((c) => c.primaryKey && c.type == DataType.integer);
+      List<int>? finalRowids;
+      if (pkIdx >= 0 &&
+          t.rows.every((r) => r[pkIdx] is int && (r[pkIdx] as int) > 0)) {
+        finalRowids = [for (final r in t.rows) r[pkIdx] as int];
+      }
+      List<List<Object?>> exportRows;
+      if (finalRowids != null) {
+        exportRows = [
+          for (final r in t.rows)
+            [
+              for (var i = 0; i < r.length; i++)
+                if (i == pkIdx) null else _toSqliteValue(r[i])
+            ]
+        ];
+      } else {
+        exportRows = [
+          for (final r in t.rows) [for (final v in r) _toSqliteValue(v)]
+        ];
+      }
+      tables.add(SqliteWriteTable(
+        name: name,
+        createSql: _renderCreateTable(t),
+        rows: exportRows,
+        rowids: finalRowids,
+      ));
+      if (!includeIndexes) continue;
+      for (final ix in t.indexDefs.values) {
+        // Expression-index branch: evaluate the expression per row and
+        // emit a single-key index entry per surviving row.
+        if (ix.exprSql != null) {
+          final exprFn = _compileIndexExpression(ix.exprSql!);
+          final partialPred = _compilePartialPredicate(ix.whereSql);
+          final entries = <List<Object?>>[];
+          for (var r = 0; r < t.rows.length; r++) {
+            final row = t.rows[r];
+            if (partialPred != null && !partialPred(t, row)) continue;
+            final rowid = finalRowids != null ? finalRowids[r] : r + 1;
+            entries.add([_toSqliteValue(exprFn(t, row)), rowid]);
+          }
+          final whereTail = ix.whereSql == null ? '' : ' WHERE ${ix.whereSql}';
+          indexes.add(SqliteWriteIndex(
+            name: ix.name,
+            tableName: name,
+            createSql: 'CREATE ${ix.unique ? "UNIQUE " : ""}INDEX ${ix.name} '
+                'ON $name(${ix.exprSql})$whereTail',
+            entries: entries,
+          ));
+          continue;
+        }
+        // Skip the auto-created INTEGER-PRIMARY-KEY shadow index: SQLite
+        // never stores one (the rowid B-tree IS the index).
+        if (pkIdx >= 0 &&
+            ix.columns.length == 1 &&
+            ix.columns.first.toLowerCase() ==
+                t.columns[pkIdx].name.toLowerCase()) {
+          continue;
+        }
+        // Resolve every key column to its row-array index. Skip the
+        // index entirely if any column is unknown.
+        final colIdxs = <int>[];
+        var ok = true;
+        for (final cn in ix.columns) {
+          final i = t.columns
+              .indexWhere((c) => c.name.toLowerCase() == cn.toLowerCase());
+          if (i < 0) {
+            ok = false;
+            break;
+          }
+          colIdxs.add(i);
+        }
+        if (!ok) continue;
+        final partialPred = _compilePartialPredicate(ix.whereSql);
+        final entries = <List<Object?>>[];
+        for (var r = 0; r < t.rows.length; r++) {
+          final row = t.rows[r];
+          if (partialPred != null && !partialPred(t, row)) continue;
+          final rowid = finalRowids != null ? finalRowids[r] : r + 1;
+          entries.add([
+            for (final ci in colIdxs) _toSqliteValue(row[ci]),
+            rowid,
+          ]);
+        }
+        final colList = _renderIndexColumnList(ix);
+        final whereTail = ix.whereSql == null ? '' : ' WHERE ${ix.whereSql}';
+        indexes.add(SqliteWriteIndex(
+          name: ix.name,
+          tableName: name,
+          createSql: 'CREATE ${ix.unique ? "UNIQUE " : ""}INDEX ${ix.name} '
+              'ON $name($colList)$whereTail',
+          entries: entries,
+        ));
+      }
+    }
+    // Synthesize SQLite's `sqlite_sequence` table from per-table autoInc
+    // counters so AUTOINCREMENT state survives the round-trip. SQLite
+    // owns this table internally; the canonical CREATE TABLE statement
+    // is exactly `CREATE TABLE sqlite_sequence(name,seq)`.
+    final seqRows = <List<Object?>>[];
+    for (final entry in _tables.entries) {
+      final t = entry.value;
+      // Only INTEGER PRIMARY KEY AUTOINCREMENT participates.
+      final hasAutoInc = t.columns.any((c) => c.autoIncrement);
+      if (!hasAutoInc) continue;
+      // SQLite's seq value is the largest assigned rowid. Use the max
+      // counter across any AUTOINCREMENT columns (always 1 in practice).
+      var seq = 0;
+      for (final c in t.columns) {
+        if (c.autoIncrement) {
+          final v = t.autoInc[c.name];
+          if (v != null && v > seq) seq = v;
+        }
+      }
+      if (seq > 0) seqRows.add([entry.key, seq]);
+    }
+    if (seqRows.isNotEmpty) {
+      tables.add(SqliteWriteTable(
+        name: 'sqlite_sequence',
+        createSql: 'CREATE TABLE sqlite_sequence(name,seq)',
+        rows: seqRows,
+      ));
+    }
+    final bytes = writeSqliteFile(tables, pageSize: pageSize, indexes: indexes);
+    await File(path).writeAsBytes(bytes);
+  }
+
+  /// Replace the contents of this database with the tables found in the
+  /// SQLite file at [path]. The file's `CREATE TABLE` statements are
+  /// re-executed against this engine, then rows are bulk-inserted. Indexes
+  /// stored in the file are recreated by re-executing their `CREATE INDEX`
+  /// statements (any indexes the local parser doesn't accept are skipped
+  /// with a warning row in the returned message).
+  ///
+  /// Returns a human-readable summary string describing what was loaded.
+  Future<String> importSqlite(String path) async {
+    final bytes = await File(path).readAsBytes();
+    // If the database is in WAL mode, the companion `<path>-wal` file
+    // may hold newer page versions. Load and overlay it transparently.
+    final walFile = File('$path-wal');
+    Uint8List? walBytes;
+    if (await walFile.exists()) {
+      walBytes = await walFile.readAsBytes();
+    }
+    final f = walBytes != null
+        ? SqliteFile.fromBytesWithWal(bytes, walBytes)
+        : SqliteFile.fromBytes(bytes);
+    _tables.clear();
+    _views.clear();
+    final schema = f.readSchema();
+    final tableSchemas = schema.where((s) => s.type == 'table').toList();
+    final indexSchemas = schema.where((s) => s.type == 'index').toList();
+    var tablesLoaded = 0;
+    var rowsLoaded = 0;
+    var indexesLoaded = 0;
+    final skipped = <String>[];
+    for (final ts in tableSchemas) {
+      if (ts.sql == null) continue;
+      // SQLite's internal sqlite_sequence is handled below; never try to
+      // re-execute its CREATE TABLE (the parser rejects sqlite_*).
+      if (ts.name == 'sqlite_sequence') continue;
+      // sqlite_stat1 is similarly synthesized below from raw rows.
+      if (ts.name == 'sqlite_stat1') continue;
+      // SQLite includes auto-created indexes for INTEGER PRIMARY KEY etc.
+      // with names like `sqlite_autoindex_*`; their entries live with the
+      // table B-tree, no separate root.
+      try {
+        await execute(ts.sql!);
+      } catch (_) {
+        skipped.add('table ${ts.name}');
+        continue;
+      }
+      final t = _tables[ts.name];
+      if (t == null) {
+        skipped.add('table ${ts.name}');
+        continue;
+      }
+      tablesLoaded++;
+      final pkIdx = t.columns
+          .indexWhere((c) => c.primaryKey && c.type == DataType.integer);
+      // For WITHOUT ROWID tables, SQLite physically stores PK columns
+      // first in the record, then the remaining columns in declared
+      // order. Build a mapping from on-disk position back to declared
+      // position so we can restore the user's column order.
+      final isWor = f.isWithoutRowid(ts.name);
+      List<int>? onDiskToDeclared;
+      if (isWor) {
+        final pkCols = <int>[];
+        for (var i = 0; i < t.columns.length; i++) {
+          if (t.columns[i].primaryKey) pkCols.add(i);
+        }
+        // Table-level PRIMARY KEY constraint, if any (preserves order).
+        if (pkCols.isEmpty) {
+          for (final con in t.constraints) {
+            if (con is PrimaryKeyConstraint) {
+              for (final n in con.columns) {
+                final idx = t.columns
+                    .indexWhere((c) => c.name.toLowerCase() == n.toLowerCase());
+                if (idx >= 0) pkCols.add(idx);
+              }
+              break;
+            }
+          }
+        }
+        // On-disk order = [pkCols..., other declared columns in order].
+        final pkSet = pkCols.toSet();
+        final onDisk = <int>[
+          ...pkCols,
+          for (var i = 0; i < t.columns.length; i++)
+            if (!pkSet.contains(i)) i,
+        ];
+        // Map: onDisk[k] = declared index. We want, for each declared
+        // index d, the on-disk index k such that onDisk[k] == d.
+        onDiskToDeclared = onDisk;
+      }
+      for (final row in f.readTable(ts.name)) {
+        var src = row.values;
+        if (onDiskToDeclared != null && src.length == t.columns.length) {
+          final remapped = List<Object?>.filled(t.columns.length, null);
+          for (var k = 0; k < src.length; k++) {
+            remapped[onDiskToDeclared[k]] = src[k];
+          }
+          src = remapped;
+        }
+        // Pad/truncate to column count and store values as-is.
+        final values = List<Object?>.from(src);
+        while (values.length < t.columns.length) {
+          values.add(null);
+        }
+        if (values.length > t.columns.length) {
+          values.removeRange(t.columns.length, values.length);
+        }
+        // SQLite's INTEGER PRIMARY KEY column is stored as NULL in the
+        // record (the rowid IS the value). Repair that on read.
+        // (WITHOUT ROWID tables don't have this trick — values are real.)
+        if (!isWor && pkIdx >= 0 && values[pkIdx] == null) {
+          values[pkIdx] = row.rowid;
+        }
+        t.rows.add(values);
+        rowsLoaded++;
+      }
+      _rebuildIndexes(t);
+    }
+    for (final ixs in indexSchemas) {
+      if (ixs.sql == null) continue;
+      if (ixs.name.startsWith('sqlite_autoindex_')) continue;
+      try {
+        await execute(ixs.sql!);
+        indexesLoaded++;
+      } catch (_) {
+        skipped.add('index ${ixs.name}');
+      }
+    }
+    // Restore AUTOINCREMENT counters from sqlite_sequence, if present.
+    final hasSeq = tableSchemas.any((s) => s.name == 'sqlite_sequence');
+    if (hasSeq) {
+      try {
+        for (final row in f.readTable('sqlite_sequence')) {
+          final vals = row.values;
+          if (vals.length < 2) continue;
+          final tname = vals[0]?.toString();
+          final seq = vals[1];
+          if (tname == null || seq is! int) continue;
+          final tt = _tables[tname];
+          if (tt == null) continue;
+          for (final c in tt.columns) {
+            if (c.autoIncrement) tt.autoInc[c.name] = seq;
+          }
+        }
+      } catch (_) {
+        // Non-fatal: leave counters at default.
+      }
+    }
+    // Restore ANALYZE planner stats from sqlite_stat1, if present.
+    final hasStat = tableSchemas.any((s) => s.name == 'sqlite_stat1');
+    if (hasStat) {
+      final stat = Table(
+        'sqlite_stat1',
+        const [
+          ColumnDef('tbl', DataType.text),
+          ColumnDef('idx', DataType.text),
+          ColumnDef('stat', DataType.text),
+        ],
+      );
+      try {
+        for (final row in f.readTable('sqlite_stat1')) {
+          final vals = List<Object?>.from(row.values);
+          while (vals.length < 3) {
+            vals.add(null);
+          }
+          stat.rows.add(vals.sublist(0, 3));
+        }
+      } catch (_) {
+        // Non-fatal.
+      }
+      _tables['sqlite_stat1'] = stat;
+      // Repopulate the planner's _stats map from the loaded rows. SQLite
+      // emits per-index rows where `stat` is `<rowCount> <avgRowsPerKey>`;
+      // the first integer doubles as the table row count.
+      final tableCounts = <String, int>{};
+      for (final r in stat.rows) {
+        final tname = r[0]?.toString();
+        final statStr = r[2]?.toString();
+        if (tname == null || statStr == null) continue;
+        final n = int.tryParse(statStr.split(' ').first);
+        if (n == null) continue;
+        // Prefer the largest count seen across rows for this table.
+        final cur = tableCounts[tname] ?? 0;
+        if (n > cur) tableCounts[tname] = n;
+      }
+      tableCounts.forEach((tname, n) {
+        if (_tables[tname] != null) {
+          _stats[tname] = _TableStats(n, <String, int>{});
+        }
+      });
+    }
+    final msg = StringBuffer('Loaded $tablesLoaded table(s), '
+        '$rowsLoaded row(s), $indexesLoaded index(es) from $path');
+    if (skipped.isNotEmpty) {
+      msg.write(' (skipped: ${skipped.join(", ")})');
+    }
+    return msg.toString();
+  }
+
+  String _renderCreateTable(Table t) {
+    String sqlType(DataType d) {
+      switch (d) {
+        case DataType.integer:
+          return 'INTEGER';
+        case DataType.real:
+          return 'REAL';
+        case DataType.text:
+          return 'TEXT';
+        case DataType.boolean:
+          return 'INTEGER';
+        case DataType.blob:
+          return 'BLOB';
+        case DataType.numeric:
+          return 'NUMERIC';
+        case DataType.any:
+          return '';
+      }
+    }
+
+    final cols = <String>[];
+    for (final c in t.columns) {
+      final pieces = <String>[c.name];
+      final ty = sqlType(c.type);
+      if (ty.isNotEmpty) pieces.add(ty);
+      if (c.primaryKey) pieces.add('PRIMARY KEY');
+      if (c.autoIncrement) pieces.add('AUTOINCREMENT');
+      if (c.notNull) pieces.add('NOT NULL');
+      if (c.unique && !c.primaryKey) pieces.add('UNIQUE');
+      cols.add(pieces.join(' '));
+    }
+    // Emit table-level PRIMARY KEY(a, b, ...) when no column-level PK
+    // marker is present. Required for composite WITHOUT ROWID tables.
+    final hasColumnPk = t.columns.any((c) => c.primaryKey);
+    if (!hasColumnPk) {
+      for (final con in t.constraints) {
+        if (con is PrimaryKeyConstraint) {
+          cols.add('PRIMARY KEY(${con.columns.join(", ")})');
+          break;
+        }
+      }
+    }
+    final trailer = <String>[];
+    if (t.withoutRowid) trailer.add('WITHOUT ROWID');
+    if (t.strict) trailer.add('STRICT');
+    final tail = trailer.isEmpty ? '' : ' ${trailer.join(", ")}';
+    return 'CREATE TABLE ${t.name}(${cols.join(", ")})$tail';
+  }
+
+  /// Render an index column list with per-column COLLATE qualifiers,
+  /// e.g. `name COLLATE NOCASE, age`.
+  String _renderIndexColumnList(IndexDef ix) {
+    final out = StringBuffer();
+    for (var i = 0; i < ix.columns.length; i++) {
+      if (i > 0) out.write(', ');
+      out.write(ix.columns[i]);
+      if (i < ix.collations.length &&
+          ix.collations[i].toUpperCase() != 'BINARY') {
+        out.write(' COLLATE ${ix.collations[i]}');
+      }
+    }
+    return out.toString();
+  }
+
+  /// Compile a partial-index `WHERE` clause into a row predicate.
+  /// Returns null when [whereSql] is null. The returned function takes the
+  /// owning table (for column-name resolution) and a row, and returns true
+  /// when the row should be included in the index.
+  bool Function(Table, List<Object?>)? _compilePartialPredicate(
+      String? whereSql) {
+    if (whereSql == null) return null;
+    final stmt =
+        Parser.fromString('SELECT $whereSql').parseStatement() as SelectStmt;
+    final expr = stmt.projection.first.expr!;
+    final bound = _bindExpr(expr);
+    return (t, row) => evalPredicate(bound, t.rowToMap(row));
+  }
+
+  /// Compile an expression-index expression into a per-row evaluator.
+  /// Returns the raw evaluated value, which the exporter writes as the
+  /// index key (subject to [_toSqliteValue] coercion at the call site).
+  Object? Function(Table, List<Object?>) _compileIndexExpression(
+      String exprSql) {
+    final stmt =
+        Parser.fromString('SELECT $exprSql').parseStatement() as SelectStmt;
+    final expr = stmt.projection.first.expr!;
+    final bound = _bindExpr(expr);
+    return (t, row) => bound.eval(t.rowToMap(row));
+  }
+
+  /// Number of PK columns in [t] — column-level PK markers if any,
+  /// otherwise the table-level PRIMARY KEY constraint.
+  int _pkColumnCount(Table t) {
+    var n = 0;
+    for (final c in t.columns) {
+      if (c.primaryKey) n++;
+    }
+    if (n > 0) return n;
+    for (final con in t.constraints) {
+      if (con is PrimaryKeyConstraint) return con.columns.length;
+    }
+    return 0;
+  }
+
+  /// Compute the on-disk column order for a WITHOUT ROWID table: PK
+  /// columns first (in declared PK order), then non-PK columns in
+  /// declared order. Returns null if the table has no PK.
+  List<int>? _withoutRowidColumnOrder(Table t) {
+    final pkIdxs = <int>[];
+    // Column-level PK markers come first, in declared order.
+    for (var i = 0; i < t.columns.length; i++) {
+      if (t.columns[i].primaryKey) pkIdxs.add(i);
+    }
+    // Table-level PRIMARY KEY(a, b, ...) wins if there's no column-level
+    // PK.
+    if (pkIdxs.isEmpty) {
+      for (final c in t.constraints) {
+        if (c is PrimaryKeyConstraint) {
+          for (final cn in c.columns) {
+            final i = t.columns
+                .indexWhere((cd) => cd.name.toLowerCase() == cn.toLowerCase());
+            if (i >= 0) pkIdxs.add(i);
+          }
+          break;
+        }
+      }
+    }
+    if (pkIdxs.isEmpty) return null;
+    final pkSet = pkIdxs.toSet();
+    final order = <int>[...pkIdxs];
+    for (var i = 0; i < t.columns.length; i++) {
+      if (!pkSet.contains(i)) order.add(i);
+    }
+    return order;
+  }
+
+  Object? _toSqliteValue(Object? v) {
+    if (v is bool) return v ? 1 : 0;
+    return v; // null, num, String, Uint8List/List<int> all pass through.
+  }
 
   Iterable<String> get tableNames => _tables.keys;
   Iterable<String> get viewNames => _views.keys;
@@ -4110,6 +4989,8 @@ class _PendingOn {
 ///
 /// `equalityKeys != null` => one or more single-key probes (cheapest plan,
 /// used both for `col = lit` and `col IN (lit, lit, ...)`).
+/// `prefixKey != null` => prefix scan over a composite-key (multi-column)
+/// index when only the leading K of N columns are equality-constrained.
 /// Otherwise (`lo`, `hi`, `loInclusive`, `hiInclusive`) define an open or
 /// closed range. Either bound may be null for half-open ranges.
 class _IndexPlan {
@@ -4117,6 +4998,7 @@ class _IndexPlan {
   final String index;
   final String column;
   final List<Object>? equalityKeys;
+  final List<Object?>? prefixKey;
   final Object? lo;
   final Object? hi;
   final bool loInclusive;
@@ -4132,6 +5014,7 @@ class _IndexPlan {
     required Object equalityKey,
     required this.estHits,
   })  : equalityKeys = [equalityKey],
+        prefixKey = null,
         lo = null,
         hi = null,
         loInclusive = false,
@@ -4143,7 +5026,8 @@ class _IndexPlan {
     required this.column,
     required this.equalityKeys,
     required this.estHits,
-  })  : lo = null,
+  })  : prefixKey = null,
+        lo = null,
         hi = null,
         loInclusive = false,
         hiInclusive = false;
@@ -4157,9 +5041,26 @@ class _IndexPlan {
     required this.loInclusive,
     required this.hiInclusive,
     required this.estHits,
-  }) : equalityKeys = null;
+  })  : equalityKeys = null,
+        prefixKey = null;
+
+  _IndexPlan.prefix({
+    required this.table,
+    required this.index,
+    required this.column,
+    required this.prefixKey,
+    required this.estHits,
+  })  : equalityKeys = null,
+        lo = null,
+        hi = null,
+        loInclusive = false,
+        hiInclusive = false;
 
   String describe() {
+    if (prefixKey != null) {
+      return 'SEARCH $table USING INDEX $index '
+          '($column PREFIX ${prefixKey!.length}=?) ~$estHits';
+    }
     if (equalityKeys != null) {
       if (equalityKeys!.length == 1) {
         return 'SEARCH $table USING INDEX $index ($column=?) ~$estHits';

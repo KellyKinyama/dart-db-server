@@ -14,6 +14,16 @@ class Parser {
   // _parseColumnDef() call. Used by CREATE TABLE to validate STRICT.
   String _lastColumnRawType = '';
 
+  /// Highest 1-based positional parameter index seen while parsing.
+  /// Used by [Database.prepare] to know how many positional values to
+  /// expect at execute time.
+  int paramCount = 0;
+
+  /// Set of named parameters (sigil + name, e.g. ':foo') seen while
+  /// parsing. Populated by [_parsePrimary]; surfaced by
+  /// [Database.prepare] so callers can validate their bindings map.
+  final Set<String> namedParams = <String>{};
+
   Parser(this._tokens);
 
   factory Parser.fromString(String sql) => Parser(Lexer(sql).tokenize());
@@ -296,9 +306,11 @@ class Parser {
     // Optional table-options trailer: WITHOUT ROWID and/or STRICT, in
     // any order, optionally separated by commas.
     bool strict = false;
+    bool withoutRowid = false;
     while (true) {
       if (_matchKw('WITHOUT')) {
         _expectKw('ROWID');
+        withoutRowid = true;
       } else if (_matchKw('STRICT')) {
         strict = true;
       } else {
@@ -318,7 +330,10 @@ class Parser {
       }
     }
     return CreateTableStmt(name, cols,
-        constraints: constraints, ifNotExists: ifNotExists, strict: strict);
+        constraints: constraints,
+        ifNotExists: ifNotExists,
+        strict: strict,
+        withoutRowid: withoutRowid);
   }
 
   bool _isTableLevelConstraintStart() {
@@ -546,15 +561,33 @@ class Parser {
     // Either a single column name or an arbitrary expression.
     String? col;
     String? exprSql;
+    List<String>? extraCols;
+    final collations = <String>[];
     final saved = _pos;
     if (_check(TokType.ident) &&
         (_peek(1).type == TokType.punct &&
-            (_peek(1).text == ')' || _peek(1).text == ','))) {
+                (_peek(1).text == ')' || _peek(1).text == ',') ||
+            _peek(1).type == TokType.keyword &&
+                (_peek(1).text.toUpperCase() == 'COLLATE' ||
+                    _peek(1).text.toUpperCase() == 'ASC' ||
+                    _peek(1).text.toUpperCase() == 'DESC'))) {
       col = _expectIdent().text;
-      // Tolerate `CREATE INDEX i ON t(c1, c2)` by ignoring extras
-      // (multi-column indexes not supported — use the first column).
+      // Optional COLLATE/ASC/DESC on the first column.
+      String coll = 'BINARY';
+      if (_matchKw('COLLATE')) coll = _expectIdent().text;
+      if (_matchKw('ASC') || _matchKw('DESC')) {}
+      collations.add(coll);
+      // Multi-column indexes: collect the rest of the column list and
+      // keep them on the statement for round-tripping (the in-memory
+      // engine still indexes only on `col`, but the format layer needs
+      // all columns to write a faithful CREATE INDEX/index B-tree).
       while (_match(TokType.punct, ',')) {
-        _expectIdent();
+        (extraCols ??= <String>[]).add(_expectIdent().text);
+        // Tolerate `ASC`/`DESC` and `COLLATE foo` qualifiers per column.
+        String c2 = 'BINARY';
+        if (_matchKw('COLLATE')) c2 = _expectIdent().text;
+        if (_matchKw('ASC') || _matchKw('DESC')) {}
+        collations.add(c2);
       }
     } else {
       // Expression index.
@@ -564,6 +597,7 @@ class Parser {
       final end = _peek().offset;
       exprSql = _sliceSource(start, end);
       col = exprSql;
+      collations.add('BINARY');
     }
     _expect(TokType.punct, ')');
     String? whereSql;
@@ -574,7 +608,11 @@ class Parser {
       whereSql = _sliceSource(start, end);
     }
     return CreateIndexStmt(indexName, table, col,
-        unique: unique, whereSql: whereSql, exprSql: exprSql);
+        unique: unique,
+        whereSql: whereSql,
+        exprSql: exprSql,
+        columns: extraCols == null ? null : [col, ...extraCols],
+        collations: collations);
   }
 
   CreateViewStmt _parseCreateViewTail() {
@@ -1316,6 +1354,27 @@ class Parser {
 
   Expr _parsePrimary() {
     final t = _peek();
+    if (t.type == TokType.param) {
+      _advance();
+      // Anonymous '?' — auto-number sequentially.
+      if (t.text == '?') {
+        paramCount++;
+        return BindParamExpr(index: paramCount, spelling: t.text);
+      }
+      // Numbered '?<digits>'.
+      if (t.text.startsWith('?')) {
+        final n = int.parse(t.text.substring(1));
+        if (n < 1) {
+          throw FormatException('Bind parameter $t must use a 1-based index');
+        }
+        if (n > paramCount) paramCount = n;
+        return BindParamExpr(index: n, spelling: t.text);
+      }
+      // Named ':foo' / '@foo' / '\$foo' — strip the leading sigil.
+      final name = t.text.substring(1);
+      namedParams.add(t.text);
+      return BindParamExpr(name: name, spelling: t.text);
+    }
     if (t.type == TokType.number) {
       _advance();
       if (t.text.contains('.')) return LiteralExpr(double.parse(t.text));

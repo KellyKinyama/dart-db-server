@@ -5,6 +5,7 @@ export 'server/client.dart';
 export 'server/concurrency.dart';
 export 'server/database.dart';
 export 'server/expression.dart' show Expr;
+export 'server/prepared.dart';
 export 'server/result.dart';
 export 'server/schema.dart';
 export 'server/server.dart';

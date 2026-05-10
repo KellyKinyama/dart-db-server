@@ -12,10 +12,12 @@ class CreateTableStmt extends Statement {
   final List<TableConstraint> constraints;
   final bool ifNotExists;
   final bool strict;
+  final bool withoutRowid;
   CreateTableStmt(this.name, this.columns,
       {this.constraints = const [],
       this.ifNotExists = false,
-      this.strict = false});
+      this.strict = false,
+      this.withoutRowid = false});
 }
 
 class DropTableStmt extends Statement {
@@ -68,8 +70,24 @@ class CreateIndexStmt extends Statement {
   /// Optional indexed-expression source. When non-null, this index is an
   /// expression index and [column] holds a synthetic key (the SQL text).
   final String? exprSql;
+
+  /// Full ordered list of indexed columns. For single-column indexes this
+  /// is `[column]`; multi-column index DDL fills in every key column so
+  /// it can be preserved through file-format round-trips.
+  final List<String> columns;
+
+  /// Per-column collation names ('BINARY' default; 'NOCASE' supported).
+  final List<String> collations;
+
   CreateIndexStmt(this.indexName, this.table, this.column,
-      {this.unique = false, this.whereSql, this.exprSql});
+      {this.unique = false,
+      this.whereSql,
+      this.exprSql,
+      List<String>? columns,
+      List<String>? collations})
+      : columns = columns ?? [column],
+        collations = collations ??
+            List<String>.filled((columns ?? [column]).length, 'BINARY');
 }
 
 class DropIndexStmt extends Statement {
