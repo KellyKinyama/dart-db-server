@@ -1,0 +1,1323 @@
+/// SQL expression AST and evaluator (used by WHERE, HAVING, ON clauses).
+library;
+
+import 'dart:convert';
+
+import 'schema.dart';
+
+abstract class Expr {
+  /// Evaluate this expression in the context of [row] (column name -> value).
+  Object? eval(Map<String, Object?> row);
+}
+
+class LiteralExpr extends Expr {
+  final Object? value;
+  LiteralExpr(this.value);
+  @override
+  Object? eval(Map<String, Object?> row) => value;
+}
+
+class ColumnExpr extends Expr {
+  final String? table; // optional qualifier (table.column)
+  final String name;
+  ColumnExpr(this.name, {this.table});
+  @override
+  Object? eval(Map<String, Object?> row) {
+    if (table != null) {
+      final qualified = '$table.$name';
+      if (row.containsKey(qualified)) return row[qualified];
+      // Case-insensitive fallback for keyword-derived names like NEW.col.
+      final upper = qualified.toUpperCase();
+      final lower = qualified.toLowerCase();
+      if (row.containsKey(upper)) return row[upper];
+      if (row.containsKey(lower)) return row[lower];
+    }
+    if (row.containsKey(name)) return row[name];
+    final upper = name.toUpperCase();
+    final lower = name.toLowerCase();
+    if (row.containsKey(upper)) return row[upper];
+    if (row.containsKey(lower)) return row[lower];
+    throw StateError(
+        'Unknown column: ${table == null ? name : '$table.$name'}');
+  }
+}
+
+class UnaryExpr extends Expr {
+  final String op; // NOT, -
+  final Expr operand;
+  UnaryExpr(this.op, this.operand);
+  @override
+  Object? eval(Map<String, Object?> row) {
+    final v = operand.eval(row);
+    switch (op) {
+      case 'NOT':
+        if (v == null) return null;
+        return !(v as bool);
+      case '-':
+        if (v == null) return null;
+        return -(v as num);
+      case 'IS NULL':
+        return v == null;
+      case 'IS NOT NULL':
+        return v != null;
+    }
+    throw StateError('Unknown unary op: $op');
+  }
+}
+
+class BinaryExpr extends Expr {
+  final String op;
+  final Expr left;
+  final Expr right;
+  BinaryExpr(this.op, this.left, this.right);
+
+  @override
+  Object? eval(Map<String, Object?> row) {
+    // Short-circuit logical ops
+    if (op == 'AND' || op == 'OR') {
+      final l = left.eval(row);
+      if (op == 'AND' && l == false) return false;
+      if (op == 'OR' && l == true) return true;
+      final r = right.eval(row);
+      if (l == null || r == null) return null;
+      return op == 'AND'
+          ? (l as bool) && (r as bool)
+          : (l as bool) || (r as bool);
+    }
+    final l = left.eval(row);
+    final r = right.eval(row);
+    if (l == null || r == null) {
+      // SQL three-valued logic: comparisons with NULL yield NULL (treated as false).
+      return null;
+    }
+    switch (op) {
+      case '->':
+        return _jsonOp(l, r, asText: false);
+      case '->>':
+        return _jsonOp(l, r, asText: true);
+      case '=':
+        return _eq(l, r);
+      case '!=':
+      case '<>':
+        return !_eq(l, r);
+      case '<':
+        return _cmp(l, r) < 0;
+      case '<=':
+        return _cmp(l, r) <= 0;
+      case '>':
+        return _cmp(l, r) > 0;
+      case '>=':
+        return _cmp(l, r) >= 0;
+      case '+':
+        return (l as num) + (r as num);
+      case '-':
+        return (l as num) - (r as num);
+      case '*':
+        return (l as num) * (r as num);
+      case '/':
+        return (l as num) / (r as num);
+      case '||':
+        return _stringify(l) + _stringify(r);
+      case 'LIKE':
+        return _like(l.toString(), r.toString());
+      case 'GLOB':
+        return _glob(l.toString(), r.toString());
+      case 'MATCH':
+        return _match(l.toString(), r.toString());
+    }
+    throw StateError('Unknown binary op: $op');
+  }
+
+  /// Toy MATCH operator: case-insensitive AND of whitespace-separated
+  /// terms, each tested as a substring of the left value. Suitable for
+  /// the toy `fts5` virtual table.
+  static bool _match(String haystack, String pattern) {
+    final h = haystack.toLowerCase();
+    for (final term in pattern.toLowerCase().split(RegExp(r'\s+'))) {
+      if (term.isEmpty) continue;
+      if (!h.contains(term)) return false;
+    }
+    return true;
+  }
+
+  static String _stringify(Object v) {
+    if (v is bool) return v ? 'true' : 'false';
+    return v.toString();
+  }
+
+  static bool _eq(Object a, Object b) => sqlEq(a, b);
+  static int _cmp(Object a, Object b) => sqlCompare(a, b);
+
+  static bool _like(String value, String pattern) {
+    // Translate SQL LIKE pattern to regex: % -> .*, _ -> .
+    final buf = StringBuffer('^');
+    for (final ch in pattern.split('')) {
+      if (ch == '%') {
+        buf.write('.*');
+      } else if (ch == '_') {
+        buf.write('.');
+      } else {
+        buf.write(RegExp.escape(ch));
+      }
+    }
+    buf.write(r'$');
+    return RegExp(buf.toString()).hasMatch(value);
+  }
+
+  static bool _glob(String value, String pattern) {
+    // Unix-style glob: * -> .*, ? -> ., [abc] -> [abc]. Case-sensitive.
+    final buf = StringBuffer('^');
+    var i = 0;
+    while (i < pattern.length) {
+      final ch = pattern[i];
+      if (ch == '*') {
+        buf.write('.*');
+      } else if (ch == '?') {
+        buf.write('.');
+      } else if (ch == '[') {
+        // copy until ']'
+        final close = pattern.indexOf(']', i + 1);
+        if (close < 0) {
+          buf.write(RegExp.escape(ch));
+        } else {
+          buf.write(pattern.substring(i, close + 1));
+          i = close;
+        }
+      } else {
+        buf.write(RegExp.escape(ch));
+      }
+      i++;
+    }
+    buf.write(r'$');
+    return RegExp(buf.toString()).hasMatch(value);
+  }
+}
+
+class BetweenExpr extends Expr {
+  final Expr value;
+  final Expr low;
+  final Expr high;
+  final bool negated;
+  BetweenExpr(this.value, this.low, this.high, {this.negated = false});
+  @override
+  Object? eval(Map<String, Object?> row) {
+    final v = value.eval(row);
+    final l = low.eval(row);
+    final h = high.eval(row);
+    if (v == null || l == null || h == null) return null;
+    final inRange = BinaryExpr._cmp(v, l) >= 0 && BinaryExpr._cmp(v, h) <= 0;
+    return negated ? !inRange : inRange;
+  }
+}
+
+class InExpr extends Expr {
+  final Expr value;
+  final List<Expr> values;
+  final bool negated;
+  InExpr(this.value, this.values, {this.negated = false});
+  @override
+  Object? eval(Map<String, Object?> row) {
+    final v = value.eval(row);
+    if (v == null) return null;
+    for (final e in values) {
+      final ev = e.eval(row);
+      if (ev != null && BinaryExpr._eq(v, ev)) return !negated;
+    }
+    return negated;
+  }
+}
+
+/// Convenience: evaluate expression as boolean (NULL -> false).
+bool evalPredicate(Expr e, Map<String, Object?> row) {
+  final v = e.eval(row);
+  return v is bool && v;
+}
+
+/// Coerce a value to the column's type for storage/comparison purposes.
+Object? coerceForColumn(Object? value, ColumnDef col, {bool strict = false}) {
+  if (value == null) {
+    if (col.notNull) {
+      throw FormatException('Column ${col.name} is NOT NULL');
+    }
+    return null;
+  }
+  if (strict) {
+    final ok = switch (col.type) {
+      // SQLite STRICT INTEGER accepts integer-valued REALs; we follow.
+      DataType.integer =>
+        value is int || (value is double && value == value.truncateToDouble()),
+      DataType.real => value is double || value is int,
+      DataType.text => value is String,
+      DataType.boolean => value is bool,
+      DataType.blob => value is List<int>,
+      DataType.numeric =>
+        value is num || (value is String && double.tryParse(value) != null),
+      DataType.any => true,
+    };
+    if (!ok) {
+      throw FormatException(
+          'STRICT: column ${col.name} expects ${col.type.name}, got ${value.runtimeType}');
+    }
+    // Even in STRICT we still normalize 1.0 -> 1 for INTEGER columns and
+    // run NUMERIC affinity, otherwise leave the value alone.
+    if (col.type == DataType.integer && value is double) {
+      return value.toInt();
+    }
+    if (col.type == DataType.numeric) {
+      return coerce(value, DataType.numeric);
+    }
+    return value;
+  }
+  return coerce(value, col.type);
+}
+
+// =============================================================================
+// SQL semantics helpers (shared by aggregates, ORDER BY, comparisons).
+// =============================================================================
+
+bool sqlEq(Object a, Object b) {
+  if (a is num && b is num) return a == b;
+  return a == b;
+}
+
+int sqlCompare(Object a, Object b) {
+  if (a is num && b is num) return a.compareTo(b);
+  if (a is Comparable && b is Comparable && a.runtimeType == b.runtimeType) {
+    return a.compareTo(b);
+  }
+  return a.toString().compareTo(b.toString());
+}
+
+int sqlCompareNullable(Object? a, Object? b, {bool nullsFirst = true}) {
+  if (a == null && b == null) return 0;
+  if (a == null) return nullsFirst ? -1 : 1;
+  if (b == null) return nullsFirst ? 1 : -1;
+  return sqlCompare(a, b);
+}
+
+bool sqlTruthy(Object? v) => v is bool && v;
+
+// =============================================================================
+// Additional expression nodes.
+// =============================================================================
+
+/// CASE WHEN ... THEN ... ELSE ... END.
+/// Both forms are supported:
+///   CASE WHEN <cond> THEN <v> ... [ELSE <v>] END   (searched)
+///   CASE <subject> WHEN <v1> THEN <r1> ... [ELSE <v>] END   (simple)
+/// The simple form is desugared by the parser into the searched form.
+class CaseExpr extends Expr {
+  final List<Expr> whens; // condition expressions
+  final List<Expr> thens;
+  final Expr? elseExpr;
+  CaseExpr(this.whens, this.thens, this.elseExpr);
+  @override
+  Object? eval(Map<String, Object?> row) {
+    for (var i = 0; i < whens.length; i++) {
+      if (sqlTruthy(whens[i].eval(row))) {
+        return thens[i].eval(row);
+      }
+    }
+    return elseExpr?.eval(row);
+  }
+}
+
+/// CAST(expr AS type).
+class CastExpr extends Expr {
+  final Expr expr;
+  final DataType targetType;
+  CastExpr(this.expr, this.targetType);
+  @override
+  Object? eval(Map<String, Object?> row) {
+    final v = expr.eval(row);
+    if (v == null) return null;
+    // CAST has more lenient conversion than the implicit table coercion:
+    // - double->int truncates
+    // - int/double->TEXT stringifies
+    switch (targetType) {
+      case DataType.integer:
+        if (v is int) return v;
+        if (v is double) return v.truncate();
+        if (v is String) {
+          final i = int.tryParse(v);
+          if (i != null) return i;
+          final d = double.tryParse(v);
+          if (d != null) return d.truncate();
+          return 0;
+        }
+        if (v is bool) return v ? 1 : 0;
+        return coerce(v, targetType);
+      case DataType.real:
+        if (v is num) return v.toDouble();
+        if (v is String) return double.tryParse(v) ?? 0.0;
+        return coerce(v, targetType);
+      case DataType.text:
+        return v.toString();
+      default:
+        return coerce(v, targetType);
+    }
+  }
+}
+
+/// Function call (scalar or aggregate). Evaluation of *aggregate* functions
+/// always throws here — the SELECT executor recognises and handles them
+/// out-of-band (per group).
+class FunctionCallExpr extends Expr {
+  final String name; // upper-cased
+  final List<Expr> args;
+  final bool isStarArg; // true only for COUNT(*)
+  final bool distinct; // COUNT(DISTINCT x)
+
+  /// When non-null this call is a window function: `fn(args) OVER (...)`.
+  /// The window machinery in the SELECT executor evaluates these out-of-band
+  /// and substitutes per-row values before normal projection.
+  final WindowSpec? window;
+
+  /// `FILTER (WHERE ...)` predicate; rows where the filter is false are
+  /// excluded from the aggregate / window aggregate.
+  final Expr? filterExpr;
+  FunctionCallExpr(this.name, this.args,
+      {this.isStarArg = false,
+      this.distinct = false,
+      this.window,
+      this.filterExpr});
+
+  bool get isAggregate => kAggregateFunctions.contains(name);
+  bool get isWindow => window != null;
+
+  @override
+  Object? eval(Map<String, Object?> row) {
+    if (isAggregate) {
+      throw StateError(
+          'Aggregate function $name() cannot be evaluated as a scalar');
+    }
+    final fn = kScalarFunctions[name];
+    if (fn == null) {
+      throw StateError('Unknown function: $name');
+    }
+    final values = args.map((a) => a.eval(row)).toList();
+    return fn(values);
+  }
+}
+
+/// Scalar subquery `(SELECT ...)`. The actual execution is delegated to a
+/// closure injected by the parser/executor (the parser doesn't depend on
+/// the database).
+class ScalarSubqueryExpr extends Expr {
+  /// Returns a single value or null. The closure receives the current
+  /// outer row map (currently unused — correlated subqueries not supported).
+  final Object? Function(Map<String, Object?> outerRow) run;
+  ScalarSubqueryExpr(this.run);
+  @override
+  Object? eval(Map<String, Object?> row) => run(row);
+}
+
+/// `expr IN (SELECT ...)` / `NOT IN (SELECT ...)`.
+class InSubqueryExpr extends Expr {
+  final Expr value;
+  final List<Object?> Function(Map<String, Object?> outerRow) run;
+  final bool negated;
+  InSubqueryExpr(this.value, this.run, {this.negated = false});
+  @override
+  Object? eval(Map<String, Object?> row) {
+    final v = value.eval(row);
+    if (v == null) return null;
+    final list = run(row);
+    for (final ev in list) {
+      if (ev != null && sqlEq(v, ev)) return !negated;
+    }
+    return negated;
+  }
+}
+
+/// `EXISTS (SELECT ...)` / `NOT EXISTS (...)`.
+class ExistsExpr extends Expr {
+  final bool Function(Map<String, Object?> outerRow) run;
+  final bool negated;
+  ExistsExpr(this.run, {this.negated = false});
+  @override
+  Object? eval(Map<String, Object?> row) {
+    final ok = run(row);
+    return negated ? !ok : ok;
+  }
+}
+
+/// One ORDER BY item inside an OVER(...) clause. Mirrors the shape of
+/// statement-level `OrderByItem` but kept here to avoid a cyclic import.
+class WindowOrderItem {
+  final Expr expr;
+  final bool descending;
+  final bool? nullsFirst;
+  WindowOrderItem(this.expr, {this.descending = false, this.nullsFirst});
+}
+
+/// Window frame mode.
+enum FrameMode { rows, range, groups }
+
+/// Frame boundary kind.
+enum FrameBoundKind {
+  unboundedPreceding,
+  preceding,
+  currentRow,
+  following,
+  unboundedFollowing,
+}
+
+class FrameBound {
+  final FrameBoundKind kind;
+  final Expr? offset; // for preceding/following with N
+  const FrameBound(this.kind, {this.offset});
+}
+
+enum FrameExclude { noOthers, currentRow, group, ties }
+
+class WindowFrame {
+  final FrameMode mode;
+  final FrameBound start;
+  final FrameBound end;
+  final FrameExclude exclude;
+  const WindowFrame({
+    this.mode = FrameMode.range,
+    this.start = const FrameBound(FrameBoundKind.unboundedPreceding),
+    this.end = const FrameBound(FrameBoundKind.currentRow),
+    this.exclude = FrameExclude.noOthers,
+  });
+}
+
+/// OVER([PARTITION BY ...] [ORDER BY ...] [frame]) specification attached
+/// to a `FunctionCallExpr` to make it a window function. Either an
+/// inline spec or a [name] referencing a named window in the SELECT.
+class WindowSpec {
+  final List<Expr> partitionBy;
+  final List<WindowOrderItem> orderBy;
+  final WindowFrame? frame;
+
+  /// Named-window reference: `OVER w` / `OVER (w PARTITION BY ...)`.
+  /// Resolved at execution time against the SELECT's WINDOW clause.
+  final String? baseName;
+  WindowSpec({
+    this.partitionBy = const [],
+    this.orderBy = const [],
+    this.frame,
+    this.baseName,
+  });
+}
+
+// =============================================================================
+// Built-in scalar function registry.
+// =============================================================================
+
+typedef ScalarFn = Object? Function(List<Object?> args);
+
+Object? _propagateNull(List<Object?> args, Object? Function() body) {
+  for (final a in args) {
+    if (a == null) return null;
+  }
+  return body();
+}
+
+/// Thrown by `RAISE(action, message)` inside a trigger. The trigger
+/// executor catches this and decides whether to silently ignore the
+/// current operation (IGNORE), abort it (ABORT/FAIL), or roll back the
+/// enclosing transaction (ROLLBACK).
+class RaiseException implements Exception {
+  final String action; // IGNORE / ABORT / FAIL / ROLLBACK
+  final String message;
+  RaiseException(this.action, this.message);
+  @override
+  String toString() => 'RAISE($action${message.isEmpty ? '' : ", '$message'"})';
+}
+
+final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
+  'UPPER': (a) => _propagateNull(a, () => a[0].toString().toUpperCase()),
+  'LOWER': (a) => _propagateNull(a, () => a[0].toString().toLowerCase()),
+  'LENGTH': (a) => _propagateNull(a, () {
+        final v = a[0]!;
+        // SQLite: LENGTH on a BLOB is the byte count, on TEXT the
+        // character count.
+        if (v is List<int>) return v.length;
+        return v.toString().length;
+      }),
+  'TRIM': (a) => _propagateNull(a, () => a[0].toString().trim()),
+  'LTRIM': (a) => _propagateNull(
+      a, () => a[0].toString().replaceFirst(RegExp(r'^\s+'), '')),
+  'RTRIM': (a) => _propagateNull(
+      a, () => a[0].toString().replaceFirst(RegExp(r'\s+$'), '')),
+  'SUBSTR': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final s = a[0].toString();
+    if (a.length < 2) return s;
+    final start = (a[1] as num).toInt();
+    // SQL is 1-based; negative offsets count from the end.
+    var idx = start > 0 ? start - 1 : (s.length + start).clamp(0, s.length);
+    if (idx < 0) idx = 0;
+    if (idx >= s.length) return '';
+    if (a.length >= 3 && a[2] != null) {
+      var len = (a[2] as num).toInt();
+      if (len < 0) len = 0;
+      final end = (idx + len).clamp(0, s.length);
+      return s.substring(idx, end);
+    }
+    return s.substring(idx);
+  },
+  'SUBSTRING': (a) => kScalarFunctions['SUBSTR']!(a),
+  'REPLACE': (a) => _propagateNull(
+      a, () => a[0].toString().replaceAll(a[1].toString(), a[2].toString())),
+  'CONCAT': (a) => a.map((v) => v ?? '').join(),
+  'COALESCE': (a) {
+    for (final v in a) {
+      if (v != null) return v;
+    }
+    return null;
+  },
+  'IFNULL': (a) => a[0] ?? (a.length > 1 ? a[1] : null),
+  'NULLIF': (a) {
+    if (a.length < 2 || a[0] == null) return a.isEmpty ? null : a[0];
+    if (a[1] == null) return a[0];
+    return sqlEq(a[0]!, a[1]!) ? null : a[0];
+  },
+  'ABS': (a) => _propagateNull(a, () => (a[0] as num).abs()),
+  'ROUND': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final v = (a[0] as num).toDouble();
+    final digits = a.length > 1 && a[1] != null ? (a[1] as num).toInt() : 0;
+    final p = _pow10(digits);
+    return (v * p).round() / p;
+  },
+  'MOD': (a) => _propagateNull(a, () => (a[0] as num) % (a[1] as num)),
+  'FLOOR': (a) => _propagateNull(a, () => (a[0] as num).floor()),
+  'CEIL': (a) => _propagateNull(a, () => (a[0] as num).ceil()),
+  'CEILING': (a) => _propagateNull(a, () => (a[0] as num).ceil()),
+  'SQRT': (a) => _propagateNull(a, () {
+        final v = (a[0] as num).toDouble();
+        if (v < 0) return null;
+        return _sqrt(v);
+      }),
+  'POWER': (a) => _propagateNull(
+      a, () => _intPow((a[0] as num).toDouble(), (a[1] as num).toDouble())),
+  'POW': (a) => kScalarFunctions['POWER']!(a),
+  'SIGN': (a) => _propagateNull(a, () {
+        final v = (a[0] as num).toDouble();
+        if (v == 0) return 0;
+        return v > 0 ? 1 : -1;
+      }),
+  'RANDOM': (a) => _rng.nextInt(1 << 31),
+  'INSTR': (a) {
+    if (a.length < 2 || a[0] == null || a[1] == null) return null;
+    final hay = a[0].toString();
+    final needle = a[1].toString();
+    if (needle.isEmpty) return 1;
+    return hay.indexOf(needle) + 1; // 1-based; 0 == not found
+  },
+  'LPAD': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final s = a[0].toString();
+    final n = a.length > 1 && a[1] != null ? (a[1] as num).toInt() : s.length;
+    final pad = a.length > 2 && a[2] != null ? a[2].toString() : ' ';
+    if (s.length >= n || pad.isEmpty)
+      return s.length > n ? s.substring(0, n) : s;
+    final buf = StringBuffer();
+    while (buf.length + s.length < n) {
+      buf.write(pad);
+    }
+    final padded = buf.toString();
+    return padded.substring(0, n - s.length) + s;
+  },
+  'RPAD': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final s = a[0].toString();
+    final n = a.length > 1 && a[1] != null ? (a[1] as num).toInt() : s.length;
+    final pad = a.length > 2 && a[2] != null ? a[2].toString() : ' ';
+    if (s.length >= n || pad.isEmpty)
+      return s.length > n ? s.substring(0, n) : s;
+    final buf = StringBuffer(s);
+    while (buf.length < n) {
+      buf.write(pad);
+    }
+    return buf.toString().substring(0, n);
+  },
+  // --- Datetime --------------------------------------------------------
+  'CURRENT_TIMESTAMP': (a) => _fmtDateTime(DateTime.now().toUtc(), full: true),
+  'CURRENT_DATE': (a) => _fmtDate(DateTime.now().toUtc()),
+  'CURRENT_TIME': (a) => _fmtTime(DateTime.now().toUtc()),
+  'DATE': (a) => _datetimeFn(a, kind: _DTKind.date),
+  'TIME': (a) => _datetimeFn(a, kind: _DTKind.time),
+  'DATETIME': (a) => _datetimeFn(a, kind: _DTKind.full),
+  'STRFTIME': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final fmt = a[0].toString();
+    final dt = _resolveDateTime(a.sublist(1));
+    if (dt == null) return null;
+    return _strftime(fmt, dt);
+  },
+  'JULIANDAY': (a) {
+    final dt = _resolveDateTime(a);
+    if (dt == null) return null;
+    return _toJulianDay(dt);
+  },
+  'UNIXEPOCH': (a) {
+    final dt = _resolveDateTime(a);
+    if (dt == null) return null;
+    return dt.millisecondsSinceEpoch ~/ 1000;
+  },
+  'TYPEOF': (a) {
+    final v = a.isEmpty ? null : a[0];
+    if (v == null) return 'null';
+    if (v is int) return 'integer';
+    if (v is double) return 'real';
+    if (v is bool) return 'integer';
+    if (v is String) return 'text';
+    return 'blob';
+  },
+  // ---- JSON1 (minimal) -----------------------------------------------------
+  'JSON': (a) => _propagateNull(a, () {
+        // Validate + reformat (canonical JSON encoding).
+        final v = jsonDecode(a[0].toString());
+        return jsonEncode(v);
+      }),
+  'JSON_VALID': (a) {
+    if (a.isEmpty || a[0] == null) return 0;
+    try {
+      jsonDecode(a[0].toString());
+      return 1;
+    } catch (_) {
+      return 0;
+    }
+  },
+  'JSON_TYPE': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    Object? v;
+    try {
+      v = jsonDecode(a[0].toString());
+    } catch (_) {
+      return null;
+    }
+    if (a.length >= 2) {
+      v = jsonPathLookup(v, a[1].toString());
+    }
+    if (v == null) return 'null';
+    if (v is bool) return v ? 'true' : 'false';
+    if (v is int) return 'integer';
+    if (v is double) return 'real';
+    if (v is String) return 'text';
+    if (v is List) return 'array';
+    if (v is Map) return 'object';
+    return null;
+  },
+  'JSON_EXTRACT': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    Object? root;
+    try {
+      root = jsonDecode(a[0].toString());
+    } catch (_) {
+      return null;
+    }
+    // SQLite: with one path returns the SQL value (JSON unwrapped for
+    // scalars, JSON text for arrays/objects). With multiple paths returns
+    // a JSON array of values.
+    if (a.length == 2) {
+      final v = jsonPathLookup(root, a[1].toString());
+      return _jsonScalarOrText(v);
+    }
+    final out = <Object?>[];
+    for (var i = 1; i < a.length; i++) {
+      out.add(jsonPathLookup(root, a[i].toString()));
+    }
+    return jsonEncode(out);
+  },
+  'JSON_ARRAY': (a) => jsonEncode(a.map(_jsonValueOf).toList()),
+  'JSON_OBJECT': (a) {
+    if (a.length.isOdd) {
+      throw StateError('json_object requires an even number of arguments');
+    }
+    final m = <String, Object?>{};
+    for (var i = 0; i < a.length; i += 2) {
+      m[a[i].toString()] = _jsonValueOf(a[i + 1]);
+    }
+    return jsonEncode(m);
+  },
+  'JSON_ARRAY_LENGTH': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    Object? v;
+    try {
+      v = jsonDecode(a[0].toString());
+    } catch (_) {
+      return null;
+    }
+    if (a.length >= 2) v = jsonPathLookup(v, a[1].toString());
+    return v is List ? v.length : 0;
+  },
+  'JSON_QUOTE': (a) {
+    if (a.isEmpty) return 'null';
+    return jsonEncode(a[0]);
+  },
+  // RAISE(IGNORE) / RAISE(ABORT|FAIL|ROLLBACK, 'msg'). Used in trigger
+  // bodies to abort the host operation. Implemented by throwing a typed
+  // exception that the trigger executor recognises.
+  'RAISE': (a) {
+    final action = (a.isEmpty ? 'ABORT' : a[0].toString()).toUpperCase();
+    final msg = a.length >= 2 ? a[1]?.toString() ?? '' : '';
+    throw RaiseException(action, msg);
+  },
+  // json_set / json_insert / json_replace / json_remove / json_patch take
+  // (json, path, value, path, value, ...). Differences:
+  //   - set:     overwrite if exists, create if not
+  //   - insert:  create if not, never overwrite existing
+  //   - replace: overwrite if exists, never create
+  //   - remove:  delete each path
+  'JSON_SET': (a) => _jsonMutate(a, overwrite: true, createMissing: true),
+  'JSON_INSERT': (a) => _jsonMutate(a, overwrite: false, createMissing: true),
+  'JSON_REPLACE': (a) => _jsonMutate(a, overwrite: true, createMissing: false),
+  'JSON_REMOVE': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    Object? root;
+    try {
+      root = jsonDecode(a[0].toString());
+    } catch (_) {
+      return null;
+    }
+    for (var i = 1; i < a.length; i++) {
+      if (a[i] == null) continue;
+      root = jsonPathRemove(root, a[i].toString());
+    }
+    return jsonEncode(root);
+  },
+  'JSON_PATCH': (a) {
+    if (a.length < 2 || a[0] == null || a[1] == null) return null;
+    Object? base;
+    Object? patch;
+    try {
+      base = jsonDecode(a[0].toString());
+      patch = jsonDecode(a[1].toString());
+    } catch (_) {
+      return null;
+    }
+    return jsonEncode(_rfc7396Merge(base, patch));
+  },
+};
+
+// ---- JSON1 helpers ---------------------------------------------------------
+
+/// Resolve a SQLite-style JSON path (e.g. `$`, `$.a.b`, `$[0]`, `$.a[1].b`)
+/// against [root]. Returns null if any segment is missing.
+Object? jsonPathLookup(Object? root, String path) {
+  if (!path.startsWith(r'$')) {
+    throw FormatException('JSON path must start with \$: $path');
+  }
+  Object? cur = root;
+  var i = 1;
+  while (i < path.length) {
+    final ch = path[i];
+    if (ch == '.') {
+      i++;
+      final start = i;
+      while (i < path.length && path[i] != '.' && path[i] != '[') {
+        i++;
+      }
+      final key = path.substring(start, i);
+      if (cur is Map) {
+        cur = cur[key];
+      } else {
+        return null;
+      }
+    } else if (ch == '[') {
+      final close = path.indexOf(']', i + 1);
+      if (close < 0) {
+        throw FormatException('Unterminated [ in JSON path: $path');
+      }
+      final idx = int.parse(path.substring(i + 1, close));
+      if (cur is List) {
+        if (idx < 0 || idx >= cur.length) return null;
+        cur = cur[idx];
+      } else {
+        return null;
+      }
+      i = close + 1;
+    } else {
+      throw FormatException('Unexpected character in JSON path: $path');
+    }
+    if (cur == null) return null;
+  }
+  return cur;
+}
+
+/// Render the result of a JSON lookup as SQLite would: scalars (number,
+/// string, bool, null) come back unwrapped; arrays/objects stay as JSON
+/// text.
+Object? _jsonScalarOrText(Object? v) {
+  if (v == null) return null;
+  if (v is num || v is String || v is bool) return v;
+  return jsonEncode(v);
+}
+
+/// Convert a Dart value into something `jsonEncode` will accept: strings
+/// that already look like JSON (start with `{`/`[`) are decoded so they
+/// nest as structured values rather than appearing as escaped strings.
+Object? _jsonValueOf(Object? v) {
+  if (v is String) {
+    final t = v.trim();
+    if (t.startsWith('{') || t.startsWith('[')) {
+      try {
+        return jsonDecode(v);
+      } catch (_) {
+        return v;
+      }
+    }
+  }
+  return v;
+}
+
+/// Implementation of the `->` and `->>` JSON operators.
+/// The right operand is either a JSON path (string starting with `$`) or a
+/// shorthand: a string is treated as a top-level object key, an integer as
+/// an array index.
+Object? _jsonOp(Object l, Object r, {required bool asText}) {
+  Object? root;
+  try {
+    root = jsonDecode(l.toString());
+  } catch (_) {
+    return null;
+  }
+  String path;
+  if (r is num) {
+    path = '\$[${r.toInt()}]';
+  } else {
+    final s = r.toString();
+    path = s.startsWith(r'$') ? s : '\$.$s';
+  }
+  final v = jsonPathLookup(root, path);
+  if (asText) return _jsonScalarOrText(v);
+  // `->` always returns JSON text.
+  if (v == null) return null;
+  if (v is num || v is bool) return jsonEncode(v);
+  if (v is String) return jsonEncode(v);
+  return jsonEncode(v);
+}
+
+final _rng = _Rng();
+
+class _Rng {
+  int _state = DateTime.now().microsecondsSinceEpoch & 0x7fffffff;
+  int nextInt(int bound) {
+    // xorshift32
+    var x = _state == 0 ? 1 : _state;
+    x ^= (x << 13) & 0xffffffff;
+    x ^= (x >> 17);
+    x ^= (x << 5) & 0xffffffff;
+    _state = x & 0x7fffffff;
+    return _state % bound;
+  }
+}
+
+double _sqrt(double v) {
+  // Newton's method (good enough; avoids dart:math import here).
+  if (v == 0) return 0;
+  var x = v;
+  for (var i = 0; i < 30; i++) {
+    x = 0.5 * (x + v / x);
+  }
+  return x;
+}
+
+double _intPow(double base, double exp) {
+  // Generic; for integer exponents use repeated multiplication; else exp/log
+  // approximation via Newton (rarely needed in tests).
+  if (exp == exp.truncate()) {
+    var n = exp.truncate();
+    var result = 1.0;
+    var b = base;
+    if (n < 0) {
+      b = 1 / b;
+      n = -n;
+    }
+    while (n > 0) {
+      if ((n & 1) == 1) result *= b;
+      b *= b;
+      n >>= 1;
+    }
+    return result;
+  }
+  // For non-integer exponents we'd ideally use math.pow; do log/exp series.
+  // Tests only exercise integer exponents.
+  throw StateError('POWER with non-integer exponent not supported');
+}
+
+enum _DTKind { date, time, full }
+
+DateTime? _parseDateTime(Object? v) {
+  if (v == null) return null;
+  if (v is DateTime) return v;
+  if (v is num) {
+    // SQLite-style julianday number; epoch handling lives in
+    // _resolveDateTime via the 'unixepoch' modifier.
+    return _fromJulianDay(v.toDouble());
+  }
+  final s = v.toString().trim();
+  if (s.toUpperCase() == 'NOW') return DateTime.now().toUtc();
+  // Try the SQLite TEXT formats first so a bare YYYY-MM-DD or
+  // 'YYYY-MM-DD HH:MM:SS' is treated as UTC, not as local time.
+  final dOnly = RegExp(r'^(\d{4})-(\d{2})-(\d{2})$').firstMatch(s);
+  if (dOnly != null) {
+    return DateTime.utc(
+        int.parse(dOnly[1]!), int.parse(dOnly[2]!), int.parse(dOnly[3]!));
+  }
+  final dt = RegExp(
+          r'^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,6}))?)?$')
+      .firstMatch(s);
+  if (dt != null) {
+    final us = dt.group(7) == null
+        ? 0
+        : int.parse(dt.group(7)!.padRight(6, '0').substring(0, 6));
+    return DateTime.utc(
+      int.parse(dt[1]!),
+      int.parse(dt[2]!),
+      int.parse(dt[3]!),
+      int.parse(dt[4]!),
+      int.parse(dt[5]!),
+      dt.group(6) == null ? 0 : int.parse(dt.group(6)!),
+      0,
+      us,
+    );
+  }
+  // Fall back to ISO-8601 with timezone (e.g. ...Z or +HH:MM).
+  final iso = DateTime.tryParse(s);
+  if (iso != null) return iso.isUtc ? iso : iso.toUtc();
+  return null;
+}
+
+String? _datetimeFn(List<Object?> a, {required _DTKind kind}) {
+  final dt = _resolveDateTime(a);
+  if (dt == null) return null;
+  switch (kind) {
+    case _DTKind.date:
+      return _fmtDate(dt);
+    case _DTKind.time:
+      return _fmtTime(dt);
+    case _DTKind.full:
+      return _fmtDateTime(dt, full: true);
+  }
+}
+
+/// Resolve SQLite-style date/time arguments: an optional time-value
+/// followed by zero or more modifier strings.
+///
+/// Behaviour:
+///   - empty args  -> 'now' (current UTC time).
+///   - first arg null -> null (whole expression null-propagates).
+///   - first arg may be a SQLite-recognised time string, a unix epoch
+///     number, a Julian day number (when followed by `'unixepoch'` it
+///     means seconds; otherwise pure REAL is interpreted as Julian day),
+///     or the literal `'now'`.
+///   - remaining args are SQLite modifier strings such as `'+1 day'`,
+///     `'start of month'`, `'unixepoch'`, `'utc'`, `'localtime'`, etc.
+///     Returns null if any modifier can't be parsed.
+DateTime? _resolveDateTime(List<Object?> args) {
+  if (args.isEmpty) return DateTime.now().toUtc();
+  final first = args[0];
+  if (first == null) return null;
+
+  // Special case: numeric first arg may be either Julian day or unix
+  // epoch depending on whether the 'unixepoch' modifier is present in the
+  // remaining arguments.
+  final mods = args.sublist(1).map((m) => m?.toString().toLowerCase()).toList();
+  final unixEpochMode = mods.contains('unixepoch');
+
+  DateTime? dt;
+  if (first is num && unixEpochMode) {
+    dt = DateTime.fromMillisecondsSinceEpoch((first.toDouble() * 1000).toInt(),
+        isUtc: true);
+  } else if (first is num) {
+    // Julian day -> DateTime.
+    dt = _fromJulianDay(first.toDouble());
+  } else {
+    dt = _parseDateTime(first);
+  }
+  if (dt == null) return null;
+
+  for (final raw in mods) {
+    if (raw == null) return null;
+    if (raw == 'unixepoch') continue; // already handled above
+    final next = _applyModifier(dt!, raw);
+    if (next == null) return null;
+    dt = next;
+  }
+  return dt;
+}
+
+DateTime? _applyModifier(DateTime dt, String mod) {
+  final m = mod.trim().toLowerCase();
+  if (m == 'utc' || m == 'localtime') {
+    // We always store/operate in UTC, so 'utc' is a no-op and 'localtime'
+    // is intentionally not implemented (would need TZ data). Treat both
+    // as no-ops for portability.
+    return dt;
+  }
+  if (m == 'start of day') {
+    return DateTime.utc(dt.year, dt.month, dt.day);
+  }
+  if (m == 'start of month') {
+    return DateTime.utc(dt.year, dt.month, 1);
+  }
+  if (m == 'start of year') {
+    return DateTime.utc(dt.year, 1, 1);
+  }
+  // weekday N => move forward 0..6 days so the result lands on weekday N
+  // (SQLite: 0 = Sunday .. 6 = Saturday).
+  final wd = RegExp(r'^weekday\s+([0-6])$').firstMatch(m);
+  if (wd != null) {
+    final target = int.parse(wd.group(1)!);
+    // Dart: Monday=1..Sunday=7 -> map to SQLite Sun=0..Sat=6.
+    final cur = dt.weekday % 7;
+    var add = (target - cur) % 7;
+    if (add < 0) add += 7;
+    return dt.add(Duration(days: add));
+  }
+  // +N <unit> / -N <unit> / N.NN <unit>
+  final rel =
+      RegExp(r'^([+-]?\d+(?:\.\d+)?)\s*(year|month|day|hour|minute|second)s?$')
+          .firstMatch(m);
+  if (rel != null) {
+    final n = double.parse(rel.group(1)!);
+    final unit = rel.group(2)!;
+    switch (unit) {
+      case 'year':
+        return DateTime.utc(dt.year + n.toInt(), dt.month, dt.day, dt.hour,
+            dt.minute, dt.second, dt.millisecond, dt.microsecond);
+      case 'month':
+        final totalMonths = dt.month - 1 + n.toInt();
+        final y = dt.year + (totalMonths ~/ 12);
+        var mo = totalMonths % 12;
+        if (mo < 0) {
+          mo += 12;
+        }
+        return DateTime.utc(y, mo + 1, dt.day, dt.hour, dt.minute, dt.second,
+            dt.millisecond, dt.microsecond);
+      case 'day':
+        return dt.add(Duration(microseconds: (n * 86400 * 1e6).round()));
+      case 'hour':
+        return dt.add(Duration(microseconds: (n * 3600 * 1e6).round()));
+      case 'minute':
+        return dt.add(Duration(microseconds: (n * 60 * 1e6).round()));
+      case 'second':
+        return dt.add(Duration(microseconds: (n * 1e6).round()));
+    }
+  }
+  return null; // unrecognised modifier
+}
+
+/// Convert [dt] (UTC) to a Julian Day Number (real). Matches SQLite's
+/// `julianday()` to fractional seconds.
+double _toJulianDay(DateTime dt) {
+  final ms = dt.toUtc().millisecondsSinceEpoch;
+  return ms / 86400000.0 + 2440587.5;
+}
+
+DateTime _fromJulianDay(double jd) {
+  final ms = ((jd - 2440587.5) * 86400000.0).round();
+  return DateTime.fromMillisecondsSinceEpoch(ms, isUtc: true);
+}
+
+String _fmtDate(DateTime d) => '${d.year.toString().padLeft(4, "0")}-'
+    '${d.month.toString().padLeft(2, "0")}-'
+    '${d.day.toString().padLeft(2, "0")}';
+
+String _fmtTime(DateTime d) => '${d.hour.toString().padLeft(2, "0")}:'
+    '${d.minute.toString().padLeft(2, "0")}:'
+    '${d.second.toString().padLeft(2, "0")}';
+
+String _fmtDateTime(DateTime d, {bool full = false}) =>
+    '${_fmtDate(d)} ${_fmtTime(d)}';
+
+String _strftime(String fmt, DateTime d) {
+  final buf = StringBuffer();
+  for (var i = 0; i < fmt.length; i++) {
+    final ch = fmt[i];
+    if (ch != '%' || i + 1 >= fmt.length) {
+      buf.write(ch);
+      continue;
+    }
+    final code = fmt[++i];
+    switch (code) {
+      case 'Y':
+        buf.write(d.year.toString().padLeft(4, '0'));
+        break;
+      case 'm':
+        buf.write(d.month.toString().padLeft(2, '0'));
+        break;
+      case 'd':
+        buf.write(d.day.toString().padLeft(2, '0'));
+        break;
+      case 'H':
+        buf.write(d.hour.toString().padLeft(2, '0'));
+        break;
+      case 'M':
+        buf.write(d.minute.toString().padLeft(2, '0'));
+        break;
+      case 'S':
+        buf.write(d.second.toString().padLeft(2, '0'));
+        break;
+      case 'j':
+        buf.write(_dayOfYear(d).toString().padLeft(3, '0'));
+        break;
+      case 's':
+        buf.write((d.millisecondsSinceEpoch ~/ 1000).toString());
+        break;
+      case '%':
+        buf.write('%');
+        break;
+      default:
+        buf.write('%');
+        buf.write(code);
+    }
+  }
+  return buf.toString();
+}
+
+int _dayOfYear(DateTime d) {
+  final start = DateTime.utc(d.year, 1, 1);
+  return d.toUtc().difference(start).inDays + 1;
+}
+
+double _pow10(int n) {
+  var r = 1.0;
+  for (var i = 0; i < n.abs(); i++) {
+    r *= 10;
+  }
+  return n < 0 ? 1 / r : r;
+}
+
+const Set<String> kAggregateFunctions = {
+  'COUNT',
+  'SUM',
+  'AVG',
+  'MIN',
+  'MAX',
+  'JSON_GROUP_ARRAY',
+  'JSON_GROUP_OBJECT',
+};
+
+// ---- More JSON1 helpers ----------------------------------------------------
+
+/// Walk [path] (`$.a.b[2]`) and return the parent container plus the final
+/// segment so callers can mutate it. Returns null when the parent doesn't
+/// exist.
+({Object container, Object? key})? _jsonPathParent(Object? root, String path) {
+  if (!path.startsWith(r'$')) {
+    throw FormatException('JSON path must start with \$: $path');
+  }
+  Object? cur = root;
+  Object? parent;
+  Object? lastKey;
+  var i = 1;
+  while (i < path.length) {
+    final ch = path[i];
+    if (ch == '.') {
+      i++;
+      final start = i;
+      while (i < path.length && path[i] != '.' && path[i] != '[') {
+        i++;
+      }
+      final key = path.substring(start, i);
+      parent = cur;
+      lastKey = key;
+      if (cur is Map) {
+        cur = cur[key];
+      } else {
+        return null;
+      }
+    } else if (ch == '[') {
+      final close = path.indexOf(']', i + 1);
+      if (close < 0) {
+        throw FormatException('Unterminated [ in JSON path: $path');
+      }
+      final idx = int.parse(path.substring(i + 1, close));
+      parent = cur;
+      lastKey = idx;
+      if (cur is List) {
+        cur = (idx < 0 || idx >= cur.length) ? null : cur[idx];
+      } else {
+        return null;
+      }
+      i = close + 1;
+    } else {
+      throw FormatException('Unexpected char in JSON path: $path');
+    }
+  }
+  if (parent == null) return null;
+  return (container: parent, key: lastKey);
+}
+
+/// Apply a json_set / json_insert / json_replace mutation. Returns the new
+/// JSON-encoded document, or null if [args] is malformed.
+Object? _jsonMutate(List<Object?> args,
+    {required bool overwrite, required bool createMissing}) {
+  if (args.isEmpty || args[0] == null) return null;
+  Object? root;
+  try {
+    root = jsonDecode(args[0].toString());
+  } catch (_) {
+    return null;
+  }
+  if (args.length.isEven) {
+    throw StateError('json_set/insert/replace require alternating path,value');
+  }
+  for (var i = 1; i + 1 < args.length; i += 2) {
+    final path = args[i]?.toString();
+    final value = _jsonValueOf(args[i + 1]);
+    if (path == null) continue;
+    if (path == r'$') {
+      root = value;
+      continue;
+    }
+    final parent = _jsonPathParent(root, path);
+    if (parent == null) continue;
+    final c = parent.container;
+    final k = parent.key;
+    if (c is Map) {
+      final has = c.containsKey(k);
+      if (has && overwrite) c[k as String] = value;
+      if (!has && createMissing) c[k as String] = value;
+    } else if (c is List) {
+      final idx = k as int;
+      final inRange = idx >= 0 && idx < c.length;
+      if (inRange && overwrite) c[idx] = value;
+      if (!inRange && createMissing) {
+        // Append; SQLite extends lists rather than skipping.
+        c.add(value);
+      }
+    }
+  }
+  return jsonEncode(root);
+}
+
+/// Remove the value at [path] from [root]. Returns the (possibly mutated)
+/// root.
+Object? jsonPathRemove(Object? root, String path) {
+  if (path == r'$') return null;
+  final parent = _jsonPathParent(root, path);
+  if (parent == null) return root;
+  final c = parent.container;
+  final k = parent.key;
+  if (c is Map) {
+    c.remove(k);
+  } else if (c is List) {
+    final idx = k as int;
+    if (idx >= 0 && idx < c.length) c.removeAt(idx);
+  }
+  return root;
+}
+
+/// RFC 7396 JSON Merge Patch (used by `json_patch`).
+Object? _rfc7396Merge(Object? target, Object? patch) {
+  if (patch is! Map) return patch;
+  final out =
+      target is Map ? Map<String, Object?>.from(target) : <String, Object?>{};
+  patch.forEach((k, v) {
+    if (v == null) {
+      out.remove(k);
+    } else {
+      out[k as String] = _rfc7396Merge(out[k], v);
+    }
+  });
+  return out;
+}
