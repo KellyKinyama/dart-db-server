@@ -5022,8 +5022,10 @@ class Database {
       }
       _tables['sqlite_stat1'] = stat;
       // Repopulate the planner's _stats map from the loaded rows. SQLite
-      // emits per-index rows where `stat` is `<rowCount> <avgRowsPerKey>`;
-      // the first integer doubles as the table row count.
+      // emits per-index rows where `stat` is `<rowCount> <avgRowsPerKey>
+      // ...`; the first integer doubles as the table row count, and the
+      // second (when present) lets us recover the indexed column's
+      // distinct cardinality.
       final tableCounts = <String, int>{};
       for (final r in stat.rows) {
         final tname = r[0]?.toString();
@@ -5040,6 +5042,27 @@ class Database {
           _stats[tname] = _TableStats(n, <String, int>{});
         }
       });
+      // Second pass: extract per-index distinct counts from the
+      // `<n> <avgRowsPerKey>` form on index-stat rows.
+      for (final r in stat.rows) {
+        final tname = r[0]?.toString();
+        final idxName = r[1]?.toString();
+        final statStr = r[2]?.toString();
+        if (tname == null || idxName == null || statStr == null) continue;
+        final parts = statStr.split(' ');
+        if (parts.length < 2) continue;
+        final n = int.tryParse(parts[0]);
+        final avg = int.tryParse(parts[1]);
+        if (n == null || avg == null || avg <= 0) continue;
+        final tbl = _tables[tname];
+        if (tbl == null) continue;
+        final def = tbl.indexDefs[idxName];
+        if (def == null) continue;
+        final distinct = (n / avg).ceil();
+        final ts = _stats.putIfAbsent(
+            tname, () => _TableStats(n, <String, int>{}));
+        ts.distinctByColumn[def.column.toLowerCase()] = distinct;
+      }
     }
     final msg = StringBuffer('Loaded $tablesLoaded table(s), '
         '$rowsLoaded row(s), $indexesLoaded index(es) from $path');
