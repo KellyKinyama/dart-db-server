@@ -116,7 +116,7 @@ void main() {
       ]);
       final f = _tmpDb('written');
       await f.writeAsBytes(bytes);
-      addTearDown(() async => f.exists().then((e) => e ? f.delete() : null));
+      addTearDown(() async { if (await f.exists()) await f.delete(); });
       final ref = sq.sqlite3.open(f.path);
       try {
         final r = ref.select('SELECT id, name, age FROM people ORDER BY id');
@@ -152,7 +152,7 @@ void main() {
       ]);
       final f = _tmpDb('multi');
       await f.writeAsBytes(bytes);
-      addTearDown(() async => f.exists().then((e) => e ? f.delete() : null));
+      addTearDown(() async { if (await f.exists()) await f.delete(); });
       final ref = sq.sqlite3.open(f.path);
       try {
         expect(
@@ -173,7 +173,7 @@ void main() {
 
     test('we can read what SQLite wrote', () async {
       final f = _tmpDb('readback');
-      addTearDown(() async => f.exists().then((e) => e ? f.delete() : null));
+      addTearDown(() async { if (await f.exists()) await f.delete(); });
       final ref = sq.sqlite3.open(f.path);
       try {
         ref.execute('CREATE TABLE t(a INTEGER, b TEXT, c REAL)');
@@ -196,7 +196,7 @@ void main() {
 
     test('we can read SQLite schema rows', () async {
       final f = _tmpDb('schema');
-      addTearDown(() async => f.exists().then((e) => e ? f.delete() : null));
+      addTearDown(() async { if (await f.exists()) await f.delete(); });
       final ref = sq.sqlite3.open(f.path);
       try {
         ref.execute('CREATE TABLE foo(a INTEGER)');
@@ -282,7 +282,7 @@ void main() {
       ]);
       final f = _tmpDb('overflow');
       await f.writeAsBytes(bytes);
-      addTearDown(() async => f.exists().then((e) => e ? f.delete() : null));
+      addTearDown(() async { if (await f.exists()) await f.delete(); });
       final ref = sq.sqlite3.open(f.path);
       try {
         final r = ref.select('SELECT id, length(data) FROM t ORDER BY id');
@@ -308,7 +308,7 @@ void main() {
       final skip = sqliteSkipReason();
       if (skip != null) return;
       final f = _tmpDb('sqlite_overflow');
-      addTearDown(() async => f.exists().then((e) => e ? f.delete() : null));
+      addTearDown(() async { if (await f.exists()) await f.delete(); });
       final big = Uint8List(10000);
       for (var i = 0; i < big.length; i++) {
         big[i] = (i * 31) & 0xff;
@@ -371,7 +371,7 @@ void main() {
       ]);
       final f = _tmpDb('mixed_overflow');
       await f.writeAsBytes(bytes);
-      addTearDown(() async => f.exists().then((e) => e ? f.delete() : null));
+      addTearDown(() async { if (await f.exists()) await f.delete(); });
       final ref = sq.sqlite3.open(f.path);
       try {
         final r =
@@ -393,7 +393,7 @@ void main() {
       final skip = sqliteSkipReason();
       if (skip != null) return;
       final f = _tmpDb('idx_small');
-      addTearDown(() async => f.exists().then((e) => e ? f.delete() : null));
+      addTearDown(() async { if (await f.exists()) await f.delete(); });
       final ref = sq.sqlite3.open(f.path);
       try {
         ref.execute('CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT)');
@@ -421,7 +421,7 @@ void main() {
       final skip = sqliteSkipReason();
       if (skip != null) return;
       final f = _tmpDb('idx_multi');
-      addTearDown(() async => f.exists().then((e) => e ? f.delete() : null));
+      addTearDown(() async { if (await f.exists()) await f.delete(); });
       final ref = sq.sqlite3.open(f.path);
       try {
         ref.execute('CREATE TABLE t(a INT, b INT, c TEXT)');
@@ -451,7 +451,7 @@ void main() {
       final skip = sqliteSkipReason();
       if (skip != null) return;
       final f = _tmpDb('idx_big');
-      addTearDown(() async => f.exists().then((e) => e ? f.delete() : null));
+      addTearDown(() async { if (await f.exists()) await f.delete(); });
       // 2000 rows with small string keys → multi-page index B-tree.
       final ref = sq.sqlite3.open(f.path);
       try {
@@ -492,7 +492,7 @@ void main() {
       final skip = sqliteSkipReason();
       if (skip != null) return;
       final f = _tmpDb('idx_overflow');
-      addTearDown(() async => f.exists().then((e) => e ? f.delete() : null));
+      addTearDown(() async { if (await f.exists()) await f.delete(); });
       final big = 'x' * 8000;
       final ref = sq.sqlite3.open(f.path);
       try {
@@ -595,7 +595,7 @@ void main() {
       );
       final f = _tmpDb('idx_write');
       await f.writeAsBytes(bytes);
-      addTearDown(() async => f.exists().then((e) => e ? f.delete() : null));
+      addTearDown(() async { if (await f.exists()) await f.delete(); });
       final ref = sq.sqlite3.open(f.path);
       try {
         // SQLite-side integrity: the index must agree with the table.
@@ -641,7 +641,7 @@ void main() {
         final tmp = _tmpDb('multileaf_table');
         await tmp.writeAsBytes(bytes);
         addTearDown(
-            () async => tmp.exists().then((e) => e ? tmp.delete() : null));
+            () async { if (await tmp.exists()) await tmp.delete(); });
         final ref = sq.sqlite3.open(tmp.path);
         try {
           expect(ref.select('PRAGMA integrity_check').rows.single.first, 'ok');
@@ -685,7 +685,7 @@ void main() {
       );
       final f = _tmpDb('multileaf_index');
       await f.writeAsBytes(bytes);
-      addTearDown(() async => f.exists().then((e) => e ? f.delete() : null));
+      addTearDown(() async { if (await f.exists()) await f.delete(); });
       final ref = sq.sqlite3.open(f.path);
       try {
         expect(ref.select('PRAGMA integrity_check').rows.single.first, 'ok');
@@ -742,7 +742,7 @@ void main() {
       );
       final f = _tmpDb('idx_multi_write');
       await f.writeAsBytes(bytes);
-      addTearDown(() async => f.exists().then((e) => e ? f.delete() : null));
+      addTearDown(() async { if (await f.exists()) await f.delete(); });
       final ref = sq.sqlite3.open(f.path);
       try {
         expect(ref.select('PRAGMA integrity_check').rows.single.first, 'ok');
