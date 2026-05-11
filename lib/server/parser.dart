@@ -201,6 +201,11 @@ class Parser {
           String? target;
           if (_check(TokType.ident)) target = _parseQualifiedTableName();
           return AnalyzeStmt(target: target);
+        case 'REINDEX':
+          _advance();
+          String? rTarget;
+          if (_check(TokType.ident)) rTarget = _parseQualifiedTableName();
+          return ReindexStmt(target: rTarget);
         case 'ATTACH':
           _advance();
           _matchKw('DATABASE');

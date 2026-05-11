@@ -196,6 +196,7 @@ const Set<String> _keywords = {
   'ROWID',
   'VACUUM',
   'ANALYZE',
+  'REINDEX',
   'WITHOUT',
   'STRICT',
   'MATCH',

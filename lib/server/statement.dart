@@ -332,6 +332,13 @@ class AnalyzeStmt extends Statement {
   AnalyzeStmt({this.target});
 }
 
+class ReindexStmt extends Statement {
+  /// Optional target: a table name, index name, or collation name. When
+  /// null, every index in the database is rebuilt.
+  final String? target;
+  ReindexStmt({this.target});
+}
+
 class DescribeStmt extends Statement {
   final String table;
   DescribeStmt(this.table);

@@ -387,6 +387,8 @@ class Database {
       result = _vacuum(stmt);
     } else if (stmt is AnalyzeStmt) {
       result = _analyze(stmt);
+    } else if (stmt is ReindexStmt) {
+      result = _reindex(stmt);
     } else if (stmt is CreateVirtualTableStmt) {
       result = _createVirtualTable(stmt);
     } else {
@@ -414,6 +416,7 @@ class Database {
       s is DropTriggerStmt ||
       s is VacuumStmt ||
       s is AnalyzeStmt ||
+      s is ReindexStmt ||
       s is CreateVirtualTableStmt;
 
   /// Best-effort: primary table touched by [s], used to seed the
@@ -4223,6 +4226,49 @@ class Database {
   /// (Returning is enough — the dispatcher persists after mutations.)
   QueryResult _vacuum(VacuumStmt s) {
     return QueryResult.message('VACUUM ok');
+  }
+
+  /// REINDEX: rebuild ordered index structures from the underlying rows.
+  /// With no target, every index in every table is rebuilt. A target may
+  /// be an index name, a table name (rebuild all its indexes), or a
+  /// collation name (no-op, since the engine has no user collations).
+  QueryResult _reindex(ReindexStmt s) {
+    int rebuilt = 0;
+    void rebuildTable(Table t) {
+      final defs = List<IndexDef>.from(t.indexDefs.values);
+      for (final d in defs) {
+        t.dropIndex(d.name);
+        t.createIndex(d);
+        rebuilt++;
+      }
+    }
+
+    final target = s.target;
+    if (target == null) {
+      for (final t in _tables.values) {
+        rebuildTable(t);
+      }
+      return QueryResult.message('REINDEX rebuilt $rebuilt index(es)');
+    }
+
+    // Try as a table name first.
+    final tbl = _tables[target];
+    if (tbl != null) {
+      rebuildTable(tbl);
+      return QueryResult.message(
+          'REINDEX rebuilt $rebuilt index(es) on $target');
+    }
+    // Try as an index name across all tables.
+    for (final t in _tables.values) {
+      final def = t.indexDefs[target];
+      if (def != null) {
+        t.dropIndex(def.name);
+        t.createIndex(def);
+        return QueryResult.message('REINDEX rebuilt index $target');
+      }
+    }
+    // SQLite treats unknown names as collation names and silently no-ops.
+    return QueryResult.message('REINDEX ok');
   }
 
   /// Create a "virtual" table. We don't have a true virtual-table API; the
