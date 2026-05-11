@@ -619,6 +619,7 @@ class Database {
       unique: old.unique,
       autoIncrement: old.autoIncrement,
       defaultValue: old.defaultValue,
+      defaultExprSql: old.defaultExprSql,
       checkExprSql: old.checkExprSql,
       references: old.references,
       generatedExprSql: old.generatedExprSql,
@@ -771,7 +772,11 @@ class Database {
       // Apply column defaults first.
       for (var i = 0; i < t.columns.length; i++) {
         final c = t.columns[i];
-        if (c.defaultValue != null) row[i] = coerce(c.defaultValue, c.type);
+        if (c.defaultValue != null) {
+          row[i] = coerce(c.defaultValue, c.type);
+        } else if (c.defaultExprSql != null) {
+          row[i] = _evalDefaultExpr(t, c, row);
+        }
       }
       if (s.columns == null) {
         if (values.length != t.columns.length) {
@@ -1118,6 +1123,18 @@ class Database {
     } finally {
       if (pushed) _cteStack.removeLast();
     }
+  }
+
+  /// Evaluate a column's `DEFAULT (<expr>)` clause in the context of the
+  /// partially-built [row]. Returns the coerced value (or null).
+  Object? _evalDefaultExpr(Table t, ColumnDef c, List<Object?> row) {
+    final expr = (Parser.fromString('SELECT ${c.defaultExprSql}')
+            .parseStatement() as SelectStmt)
+        .projection
+        .first
+        .expr!;
+    final v = _bindExpr(expr).eval(t.rowToMap(row));
+    return v == null ? null : coerce(v, c.type);
   }
 
   /// Evaluate any GENERATED ALWAYS columns in [row]; mutates [row] in place.

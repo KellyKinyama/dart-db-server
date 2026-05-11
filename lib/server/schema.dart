@@ -149,6 +149,11 @@ class ColumnDef {
   final bool autoIncrement;
   final Object? defaultValue;
 
+  /// `DEFAULT (<expr>)` source text (column-level). Mutually optional
+  /// with [defaultValue]; when both are present [defaultValue] wins as
+  /// the cheap fast-path for plain literals.
+  final String? defaultExprSql;
+
   /// CHECK expression source text (column-level). The DB engine re-parses
   /// this on demand. Stored as text so it survives JSON serialization.
   final String? checkExprSql;
@@ -169,6 +174,7 @@ class ColumnDef {
     this.unique = false,
     this.autoIncrement = false,
     this.defaultValue,
+    this.defaultExprSql,
     this.checkExprSql,
     this.references,
     this.generatedExprSql,
@@ -183,6 +189,7 @@ class ColumnDef {
         if (unique) 'unique': true,
         if (autoIncrement) 'autoIncrement': true,
         if (defaultValue != null) 'default': defaultValue,
+        if (defaultExprSql != null) 'defaultExpr': defaultExprSql,
         if (checkExprSql != null) 'check': checkExprSql,
         if (references != null) 'references': references!.toJson(),
         if (generatedExprSql != null) 'generated': generatedExprSql,
@@ -197,6 +204,7 @@ class ColumnDef {
         unique: j['unique'] == true,
         autoIncrement: j['autoIncrement'] == true,
         defaultValue: j['default'],
+        defaultExprSql: j['defaultExpr'] as String?,
         checkExprSql: j['check'] as String?,
         references: j['references'] == null
             ? null

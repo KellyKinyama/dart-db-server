@@ -454,6 +454,7 @@ class Parser {
     bool unique = false;
     bool autoInc = false;
     Object? defaultValue;
+    String? defaultExprSql;
     String? checkSql;
     ForeignKeyRef? references;
     String? generatedSql;
@@ -483,7 +484,30 @@ class Parser {
         continue;
       }
       if (_matchKw('DEFAULT')) {
-        // Allow signed numeric default.
+        // 1) DEFAULT (<expr>) — parenthesized expression.
+        if (_check(TokType.punct, '(')) {
+          _advance(); // consume '('
+          final start = _peek().offset;
+          _parseExpr();
+          final end = _peek().offset;
+          _expect(TokType.punct, ')');
+          defaultExprSql = _sliceSource(start, end);
+          continue;
+        }
+        // 2) DEFAULT CURRENT_TIMESTAMP | CURRENT_DATE | CURRENT_TIME.
+        if (_checkKw('CURRENT_TIMESTAMP') ||
+            _checkKw('CURRENT_DATE') ||
+            _checkKw('CURRENT_TIME') ||
+            (_check(TokType.ident) &&
+                const {
+                  'CURRENT_TIMESTAMP',
+                  'CURRENT_DATE',
+                  'CURRENT_TIME',
+                }.contains(_peek().upper))) {
+          defaultExprSql = _advance().text;
+          continue;
+        }
+        // 3) Bare literal (possibly signed numeric).
         Expr lit;
         if (_check(TokType.op, '-') || _check(TokType.op, '+')) {
           final sign = _advance().text;
@@ -553,6 +577,7 @@ class Parser {
         unique: unique,
         autoIncrement: autoInc,
         defaultValue: defaultValue,
+        defaultExprSql: defaultExprSql,
         checkExprSql: checkSql,
         references: references,
         generatedExprSql: generatedSql,
