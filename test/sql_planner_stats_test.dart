@@ -38,8 +38,8 @@ void main() {
         final r = await db.execute("SELECT count(*) FROM t WHERE k = 'v3'");
         expect(r.rows.single.first, 5);
         // And the table count is reflected in sqlite_stat1.
-        final s = await db
-            .execute("SELECT stat FROM sqlite_stat1 WHERE tbl='t' AND idx='i_k'");
+        final s = await db.execute(
+            "SELECT stat FROM sqlite_stat1 WHERE tbl='t' AND idx='i_k'");
         expect(s.rows.single.first, '100 5');
       } finally {
         await db.close();
@@ -56,8 +56,7 @@ void main() {
       // and ANALYZE it so sqlite_stat1 is populated.
       final ref = sq.sqlite3.open(f.path);
       try {
-        ref.execute(
-            'CREATE TABLE t(id INTEGER PRIMARY KEY, hi TEXT, lo TEXT)');
+        ref.execute('CREATE TABLE t(id INTEGER PRIMARY KEY, hi TEXT, lo TEXT)');
         ref.execute('CREATE INDEX i_hi ON t(hi)');
         ref.execute('CREATE INDEX i_lo ON t(lo)');
         final st = ref.prepare('INSERT INTO t VALUES (?, ?, ?)');
@@ -81,11 +80,10 @@ void main() {
         // And queries on either column still return correct results
         // (proving the planner picked something workable using the
         // imported stats).
-        final hits = await db
-            .execute("SELECT count(*) FROM t WHERE hi = 'h42'");
+        final hits =
+            await db.execute("SELECT count(*) FROM t WHERE hi = 'h42'");
         expect(hits.rows.single.first, 1);
-        final many = await db
-            .execute("SELECT count(*) FROM t WHERE lo = 'a'");
+        final many = await db.execute("SELECT count(*) FROM t WHERE lo = 'a'");
         expect(many.rows.single.first, 50);
       } finally {
         await db.close();

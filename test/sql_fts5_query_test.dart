@@ -59,8 +59,8 @@ void main() {
     test('parentheses group OR before AND', () {
       // Without parens: alpha AND (beta OR gamma) by precedence anyway,
       // but verify explicit grouping.
-      expect(fts5Match('alpha gamma delta', '(beta OR gamma) AND alpha'),
-          isTrue);
+      expect(
+          fts5Match('alpha gamma delta', '(beta OR gamma) AND alpha'), isTrue);
       expect(fts5Match('alpha delta', '(beta OR gamma) AND alpha'), isFalse);
     });
 
@@ -79,9 +79,9 @@ void main() {
             "('the quick brown fox'),"
             "('quick fast brown fox'),"
             "('brown quick fox')");
-        final r = await db.execute(
-            'SELECT body FROM docs WHERE body MATCH \'"quick brown"\' '
-            'ORDER BY body');
+        final r = await db
+            .execute('SELECT body FROM docs WHERE body MATCH \'"quick brown"\' '
+                'ORDER BY body');
         expect(r.rows, [
           ['the quick brown fox'],
         ]);
@@ -116,9 +116,9 @@ void main() {
             "('apple'),"
             "('banana'),"
             "('cherry')");
-        final r = await db.execute(
-            "SELECT body FROM docs WHERE body MATCH 'apple OR cherry' "
-            'ORDER BY body');
+        final r = await db
+            .execute("SELECT body FROM docs WHERE body MATCH 'apple OR cherry' "
+                'ORDER BY body');
         expect(r.rows, [
           ['apple'],
           ['cherry'],
@@ -136,9 +136,9 @@ void main() {
             "('alpha gamma'),"
             "('alpha beta'),"
             "('only gamma')");
-        final r = await db.execute(
-            "SELECT body FROM docs WHERE body MATCH 'alpha NOT gamma' "
-            'ORDER BY body');
+        final r = await db
+            .execute("SELECT body FROM docs WHERE body MATCH 'alpha NOT gamma' "
+                'ORDER BY body');
         expect(r.rows, [
           ['alpha beta'],
         ]);

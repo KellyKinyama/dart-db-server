@@ -243,12 +243,10 @@ class Database {
   void _refreshPartialIndexes(Table t) {
     for (final def in t.indexDefs.values) {
       if (def.whereSql == null && def.exprSql == null) continue;
-      final pred = def.whereSql == null
-          ? null
-          : _compilePartialPredicate(def.whereSql);
-      final exprFn = def.exprSql == null
-          ? null
-          : _compileIndexExpression(def.exprSql!);
+      final pred =
+          def.whereSql == null ? null : _compilePartialPredicate(def.whereSql);
+      final exprFn =
+          def.exprSql == null ? null : _compileIndexExpression(def.exprSql!);
       final tree = t.indexes[def.name];
       if (tree == null) continue;
       tree.clear();
@@ -2371,8 +2369,8 @@ class Database {
   /// bbox, and returns rows whose stored bbox intersects it. Per-row
   /// re-evaluation of the original WHERE is left to the caller, so it's
   /// safe to be conservative: unrecognised shapes just fall through.
-  List<Map<String, Object?>>? _planRtreeScan(Table t, List<Expr> conjuncts,
-      SelectStmt s, Map<String, Object?> outer) {
+  List<Map<String, Object?>>? _planRtreeScan(
+      Table t, List<Expr> conjuncts, SelectStmt s, Map<String, Object?> outer) {
     final dims = (t.columns.length - 1) ~/ 2;
     if (dims <= 0) return null;
     // Lower/upper bounds of the query bbox per axis; default to ±∞.
@@ -2545,8 +2543,8 @@ class Database {
       if (def.exprSql == null) continue;
       if (!_partialIndexUsable(def)) continue;
       final ast = _exprIndexAstCache.putIfAbsent(def.name, () {
-        final stmt = Parser.fromString('SELECT ${def.exprSql}')
-            .parseStatement() as SelectStmt;
+        final stmt = Parser.fromString('SELECT ${def.exprSql}').parseStatement()
+            as SelectStmt;
         return stmt.projection.first.expr!;
       });
       for (final c in conjuncts) {
@@ -2692,7 +2690,67 @@ class Database {
         estHits: est,
       );
     }
+    // LIKE 'prefix%' on a BINARY-collated indexed text column rewrites to
+    // a half-open range scan over [prefix, prefix++). When the pattern
+    // contains '%' or '_' anywhere before the trailing '%' (or contains
+    // a backslash-escape) we conservatively decline.
+    if (conjunct is BinaryExpr && conjunct.op == 'LIKE') {
+      if (conjunct.left is! ColumnExpr) return null;
+      if (!_isConstExpr(conjunct.right)) return null;
+      final col = (conjunct.left as ColumnExpr).name;
+      final idx = _findIndexForColumn(t, col);
+      if (idx == null) return null;
+      if (idx.columns.length > 1) return null;
+      // This engine's LIKE is case-sensitive (== BINARY semantics), so a
+      // BINARY-collated index is safe to range-scan. NOCASE indexes store
+      // lower-cased keys; the pattern's case would have to be normalised
+      // first, but since LIKE is already case-sensitive here a NOCASE
+      // index can never be used safely for LIKE prefix.
+      final isNocase = idx.collations.isNotEmpty &&
+          idx.collations[0].toUpperCase() == 'NOCASE';
+      if (isNocase) return null;
+      final pat = _evalConst(conjunct.right);
+      if (pat is! String) return null;
+      final prefix = _likePrefix(pat);
+      if (prefix == null || prefix.isEmpty) return null;
+      // Build the half-open range [prefix, succ(prefix)).
+      final hi = _stringSuccessor(prefix);
+      return _IndexPlan.range(
+          table: t.name,
+          index: idx.name,
+          column: col,
+          lo: prefix,
+          hi: hi,
+          loInclusive: true,
+          hiInclusive: false,
+          estHits: _estimateRangeHits(t));
+    }
     return null;
+  }
+
+  /// If [pattern] is `prefix%` with no LIKE wildcards (`%`, `_`) inside
+  /// `prefix`, returns the prefix. Otherwise returns null. Recognises a
+  /// trailing `%` (zero or more chars) — every other LIKE pattern is
+  /// rejected.
+  String? _likePrefix(String pattern) {
+    if (pattern.isEmpty) return null;
+    if (!pattern.endsWith('%')) return null;
+    final head = pattern.substring(0, pattern.length - 1);
+    if (head.contains('%') || head.contains('_')) return null;
+    return head;
+  }
+
+  /// Lexicographic successor of [s]: the smallest string strictly greater
+  /// than [s] under string compareTo. Implemented by incrementing the
+  /// final code unit; when the final unit is U+FFFF we append a
+  /// zero-width sentinel character so the bound still satisfies s < succ.
+  String _stringSuccessor(String s) {
+    if (s.isEmpty) return '\u0000';
+    final last = s.codeUnitAt(s.length - 1);
+    if (last < 0xFFFF) {
+      return s.substring(0, s.length - 1) + String.fromCharCode(last + 1);
+    }
+    return '$s\u0000';
   }
 
   /// If [b] is `column op literal` or `literal op column`, return the

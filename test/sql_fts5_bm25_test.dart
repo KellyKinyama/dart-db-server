@@ -112,12 +112,12 @@ void main() {
       try {
         await db.execute('CREATE VIRTUAL TABLE docs USING fts5(body)');
         await db.execute("INSERT INTO docs VALUES ('alpha alpha alpha')");
-        final r = await db.execute(
-            "SELECT bm25(body, 'alpha', 5.0, 0.0) FROM docs");
+        final r =
+            await db.execute("SELECT bm25(body, 'alpha', 5.0, 0.0) FROM docs");
         // Same value as the pure-Dart call.
         final expected = fts5Bm25('alpha alpha alpha', 'alpha', k1: 5.0, b: 0);
-        expect((r.rows.single.first as num).toDouble(),
-            closeTo(expected, 1e-9));
+        expect(
+            (r.rows.single.first as num).toDouble(), closeTo(expected, 1e-9));
       } finally {
         await db.close();
       }

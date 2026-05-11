@@ -197,8 +197,7 @@ class RTreeIndex {
   }
 
   /// Convenience point query: returns rowids whose bbox contains [point].
-  Iterable<int> searchPoint(List<double> point) =>
-      search(BBox.point(point));
+  Iterable<int> searchPoint(List<double> point) => search(BBox.point(point));
 
   // --- internal: insertion ----------------------------------------------
 
@@ -232,8 +231,7 @@ class RTreeIndex {
     node.entries[best] = _Entry.inner(_encloseNode(chosenChild), chosenChild);
     if (newSibling == null) return null;
     // The child split: attach the new sibling at this level.
-    node.entries
-        .add(_Entry.inner(_encloseNode(newSibling), newSibling));
+    node.entries.add(_Entry.inner(_encloseNode(newSibling), newSibling));
     if (node.entries.length <= maxEntries) return null;
     return _splitNode(node);
   }
@@ -375,9 +373,7 @@ class RTreeIndex {
     final slicesPerAxis = math.max(1, math.pow(groups, 1 / dims).ceil());
     var cur = entries;
     for (var axis = 0; axis < dims; axis++) {
-      cur.sort((a, b) => a.bbox
-          .minOf(axis)
-          .compareTo(b.bbox.minOf(axis)));
+      cur.sort((a, b) => a.bbox.minOf(axis).compareTo(b.bbox.minOf(axis)));
       // Group into slices on this axis.
       final sliceSize = (cur.length / slicesPerAxis).ceil();
       final sliced = <_Entry>[];
@@ -400,5 +396,4 @@ class RTreeIndex {
   }
 }
 
-BBox _encloseNode(_Node n) =>
-    BBox.enclose(n.entries.map((e) => e.bbox));
+BBox _encloseNode(_Node n) => BBox.enclose(n.entries.map((e) => e.bbox));

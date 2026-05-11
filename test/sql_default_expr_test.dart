@@ -80,8 +80,7 @@ void main() {
     });
 
     test('ColumnDef round-trips defaultExprSql through JSON', () {
-      const c = ColumnDef('a', DataType.integer,
-          defaultExprSql: '2 + 3');
+      const c = ColumnDef('a', DataType.integer, defaultExprSql: '2 + 3');
       final rt = ColumnDef.fromJson(c.toJson());
       expect(rt.defaultExprSql, '2 + 3');
       expect(rt.defaultValue, isNull);

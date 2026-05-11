@@ -124,8 +124,7 @@ void main() {
       }
     });
 
-    test('length normalisation: same tf, shorter doc scores higher',
-        () async {
+    test('length normalisation: same tf, shorter doc scores higher', () async {
       final db = await Database.open();
       try {
         await db.execute('CREATE VIRTUAL TABLE docs USING fts5(body)');
@@ -163,10 +162,8 @@ void main() {
             "ORDER BY bm25_corpus(body, 'row', 'docs', 'body') DESC, body");
         // Highest tf for 'row' wins under length normalisation, regardless
         // of order. Just assert all matching docs are present.
-        expect(
-            r.rows.map((e) => e.first).toSet(),
-            containsAll(
-                {'only one row', 'row row'}));
+        expect(r.rows.map((e) => e.first).toSet(),
+            containsAll({'only one row', 'row row'}));
       } finally {
         await db.close();
       }

@@ -16,12 +16,11 @@ void main() {
           await db.execute(
               "INSERT INTO t VALUES ($i, '${i % 5 == 0 ? 'open' : 'done'}', $i)");
         }
-        await db.execute(
-            "CREATE INDEX t_open ON t(val) WHERE status = 'open'");
+        await db.execute("CREATE INDEX t_open ON t(val) WHERE status = 'open'");
 
         // Query whose conjunct exactly matches the partial-index WHERE.
-        final r = await db.execute(
-            "SELECT id FROM t WHERE status = 'open' AND val = 100");
+        final r = await db
+            .execute("SELECT id FROM t WHERE status = 'open' AND val = 100");
         expect(r.rows, [
           [100]
         ]);
@@ -43,8 +42,7 @@ void main() {
           await db.execute(
               "INSERT INTO t VALUES ($i, '${i % 5 == 0 ? 'open' : 'done'}', $i)");
         }
-        await db.execute(
-            "CREATE INDEX t_open ON t(val) WHERE status = 'open'");
+        await db.execute("CREATE INDEX t_open ON t(val) WHERE status = 'open'");
 
         // No status filter — partial index cannot be used.
         final r = await db.execute('SELECT id FROM t WHERE val = 100');
@@ -60,8 +58,7 @@ void main() {
       }
     });
 
-    test('partial index reflects rows inserted after CREATE INDEX',
-        () async {
+    test('partial index reflects rows inserted after CREATE INDEX', () async {
       final db = await Database.open();
       try {
         await db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, '
@@ -90,8 +87,8 @@ void main() {
         await db.execute('INSERT INTO t VALUES (1, 1, 100)');
         await db.execute('INSERT INTO t VALUES (2, 1, 200)');
         await db.execute('DELETE FROM t WHERE id = 1');
-        final r = await db
-            .execute('SELECT id FROM t WHERE flag = 1 ORDER BY id');
+        final r =
+            await db.execute('SELECT id FROM t WHERE flag = 1 ORDER BY id');
         expect(r.rows, [
           [2]
         ]);

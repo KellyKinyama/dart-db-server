@@ -41,8 +41,7 @@ void main() {
     test('empty index reports length 0 and yields nothing', () {
       final idx = RTreeIndex(2);
       expect(idx.length, 0);
-      expect(idx.search(BBox.fromMinMax([-1e9, -1e9], [1e9, 1e9])),
-          isEmpty);
+      expect(idx.search(BBox.fromMinMax([-1e9, -1e9], [1e9, 1e9])), isEmpty);
     });
 
     test('point lookup returns only the matching rowid', () {
@@ -59,8 +58,8 @@ void main() {
       idx.insert(1, BBox.fromMinMax([0, 0], [10, 10]));
       idx.insert(2, BBox.fromMinMax([5, 5], [15, 15]));
       idx.insert(3, BBox.fromMinMax([20, 20], [25, 25]));
-      final hits =
-          idx.search(BBox.fromMinMax([8, 8], [12, 12])).toList()..sort();
+      final hits = idx.search(BBox.fromMinMax([8, 8], [12, 12])).toList()
+        ..sort();
       expect(hits, [1, 2]);
     });
 
@@ -114,8 +113,7 @@ void main() {
             if (e.value.intersects(q)) e.key,
         ]..sort();
         final actual = idx.search(q).toList()..sort();
-        expect(actual, expected,
-            reason: 'mismatch at center=($cx,$cy)');
+        expect(actual, expected, reason: 'mismatch at center=($cx,$cy)');
       }
     });
 
@@ -126,10 +124,10 @@ void main() {
         MapEntry(3, BBox.point([5, 5, 5])),
       ];
       final idx = RTreeIndex.bulkLoad(3, items);
-      final hits =
-          idx.search(BBox.fromMinMax([-0.5, -0.5, -0.5], [1.5, 1.5, 1.5]))
-              .toList()
-            ..sort();
+      final hits = idx
+          .search(BBox.fromMinMax([-0.5, -0.5, -0.5], [1.5, 1.5, 1.5]))
+          .toList()
+        ..sort();
       expect(hits, [1, 2]);
     });
   });

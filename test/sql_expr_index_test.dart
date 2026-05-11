@@ -10,15 +10,14 @@ void main() {
         () async {
       final db = await Database.open();
       try {
-        await db.execute(
-            'CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)');
+        await db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)');
         for (var i = 0; i < 200; i++) {
           await db.execute("INSERT INTO t VALUES ($i, 'Name$i')");
         }
         await db.execute('CREATE INDEX t_lower ON t(LOWER(name))');
 
-        final r = await db
-            .execute("SELECT id FROM t WHERE LOWER(name) = 'name42'");
+        final r =
+            await db.execute("SELECT id FROM t WHERE LOWER(name) = 'name42'");
         expect(r.rows, [
           [42]
         ]);
@@ -30,19 +29,18 @@ void main() {
       }
     });
 
-    test('planner ignores the expression index when the query uses the raw column',
+    test(
+        'planner ignores the expression index when the query uses the raw column',
         () async {
       final db = await Database.open();
       try {
-        await db.execute(
-            'CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)');
+        await db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)');
         for (var i = 0; i < 200; i++) {
           await db.execute("INSERT INTO t VALUES ($i, 'Name$i')");
         }
         await db.execute('CREATE INDEX t_lower ON t(LOWER(name))');
 
-        final r = await db
-            .execute("SELECT id FROM t WHERE name = 'Name42'");
+        final r = await db.execute("SELECT id FROM t WHERE name = 'Name42'");
         expect(r.rows, [
           [42]
         ]);
@@ -58,13 +56,12 @@ void main() {
         () async {
       final db = await Database.open();
       try {
-        await db.execute(
-            'CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)');
+        await db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)');
         await db.execute('CREATE INDEX t_lower ON t(LOWER(name))');
         await db.execute("INSERT INTO t VALUES (1, 'Alpha')");
         await db.execute("INSERT INTO t VALUES (2, 'Beta')");
-        final r = await db
-            .execute("SELECT id FROM t WHERE LOWER(name) = 'beta'");
+        final r =
+            await db.execute("SELECT id FROM t WHERE LOWER(name) = 'beta'");
         expect(r.rows, [
           [2]
         ]);
@@ -76,14 +73,13 @@ void main() {
     test('expression index drops rows on DELETE', () async {
       final db = await Database.open();
       try {
-        await db.execute(
-            'CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)');
+        await db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)');
         await db.execute('CREATE INDEX t_lower ON t(LOWER(name))');
         await db.execute("INSERT INTO t VALUES (1, 'Foo')");
         await db.execute("INSERT INTO t VALUES (2, 'Foo')");
         await db.execute('DELETE FROM t WHERE id = 1');
-        final r = await db
-            .execute("SELECT id FROM t WHERE LOWER(name) = 'foo'");
+        final r =
+            await db.execute("SELECT id FROM t WHERE LOWER(name) = 'foo'");
         expect(r.rows, [
           [2]
         ]);
