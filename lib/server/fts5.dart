@@ -18,6 +18,8 @@
 /// can be unit-tested in isolation.
 library;
 
+import 'dart:math' as math;
+
 /// Split [text] into lower-cased word tokens. The same tokenizer is used
 /// for both indexing and query terms.
 List<String> tokenizeFts(String text) {
@@ -346,4 +348,189 @@ double _scoreNode(Fts5Node node, List<String> tokens) {
     return node.evaluate(tokens) ? 0.0 : 0.0;
   }
   return 0.0;
+}
+
+// ---------------------------------------------------------------------------
+// Corpus-aware ranking
+// ---------------------------------------------------------------------------
+
+/// Inverted index over a fixed corpus of text documents, supporting
+/// proper BM25 scoring (with IDF and length normalisation).
+///
+/// Build once with [Fts5Index.build] and score arbitrary queries with
+/// [bm25]. Document ids are assigned by insertion order (0-based) and
+/// match the index of the corresponding document in the input list.
+///
+/// This class is independent of the SQL engine and can be used directly
+/// from Dart code to rank arbitrary text against a corpus.
+class Fts5Index {
+  /// Per-document token sequences (kept for phrase scoring).
+  final List<List<String>> _docs;
+
+  /// Per-term document frequency: how many documents contain the term.
+  final Map<String, int> _df;
+
+  /// Total document count.
+  int get docCount => _docs.length;
+
+  /// Average document length, in tokens.
+  final double avgDocLength;
+
+  Fts5Index._(this._docs, this._df, this.avgDocLength);
+
+  /// Tokenise each document with [tokenizeFts] and build the index.
+  factory Fts5Index.build(Iterable<String> documents) {
+    final docs = <List<String>>[];
+    final df = <String, int>{};
+    var totalLen = 0;
+    for (final raw in documents) {
+      final toks = tokenizeFts(raw);
+      docs.add(toks);
+      totalLen += toks.length;
+      for (final t in toks.toSet()) {
+        df[t] = (df[t] ?? 0) + 1;
+      }
+    }
+    final avg = docs.isEmpty ? 0.0 : totalLen / docs.length;
+    return Fts5Index._(docs, df, avg);
+  }
+
+  /// Document frequency for [term] across the corpus.
+  int df(String term) => _df[term.toLowerCase()] ?? 0;
+
+  /// Token length of the document at [docId].
+  int docLength(int docId) => _docs[docId].length;
+
+  /// True iff [docId] matches the FTS5 [query] (same grammar as
+  /// [fts5Match]).
+  bool matches(int docId, String query) {
+    final node = parseFts5Query(query);
+    if (node == null) return true;
+    return node.evaluate(_docs[docId]);
+  }
+
+  /// BM25 score for [docId] against [query]. Returns 0 when the
+  /// document doesn't match. Uses the Robertson-Sparck-Jones IDF form:
+  ///
+  ///   idf(t) = ln((N - df + 0.5) / (df + 0.5) + 1)
+  ///
+  /// and the standard BM25 saturation/length-normalisation:
+  ///
+  ///   score = sum_t idf(t) * tf * (k1+1) /
+  ///           (tf + k1 * (1 - b + b * dl/avgdl))
+  ///
+  /// Returns positive scores so `ORDER BY ... DESC` ranks best matches
+  /// first.
+  double bm25(int docId, String query, {double k1 = 1.2, double b = 0.75}) {
+    final node = parseFts5Query(query);
+    if (node == null) return 0.0;
+    final tokens = _docs[docId];
+    if (tokens.isEmpty) return 0.0;
+    if (!node.evaluate(tokens)) return 0.0;
+    return _bm25Node(node, tokens, k1, b);
+  }
+
+  /// BM25 score for an arbitrary [text] (not necessarily one of the
+  /// indexed documents) against [query], using this corpus's df and
+  /// avgdl. Returns 0 when [text] doesn't match the query.
+  ///
+  /// Use this to rank rows of an fts5 virtual table where the document
+  /// text is supplied at evaluation time but the corpus statistics are
+  /// already known.
+  double bm25Text(String text, String query,
+      {double k1 = 1.2, double b = 0.75}) {
+    final node = parseFts5Query(query);
+    if (node == null) return 0.0;
+    final tokens = tokenizeFts(text);
+    if (tokens.isEmpty) return 0.0;
+    if (!node.evaluate(tokens)) return 0.0;
+    return _bm25Node(node, tokens, k1, b);
+  }
+
+  double _bm25Node(Fts5Node node, List<String> tokens, double k1, double b) {
+    if (node is _TermNode) {
+      return _termScore(node.term, tokens, k1, b);
+    }
+    if (node is _PrefixNode) {
+      // Each token in the corpus that starts with the prefix contributes
+      // independently (its own IDF weighting).
+      final seen = <String>{};
+      var total = 0.0;
+      for (final t in tokens) {
+        if (!t.startsWith(node.prefix) || !seen.add(t)) continue;
+        total += _termScore(t, tokens, k1, b);
+      }
+      return total;
+    }
+    if (node is _PhraseNode) {
+      if (node.phrase.isEmpty) return 0.0;
+      // Phrase TF = non-overlapping occurrence count; phrase IDF =
+      // minimum IDF over the phrase's tokens (rarest token bounds it).
+      var count = 0;
+      for (var i = 0; i + node.phrase.length <= tokens.length;) {
+        var ok = true;
+        for (var j = 0; j < node.phrase.length; j++) {
+          if (tokens[i + j] != node.phrase[j]) {
+            ok = false;
+            break;
+          }
+        }
+        if (ok) {
+          count++;
+          i += node.phrase.length;
+        } else {
+          i++;
+        }
+      }
+      if (count == 0) return 0.0;
+      var minIdf = double.infinity;
+      for (final t in node.phrase) {
+        final idf = _idf(t);
+        if (idf < minIdf) minIdf = idf;
+      }
+      final tf = count.toDouble();
+      final dl = tokens.length.toDouble();
+      final norm = 1 - b + b * dl / (avgDocLength == 0 ? 1 : avgDocLength);
+      return minIdf * tf * (k1 + 1) / (tf + k1 * norm);
+    }
+    if (node is _AndNode) {
+      var total = 0.0;
+      for (final c in node.children) {
+        if (!c.evaluate(tokens)) return 0.0;
+        total += _bm25Node(c, tokens, k1, b);
+      }
+      return total;
+    }
+    if (node is _OrNode) {
+      var total = 0.0;
+      for (final c in node.children) {
+        total += _bm25Node(c, tokens, k1, b);
+      }
+      return total;
+    }
+    if (node is _NotNode) {
+      // NOT only acts as a filter (already applied at the outer level).
+      return 0.0;
+    }
+    return 0.0;
+  }
+
+  double _termScore(String term, List<String> tokens, double k1, double b) {
+    var tf = 0;
+    for (final t in tokens) {
+      if (t == term) tf++;
+    }
+    if (tf == 0) return 0.0;
+    final dl = tokens.length.toDouble();
+    final norm = 1 - b + b * dl / (avgDocLength == 0 ? 1 : avgDocLength);
+    return _idf(term) * tf * (k1 + 1) / (tf + k1 * norm);
+  }
+
+  double _idf(String term) {
+    final n = docCount;
+    final dfi = df(term);
+    // Robertson-Sparck-Jones with +1 to keep IDF non-negative even for
+    // very common terms.
+    return math.log((n - dfi + 0.5) / (dfi + 0.5) + 1);
+  }
 }

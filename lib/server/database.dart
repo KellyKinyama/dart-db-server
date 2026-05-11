@@ -11,6 +11,7 @@ import 'dart:typed_data';
 
 import 'concurrency.dart';
 import 'expression.dart';
+import 'fts5.dart';
 import 'parser.dart';
 import 'prepared.dart';
 import 'result.dart';
@@ -139,6 +140,54 @@ class Database {
   /// constant heuristics (see [_estimateEqualityHits]).
   final Map<String, _TableStats> _stats = <String, _TableStats>{};
 
+  /// Lazy cache of corpus-aware FTS5 indexes, keyed by
+  /// `'<table>:<column>'` (lower-cased). Built on first access via
+  /// [fts5IndexFor] and invalidated when the underlying table is
+  /// mutated.
+  final Map<String, Fts5Index> _fts5IndexCache = <String, Fts5Index>{};
+
+  /// Stack of [Database] instances currently mid-`executeStmt`. The
+  /// FTS5 ranking scalar functions (`BM25_CORPUS`) consult
+  /// [Database.current] to discover the active corpus.
+  static final List<Database> _executionStack = <Database>[];
+
+  /// The innermost [Database] whose `executeStmt` is currently on the
+  /// call stack, or null when none is. Used by context-sensitive
+  /// scalar functions.
+  static Database? get current =>
+      _executionStack.isEmpty ? null : _executionStack.last;
+
+  /// Return (and lazily build) the corpus-aware FTS5 index for
+  /// [tableName].[columnName]. The index is rebuilt automatically
+  /// after any mutation of [tableName].
+  Fts5Index fts5IndexFor(String tableName, String columnName) {
+    final key = '${tableName.toLowerCase()}:${columnName.toLowerCase()}';
+    final cached = _fts5IndexCache[key];
+    if (cached != null) return cached;
+    final t = _tables[tableName];
+    if (t == null) {
+      throw StateError('No such table: $tableName');
+    }
+    final colIdx = t.columns
+        .indexWhere((c) => c.name.toLowerCase() == columnName.toLowerCase());
+    if (colIdx < 0) {
+      throw StateError('No such column: $tableName.$columnName');
+    }
+    final docs = <String>[
+      for (final row in t.rows) (row[colIdx] ?? '').toString(),
+    ];
+    final idx = Fts5Index.build(docs);
+    _fts5IndexCache[key] = idx;
+    return idx;
+  }
+
+  /// Invalidate the cached FTS5 index for [tableName] (any column).
+  /// Called whenever the table's row set may have changed.
+  void _invalidateFts5(String tableName) {
+    final prefix = '${tableName.toLowerCase()}:';
+    _fts5IndexCache.removeWhere((k, _) => k.startsWith(prefix));
+  }
+
   /// Last plan chosen by the executor for the most recent SELECT. Exposed
   /// to tests via [lastPlanTrace] so we can assert "this query used the
   /// expected index" without parsing EXPLAIN output.
@@ -155,7 +204,20 @@ class Database {
     coveringScansUsed = 0;
   }
 
-  Database({this.path});
+  Database({this.path}) {
+    // Install the corpus-lookup hook for FTS5 ranking functions. The
+    // hook routes through [Database.current] so all live databases
+    // share a single installation.
+    fts5CorpusLookup ??= (table, column) {
+      final db = Database.current;
+      if (db == null) return null;
+      try {
+        return db.fts5IndexFor(table, column);
+      } catch (_) {
+        return null;
+      }
+    };
+  }
 
   static Future<Database> open([String? path]) async {
     final db = Database(path: path);
@@ -263,7 +325,19 @@ class Database {
           return QueryResult.message('ignored by authorizer');
         }
       }
-      final result = _dispatch(stmt);
+      _executionStack.add(this);
+      QueryResult result;
+      try {
+        result = _dispatch(stmt);
+      } finally {
+        _executionStack.removeLast();
+      }
+      if (_isMutation(stmt)) {
+        // Conservatively drop FTS5 caches for the statement's target
+        // table; the next ranking call will rebuild on demand.
+        final tname = _statementTable(stmt);
+        if (tname != null) _invalidateFts5(tname);
+      }
       if (stmt is CommitStmt) {
         await _persist();
         return result;
@@ -5059,8 +5133,8 @@ class Database {
         final def = tbl.indexDefs[idxName];
         if (def == null) continue;
         final distinct = (n / avg).ceil();
-        final ts = _stats.putIfAbsent(
-            tname, () => _TableStats(n, <String, int>{}));
+        final ts =
+            _stats.putIfAbsent(tname, () => _TableStats(n, <String, int>{}));
         ts.distinctByColumn[def.column.toLowerCase()] = distinct;
       }
     }

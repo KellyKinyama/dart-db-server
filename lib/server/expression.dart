@@ -863,7 +863,41 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     final b = a.length > 3 && a[3] != null ? (a[3] as num).toDouble() : 0.75;
     return fts5Bm25(a[0].toString(), a[1].toString(), k1: k1, b: b);
   },
+  // Corpus-aware BM25: `BM25_CORPUS(text, query, 'table', 'column'[, k1[, b]])`.
+  // Looks up the cached Fts5Index for the named table/column on the
+  // active database (Database.current) and computes a properly
+  // IDF-weighted, length-normalised BM25 score for [text]. Useful in
+  // ORDER BY on fts5 virtual tables, e.g.:
+  //   SELECT body FROM docs WHERE body MATCH 'cat'
+  //   ORDER BY bm25_corpus(body, 'cat', 'docs', 'body') DESC
+  'BM25_CORPUS': (a) {
+    if (a.length < 4 ||
+        a[0] == null ||
+        a[1] == null ||
+        a[2] == null ||
+        a[3] == null) {
+      return 0;
+    }
+    final lookup = fts5CorpusLookup;
+    if (lookup == null) {
+      // No active database context — fall back to single-doc BM25 so
+      // the function is still useful at the Dart-API layer.
+      return fts5Bm25(a[0].toString(), a[1].toString());
+    }
+    final k1 = a.length > 4 && a[4] != null ? (a[4] as num).toDouble() : 1.2;
+    final b = a.length > 5 && a[5] != null ? (a[5] as num).toDouble() : 0.75;
+    final idx = lookup(a[2].toString(), a[3].toString());
+    if (idx == null) return 0;
+    return idx.bm25Text(a[0].toString(), a[1].toString(), k1: k1, b: b);
+  },
 };
+
+/// Hook installed by the engine: given a table and column name, return
+/// the corpus-aware FTS5 index, or null when no active database is in
+/// scope. Wired up by `Database.executeStmt` so that scalar functions
+/// can reach back into the database without [expression.dart] importing
+/// it (which would create a cycle).
+Fts5Index? Function(String table, String column)? fts5CorpusLookup;
 
 // ---- JSON1 helpers ---------------------------------------------------------
 
