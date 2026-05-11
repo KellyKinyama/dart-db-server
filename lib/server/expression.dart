@@ -852,6 +852,17 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     }
     return jsonEncode(_rfc7396Merge(base, patch));
   },
+  // ---- FTS5 ranking ------------------------------------------------------
+  'FTS5_TF': (a) {
+    if (a.length < 2 || a[0] == null || a[1] == null) return 0;
+    return fts5TermFrequency(a[0].toString(), a[1].toString());
+  },
+  'BM25': (a) {
+    if (a.length < 2 || a[0] == null || a[1] == null) return 0;
+    final k1 = a.length > 2 && a[2] != null ? (a[2] as num).toDouble() : 1.2;
+    final b = a.length > 3 && a[3] != null ? (a[3] as num).toDouble() : 0.75;
+    return fts5Bm25(a[0].toString(), a[1].toString(), k1: k1, b: b);
+  },
 };
 
 // ---- JSON1 helpers ---------------------------------------------------------

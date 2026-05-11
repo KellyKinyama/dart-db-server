@@ -58,8 +58,7 @@ class _PrefixNode extends Fts5Node {
   final String prefix;
   _PrefixNode(this.prefix);
   @override
-  bool evaluate(List<String> tokens) =>
-      tokens.any((t) => t.startsWith(prefix));
+  bool evaluate(List<String> tokens) => tokens.any((t) => t.startsWith(prefix));
 }
 
 class _PhraseNode extends Fts5Node {
@@ -91,8 +90,7 @@ class _OrNode extends Fts5Node {
   final List<Fts5Node> children;
   _OrNode(this.children);
   @override
-  bool evaluate(List<String> tokens) =>
-      children.any((c) => c.evaluate(tokens));
+  bool evaluate(List<String> tokens) => children.any((c) => c.evaluate(tokens));
 }
 
 class _NotNode extends Fts5Node {
@@ -253,4 +251,99 @@ class _QueryParser {
     }
     return _TermNode(raw);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Ranking
+// ---------------------------------------------------------------------------
+
+/// Per-document term-frequency score useful as a relevance signal in
+/// `ORDER BY`. The result is the sum over query terms of their raw
+/// occurrence counts in [document] (after the same tokenization used by
+/// [fts5Match]). Phrases count as 1 per non-overlapping occurrence;
+/// prefix terms count occurrences of every matching token. Documents
+/// that don't match the query at all score 0.
+double fts5TermFrequency(String document, String query) {
+  final node = parseFts5Query(query);
+  if (node == null) return 0.0;
+  final tokens = tokenizeFts(document);
+  return _scoreNode(node, tokens);
+}
+
+/// BM25-style score for [document] vs [query]. With only a single
+/// document of context (no corpus), the inverse-document-frequency
+/// term collapses to a constant, so this is effectively the saturated
+/// term-frequency form of BM25:
+///
+///   score = sum_t (tf_t * (k1 + 1)) / (tf_t + k1 * (1 - b + b * dl/avgdl))
+///
+/// where `dl` is this document's token count and `avgdl` is taken as
+/// the document's own length when no corpus is available (so the
+/// length-normalisation factor reduces to `k1 + 1`). Suitable for
+/// `ORDER BY bm25(body, 'query') DESC`. SQLite's `bm25()` returns
+/// negative scores so smaller-is-better; this function returns positive
+/// scores so the more familiar `DESC` ordering yields best matches first.
+double fts5Bm25(String document, String query,
+    {double k1 = 1.2, double b = 0.75}) {
+  final node = parseFts5Query(query);
+  if (node == null) return 0.0;
+  final tokens = tokenizeFts(document);
+  if (tokens.isEmpty) return 0.0;
+  if (!node.evaluate(tokens)) return 0.0;
+  // Single-doc context: dl == avgdl, so the length normalisation cancels.
+  // Each TF contribution becomes tf * (k1+1) / (tf + k1).
+  final tf = _scoreNode(node, tokens);
+  if (tf <= 0) return 0.0;
+  return tf * (k1 + 1) / (tf + k1);
+}
+
+double _scoreNode(Fts5Node node, List<String> tokens) {
+  if (node is _TermNode) {
+    return tokens.where((t) => t == node.term).length.toDouble();
+  }
+  if (node is _PrefixNode) {
+    return tokens.where((t) => t.startsWith(node.prefix)).length.toDouble();
+  }
+  if (node is _PhraseNode) {
+    if (node.phrase.isEmpty) return 0.0;
+    var count = 0;
+    for (var i = 0; i + node.phrase.length <= tokens.length;) {
+      var ok = true;
+      for (var j = 0; j < node.phrase.length; j++) {
+        if (tokens[i + j] != node.phrase[j]) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) {
+        count++;
+        i += node.phrase.length; // non-overlapping
+      } else {
+        i++;
+      }
+    }
+    return count.toDouble();
+  }
+  if (node is _AndNode) {
+    // Every child must match; total score is the sum.
+    var total = 0.0;
+    for (final c in node.children) {
+      final s = _scoreNode(c, tokens);
+      if (s == 0 && !c.evaluate(tokens)) return 0.0;
+      total += s;
+    }
+    return total;
+  }
+  if (node is _OrNode) {
+    var total = 0.0;
+    for (final c in node.children) {
+      total += _scoreNode(c, tokens);
+    }
+    return total;
+  }
+  if (node is _NotNode) {
+    // NOT contributes nothing to the score but acts as a hard filter.
+    return node.evaluate(tokens) ? 0.0 : 0.0;
+  }
+  return 0.0;
 }
