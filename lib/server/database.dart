@@ -44,6 +44,14 @@ class Database {
   /// `.sqlite`, `.sqlite3`, or `.db` extension.
   bool _persistAsSqlite = false;
 
+  /// Last full-image bytes written to disk for the SQLite path. Used as
+  /// the diff baseline for incremental `-wal` persistence.
+  Uint8List? _sqliteBaselineBytes;
+
+  /// Page size used the last time we wrote a full image. Subsequent
+  /// incremental WAL writes must use the same page size.
+  int _sqlitePageSize = 4096;
+
   /// User-supplied authorizer callback. When non-null, every dispatched
   /// statement is run past this callback before executing; the callback
   /// can [AuthorizerResult.deny] (throws) or [AuthorizerResult.ignore]
@@ -4360,7 +4368,7 @@ class Database {
   Future<void> _persist() async {
     if (path == null) return;
     if (_persistAsSqlite) {
-      await exportSqlite(path!);
+      await _persistSqlite();
       return;
     }
     final out = <String, Object?>{
@@ -4369,6 +4377,93 @@ class Database {
       'views': {for (final e in _viewSql.entries) e.key: e.value},
     };
     await File(path!).writeAsString(jsonEncode(out));
+  }
+
+  /// Maximum fraction of pages that may change before we abandon the
+  /// incremental `-wal` and rewrite the whole main file. 0.75 mirrors
+  /// the threshold the SQLite library uses for auto-checkpointing.
+  static const double _walAutoCheckpointThreshold = 0.75;
+
+  /// SQLite-format persist. First call (or any call where the change
+  /// ratio exceeds [_walAutoCheckpointThreshold], or where the file
+  /// shrinks) writes the main file in full and snapshots it as the diff
+  /// baseline. Subsequent calls write a fresh `<path>-wal` companion
+  /// containing only the pages that differ from the baseline, leaving
+  /// the main file untouched.
+  Future<void> _persistSqlite() async {
+    final current = _buildSqliteBytes(pageSize: _sqlitePageSize);
+    final baseline = _sqliteBaselineBytes;
+    final walPath = '${path!}-wal';
+    final ps = _sqlitePageSize;
+    final canDiff = baseline != null &&
+        baseline.length % ps == 0 &&
+        current.length % ps == 0 &&
+        current.length >= baseline.length;
+    if (!canDiff) {
+      // Full rewrite path.
+      await File(path!).writeAsBytes(current);
+      _sqliteBaselineBytes = Uint8List.fromList(current);
+      final wf = File(walPath);
+      if (await wf.exists()) await wf.delete();
+      return;
+    }
+    final pages = current.length ~/ ps;
+    final basePages = baseline.length ~/ ps;
+    final overrides = <int, Uint8List>{};
+    for (var i = 0; i < pages; i++) {
+      final off = i * ps;
+      final cur = Uint8List.sublistView(current, off, off + ps);
+      if (i < basePages) {
+        final bp =
+            Uint8List.sublistView(baseline, off, off + ps);
+        if (_bytesEqual(bp, cur)) continue;
+      }
+      overrides[i + 1] = Uint8List.fromList(cur);
+    }
+    if (overrides.isEmpty) {
+      // No-op commit; drop any stale WAL.
+      final wf = File(walPath);
+      if (await wf.exists()) await wf.delete();
+      return;
+    }
+    final ratio = overrides.length / pages;
+    if (ratio >= _walAutoCheckpointThreshold) {
+      // Too churny: rewrite the main file and reset baseline.
+      await File(path!).writeAsBytes(current);
+      _sqliteBaselineBytes = Uint8List.fromList(current);
+      final wf = File(walPath);
+      if (await wf.exists()) await wf.delete();
+      return;
+    }
+    final wal = buildWal(
+      pageSize: ps,
+      pageOverrides: overrides,
+      dbSizeAfterCommit: pages,
+    );
+    await File(walPath).writeAsBytes(wal);
+    // Baseline stays at the on-disk main image; we do NOT update it
+    // here, so subsequent incremental writes keep diffing against the
+    // last full snapshot.
+  }
+
+  static bool _bytesEqual(Uint8List a, Uint8List b) {
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
+  }
+
+  /// Flush any pending `-wal` content into the main SQLite file and
+  /// delete the WAL. After this returns the on-disk main file is the
+  /// canonical image and the diff baseline is reset.
+  Future<void> checkpointSqlite() async {
+    if (path == null || !_persistAsSqlite) return;
+    final bytes = _buildSqliteBytes(pageSize: _sqlitePageSize);
+    await File(path!).writeAsBytes(bytes);
+    _sqliteBaselineBytes = Uint8List.fromList(bytes);
+    final wf = File('${path!}-wal');
+    if (await wf.exists()) await wf.delete();
   }
 
   String _serializeSelect(SelectStmt s) {
@@ -4414,6 +4509,17 @@ class Database {
       if (isSqlite) {
         await importSqlite(path!);
         _persistAsSqlite = true;
+        // Capture page size from the loaded image (bytes 16-17 are BE
+        // page size; 1 means 65536). Snapshot the bytes as the diff
+        // baseline so the first follow-up persist can write a -wal.
+        if (raw.length >= 18) {
+          var ps = (raw[16] << 8) | raw[17];
+          if (ps == 1) ps = 65536;
+          if (ps >= 512 && (ps & (ps - 1)) == 0) {
+            _sqlitePageSize = ps;
+          }
+        }
+        _sqliteBaselineBytes = Uint8List.fromList(raw);
         return;
       }
     }
@@ -4432,7 +4538,7 @@ class Database {
           final sql = ve.value;
           if (sql is! String || sql.isEmpty) continue;
           try {
-            final stmt = Parser.fromString('SELECT $sql').parseStatement();
+            final stmt = Parser.fromString(sql).parseStatement();
             if (stmt is SelectStmt) {
               _views[ve.key] = stmt;
               _viewSql[ve.key] = sql;
@@ -4470,6 +4576,15 @@ class Database {
   /// / NULL). Booleans are stored as 0/1 integers.
   Future<void> exportSqlite(String path,
       {int pageSize = 4096, bool includeIndexes = true}) async {
+    final bytes =
+        _buildSqliteBytes(pageSize: pageSize, includeIndexes: includeIndexes);
+    await File(path).writeAsBytes(bytes);
+  }
+
+  /// Build the SQLite-format byte image for the current in-memory state.
+  /// Pure: no I/O. See [exportSqlite] for the disk-writing wrapper.
+  Uint8List _buildSqliteBytes(
+      {int pageSize = 4096, bool includeIndexes = true}) {
     final tables = <SqliteWriteTable>[];
     final indexes = <SqliteWriteIndex>[];
     for (final entry in _tables.entries) {
@@ -4708,7 +4823,7 @@ class Database {
       ));
     }
     final bytes = writeSqliteFile(tables, pageSize: pageSize, indexes: indexes);
-    await File(path).writeAsBytes(bytes);
+    return bytes;
   }
 
   /// Replace the contents of this database with the tables found in the
