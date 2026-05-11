@@ -324,6 +324,24 @@ Object? coerceForColumn(Object? value, ColumnDef col, {bool strict = false}) {
     }
     return value;
   }
+  // SQLite affinity semantics in non-strict mode:
+  //   * BLOB affinity never converts \u2014 every value is stored verbatim.
+  //   * INTEGER / REAL / NUMERIC affinity tries to convert; if the value
+  //     cannot be losslessly converted (e.g. INTEGER column receiving the
+  //     string 'abc') the original value is stored unchanged, matching
+  //     SQLite's "no-op when conversion fails" rule.
+  //   * TEXT and BOOLEAN affinity continue to delegate to [coerce], which
+  //     already performs the standard conversions.
+  if (col.type == DataType.blob) return value;
+  if (col.type == DataType.integer ||
+      col.type == DataType.real ||
+      col.type == DataType.numeric) {
+    try {
+      return coerce(value, col.type);
+    } on FormatException {
+      return value;
+    }
+  }
   return coerce(value, col.type);
 }
 
