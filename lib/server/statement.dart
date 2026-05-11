@@ -99,7 +99,13 @@ class CreateViewStmt extends Statement {
   final String name;
   final SelectStmt select;
   final bool ifNotExists;
-  CreateViewStmt(this.name, this.select, {this.ifNotExists = false});
+
+  /// Original SQL text of the SELECT clause (everything after `AS`),
+  /// preserved so views can be persisted and re-parsed verbatim across
+  /// open/close cycles. Empty for views created programmatically.
+  final String selectSql;
+  CreateViewStmt(this.name, this.select,
+      {this.ifNotExists = false, this.selectSql = ''});
 }
 
 class DropViewStmt extends Statement {

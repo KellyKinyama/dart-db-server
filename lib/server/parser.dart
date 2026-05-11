@@ -624,8 +624,12 @@ class Parser {
     }
     final name = _expectIdent().text;
     _expectKw('AS');
+    final selStart = _peek().offset;
     final sel = _parseSelect();
-    return CreateViewStmt(name, sel, ifNotExists: ifNotExists);
+    final selEnd = _peek().offset;
+    final selSql = _sliceSource(selStart, selEnd).trim();
+    return CreateViewStmt(name, sel,
+        ifNotExists: ifNotExists, selectSql: selSql);
   }
 
   CreateTriggerStmt _parseCreateTriggerTail() {

@@ -19,10 +19,50 @@ import 'sqlite_format.dart';
 import 'statement.dart';
 import 'table.dart';
 
+/// Outcome of an [AuthorizerCallback] invocation. Mirrors the
+/// SQLITE_OK / SQLITE_DENY / SQLITE_IGNORE constants of the C API.
+enum AuthorizerResult { allow, deny, ignore }
+
+/// Authorizer callback. Invoked by [Database.executeStmt] for every
+/// dispatched statement; the second argument is the primary table the
+/// statement targets (or null when there is none, e.g. PRAGMA).
+typedef AuthorizerCallback = AuthorizerResult Function(
+    Statement action, String? tableName);
+
 class Database {
   final Map<String, Table> _tables = <String, Table>{};
   final Map<String, SelectStmt> _views = <String, SelectStmt>{};
+
+  /// Original SELECT SQL text for each view, keyed by view name.
+  /// Used to persist views faithfully through save/reload cycles.
+  final Map<String, String> _viewSql = <String, String>{};
   final String? path;
+
+  /// When true, [_persist] writes the database as a real SQLite-format
+  /// file (via [exportSqlite]). Set automatically when the on-disk file
+  /// has the SQLite magic header or when a fresh file is opened with a
+  /// `.sqlite`, `.sqlite3`, or `.db` extension.
+  bool _persistAsSqlite = false;
+
+  /// User-supplied authorizer callback. When non-null, every dispatched
+  /// statement is run past this callback before executing; the callback
+  /// can [AuthorizerResult.deny] (throws) or [AuthorizerResult.ignore]
+  /// (statement is skipped and a message is returned).
+  AuthorizerCallback? authorizer;
+
+  /// Queue of FK checks accumulated while `PRAGMA defer_foreign_keys = 1`
+  /// is in effect. Replayed at [_commit] time; failure rolls back.
+  final List<_DeferredFk> _deferredFkChecks = <_DeferredFk>[];
+
+  bool get _deferFks => _truthy(_pragmas['defer_foreign_keys']);
+
+  static bool _truthy(Object? v) {
+    if (v == null) return false;
+    if (v is bool) return v;
+    if (v is num) return v != 0;
+    final s = v.toString().toLowerCase();
+    return s == '1' || s == 'true' || s == 'on' || s == 'yes';
+  }
 
   /// Cross-process advisory lock on the JSON file. Created (and acquired)
   /// by [Database.open] when [path] is non-null.
@@ -117,6 +157,14 @@ class Database {
       await db._fileLock!.acquire();
       if (await File(path).exists()) {
         await db._load();
+      } else {
+        // Fresh file: pick the persist format from the extension.
+        final lower = path.toLowerCase();
+        if (lower.endsWith('.sqlite') ||
+            lower.endsWith('.sqlite3') ||
+            lower.endsWith('.db')) {
+          db._persistAsSqlite = true;
+        }
       }
     }
     return db;
@@ -196,6 +244,16 @@ class Database {
       if (_readOnlySnapshot && _isMutation(stmt)) {
         throw StateError(
             'Cannot mutate inside a read-only snapshot transaction');
+      }
+      final cb = authorizer;
+      if (cb != null) {
+        final outcome = cb(stmt, _statementTable(stmt));
+        if (outcome == AuthorizerResult.deny) {
+          throw StateError('not authorized');
+        }
+        if (outcome == AuthorizerResult.ignore) {
+          return QueryResult.message('ignored by authorizer');
+        }
       }
       final result = _dispatch(stmt);
       if (stmt is CommitStmt) {
@@ -349,6 +407,28 @@ class Database {
       s is VacuumStmt ||
       s is AnalyzeStmt ||
       s is CreateVirtualTableStmt;
+
+  /// Best-effort: primary table touched by [s], used to seed the
+  /// authorizer callback's `tableName` argument. Returns null when the
+  /// statement has no single target (PRAGMA, BEGIN, EXPLAIN, ...).
+  String? _statementTable(Statement s) {
+    if (s is CreateTableStmt) return s.name;
+    if (s is DropTableStmt) return s.name;
+    if (s is TruncateTableStmt) return s.name;
+    if (s is AlterTableAddColumnStmt) return s.table;
+    if (s is AlterTableDropColumnStmt) return s.table;
+    if (s is AlterTableRenameColumnStmt) return s.table;
+    if (s is AlterTableRenameStmt) return s.oldName;
+    if (s is CreateIndexStmt) return s.table;
+    if (s is CreateViewStmt) return s.name;
+    if (s is DropViewStmt) return s.name;
+    if (s is InsertStmt) return s.table;
+    if (s is UpdateStmt) return s.table;
+    if (s is DeleteStmt) return s.table;
+    if (s is SelectStmt) return s.fromTable;
+    if (s is CreateTriggerStmt) return s.table;
+    return null;
+  }
 
   // ---------------------------------------------------------------------------
   // DDL
@@ -533,6 +613,7 @@ class Database {
       throw StateError('Object ${s.name} already exists');
     }
     _views[s.name] = s.select;
+    if (s.selectSql.isNotEmpty) _viewSql[s.name] = s.selectSql;
     return QueryResult.message('View ${s.name} created');
   }
 
@@ -544,6 +625,7 @@ class Database {
       throw StateError('No such view: ${s.name}');
     }
     _views.remove(s.name);
+    _viewSql.remove(s.name);
     return QueryResult.message('View ${s.name} dropped');
   }
 
@@ -1009,6 +1091,10 @@ class Database {
   }
 
   void _enforceForeignKeysOnInsert(Table child, List<Object?> row) {
+    if (_deferFks && inTransaction) {
+      _deferredFkChecks.add(_DeferredFk(child.name, List<Object?>.from(row)));
+      return;
+    }
     for (final fk in _foreignKeysOf(child)) {
       final values = fk.columns.map((c) => row[child.columnIndex(c)]).toList();
       if (values.any((v) => v == null)) continue; // SQL: any-null => allowed
@@ -3500,6 +3586,55 @@ class Database {
 
   QueryResult _commit() {
     if (!inTransaction) throw StateError('No transaction in progress');
+    // Replay any deferred FK checks now. Failure rolls the txn back
+    // and throws with a deferred-prefixed message.
+    if (_deferredFkChecks.isNotEmpty && !_readOnlySnapshot) {
+      final queued = List<_DeferredFk>.from(_deferredFkChecks);
+      _deferredFkChecks.clear();
+      for (final d in queued) {
+        final t = _tables[d.childTable];
+        if (t == null) continue;
+        try {
+          // Re-check synchronously; bypass the deferral path.
+          for (final fk in _foreignKeysOf(t)) {
+            final values =
+                fk.columns.map((c) => d.row[t.columnIndex(c)]).toList();
+            if (values.any((v) => v == null)) continue;
+            final parent = _tables[fk.references.table];
+            if (parent == null) {
+              throw StateError(
+                  'FK references missing table ${fk.references.table}');
+            }
+            final parentCols = fk.references.column != null
+                ? [fk.references.column!]
+                : _primaryKeyColumns(parent);
+            var found = false;
+            for (final r in parent.rows) {
+              var match = true;
+              for (var i = 0; i < parentCols.length; i++) {
+                final pv = r[parent.columnIndex(parentCols[i])];
+                if (pv == null || !sqlEq(pv, values[i] as Object)) {
+                  match = false;
+                  break;
+                }
+              }
+              if (match) {
+                found = true;
+                break;
+              }
+            }
+            if (!found) {
+              throw StateError('FOREIGN KEY constraint failed: '
+                  '${t.name}.${fk.columns.join(",")} -> '
+                  '${parent.name}.${parentCols.join(",")} = $values');
+            }
+          }
+        } catch (e) {
+          _rollback();
+          throw StateError('DEFERRED FOREIGN KEY check failed on commit: $e');
+        }
+      }
+    }
     if (_readOnlySnapshot) {
       // Discard the snapshot view; restore the live (unchanged) state.
       _tables
@@ -3519,6 +3654,7 @@ class Database {
 
   QueryResult _rollback() {
     if (!inTransaction) throw StateError('No transaction in progress');
+    _deferredFkChecks.clear();
     if (_readOnlySnapshot) {
       _tables
         ..clear()
@@ -4223,12 +4359,14 @@ class Database {
   // ---------------------------------------------------------------------------
   Future<void> _persist() async {
     if (path == null) return;
+    if (_persistAsSqlite) {
+      await exportSqlite(path!);
+      return;
+    }
     final out = <String, Object?>{
       '__schema__': 2,
       'tables': {for (final e in _tables.entries) e.key: e.value.toJson()},
-      'views': {
-        for (final e in _views.entries) e.key: _serializeSelect(e.value)
-      },
+      'views': {for (final e in _viewSql.entries) e.key: e.value},
     };
     await File(path!).writeAsString(jsonEncode(out));
   }
@@ -4275,6 +4413,7 @@ class Database {
       }
       if (isSqlite) {
         await importSqlite(path!);
+        _persistAsSqlite = true;
         return;
       }
     }
@@ -4287,7 +4426,22 @@ class Database {
         final t = Table.fromJson((e.value as Map).cast<String, Object?>());
         _tables[t.name] = t;
       }
-      // Views are dropped on reload (best-effort serialization).
+      final views = (data['views'] as Map?)?.cast<String, Object?>();
+      if (views != null) {
+        for (final ve in views.entries) {
+          final sql = ve.value;
+          if (sql is! String || sql.isEmpty) continue;
+          try {
+            final stmt = Parser.fromString('SELECT $sql').parseStatement();
+            if (stmt is SelectStmt) {
+              _views[ve.key] = stmt;
+              _viewSql[ve.key] = sql;
+            }
+          } catch (_) {
+            // Best-effort: skip views we can no longer parse.
+          }
+        }
+      }
       return;
     }
     // Legacy v1 format: bare {tableName: {columns:..., rows:...}}.
@@ -5073,4 +5227,11 @@ class _IndexPlan {
     final cond = [loS, hiS].where((s) => s.isNotEmpty).join(' AND ');
     return 'SEARCH $table USING INDEX $index ($column $cond) ~$estHits';
   }
+}
+
+/// Pending FK constraint check accumulated during a deferred-FK txn.
+class _DeferredFk {
+  final String childTable;
+  final List<Object?> row;
+  _DeferredFk(this.childTable, this.row);
 }

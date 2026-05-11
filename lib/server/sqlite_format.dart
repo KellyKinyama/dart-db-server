@@ -1347,6 +1347,11 @@ List<_LeafPageNode> _packTableLeaves(List<_PlannedCell> cells, int pageSize) {
   if (current.isNotEmpty) {
     pages.add(_LeafPageNode(isIndex: false, cells: current));
   }
+  if (pages.isEmpty) {
+    // Empty tables still need a root page so `sqlite_schema.rootpage`
+    // points somewhere valid.
+    pages.add(_LeafPageNode(isIndex: false, cells: const []));
+  }
   return pages;
 }
 
@@ -1455,6 +1460,13 @@ List<_BTreePage> _buildIndexBTree(
   int pageSize,
 ) {
   var level = _buildIndexLeafLevel(cells, entries, pageSize);
+  if (level.pages.isEmpty) {
+    // Empty index/WITHOUT-ROWID table still needs a root page.
+    level = _IndexLevel(
+      pages: [_LeafPageNode(isIndex: true, cells: const [], entries: const [])],
+      separators: const [],
+    );
+  }
   final all = <_BTreePage>[...level.pages];
   while (level.pages.length > 1) {
     final next = _buildIndexInteriorLevelPromoted(level, pageSize);
