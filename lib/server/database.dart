@@ -236,24 +236,34 @@ class Database {
   /// index is created or dropped.
   final Map<String, Expr> _partialIndexAstCache = <String, Expr>{};
 
-  /// Drop and rebuild every partial (non-expression) index attached to
+  /// Drop and rebuild every partial / expression index attached to
   /// [t] so that its entries reflect the current row set. Called from
   /// the `executeStmt` mutation hook and from [_createIndex] when the
-  /// new index is partial.
+  /// new index is partial or expression-based.
   void _refreshPartialIndexes(Table t) {
     for (final def in t.indexDefs.values) {
-      if (def.whereSql == null) continue;
-      if (def.exprSql != null) continue;
-      final pred = _compilePartialPredicate(def.whereSql);
-      if (pred == null) continue;
+      if (def.whereSql == null && def.exprSql == null) continue;
+      final pred = def.whereSql == null
+          ? null
+          : _compilePartialPredicate(def.whereSql);
+      final exprFn = def.exprSql == null
+          ? null
+          : _compileIndexExpression(def.exprSql!);
       final tree = t.indexes[def.name];
       if (tree == null) continue;
       tree.clear();
       for (var i = 0; i < t.rows.length; i++) {
         final row = t.rows[i];
-        if (!pred(t, row)) continue;
-        final key = t.buildIndexKey(def, row);
-        if (key == null) continue;
+        if (pred != null && !pred(t, row)) continue;
+        Object? key;
+        if (exprFn != null) {
+          final v = exprFn(t, row);
+          if (v == null) continue;
+          key = v;
+        } else {
+          key = t.buildIndexKey(def, row);
+          if (key == null) continue;
+        }
         final list = tree.putIfAbsent(key, () => <int>[]);
         if (def.unique && list.isNotEmpty) {
           throw StateError(
@@ -823,7 +833,8 @@ class Database {
     // Drop any stale cached AST for this name (in case the same name was
     // previously used for a different predicate).
     _partialIndexAstCache.remove(s.indexName);
-    if (s.whereSql != null && s.exprSql == null) {
+    _exprIndexAstCache.remove(s.indexName);
+    if ((s.whereSql != null || s.exprSql != null)) {
       _refreshPartialIndexes(t);
     }
     return QueryResult.message('Index ${s.indexName} created');
@@ -834,6 +845,7 @@ class Database {
       if (t.indexDefs.containsKey(s.indexName)) {
         t.dropIndex(s.indexName);
         _partialIndexAstCache.remove(s.indexName);
+        _exprIndexAstCache.remove(s.indexName);
         return QueryResult.message('Index ${s.indexName} dropped');
       }
     }
@@ -2321,6 +2333,10 @@ class Database {
       // probe (full match) or prefix scan (partial match). These are added on
       // top of the per-conjunct candidates and almost always win.
       candidates.addAll(_classifyMultiColumnPlans(t, conjuncts));
+      // Expression-index plans: a conjunct `<expr> = literal` where
+      // `<expr>` structurally matches a `CREATE INDEX ... ON t(<expr>)`
+      // becomes a single equality probe of the expression index.
+      candidates.addAll(_classifyExpressionIndexPlans(t, conjuncts));
       if (candidates.isEmpty) return null;
 
       // Pick the candidate with the lowest estimated hits. Tie-break on
@@ -2509,6 +2525,47 @@ class Database {
           column: def.columns.take(parts.length).join(','),
           prefixKey: parts,
           estHits: est,
+        ));
+      }
+    }
+    return out;
+  }
+
+  /// Cached parsed ASTs of `CREATE INDEX ... ON t(<expr>)` index
+  /// expressions, keyed by index name.
+  final Map<String, Expr> _exprIndexAstCache = <String, Expr>{};
+
+  /// Build single-key equality plans for expression indexes. Scans
+  /// [conjuncts] for `<expr> = <literal>` (or the literal-on-left form)
+  /// where `<expr>` structurally matches one of [t]'s expression indexes.
+  List<_IndexPlan> _classifyExpressionIndexPlans(
+      Table t, List<Expr> conjuncts) {
+    final out = <_IndexPlan>[];
+    for (final def in t.indexDefs.values) {
+      if (def.exprSql == null) continue;
+      if (!_partialIndexUsable(def)) continue;
+      final ast = _exprIndexAstCache.putIfAbsent(def.name, () {
+        final stmt = Parser.fromString('SELECT ${def.exprSql}')
+            .parseStatement() as SelectStmt;
+        return stmt.projection.first.expr!;
+      });
+      for (final c in conjuncts) {
+        if (c is! BinaryExpr || c.op != '=') continue;
+        Expr? other;
+        if (_exprStructEq(c.left, ast) && _isConstExpr(c.right)) {
+          other = c.right;
+        } else if (_exprStructEq(c.right, ast) && _isConstExpr(c.left)) {
+          other = c.left;
+        }
+        if (other == null) continue;
+        final key = _evalConst(other);
+        if (key == null) continue;
+        out.add(_IndexPlan.equality(
+          table: t.name,
+          index: def.name,
+          column: def.exprSql!,
+          equalityKey: key,
+          estHits: _estimateEqualityHits(t, def.column),
         ));
       }
     }
