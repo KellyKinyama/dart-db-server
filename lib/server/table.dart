@@ -181,6 +181,12 @@ class Table {
   /// Build the storage key for [def] from a single row's values. Returns
   /// null when the index should skip this row (any indexed column is
   /// NULL — matching SQLite's default treatment of NULL in indexes).
+  Object? buildIndexKey(IndexDef def, List<Object?> values) =>
+      _buildIndexKey(def, values);
+
+  /// Build the storage key for [def] from a single row's values. Returns
+  /// null when the index should skip this row (any indexed column is
+  /// NULL — matching SQLite's default treatment of NULL in indexes).
   Object? _buildIndexKey(IndexDef def, List<Object?> values) {
     if (def.columns.length == 1) {
       final colIdx = columnIndex(def.column);

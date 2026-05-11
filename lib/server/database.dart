@@ -188,6 +188,103 @@ class Database {
     _fts5IndexCache.removeWhere((k, _) => k.startsWith(prefix));
   }
 
+  /// Cached, parsed partial-index `WHERE` predicate AST per index name.
+  /// Built lazily on first planner access and cleared when a partial
+  /// index is created or dropped.
+  final Map<String, Expr> _partialIndexAstCache = <String, Expr>{};
+
+  /// Drop and rebuild every partial (non-expression) index attached to
+  /// [t] so that its entries reflect the current row set. Called from
+  /// the `executeStmt` mutation hook and from [_createIndex] when the
+  /// new index is partial.
+  void _refreshPartialIndexes(Table t) {
+    for (final def in t.indexDefs.values) {
+      if (def.whereSql == null) continue;
+      if (def.exprSql != null) continue;
+      final pred = _compilePartialPredicate(def.whereSql);
+      if (pred == null) continue;
+      final tree = t.indexes[def.name];
+      if (tree == null) continue;
+      tree.clear();
+      for (var i = 0; i < t.rows.length; i++) {
+        final row = t.rows[i];
+        if (!pred(t, row)) continue;
+        final key = t.buildIndexKey(def, row);
+        if (key == null) continue;
+        final list = tree.putIfAbsent(key, () => <int>[]);
+        if (def.unique && list.isNotEmpty) {
+          throw StateError(
+              'UNIQUE index ${def.name} violation while refreshing '
+              'partial index: $key');
+        }
+        list.add(i);
+      }
+    }
+  }
+
+  /// Conjuncts of the WHERE clause currently being planned. Set at the
+  /// top of [_planScan] and consulted by [_partialIndexUsable] to decide
+  /// whether a partial index's predicate is implied by the query.
+  List<Expr> _currentScanConjuncts = const [];
+
+  /// Returns true when [def] is non-partial OR when the query currently
+  /// being planned has a conjunct that structurally matches the index's
+  /// `WHERE` predicate (i.e. the query is provably narrower than the
+  /// partial index's filter). When false, the planner must skip the
+  /// index — using it would miss rows.
+  bool _partialIndexUsable(IndexDef def) {
+    if (def.whereSql == null) return true;
+    final ast = _partialIndexAstCache.putIfAbsent(def.name, () {
+      final stmt = Parser.fromString('SELECT ${def.whereSql}')
+          .parseStatement() as SelectStmt;
+      return stmt.projection.first.expr!;
+    });
+    for (final c in _currentScanConjuncts) {
+      if (_exprStructEq(c, ast)) return true;
+    }
+    return false;
+  }
+
+  /// Structural equality on the subset of Expr shapes that commonly
+  /// appear in partial-index predicates: column refs, literals,
+  /// `IS NULL` / `IS NOT NULL`, comparisons against literals, and
+  /// AND/OR combinations of the above. Returns false for any AST it
+  /// doesn't recognise (safe: the planner just falls back to a scan).
+  bool _exprStructEq(Expr a, Expr b) {
+    if (identical(a, b)) return true;
+    if (a is LiteralExpr && b is LiteralExpr) return a.value == b.value;
+    if (a is ColumnExpr && b is ColumnExpr) {
+      return a.name.toLowerCase() == b.name.toLowerCase() &&
+          (a.table?.toLowerCase() ?? '') ==
+              (b.table?.toLowerCase() ?? '');
+    }
+    if (a is UnaryExpr && b is UnaryExpr) {
+      return a.op == b.op && _exprStructEq(a.operand, b.operand);
+    }
+    if (a is BinaryExpr && b is BinaryExpr) {
+      if (a.op != b.op) return false;
+      if (_exprStructEq(a.left, b.left) &&
+          _exprStructEq(a.right, b.right)) {
+        return true;
+      }
+      const commutative = {'=', '!=', '<>', 'AND', 'OR', '+', '*'};
+      if (commutative.contains(a.op)) {
+        return _exprStructEq(a.left, b.right) &&
+            _exprStructEq(a.right, b.left);
+      }
+      return false;
+    }
+    if (a is FunctionCallExpr && b is FunctionCallExpr) {
+      if (a.name.toUpperCase() != b.name.toUpperCase()) return false;
+      if (a.args.length != b.args.length) return false;
+      for (var i = 0; i < a.args.length; i++) {
+        if (!_exprStructEq(a.args[i], b.args[i])) return false;
+      }
+      return true;
+    }
+    return false;
+  }
+
   /// Last plan chosen by the executor for the most recent SELECT. Exposed
   /// to tests via [lastPlanTrace] so we can assert "this query used the
   /// expected index" without parsing EXPLAIN output.
@@ -336,7 +433,11 @@ class Database {
         // Conservatively drop FTS5 caches for the statement's target
         // table; the next ranking call will rebuild on demand.
         final tname = _statementTable(stmt);
-        if (tname != null) _invalidateFts5(tname);
+        if (tname != null) {
+          _invalidateFts5(tname);
+          final t = _tables[tname];
+          if (t != null) _refreshPartialIndexes(t);
+        }
       }
       if (stmt is CommitStmt) {
         await _persist();
@@ -678,6 +779,12 @@ class Database {
         exprSql: s.exprSql,
         columns: s.columns.length > 1 ? s.columns : null,
         collations: hasNonBinary ? s.collations : null));
+    // Drop any stale cached AST for this name (in case the same name was
+    // previously used for a different predicate).
+    _partialIndexAstCache.remove(s.indexName);
+    if (s.whereSql != null && s.exprSql == null) {
+      _refreshPartialIndexes(t);
+    }
     return QueryResult.message('Index ${s.indexName} created');
   }
 
@@ -685,6 +792,7 @@ class Database {
     for (final t in _tables.values) {
       if (t.indexDefs.containsKey(s.indexName)) {
         t.dropIndex(s.indexName);
+        _partialIndexAstCache.remove(s.indexName);
         return QueryResult.message('Index ${s.indexName} dropped');
       }
     }
@@ -2152,39 +2260,45 @@ class Database {
     if (t == null) return null;
 
     final conjuncts = _splitAndConjuncts(s.where!);
-    final candidates = <_IndexPlan>[];
-    for (final c in conjuncts) {
-      final p = _classifyConjunct(t, c);
-      if (p != null) candidates.add(p);
+    final prevConjuncts = _currentScanConjuncts;
+    _currentScanConjuncts = conjuncts;
+    try {
+      final candidates = <_IndexPlan>[];
+      for (final c in conjuncts) {
+        final p = _classifyConjunct(t, c);
+        if (p != null) candidates.add(p);
+      }
+      // Multi-column index plans: when a contiguous prefix of a multi-column
+      // index has every column equality-constrained, build a single composite
+      // probe (full match) or prefix scan (partial match). These are added on
+      // top of the per-conjunct candidates and almost always win.
+      candidates.addAll(_classifyMultiColumnPlans(t, conjuncts));
+      if (candidates.isEmpty) return null;
+
+      // Pick the candidate with the lowest estimated hits. Tie-break on
+      // equality-over-range so a unique probe wins over a half-open scan.
+      candidates.sort((a, b) {
+        final c = a.estHits.compareTo(b.estHits);
+        if (c != 0) return c;
+        return (a.equalityKeys != null ? 0 : 1) -
+            (b.equalityKeys != null ? 0 : 1);
+      });
+      final best = candidates.first;
+
+      // If the cheapest plan still touches more than ~80% of the table, just
+      // scan — random-access via the index would cost more than a sequential
+      // sweep.
+      if (best.estHits >= (t.rows.length * 0.8).ceil()) return null;
+
+      _planTrace = [best.describe()];
+      final rowIds = _executeIndexPlan(t, best);
+      return [
+        for (final ri in rowIds)
+          {...outer, ...t.rowToMap(t.rows[ri], alias: s.fromAlias)},
+      ];
+    } finally {
+      _currentScanConjuncts = prevConjuncts;
     }
-    // Multi-column index plans: when a contiguous prefix of a multi-column
-    // index has every column equality-constrained, build a single composite
-    // probe (full match) or prefix scan (partial match). These are added on
-    // top of the per-conjunct candidates and almost always win.
-    candidates.addAll(_classifyMultiColumnPlans(t, conjuncts));
-    if (candidates.isEmpty) return null;
-
-    // Pick the candidate with the lowest estimated hits. Tie-break on
-    // equality-over-range so a unique probe wins over a half-open scan.
-    candidates.sort((a, b) {
-      final c = a.estHits.compareTo(b.estHits);
-      if (c != 0) return c;
-      return (a.equalityKeys != null ? 0 : 1) -
-          (b.equalityKeys != null ? 0 : 1);
-    });
-    final best = candidates.first;
-
-    // If the cheapest plan still touches more than ~80% of the table, just
-    // scan — random-access via the index would cost more than a sequential
-    // sweep.
-    if (best.estHits >= (t.rows.length * 0.8).ceil()) return null;
-
-    _planTrace = [best.describe()];
-    final rowIds = _executeIndexPlan(t, best);
-    return [
-      for (final ri in rowIds)
-        {...outer, ...t.rowToMap(t.rows[ri], alias: s.fromAlias)},
-    ];
   }
 
   /// Flatten an `a AND b AND c` chain into `[a, b, c]`. Other expressions
@@ -2224,8 +2338,9 @@ class Database {
     if (eqByCol.isEmpty) return out;
 
     for (final def in t.indexDefs.values) {
-      if (def.exprSql != null || def.whereSql != null) continue;
+      if (def.exprSql != null) continue;
       if (def.columns.length < 2) continue;
+      if (!_partialIndexUsable(def)) continue;
       // Determine the longest leading prefix of def.columns that's
       // entirely equality-bound.
       final parts = <Object>[];
@@ -2414,9 +2529,9 @@ class Database {
     // Single-column indexes are the cheapest and unambiguous match.
     for (final d in t.indexDefs.values) {
       if (d.exprSql == null &&
-          d.whereSql == null &&
           d.columns.length == 1 &&
-          d.column.toLowerCase() == lc) {
+          d.column.toLowerCase() == lc &&
+          _partialIndexUsable(d)) {
         return d;
       }
     }
@@ -2425,9 +2540,9 @@ class Database {
     // SplayTreeMap (see [_executeIndexPlan]).
     for (final d in t.indexDefs.values) {
       if (d.exprSql == null &&
-          d.whereSql == null &&
           d.columns.length > 1 &&
-          d.columns.first.toLowerCase() == lc) {
+          d.columns.first.toLowerCase() == lc &&
+          _partialIndexUsable(d)) {
         return d;
       }
     }
