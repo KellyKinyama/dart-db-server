@@ -5,6 +5,7 @@ export 'server/client.dart';
 export 'server/concurrency.dart';
 export 'server/database.dart';
 export 'server/expression.dart' show Expr;
+export 'server/fts5.dart' show tokenizeFts, fts5Match, parseFts5Query, Fts5Node;
 export 'server/prepared.dart';
 export 'server/result.dart';
 export 'server/schema.dart';

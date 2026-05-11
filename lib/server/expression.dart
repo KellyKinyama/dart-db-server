@@ -3,6 +3,7 @@ library;
 
 import 'dart:convert';
 
+import 'fts5.dart';
 import 'schema.dart';
 
 abstract class Expr {
@@ -189,17 +190,11 @@ class BinaryExpr extends Expr {
     throw StateError('Unknown binary op: $op');
   }
 
-  /// Toy MATCH operator: case-insensitive AND of whitespace-separated
-  /// terms, each tested as a substring of the left value. Suitable for
-  /// the toy `fts5` virtual table.
-  static bool _match(String haystack, String pattern) {
-    final h = haystack.toLowerCase();
-    for (final term in pattern.toLowerCase().split(RegExp(r'\s+'))) {
-      if (term.isEmpty) continue;
-      if (!h.contains(term)) return false;
-    }
-    return true;
-  }
+  /// FTS5 `MATCH` operator: parses [pattern] as an FTS5 query expression
+  /// (AND/OR/NOT, phrases, prefix `foo*`, parentheses) and matches it
+  /// against the tokens of [haystack]. See [fts5Match] for syntax.
+  static bool _match(String haystack, String pattern) =>
+      fts5Match(haystack, pattern);
 
   static String _stringify(Object v) {
     if (v is bool) return v ? 'true' : 'false';
