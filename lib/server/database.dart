@@ -3532,8 +3532,9 @@ class Database {
       return BinaryExpr(
           e.op, _bindExpr(e.left, outerScope), _bindExpr(e.right, outerScope));
     }
-    if (e is UnaryExpr)
+    if (e is UnaryExpr) {
       return UnaryExpr(e.op, _bindExpr(e.operand, outerScope));
+    }
     if (e is BetweenExpr) {
       return BetweenExpr(_bindExpr(e.value, outerScope),
           _bindExpr(e.low, outerScope), _bindExpr(e.high, outerScope),
@@ -3550,8 +3551,9 @@ class Database {
           e.thens.map((x) => _bindExpr(x, outerScope)).toList(),
           e.elseExpr == null ? null : _bindExpr(e.elseExpr!, outerScope));
     }
-    if (e is CastExpr)
+    if (e is CastExpr) {
       return CastExpr(_bindExpr(e.expr, outerScope), e.targetType);
+    }
     if (e is FunctionCallExpr) {
       // Window arguments are evaluated in their own pass, but we still
       // need to bind subqueries / nested exprs in their args.
@@ -4395,8 +4397,9 @@ class Database {
         lines.add('  GROUP BY ${stmt.groupBy.length} key(s)');
       }
       if (stmt.having != null) lines.add('  HAVING');
-      if (stmt.orderBy.isNotEmpty)
+      if (stmt.orderBy.isNotEmpty) {
         lines.add('  ORDER BY ${stmt.orderBy.length} key(s)');
+      }
       if (stmt.limit != null) lines.add('  LIMIT ${stmt.limit}');
       if (stmt.offset != null) lines.add('  OFFSET ${stmt.offset}');
       if (stmt.setOp != null) {
@@ -4510,34 +4513,6 @@ class Database {
     final wf = File('${path!}-wal');
     if (await wf.exists()) await wf.delete();
   }
-
-  String _serializeSelect(SelectStmt s) {
-    // We don't have a SQL pretty-printer — serialize the source by
-    // re-roundtripping through identifiers we know about. As a pragmatic
-    // shortcut we just store the original projection labels and inputs.
-    // Views are reparsed on load from this representation via PRAGMA-like
-    // marshaling: persist as JSON-blob-of-AST.
-    return jsonEncode(_selectToJson(s));
-  }
-
-  Map<String, Object?> _selectToJson(SelectStmt s) => {
-        'from': s.fromTable,
-        if (s.fromAlias != null) 'fromAlias': s.fromAlias,
-        'projection': s.projection.map((p) {
-          if (p.isStar)
-            return {
-              'star': true,
-              if (p.starTable != null) 'table': p.starTable
-            };
-          return {
-            'expr': _exprLabel(p.expr!),
-            if (p.alias != null) 'alias': p.alias
-          };
-        }).toList(),
-        // Note: full AST round-tripping for views is non-trivial. For now we
-        // store the original SQL by re-rendering minimal projections; this is
-        // best-effort and views may be lost on reload. See README.
-      };
 
   Future<void> _load() async {
     // Sniff the first 16 bytes: a real SQLite file starts with the

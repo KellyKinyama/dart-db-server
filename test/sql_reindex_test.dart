@@ -63,8 +63,8 @@ void main() {
     test('UNIQUE constraints remain enforced after REINDEX', () async {
       final db = await Database.open();
       try {
-        await db.execute(
-            'CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT UNIQUE)');
+        await db
+            .execute('CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT UNIQUE)');
         await db.execute("INSERT INTO t VALUES (1,'a'),(2,'b')");
         await db.execute('REINDEX t');
         expect(

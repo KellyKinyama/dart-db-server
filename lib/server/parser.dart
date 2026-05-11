@@ -464,8 +464,9 @@ class Parser {
         primaryKey = true;
         notNull = true;
         unique = true;
-        if (_matchKw('AUTOINCREMENT') || _matchKw('AUTO_INCREMENT'))
+        if (_matchKw('AUTOINCREMENT') || _matchKw('AUTO_INCREMENT')) {
           autoInc = true;
+        }
         continue;
       }
       if (_matchKw('AUTOINCREMENT') || _matchKw('AUTO_INCREMENT')) {

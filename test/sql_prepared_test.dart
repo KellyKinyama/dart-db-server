@@ -203,8 +203,8 @@ void main() {
     });
   });
 
+  final skip = sqliteSkipReason();
   group('Cross-engine parity', () {
-    final skip = sqliteSkipReason();
     late SqliteOracle o;
 
     setUp(() async {
@@ -235,5 +235,5 @@ void main() {
       final ref = o.ref.select(sql, [30]);
       expect(ours.rows.length, ref.rows.length);
     });
-  }, skip: null);
+  }, skip: skip);
 }

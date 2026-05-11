@@ -1631,7 +1631,7 @@ void _writeTableInteriorPage(
   final paSize = cells.length * 2;
   if (ph + paSize + totalCellBytes > pageSize) {
     throw StateError(
-        'Table interior page does not fit in one ${pageSize}-byte page '
+        'Table interior page does not fit in one $pageSize-byte page '
         '(need ${ph + paSize + totalCellBytes} bytes).');
   }
 
@@ -1694,7 +1694,7 @@ void _writeIndexInteriorPage(
   final paSize = cells.length * 2;
   if (ph + paSize + totalCellBytes > pageSize) {
     throw StateError(
-        'Index interior page does not fit in one ${pageSize}-byte page '
+        'Index interior page does not fit in one $pageSize-byte page '
         '(need ${ph + paSize + totalCellBytes} bytes).');
   }
 
@@ -1752,7 +1752,7 @@ void _writeIndexLeafPage(
   final pointerArraySize = cells.length * 2;
   final overhead = pageHeaderSize + pointerArraySize;
   if (overhead + totalCellBytes > pageSize) {
-    throw StateError('Index leaf does not fit in one ${pageSize}-byte page '
+    throw StateError('Index leaf does not fit in one $pageSize-byte page '
         '(need ${overhead + totalCellBytes} bytes). '
         'This should not happen — cells are pre-packed by the writer.');
   }
@@ -1903,7 +1903,7 @@ void _writeTableLeafPage(
   final pointerArraySize = cells.length * 2;
   final overhead = headerInsetOffset + pageHeaderSize + pointerArraySize;
   if (overhead + totalCellBytes > pageSize) {
-    throw StateError('Leaf page contents do not fit in one ${pageSize}-byte '
+    throw StateError('Leaf page contents do not fit in one $pageSize-byte '
         'page (need ${overhead + totalCellBytes} bytes). '
         'This should not happen — cells are pre-packed by the writer.');
   }

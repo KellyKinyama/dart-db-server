@@ -4,9 +4,9 @@
 ///   dart run bin/dart_db_server.dart [options]
 ///
 /// Options:
-///   --file <path>    JSON file used for persistence (default: mydatabase.json)
-///   --port <n>       TCP port to listen on (default: 4555, 0 disables)
-///   --host <addr>    Bind address (default: 127.0.0.1)
+///   `--file <path>`    JSON file used for persistence (default: mydatabase.json)
+///   `--port <n>`       TCP port to listen on (default: 4555, 0 disables)
+///   `--host <addr>`    Bind address (default: 127.0.0.1)
 ///   --repl           Also start an interactive REPL on stdin
 ///   --memory         Run in-memory only (no persistence)
 ///   -h, --help       Show this help

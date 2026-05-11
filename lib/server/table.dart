@@ -115,8 +115,9 @@ class Table {
   int columnIndex(String colName) {
     final i = columns
         .indexWhere((c) => c.name.toLowerCase() == colName.toLowerCase());
-    if (i == -1)
+    if (i == -1) {
       throw StateError('Column "$colName" not found in table "$name"');
+    }
     return i;
   }
 
@@ -322,12 +323,12 @@ class CompositeIndexKey implements Comparable<CompositeIndexKey> {
   }
 
   @override
-  bool operator ==(Object o) {
-    if (identical(this, o)) return true;
-    if (o is! CompositeIndexKey) return false;
-    if (o.parts.length != parts.length) return false;
+  bool operator ==(Object other) {
+    if (identical(this, other)) return true;
+    if (other is! CompositeIndexKey) return false;
+    if (other.parts.length != parts.length) return false;
     for (var i = 0; i < parts.length; i++) {
-      if (compareValues(parts[i], o.parts[i]) != 0) return false;
+      if (compareValues(parts[i], other.parts[i]) != 0) return false;
     }
     return true;
   }

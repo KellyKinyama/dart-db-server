@@ -35,7 +35,9 @@ Future<void> main(List<String> args) async {
     if (line == null) break;
     final trimmed = line.trim();
     if (buffer.isEmpty &&
-        (trimmed == 'exit' || trimmed == 'quit' || trimmed == '\\q')) break;
+        (trimmed == 'exit' || trimmed == 'quit' || trimmed == '\\q')) {
+      break;
+    }
     buffer.writeln(line);
     if (!trimmed.endsWith(';')) continue;
     final sql = buffer.toString();

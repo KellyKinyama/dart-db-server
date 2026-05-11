@@ -126,7 +126,7 @@ List<Object?> _normalizeRow(Iterable<Object?> r) =>
 /// - integer-valued double -> int (1.0 -> 1).
 /// - other doubles are rounded to 12 significant digits to absorb
 ///   floating-point noise across two independent evaluators.
-/// - BLOB-ish: Uint8List <-> List<int> are unified to List<int>.
+/// - BLOB-ish: `Uint8List` <-> `List<int>` are unified to `List<int>`.
 Object? _normalizeValue(Object? v) {
   if (v == null) return null;
   if (v is bool) return v ? 1 : 0;

@@ -364,8 +364,8 @@ bool sqlTruthy(Object? v) => v is bool && v;
 
 /// CASE WHEN ... THEN ... ELSE ... END.
 /// Both forms are supported:
-///   CASE WHEN <cond> THEN <v> ... [ELSE <v>] END   (searched)
-///   CASE <subject> WHEN <v1> THEN <r1> ... [ELSE <v>] END   (simple)
+///   `CASE WHEN <cond> THEN <v> ... [ELSE <v>] END`   (searched)
+///   `CASE <subject> WHEN <v1> THEN <r1> ... [ELSE <v>] END`   (simple)
 /// The simple form is desugared by the parser into the searched form.
 class CaseExpr extends Expr {
   final List<Expr> whens; // condition expressions
@@ -675,8 +675,9 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     final s = a[0].toString();
     final n = a.length > 1 && a[1] != null ? (a[1] as num).toInt() : s.length;
     final pad = a.length > 2 && a[2] != null ? a[2].toString() : ' ';
-    if (s.length >= n || pad.isEmpty)
+    if (s.length >= n || pad.isEmpty) {
       return s.length > n ? s.substring(0, n) : s;
+    }
     final buf = StringBuffer();
     while (buf.length + s.length < n) {
       buf.write(pad);
@@ -689,8 +690,9 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     final s = a[0].toString();
     final n = a.length > 1 && a[1] != null ? (a[1] as num).toInt() : s.length;
     final pad = a.length > 2 && a[2] != null ? a[2].toString() : ' ';
-    if (s.length >= n || pad.isEmpty)
+    if (s.length >= n || pad.isEmpty) {
       return s.length > n ? s.substring(0, n) : s;
+    }
     final buf = StringBuffer(s);
     while (buf.length < n) {
       buf.write(pad);

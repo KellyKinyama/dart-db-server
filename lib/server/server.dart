@@ -2,10 +2,10 @@
 /// stream of JSON requests, one per line, and replies with one JSON object
 /// per request.
 ///
-/// Request:  {"id": <any>, "sql": "SELECT ..."}
-///           or {"id": <any>, "ping": true}
-/// Response: {"id": <same>, "ok": true,  "columns": [...], "rows": [...], "affected": N, "message": "..."}
-///           {"id": <same>, "ok": false, "error": "..."}
+/// Request:  `{"id": <any>, "sql": "SELECT ..."}`
+///           or `{"id": <any>, "ping": true}`
+/// Response: `{"id": <same>, "ok": true,  "columns": [...], "rows": [...], "affected": N, "message": "..."}`
+///           `{"id": <same>, "ok": false, "error": "..."}`
 library;
 
 import 'dart:async';
@@ -69,15 +69,18 @@ class DbServer {
     Object? id;
     try {
       final req = jsonDecode(line);
-      if (req is! Map)
+      if (req is! Map) {
         throw const FormatException('request must be JSON object');
+      }
       id = req['id'];
       if (req['ping'] == true) {
         _send(socket, {'id': id, 'ok': true, 'message': 'pong'});
         return;
       }
       final sql = req['sql'];
-      if (sql is! String) throw const FormatException('missing "sql" string');
+      if (sql is! String) {
+        throw const FormatException('missing "sql" string');
+      }
       final results = await db.executeScript(sql);
       final last = results.isEmpty ? QueryResult.empty : results.last;
       _send(socket, {'id': id, 'ok': true, ...last.toJson()});
