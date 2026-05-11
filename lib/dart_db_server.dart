@@ -16,6 +16,7 @@ export 'server/fts5.dart'
         Fts5Index;
 export 'server/prepared.dart';
 export 'server/result.dart';
+export 'server/rtree.dart' show BBox, RTreeIndex;
 export 'server/schema.dart';
 export 'server/server.dart';
 export 'server/sqlite_format.dart';
