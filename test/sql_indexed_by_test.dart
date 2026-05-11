@@ -35,8 +35,7 @@ void main() {
         await db.execute('INSERT INTO t VALUES (1, 10), (2, 20)');
         // ix_b is on b; the WHERE filters on a so the index cannot serve
         // the query.
-        expect(
-            () => db.execute('SELECT * FROM t INDEXED BY ix_b WHERE a = 1'),
+        expect(() => db.execute('SELECT * FROM t INDEXED BY ix_b WHERE a = 1'),
             throwsA(isA<FormatException>()));
       } finally {
         await db.close();
@@ -53,8 +52,8 @@ void main() {
         }
         // Without NOT INDEXED, a = 42 would probe ix_a. With NOT INDEXED
         // the planner must not record an index probe in the trace.
-        final hinted = await db
-            .execute('SELECT b FROM t NOT INDEXED WHERE a = 42');
+        final hinted =
+            await db.execute('SELECT b FROM t NOT INDEXED WHERE a = 42');
         expect(hinted.rows.first.first, 420);
         expect(db.lastPlanTrace.join(' '), isNot(contains('ix_a')),
             reason: 'NOT INDEXED must suppress index usage, got '
@@ -69,8 +68,7 @@ void main() {
       }
     });
 
-    test('UPDATE / DELETE NOT INDEXED still produce correct results',
-        () async {
+    test('UPDATE / DELETE NOT INDEXED still produce correct results', () async {
       final db = await Database.open();
       try {
         await db.execute('CREATE TABLE t (a INTEGER)');

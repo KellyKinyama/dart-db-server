@@ -1156,7 +1156,9 @@ class Parser {
           }
         }
         joins.add(JoinClause(joinType, tbl, alias, on,
-            subquery: sub, using: usingCols, natural: natural,
+            subquery: sub,
+            using: usingCols,
+            natural: natural,
             indexedBy: joinHint));
       }
     }
@@ -1503,6 +1505,12 @@ class Parser {
     // keyword used by CREATE TRIGGER syntax.
     if (t.type == TokType.keyword) {
       _advance();
+      // A keyword immediately followed by `(` is a function call. This
+      // lets type-name keywords like CHAR / TEXT double as function
+      // names (e.g. CHAR(65) -> 'A').
+      if (_check(TokType.punct, '(')) {
+        return _parseFunctionCall(t.text);
+      }
       if (_check(TokType.punct, '.')) {
         _advance();
         final col = _expectName();

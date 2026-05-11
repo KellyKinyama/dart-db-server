@@ -64,7 +64,16 @@ class Database {
   /// is in effect. Replayed at [_commit] time; failure rolls back.
   final List<_DeferredFk> _deferredFkChecks = <_DeferredFk>[];
 
+  /// Queue of CHECK validations accumulated while `PRAGMA defer_checks = 1`
+  /// is in effect. Stores only the *names* of tables that had at least one
+  /// mutating operation; at commit time every row of each such table is
+  /// re-validated against its CHECK constraints. This sidesteps the
+  /// problem of stale intermediate row images when a row is mutated
+  /// repeatedly inside a single transaction.
+  final Set<String> _deferredCheckTables = <String>{};
+
   bool get _deferFks => _truthy(_pragmas['defer_foreign_keys']);
+  bool get _deferChecks => _truthy(_pragmas['defer_checks']);
 
   static bool _truthy(Object? v) {
     if (v == null) return false;
@@ -1316,6 +1325,20 @@ class Database {
   // Constraints
   // ---------------------------------------------------------------------------
   void _enforceChecks(Table t, List<Object?> row) {
+    // When `PRAGMA defer_checks = 1` is in effect inside a transaction,
+    // record the table for end-of-transaction re-validation instead of
+    // checking the row now. We validate every live row of the table at
+    // COMMIT, which sidesteps stale intermediate row images.
+    if (_deferChecks && inTransaction) {
+      _deferredCheckTables.add(t.name);
+      return;
+    }
+    _runChecks(t, row);
+  }
+
+  /// Apply all column- and table-level CHECK constraints to [row]
+  /// immediately and throw on the first failure.
+  void _runChecks(Table t, List<Object?> row) {
     final view = t.rowToMap(row);
     for (var i = 0; i < t.columns.length; i++) {
       final c = t.columns[i];
@@ -2345,9 +2368,8 @@ class Database {
       // If no plan can use the named index, raise like SQLite does.
       if (hint != null && hint.indexName != null) {
         final wanted = hint.indexName!.toLowerCase();
-        final usable = candidates
-            .where((p) => p.index.toLowerCase() == wanted)
-            .toList();
+        final usable =
+            candidates.where((p) => p.index.toLowerCase() == wanted).toList();
         if (usable.isEmpty) {
           throw FormatException(
               'no query solution for INDEXED BY ${hint.indexName} on ${t.name}');
@@ -3364,12 +3386,31 @@ class Database {
 
   // ---- Aggregate execution -----------------------------------------------
   _AggResult _runAggregate(SelectStmt s, List<Map<String, Object?>> rows) {
+    // Resolve `GROUP BY <int>` to the underlying projection expression
+    // (1-based, like ORDER BY positions). Non-integer GROUP BY items are
+    // bound and evaluated as usual.
+    Expr resolveGroupExpr(Expr g) {
+      if (g is LiteralExpr && g.value is int) {
+        final pos = (g.value as int) - 1;
+        if (pos < 0 || pos >= s.projection.length) {
+          throw StateError('GROUP BY position out of range');
+        }
+        final item = s.projection[pos];
+        if (item.isStar || item.expr == null) {
+          throw StateError('GROUP BY position refers to *');
+        }
+        return _bindExpr(item.expr!);
+      }
+      return _bindExpr(g);
+    }
+
+    final boundGroup = s.groupBy.map(resolveGroupExpr).toList();
     // Group rows by GROUP BY key (empty group-by => single group).
     final groups = <String, List<Map<String, Object?>>>{};
     final groupKeys = <String, List<Object?>>{};
     final groupOrder = <String>[];
     for (final r in rows) {
-      final keyVals = s.groupBy.map((g) => _bindExpr(g).eval(r)).toList();
+      final keyVals = boundGroup.map((g) => g.eval(r)).toList();
       final key = jsonEncode(keyVals);
       if (!groups.containsKey(key)) {
         groups[key] = <Map<String, Object?>>[];
@@ -4139,6 +4180,25 @@ class Database {
         }
       }
     }
+    // Replay any deferred CHECK validations: every row of every table
+    // that had a mutating operation during the transaction is re-checked
+    // against its CHECK constraints.
+    if (_deferredCheckTables.isNotEmpty && !_readOnlySnapshot) {
+      final queued = Set<String>.from(_deferredCheckTables);
+      _deferredCheckTables.clear();
+      for (final name in queued) {
+        final t = _tables[name];
+        if (t == null) continue;
+        try {
+          for (final r in t.rows) {
+            _runChecks(t, r);
+          }
+        } catch (e) {
+          _rollback();
+          throw StateError('DEFERRED CHECK constraint failed on commit: $e');
+        }
+      }
+    }
     if (_readOnlySnapshot) {
       // Discard the snapshot view; restore the live (unchanged) state.
       _tables
@@ -4159,6 +4219,7 @@ class Database {
   QueryResult _rollback() {
     if (!inTransaction) throw StateError('No transaction in progress');
     _deferredFkChecks.clear();
+    _deferredCheckTables.clear();
     if (_readOnlySnapshot) {
       _tables
         ..clear()

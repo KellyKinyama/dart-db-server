@@ -590,6 +590,15 @@ Object? _propagateNull(List<Object?> args, Object? Function() body) {
   return body();
 }
 
+/// Returns the numeric value of an ASCII hex digit (`0`-`9`, `A`-`F`,
+/// `a`-`f`), or -1 when [cu] is not a hex digit.
+int _hexDigit(int cu) {
+  if (cu >= 0x30 && cu <= 0x39) return cu - 0x30; // 0-9
+  if (cu >= 0x41 && cu <= 0x46) return cu - 0x41 + 10; // A-F
+  if (cu >= 0x61 && cu <= 0x66) return cu - 0x61 + 10; // a-f
+  return -1;
+}
+
 /// Thrown by `RAISE(action, message)` inside a trigger. The trigger
 /// executor catches this and decides whether to silently ignore the
 /// current operation (IGNORE), abort it (ABORT/FAIL), or roll back the
@@ -711,6 +720,59 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
       buf.write(pad);
     }
     return buf.toString().substring(0, n);
+  },
+  // --- Encoding / codepoint helpers ------------------------------------
+  // HEX(X) — uppercase hex of a BLOB or string's UTF-8 bytes.
+  'HEX': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final v = a[0]!;
+    final bytes = v is List<int> ? v : utf8.encode(v.toString());
+    final sb = StringBuffer();
+    for (final b in bytes) {
+      sb.write((b & 0xFF).toRadixString(16).padLeft(2, '0').toUpperCase());
+    }
+    return sb.toString();
+  },
+  // UNHEX(X[, ignored]) — inverse of HEX. Returns NULL on malformed input
+  // (matches SQLite). Optional second arg lists characters to skip; we
+  // honor the SQLite default of allowing whitespace.
+  'UNHEX': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final s = a[0].toString();
+    final ignore = a.length > 1 && a[1] != null ? a[1].toString() : '';
+    final bytes = <int>[];
+    int? pending;
+    for (final cu in s.codeUnits) {
+      final ch = String.fromCharCode(cu);
+      if (ignore.contains(ch)) continue;
+      final d = _hexDigit(cu);
+      if (d < 0) return null;
+      if (pending == null) {
+        pending = d;
+      } else {
+        bytes.add((pending << 4) | d);
+        pending = null;
+      }
+    }
+    if (pending != null) return null;
+    return bytes;
+  },
+  // UNICODE(X) — codepoint of the first character of X, or NULL if X is
+  // null/empty.
+  'UNICODE': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final s = a[0].toString();
+    if (s.isEmpty) return null;
+    return s.runes.first;
+  },
+  // CHAR(X1, X2, ...) — string formed from the given Unicode codepoints.
+  'CHAR': (a) {
+    final cps = <int>[];
+    for (final v in a) {
+      if (v == null) continue;
+      cps.add((v as num).toInt());
+    }
+    return String.fromCharCodes(cps);
   },
   // --- Datetime --------------------------------------------------------
   'CURRENT_TIMESTAMP': (a) => _fmtDateTime(DateTime.now().toUtc(), full: true),
