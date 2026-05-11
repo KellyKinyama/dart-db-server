@@ -15,6 +15,7 @@ import 'fts5.dart';
 import 'parser.dart';
 import 'prepared.dart';
 import 'result.dart';
+import 'rtree.dart';
 import 'schema.dart';
 import 'sqlite_format.dart';
 import 'statement.dart';
@@ -188,6 +189,48 @@ class Database {
     _fts5IndexCache.removeWhere((k, _) => k.startsWith(prefix));
   }
 
+  /// Names (lowercased) of tables created via `CREATE VIRTUAL TABLE ... USING rtree`
+  /// in the current session. Used to enable bbox-aware planning. Reloaded
+  /// tables don't gain this set bit, so range queries on them fall back to
+  /// scans — still correct.
+  final Set<String> _rtreeTables = <String>{};
+
+  /// Lazy cache of in-memory [RTreeIndex]es keyed by lower-cased table
+  /// name. Built on first planner access and dropped on any mutation of
+  /// the underlying table.
+  final Map<String, RTreeIndex> _rtreeIndexCache = <String, RTreeIndex>{};
+
+  /// Build (or return cached) [RTreeIndex] for [t], which must be an
+  /// rtree virtual table (column 0 is the rowid; remaining columns come
+  /// in min/max pairs per axis).
+  RTreeIndex _rtreeIndexFor(Table t) {
+    final key = t.name.toLowerCase();
+    final cached = _rtreeIndexCache[key];
+    if (cached != null) return cached;
+    final dims = (t.columns.length - 1) ~/ 2;
+    final items = <MapEntry<int, BBox>>[];
+    for (var ri = 0; ri < t.rows.length; ri++) {
+      final row = t.rows[ri];
+      final rowid = (row[0] as num).toInt();
+      final mins = <double>[];
+      final maxs = <double>[];
+      for (var d = 0; d < dims; d++) {
+        final a = (row[1 + d * 2] as num).toDouble();
+        final b = (row[2 + d * 2] as num).toDouble();
+        mins.add(math.min(a, b));
+        maxs.add(math.max(a, b));
+      }
+      items.add(MapEntry(rowid, BBox.fromMinMax(mins, maxs)));
+    }
+    final idx = RTreeIndex.bulkLoad(dims, items);
+    _rtreeIndexCache[key] = idx;
+    return idx;
+  }
+
+  void _invalidateRtree(String tableName) {
+    _rtreeIndexCache.remove(tableName.toLowerCase());
+  }
+
   /// Cached, parsed partial-index `WHERE` predicate AST per index name.
   /// Built lazily on first planner access and cleared when a partial
   /// index is created or dropped.
@@ -235,8 +278,8 @@ class Database {
   bool _partialIndexUsable(IndexDef def) {
     if (def.whereSql == null) return true;
     final ast = _partialIndexAstCache.putIfAbsent(def.name, () {
-      final stmt = Parser.fromString('SELECT ${def.whereSql}')
-          .parseStatement() as SelectStmt;
+      final stmt = Parser.fromString('SELECT ${def.whereSql}').parseStatement()
+          as SelectStmt;
       return stmt.projection.first.expr!;
     });
     for (final c in _currentScanConjuncts) {
@@ -255,22 +298,19 @@ class Database {
     if (a is LiteralExpr && b is LiteralExpr) return a.value == b.value;
     if (a is ColumnExpr && b is ColumnExpr) {
       return a.name.toLowerCase() == b.name.toLowerCase() &&
-          (a.table?.toLowerCase() ?? '') ==
-              (b.table?.toLowerCase() ?? '');
+          (a.table?.toLowerCase() ?? '') == (b.table?.toLowerCase() ?? '');
     }
     if (a is UnaryExpr && b is UnaryExpr) {
       return a.op == b.op && _exprStructEq(a.operand, b.operand);
     }
     if (a is BinaryExpr && b is BinaryExpr) {
       if (a.op != b.op) return false;
-      if (_exprStructEq(a.left, b.left) &&
-          _exprStructEq(a.right, b.right)) {
+      if (_exprStructEq(a.left, b.left) && _exprStructEq(a.right, b.right)) {
         return true;
       }
       const commutative = {'=', '!=', '<>', 'AND', 'OR', '+', '*'};
       if (commutative.contains(a.op)) {
-        return _exprStructEq(a.left, b.right) &&
-            _exprStructEq(a.right, b.left);
+        return _exprStructEq(a.left, b.right) && _exprStructEq(a.right, b.left);
       }
       return false;
     }
@@ -435,6 +475,7 @@ class Database {
         final tname = _statementTable(stmt);
         if (tname != null) {
           _invalidateFts5(tname);
+          _invalidateRtree(tname);
           final t = _tables[tname];
           if (t != null) _refreshPartialIndexes(t);
         }
@@ -2260,6 +2301,13 @@ class Database {
     if (t == null) return null;
 
     final conjuncts = _splitAndConjuncts(s.where!);
+
+    // R-tree fast path: bbox-intersection query on an rtree virtual table.
+    if (_rtreeTables.contains(t.name.toLowerCase())) {
+      final rows = _planRtreeScan(t, conjuncts, s, outer);
+      if (rows != null) return rows;
+    }
+
     final prevConjuncts = _currentScanConjuncts;
     _currentScanConjuncts = conjuncts;
     try {
@@ -2299,6 +2347,96 @@ class Database {
     } finally {
       _currentScanConjuncts = prevConjuncts;
     }
+  }
+
+  /// Bbox-intersection planner for rtree virtual tables. Looks at the
+  /// query's AND-conjuncts for `<minCol> <= K` and `<maxCol> >= K`
+  /// patterns (and the literal-on-left flips) per axis, builds a query
+  /// bbox, and returns rows whose stored bbox intersects it. Per-row
+  /// re-evaluation of the original WHERE is left to the caller, so it's
+  /// safe to be conservative: unrecognised shapes just fall through.
+  List<Map<String, Object?>>? _planRtreeScan(Table t, List<Expr> conjuncts,
+      SelectStmt s, Map<String, Object?> outer) {
+    final dims = (t.columns.length - 1) ~/ 2;
+    if (dims <= 0) return null;
+    // Lower/upper bounds of the query bbox per axis; default to ±∞.
+    final qmin = List<double>.filled(dims, double.negativeInfinity);
+    final qmax = List<double>.filled(dims, double.infinity);
+    var anyBoundSeen = false;
+    // Column name (lowercased) -> (axis, isMinCol).
+    final colMap = <String, (int, bool)>{};
+    for (var d = 0; d < dims; d++) {
+      colMap[t.columns[1 + d * 2].name.toLowerCase()] = (d, true);
+      colMap[t.columns[2 + d * 2].name.toLowerCase()] = (d, false);
+    }
+    for (final c in conjuncts) {
+      if (c is! BinaryExpr) continue;
+      final op = c.op;
+      if (op != '<' && op != '<=' && op != '>' && op != '>=' && op != '=') {
+        continue;
+      }
+      String? colName;
+      double? lit;
+      var flipped = false;
+      if (c.left is ColumnExpr && _isConstExpr(c.right)) {
+        colName = (c.left as ColumnExpr).name.toLowerCase();
+        final v = _evalConst(c.right);
+        if (v is num) lit = v.toDouble();
+      } else if (c.right is ColumnExpr && _isConstExpr(c.left)) {
+        colName = (c.right as ColumnExpr).name.toLowerCase();
+        final v = _evalConst(c.left);
+        if (v is num) lit = v.toDouble();
+        flipped = true;
+      }
+      if (colName == null || lit == null) continue;
+      final info = colMap[colName];
+      if (info == null) continue;
+      final (axis, _) = info;
+      final effOp = flipped ? _flipComparison(op) : op;
+      // `xMIN <= K` => bbox.minOf(axis) <= K, i.e. xMIN is bounded above
+      //                by K. Since we want intersection with query box
+      //                [qmin, qmax], that means qmax[axis] = K.
+      // `xMAX >= K` => bbox.maxOf(axis) >= K, so qmin[axis] = K.
+      // `xMIN = K`  => qmax[axis] = min(qmax,K) (xMIN cannot exceed K).
+      // `xMAX = K`  => qmin[axis] = max(qmin,K).
+      final isMinCol = info.$2;
+      switch (effOp) {
+        case '<':
+        case '<=':
+          if (isMinCol && lit < qmax[axis]) qmax[axis] = lit;
+          anyBoundSeen = true;
+          break;
+        case '>':
+        case '>=':
+          if (!isMinCol && lit > qmin[axis]) qmin[axis] = lit;
+          anyBoundSeen = true;
+          break;
+        case '=':
+          if (isMinCol && lit < qmax[axis]) qmax[axis] = lit;
+          if (!isMinCol && lit > qmin[axis]) qmin[axis] = lit;
+          anyBoundSeen = true;
+          break;
+      }
+    }
+    if (!anyBoundSeen) return null;
+    // Replace ±∞ with the data extent so BBox.fromMinMax accepts the box.
+    for (var d = 0; d < dims; d++) {
+      if (qmin[d].isInfinite) qmin[d] = -1e308;
+      if (qmax[d].isInfinite) qmax[d] = 1e308;
+      if (qmin[d] > qmax[d]) return const <Map<String, Object?>>[];
+    }
+    final idx = _rtreeIndexFor(t);
+    final query = BBox.fromMinMax(qmin, qmax);
+    final hits = idx.search(query).toSet();
+    if (hits.isEmpty) return const <Map<String, Object?>>[];
+    _planTrace = ['SEARCH ${t.name} USING RTREE'];
+    final out = <Map<String, Object?>>[];
+    for (final row in t.rows) {
+      final rowid = (row[0] as num).toInt();
+      if (!hits.contains(rowid)) continue;
+      out.add({...outer, ...t.rowToMap(row, alias: s.fromAlias)});
+    }
+    return out;
   }
 
   /// Flatten an `a AND b AND c` chain into `[a, b, c]`. Other expressions
@@ -4518,6 +4656,9 @@ class Database {
         throw StateError('Unsupported virtual-table module: $module');
     }
     _tables[s.name] = Table(s.name, cols);
+    if (module == 'rtree') {
+      _rtreeTables.add(s.name.toLowerCase());
+    }
     return QueryResult.message(
         'Virtual table ${s.name} (USING $module) created');
   }
