@@ -114,16 +114,18 @@ class Parser {
     return first;
   }
 
-  /// Consume an optional `INDEXED BY name` or `NOT INDEXED` hint. The
-  /// hint is parsed for compatibility with SQLite syntax and otherwise
-  /// ignored — this engine has no query planner that reads it.
-  void _consumeIndexedHint() {
+  /// Consume an optional `INDEXED BY name` or `NOT INDEXED` hint and
+  /// return it for the planner. Returns `null` when no hint is present.
+  IndexHint? _consumeIndexedHint() {
     if (_matchKw('INDEXED')) {
       _expectKw('BY');
-      _expectIdent();
+      final name = _expectIdent().text;
+      return IndexHint.byName(name);
     } else if (_matchKw('NOT')) {
       _expectKw('INDEXED');
+      return const IndexHint.notIndexed();
     }
+    return null;
   }
 
   // ---------------------------------------------------------------------------
@@ -897,7 +899,7 @@ class Parser {
   UpdateStmt _parseUpdate() {
     _expectKw('UPDATE');
     final table = _expectIdent().text;
-    _consumeIndexedHint();
+    final hint = _consumeIndexedHint();
     _expectKw('SET');
     final assignments = <String, Expr>{};
     do {
@@ -908,7 +910,8 @@ class Parser {
     Expr? where;
     if (_matchKw('WHERE')) where = _parseExpr();
     final ret = _parseReturning();
-    return UpdateStmt(table, assignments, where, returning: ret);
+    return UpdateStmt(table, assignments, where,
+        returning: ret, indexedBy: hint);
   }
 
   // ---- DELETE -------------------------------------------------------------
@@ -916,11 +919,11 @@ class Parser {
     _expectKw('DELETE');
     _expectKw('FROM');
     final table = _expectIdent().text;
-    _consumeIndexedHint();
+    final hint = _consumeIndexedHint();
     Expr? where;
     if (_matchKw('WHERE')) where = _parseExpr();
     final ret = _parseReturning();
-    return DeleteStmt(table, where, returning: ret);
+    return DeleteStmt(table, where, returning: ret, indexedBy: hint);
   }
 
   // ---- WITH (CTEs) --------------------------------------------------------
@@ -1064,6 +1067,7 @@ class Parser {
     SelectStmt? fromSub;
     String? fromAlias;
     FunctionCallExpr? fromFunc;
+    IndexHint? fromIndexHint;
     final joins = <JoinClause>[];
     if (_matchKw('FROM')) {
       if (_match(TokType.punct, '(')) {
@@ -1087,7 +1091,7 @@ class Parser {
       } else if (_matchKw('AS')) {
         fromAlias = _expectName();
       }
-      _consumeIndexedHint();
+      fromIndexHint = _consumeIndexedHint();
       while (true) {
         String? joinType;
         bool natural = false;
@@ -1135,7 +1139,7 @@ class Parser {
         } else if (_matchKw('AS')) {
           alias = _expectName();
         }
-        _consumeIndexedHint();
+        final joinHint = _consumeIndexedHint();
         Expr? on;
         List<String>? usingCols;
         if (!natural && joinType != 'CROSS') {
@@ -1152,7 +1156,8 @@ class Parser {
           }
         }
         joins.add(JoinClause(joinType, tbl, alias, on,
-            subquery: sub, using: usingCols, natural: natural));
+            subquery: sub, using: usingCols, natural: natural,
+            indexedBy: joinHint));
       }
     }
     Expr? where;
@@ -1207,6 +1212,7 @@ class Parser {
       distinct: distinct,
       fromFunction: fromFunc,
       namedWindows: namedWindows,
+      indexedBy: fromIndexHint,
     );
   }
 

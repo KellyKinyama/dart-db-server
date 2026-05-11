@@ -170,6 +170,21 @@ class InsertStmt extends Statement {
       this.onConflict});
 }
 
+/// Optional `INDEXED BY name` / `NOT INDEXED` hint attached to a table
+/// reference. SQLite-compatible; when [notIndexed] the planner must skip
+/// index lookups; when [indexName] is set the planner must use exactly
+/// that index or raise an error.
+class IndexHint {
+  final String? indexName;
+  final bool notIndexed;
+  const IndexHint.byName(String name)
+      : indexName = name,
+        notIndexed = false;
+  const IndexHint.notIndexed()
+      : indexName = null,
+        notIndexed = true;
+}
+
 class JoinClause {
   final String type; // INNER, LEFT, RIGHT, FULL, CROSS
   /// Base relation name. Mutually exclusive with [subquery].
@@ -186,8 +201,11 @@ class JoinClause {
   /// `NATURAL [LEFT|RIGHT|FULL] JOIN` — join on every common column.
   final bool natural;
 
+  /// Optional `INDEXED BY` / `NOT INDEXED` hint on this joined relation.
+  final IndexHint? indexedBy;
+
   JoinClause(this.type, this.table, this.alias, this.on,
-      {this.subquery, this.using, this.natural = false});
+      {this.subquery, this.using, this.natural = false, this.indexedBy});
 }
 
 class SelectStmt extends Statement {
@@ -231,6 +249,9 @@ class SelectStmt extends Statement {
   /// Visible to all `OVER w` references in this SELECT.
   final Map<String, WindowSpec> namedWindows;
 
+  /// Optional `INDEXED BY` / `NOT INDEXED` hint attached to the FROM table.
+  final IndexHint? indexedBy;
+
   SelectStmt({
     required this.projection,
     this.fromTable,
@@ -251,6 +272,7 @@ class SelectStmt extends Statement {
     this.ctesRecursive = false,
     this.fromFunction,
     this.namedWindows = const {},
+    this.indexedBy,
   });
 }
 
@@ -284,11 +306,13 @@ class UpdateStmt extends Statement {
   final Map<String, SelectStmt> ctes;
   final Map<String, List<String>> cteColumns;
   final bool ctesRecursive;
+  final IndexHint? indexedBy;
   UpdateStmt(this.table, this.assignments, this.where,
       {this.returning,
       this.ctes = const {},
       this.cteColumns = const {},
-      this.ctesRecursive = false});
+      this.ctesRecursive = false,
+      this.indexedBy});
 }
 
 class DeleteStmt extends Statement {
@@ -298,11 +322,13 @@ class DeleteStmt extends Statement {
   final Map<String, SelectStmt> ctes;
   final Map<String, List<String>> cteColumns;
   final bool ctesRecursive;
+  final IndexHint? indexedBy;
   DeleteStmt(this.table, this.where,
       {this.returning,
       this.ctes = const {},
       this.cteColumns = const {},
-      this.ctesRecursive = false});
+      this.ctesRecursive = false,
+      this.indexedBy});
 }
 
 class BeginStmt extends Statement {}

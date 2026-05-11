@@ -11,14 +11,13 @@ void main() {
     test('BINARY index serves LIKE prefix as a range scan', () async {
       final db = await Database.open();
       try {
-        await db.execute(
-            'CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)');
+        await db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)');
         for (var i = 0; i < 200; i++) {
           await db.execute("INSERT INTO t VALUES ($i, 'Name$i')");
         }
         await db.execute('CREATE INDEX t_name ON t(name)');
-        final r = await db.execute(
-            "SELECT id FROM t WHERE name LIKE 'Name1%' ORDER BY id");
+        final r = await db
+            .execute("SELECT id FROM t WHERE name LIKE 'Name1%' ORDER BY id");
         // Name1, Name10..Name19, Name100..Name199 -> 1, 10..19, 100..199.
         final ids = r.rows.map((r) => r.first as int).toList();
         expect(ids.contains(1), isTrue);
@@ -37,8 +36,7 @@ void main() {
     test('LIKE without a fixed prefix falls back to a scan', () async {
       final db = await Database.open();
       try {
-        await db.execute(
-            'CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)');
+        await db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)');
         for (var i = 0; i < 50; i++) {
           await db.execute("INSERT INTO t VALUES ($i, 'Name$i')");
         }
@@ -54,12 +52,10 @@ void main() {
       }
     });
 
-    test('NOCASE index is not used for case-sensitive LIKE prefix',
-        () async {
+    test('NOCASE index is not used for case-sensitive LIKE prefix', () async {
       final db = await Database.open();
       try {
-        await db.execute(
-            'CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)');
+        await db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)');
         for (var i = 0; i < 30; i++) {
           await db.execute("INSERT INTO t VALUES ($i, 'Name$i')");
         }
@@ -68,8 +64,8 @@ void main() {
         // A NOCASE index's lowercased keys would yield 0 rows on a
         // BINARY range scan of 'Name'..'Namf', so the planner must
         // refuse to use it.
-        final r = await db.execute(
-            "SELECT id FROM t WHERE name LIKE 'Name%' ORDER BY id");
+        final r = await db
+            .execute("SELECT id FROM t WHERE name LIKE 'Name%' ORDER BY id");
         expect(r.rows.length, 30);
         expect(db.lastPlanTrace.join(' '), isNot(contains('t_name')),
             reason: 'NOCASE index must not be used for case-sensitive LIKE, '
@@ -82,13 +78,12 @@ void main() {
     test('underscore wildcard before % disables the optimisation', () async {
       final db = await Database.open();
       try {
-        await db.execute(
-            'CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)');
-        await db.execute(
-            "INSERT INTO t VALUES (1, 'abc'), (2, 'axc'), (3, 'azc')");
+        await db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)');
+        await db
+            .execute("INSERT INTO t VALUES (1, 'abc'), (2, 'axc'), (3, 'azc')");
         await db.execute('CREATE INDEX t_name ON t(name)');
-        final r = await db.execute(
-            "SELECT id FROM t WHERE name LIKE 'a_c%' ORDER BY id");
+        final r = await db
+            .execute("SELECT id FROM t WHERE name LIKE 'a_c%' ORDER BY id");
         expect(r.rows.map((r) => r.first).toList(), [1, 2, 3]);
         expect(db.lastPlanTrace.join(' '), isNot(contains('t_name')));
       } finally {

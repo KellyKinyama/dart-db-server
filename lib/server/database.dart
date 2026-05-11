@@ -2312,6 +2312,10 @@ class Database {
 
     final conjuncts = _splitAndConjuncts(s.where!);
 
+    // Honor `NOT INDEXED`: skip the index planner entirely.
+    final hint = s.indexedBy;
+    if (hint != null && hint.notIndexed) return null;
+
     // R-tree fast path: bbox-intersection query on an rtree virtual table.
     if (_rtreeTables.contains(t.name.toLowerCase())) {
       final rows = _planRtreeScan(t, conjuncts, s, outer);
@@ -2335,6 +2339,34 @@ class Database {
       // `<expr>` structurally matches a `CREATE INDEX ... ON t(<expr>)`
       // becomes a single equality probe of the expression index.
       candidates.addAll(_classifyExpressionIndexPlans(t, conjuncts));
+
+      // Honor `INDEXED BY name`: restrict to plans using that index, and
+      // bypass the cost-vs-scan threshold so the user's choice is forced.
+      // If no plan can use the named index, raise like SQLite does.
+      if (hint != null && hint.indexName != null) {
+        final wanted = hint.indexName!.toLowerCase();
+        final usable = candidates
+            .where((p) => p.index.toLowerCase() == wanted)
+            .toList();
+        if (usable.isEmpty) {
+          throw FormatException(
+              'no query solution for INDEXED BY ${hint.indexName} on ${t.name}');
+        }
+        usable.sort((a, b) {
+          final c = a.estHits.compareTo(b.estHits);
+          if (c != 0) return c;
+          return (a.equalityKeys != null ? 0 : 1) -
+              (b.equalityKeys != null ? 0 : 1);
+        });
+        final best = usable.first;
+        _planTrace = [best.describe()];
+        final rowIds = _executeIndexPlan(t, best);
+        return [
+          for (final ri in rowIds)
+            {...outer, ...t.rowToMap(t.rows[ri], alias: s.fromAlias)},
+        ];
+      }
+
       if (candidates.isEmpty) return null;
 
       // Pick the candidate with the lowest estimated hits. Tie-break on
