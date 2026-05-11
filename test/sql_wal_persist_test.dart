@@ -8,8 +8,7 @@ import 'dart:io';
 import 'package:dart_db_server/dart_db_server.dart';
 import 'package:test/test.dart';
 
-String _tmpPath(String tag) =>
-    '${Directory.systemTemp.path}/ddb_wal_${tag}_'
+String _tmpPath(String tag) => '${Directory.systemTemp.path}/ddb_wal_${tag}_'
     '${DateTime.now().microsecondsSinceEpoch}.sqlite';
 
 void main() {

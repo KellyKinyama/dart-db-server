@@ -4414,8 +4414,7 @@ class Database {
       final off = i * ps;
       final cur = Uint8List.sublistView(current, off, off + ps);
       if (i < basePages) {
-        final bp =
-            Uint8List.sublistView(baseline, off, off + ps);
+        final bp = Uint8List.sublistView(baseline, off, off + ps);
         if (_bytesEqual(bp, cur)) continue;
       }
       overrides[i + 1] = Uint8List.fromList(cur);
@@ -4507,11 +4506,9 @@ class Database {
         if (raw[i] != magic.codeUnitAt(i)) isSqlite = false;
       }
       if (isSqlite) {
-        await importSqlite(path!);
-        _persistAsSqlite = true;
-        // Capture page size from the loaded image (bytes 16-17 are BE
-        // page size; 1 means 65536). Snapshot the bytes as the diff
-        // baseline so the first follow-up persist can write a -wal.
+        // Capture page size + baseline BEFORE calling importSqlite,
+        // because importSqlite re-issues DDL/DML through executeStmt,
+        // which would otherwise persist as JSON.
         if (raw.length >= 18) {
           var ps = (raw[16] << 8) | raw[17];
           if (ps == 1) ps = 65536;
@@ -4520,6 +4517,14 @@ class Database {
           }
         }
         _sqliteBaselineBytes = Uint8List.fromList(raw);
+        _persistAsSqlite = true;
+        await importSqlite(path!);
+        // The reissued CREATE/INSERTs above will have produced one or
+        // more incremental WAL writes against our baseline. Drop any
+        // stale WAL — the in-memory state already equals "baseline +
+        // its original WAL", so the baseline alone is canonical.
+        final wf = File('${path!}-wal');
+        if (await wf.exists()) await wf.delete();
         return;
       }
     }
