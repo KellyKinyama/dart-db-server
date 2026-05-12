@@ -923,6 +923,36 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
         if (v is List<int>) return v.length;
         return v.toString().length;
       }),
+  // OCTET_LENGTH: UTF-8 byte length for text, byte length for blobs.
+  'OCTET_LENGTH': (a) => _propagateNull(a, () {
+        final v = a[0]!;
+        if (v is List<int>) return v.length;
+        return utf8.encode(v.toString()).length;
+      }),
+  // BIT_LENGTH: OCTET_LENGTH * 8.
+  'BIT_LENGTH': (a) => _propagateNull(a, () {
+        final v = a[0]!;
+        if (v is List<int>) return v.length * 8;
+        return utf8.encode(v.toString()).length * 8;
+      }),
+  // LEAST(a, b, ...) -- smallest non-NULL value; returns NULL if all NULL.
+  'LEAST': (a) {
+    Object? best;
+    for (final v in a) {
+      if (v == null) continue;
+      if (best == null || sqlCompare(v, best) < 0) best = v;
+    }
+    return best;
+  },
+  // GREATEST(a, b, ...) -- largest non-NULL value.
+  'GREATEST': (a) {
+    Object? best;
+    for (final v in a) {
+      if (v == null) continue;
+      if (best == null || sqlCompare(v, best) > 0) best = v;
+    }
+    return best;
+  },
   'TRIM': (a) => _propagateNull(a, () => a[0].toString().trim()),
   'LTRIM': (a) => _propagateNull(
       a, () => a[0].toString().replaceFirst(RegExp(r'^\s+'), '')),
@@ -1206,6 +1236,31 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     final dt = _resolveDateTime(a.sublist(1));
     if (dt == null) return null;
     return _strftime(fmt, dt);
+  },
+  // TIMEDIFF(a, b) -- SQLite 3.43+. Returns the difference (a - b) as a
+  // datetime string with leading sign: '+/-YYYY-MM-DD HH:MM:SS.SSS'.
+  'TIMEDIFF': (a) {
+    if (a.length < 2 || a[0] == null || a[1] == null) return null;
+    final da = _resolveDateTime([a[0]]);
+    final db = _resolveDateTime([a[1]]);
+    if (da == null || db == null) return null;
+    final diffMicros = da.difference(db).inMicroseconds;
+    final neg = diffMicros < 0;
+    var abs = diffMicros.abs();
+    final days = abs ~/ Duration.microsecondsPerDay;
+    abs -= days * Duration.microsecondsPerDay;
+    final hours = abs ~/ Duration.microsecondsPerHour;
+    abs -= hours * Duration.microsecondsPerHour;
+    final mins = abs ~/ Duration.microsecondsPerMinute;
+    abs -= mins * Duration.microsecondsPerMinute;
+    final secs = abs ~/ Duration.microsecondsPerSecond;
+    abs -= secs * Duration.microsecondsPerSecond;
+    final ms = abs ~/ 1000;
+    String two(int v) => v.toString().padLeft(2, '0');
+    String three(int v) => v.toString().padLeft(3, '0');
+    final yearDays = days; // expressed as days only; year/month not split.
+    return '${neg ? '-' : '+'}0000-00-${two(yearDays)} '
+        '${two(hours)}:${two(mins)}:${two(secs)}.${three(ms)}';
   },
   'JULIANDAY': (a) {
     final dt = _resolveDateTime(a);
