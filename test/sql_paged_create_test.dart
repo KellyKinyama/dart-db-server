@@ -117,19 +117,15 @@ void main() {
         'id INTEGER PRIMARY KEY, name TEXT) USING paged');
     await db.execute("INSERT INTO t VALUES (1, 'a')");
 
-    // INSERT … SELECT.
-    await expectLater(
-      db.execute('INSERT INTO t SELECT * FROM t'),
-      throwsA(isA<UnsupportedError>()),
-    );
     // UPDATE that tries to reassign the primary key.
     await expectLater(
       db.execute('UPDATE t SET id = 99 WHERE id = 1'),
       throwsA(isA<UnsupportedError>()),
     );
-    // RETURNING is not wired.
+    // INSERT OR REPLACE is still not supported (paged tables can't
+    // upsert atomically).
     await expectLater(
-      db.execute('DELETE FROM t WHERE id = 1 RETURNING *'),
+      db.execute("INSERT OR REPLACE INTO t VALUES (1, 'x')"),
       throwsA(isA<UnsupportedError>()),
     );
   });

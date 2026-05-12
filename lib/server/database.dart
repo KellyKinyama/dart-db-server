@@ -1795,15 +1795,27 @@ class Database {
           'INSERT OR ${s.mode.name.toUpperCase()} is not supported on '
           'paged table ${s.table}.');
     }
-    if (s.select != null || s.onConflict != null || s.returning != null) {
+    if (s.onConflict != null) {
       throw UnsupportedError(
-          'INSERT … SELECT / ON CONFLICT / RETURNING are not supported '
-          'on paged table ${s.table}.');
+          'INSERT … ON CONFLICT is not supported on paged table '
+          '${s.table}.');
     }
-    final rows = s.rows;
-    if (rows == null) {
-      throw UnsupportedError(
-          'INSERT into paged table ${s.table} requires VALUES rows.');
+    // Materialise the source rows. For INSERT … SELECT we run the
+    // inner SELECT through the regular executor first and convert
+    // each value into a LiteralExpr so the rest of the path is
+    // identical to the VALUES case. If the inner SELECT targets a
+    // paged table (e.g. `INSERT INTO t SELECT … FROM t`) we route
+    // through the async paged path; otherwise we fall back to the
+    // synchronous in-memory executor.
+    final List<List<Expr>> sourceRows;
+    if (s.select != null) {
+      final paged = await _maybeRunPagedStmt(s.select!);
+      final res = paged ?? _selectTopLevel(s.select!);
+      sourceRows = [
+        for (final row in res.rows) [for (final v in row) LiteralExpr(v)],
+      ];
+    } else {
+      sourceRows = s.rows ?? const <List<Expr>>[];
     }
     final colNames = s.columns ?? [for (final c in pt.columns) c.name];
     if (colNames.length != pt.columns.length) {
@@ -1815,8 +1827,25 @@ class Database {
           'INSERT into paged table ${s.table}: every column must be '
           'supplied (got ${colNames.length}, want ${pt.columns.length}).');
     }
+    // Set up RETURNING projection, if any.
+    final returningCols = <String>[];
+    final returningExprs = <Expr>[];
+    if (s.returning != null) {
+      for (final item in s.returning!) {
+        if (item.isStar) {
+          for (final c in pt.columns) {
+            returningCols.add(c.name);
+            returningExprs.add(ColumnExpr(c.name));
+          }
+        } else {
+          returningCols.add(item.alias ?? _exprLabel(item.expr!));
+          returningExprs.add(item.expr!);
+        }
+      }
+    }
+    final returnedRows = <List<Object?>>[];
     var affected = 0;
-    for (final r in rows) {
+    for (final r in sourceRows) {
       if (r.length != colNames.length) {
         throw StateError(
             'INSERT into ${s.table}: row arity ${r.length} ≠ column '
@@ -1829,11 +1858,18 @@ class Database {
       }
       await pt.insert(map);
       affected++;
+      if (returningExprs.isNotEmpty) {
+        returnedRows.add([for (final e in returningExprs) e.eval(map)]);
+      }
     }
     if (inTransaction) {
       _pagedDirty.add(pt);
     } else {
       await pt.commit();
+    }
+    if (returningExprs.isNotEmpty) {
+      return QueryResult(
+          columns: returningCols, rows: returnedRows, affected: affected);
     }
     return QueryResult(affected: affected, message: '$affected row(s)');
   }
@@ -2198,36 +2234,55 @@ class Database {
   }
 
   Future<QueryResult> _pagedUpdate(UpdateStmt s, PagedTable pt) async {
-    if (s.returning != null) {
-      throw UnsupportedError(
-          'UPDATE … RETURNING is not supported on paged table ${s.table}.');
-    }
     final pkName = pt.columns[pt.primaryKeyIndex].name;
     final range = _pagedExtractPkRange(
         s.where, pkName, 'UPDATE on paged table ${s.table}');
-    // Resolve assignment columns once.
-    final assigns = <String, Object?>{};
+    // Resolve assignment columns once. Each RHS expression is kept
+    // as an Expr so it can be evaluated against the current row at
+    // mutation time — that supports things like `SET qty = qty + 1`.
+    final assignExprs = <String, Expr>{};
     s.assignments.forEach((col, expr) {
       final hit = pt.columns.firstWhere(
         (c) => c.name.toLowerCase() == col.toLowerCase(),
         orElse: () => throw StateError(
             'UPDATE on paged table ${s.table}: unknown column $col'),
       );
-      assigns[hit.name] =
-          _evalLiteral(expr, 'UPDATE on paged table ${s.table}');
+      assignExprs[hit.name] = expr;
     });
     // Refuse to mutate the primary key column — PagedTable.update keeps
     // the pk fixed; changing it would require delete+insert and is not
     // worth the complexity here.
-    if (assigns.containsKey(pkName)) {
+    if (assignExprs.containsKey(pkName)) {
       throw UnsupportedError(
           'UPDATE on paged table ${s.table}: cannot reassign the '
           'primary key column "$pkName".');
     }
+    // Set up RETURNING projection, if any. SQLite returns the *new*
+    // row values for UPDATE … RETURNING.
+    final returningCols = <String>[];
+    final returningExprs = <Expr>[];
+    if (s.returning != null) {
+      for (final item in s.returning!) {
+        if (item.isStar) {
+          for (final c in pt.columns) {
+            returningCols.add(c.name);
+            returningExprs.add(ColumnExpr(c.name));
+          }
+        } else {
+          returningCols.add(item.alias ?? _exprLabel(item.expr!));
+          returningExprs.add(item.expr!);
+        }
+      }
+    }
+    final returnedRows = <List<Object?>>[];
     // Materialise matching rows first (PK + current values) so we
     // don't mutate while iterating the index. _pagedRangeStream
     // handles both the eq fast-path and any residual post-filter.
     if (range.contradiction) {
+      if (s.returning != null) {
+        return QueryResult(
+            columns: returningCols, rows: returnedRows, affected: 0);
+      }
       return QueryResult(affected: 0, message: '0 row(s)');
     }
     final matches = <Map<String, Object?>>[];
@@ -2238,9 +2293,17 @@ class Database {
     for (final row in matches) {
       final pkVal = row[pkName];
       if (pkVal == null) continue;
-      final updated = Map<String, Object?>.from(row)..addAll(assigns);
+      // Evaluate each assignment against the *current* row so
+      // expressions like `qty = qty + 1` see the pre-update value.
+      final updated = Map<String, Object?>.from(row);
+      assignExprs.forEach((col, expr) {
+        updated[col] = expr.eval(row);
+      });
       await pt.update(pkVal, updated);
       affected++;
+      if (returningExprs.isNotEmpty) {
+        returnedRows.add([for (final e in returningExprs) e.eval(updated)]);
+      }
     }
     if (affected > 0) {
       if (inTransaction) {
@@ -2248,31 +2311,60 @@ class Database {
       } else {
         await pt.commit();
       }
+    }
+    if (s.returning != null) {
+      return QueryResult(
+          columns: returningCols, rows: returnedRows, affected: affected);
     }
     return QueryResult(affected: affected, message: '$affected row(s)');
   }
 
   Future<QueryResult> _pagedDelete(DeleteStmt s, PagedTable pt) async {
-    if (s.returning != null) {
-      throw UnsupportedError(
-          'DELETE … RETURNING is not supported on paged table ${s.table}.');
-    }
     final pkName = pt.columns[pt.primaryKeyIndex].name;
     final range = _pagedExtractPkRange(
         s.where, pkName, 'DELETE on paged table ${s.table}');
+    // Set up RETURNING projection, if any. SQLite returns the *pre-
+    // deletion* row values for DELETE … RETURNING.
+    final returningCols = <String>[];
+    final returningExprs = <Expr>[];
+    if (s.returning != null) {
+      for (final item in s.returning!) {
+        if (item.isStar) {
+          for (final c in pt.columns) {
+            returningCols.add(c.name);
+            returningExprs.add(ColumnExpr(c.name));
+          }
+        } else {
+          returningCols.add(item.alias ?? _exprLabel(item.expr!));
+          returningExprs.add(item.expr!);
+        }
+      }
+    }
+    final returnedRows = <List<Object?>>[];
     if (range.contradiction) {
+      if (s.returning != null) {
+        return QueryResult(
+            columns: returningCols, rows: returnedRows, affected: 0);
+      }
       return QueryResult(affected: 0, message: '0 row(s)');
     }
-    // Materialise matching PKs first (don't mutate during traversal).
-    // _pagedRangeStream handles both eq and residual filtering.
-    final pks = <Object>[];
+    // Materialise matching rows first (don't mutate during traversal).
+    // We keep the full row map (not just PKs) so RETURNING can
+    // evaluate against the pre-deletion image.
+    final matched = <Map<String, Object?>>[];
     await for (final row in _pagedRangeStream(pt, range)) {
-      final pk = row[pkName];
-      if (pk != null) pks.add(pk);
+      matched.add(row);
     }
     var affected = 0;
-    for (final pk in pks) {
-      if (await pt.delete(pk)) affected++;
+    for (final row in matched) {
+      final pk = row[pkName];
+      if (pk == null) continue;
+      if (await pt.delete(pk)) {
+        affected++;
+        if (returningExprs.isNotEmpty) {
+          returnedRows.add([for (final e in returningExprs) e.eval(row)]);
+        }
+      }
     }
     if (affected > 0) {
       if (inTransaction) {
@@ -2280,6 +2372,10 @@ class Database {
       } else {
         await pt.commit();
       }
+    }
+    if (s.returning != null) {
+      return QueryResult(
+          columns: returningCols, rows: returnedRows, affected: affected);
     }
     return QueryResult(affected: affected, message: '$affected row(s)');
   }

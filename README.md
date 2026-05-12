@@ -167,17 +167,27 @@ implemented:
   indexed column drives an index range scan; remaining residual
   conjuncts are re-applied per row. `GROUP BY`, `HAVING`, and the
   full aggregate set (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, including
-  `COUNT(DISTINCT ...)`) work on paged tables. Joins involving paged
-  tables (any combination of `INNER` / `LEFT` / `RIGHT` / `FULL` /
-  `CROSS` / `NATURAL` / `USING`, including joins between two paged
-  tables) work by snapshotting each paged participant into a
-  transient in-memory table for the duration of the query; the
-  out-of-core benefit on those joins is therefore partial.
-  `UNIQUE`, expression, and partial indexes on paged tables raise
-  `UnsupportedError`; so do `RETURNING`, `INSERT … SELECT`,
-  primary-key reassignment, and triggers. The lower-level
-  `PagedTable` API in `lib/server/paged_table.dart` exposes the full
-  primitives directly.
+  `COUNT(DISTINCT ...)`) work on paged tables. `INSERT … SELECT`
+  (including self-referential `INSERT INTO t SELECT … FROM t`) and
+  `RETURNING` on `INSERT` / `UPDATE` / `DELETE` are supported.
+  Multi-statement transactions (`BEGIN … COMMIT/ROLLBACK`) atomically
+  cover paged-table writes via per-file undo journals; paged DDL
+  (`CREATE TABLE USING paged`, `CREATE/DROP INDEX`, `DROP TABLE`,
+  `TRUNCATE`) is rejected inside a transaction, and paged DML is
+  rejected while a `SAVEPOINT` is open. Joins involving paged tables
+  (any combination of `INNER` / `LEFT` / `RIGHT` / `FULL` / `CROSS` /
+  `NATURAL` / `USING`, including joins between two paged tables)
+  work by snapshotting each paged participant into a transient
+  in-memory table; when the query is an equi-join between exactly
+  one paged participant and an in-memory partner, the planner
+  restricts that snapshot to rows whose join-key value appears on
+  the in-memory side (via primary-key lookup, secondary-index
+  lookup, or filtered scan, whichever applies), so the out-of-core
+  benefit is preserved on selective joins. `UNIQUE`, expression, and
+  partial indexes on paged tables raise `UnsupportedError`; so do
+  `INSERT OR REPLACE`, `ON CONFLICT`, primary-key reassignment, and
+  triggers. The lower-level `PagedTable` API in
+  `lib/server/paged_table.dart` exposes the full primitives directly.
 - **SQLite wire protocol**: clients speak this engine's JSON line protocol,
   not SQLite's native protocol.
 - **Production-grade FTS5 / R*Tree**: `CREATE VIRTUAL TABLE ... USING fts5`n  and `USING rtree` are accepted and create regular tables; `MATCH` does a
