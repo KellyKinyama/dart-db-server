@@ -255,8 +255,8 @@ class PagedBTree {
       final keyLen = _u16(buf, off);
       final value = _u64(buf, off + 4);
       final keyOff = off + 12;
-      final key =
-          Uint8List.fromList(Uint8List.sublistView(buf, keyOff, keyOff + keyLen));
+      final key = Uint8List.fromList(
+          Uint8List.sublistView(buf, keyOff, keyOff + keyLen));
       entries.add((
         key: key,
         value: value,
@@ -337,11 +337,9 @@ class PagedBTree {
       for (final e in entries.sublist(0, insertAt))
         (key: e.key, value: e.value),
       (key: key, value: value),
-      for (final e in entries.sublist(insertAt))
-        (key: e.key, value: e.value),
+      for (final e in entries.sublist(insertAt)) (key: e.key, value: e.value),
     ];
-    final totalBytes =
-        all.fold<int>(0, (a, e) => a + 12 + e.key.length);
+    final totalBytes = all.fold<int>(0, (a, e) => a + 12 + e.key.length);
     var leftBytes = 0;
     var splitIdx = 0;
     for (var i = 0; i < all.length; i++) {
@@ -358,7 +356,12 @@ class PagedBTree {
     // Write left half back into the existing page.
     _writeLeafEntries(buf, [
       for (final e in leftEntries)
-        (key: e.key, value: e.value, entryStart: 0, entryLen: 12 + e.key.length),
+        (
+          key: e.key,
+          value: e.value,
+          entryStart: 0,
+          entryLen: 12 + e.key.length
+        ),
     ]);
 
     // Allocate the new right page and write the right half.
@@ -367,15 +370,24 @@ class PagedBTree {
     _initLeaf(rightBuf);
     _writeLeafEntries(rightBuf, [
       for (final e in rightEntries)
-        (key: e.key, value: e.value, entryStart: 0, entryLen: 12 + e.key.length),
+        (
+          key: e.key,
+          value: e.value,
+          entryStart: 0,
+          entryLen: 12 + e.key.length
+        ),
     ]);
 
-    // Stitch the leaf chain: rightBuf.next = oldNext; buf.next = rightPage.
-    // Re-fetch buf because allocatePage may have evicted it.
+    // Stitch the leaf chain: right.next = oldNext; left.next = rightPage.
+    // We must re-fetch BOTH buffers via getForWrite — under cache
+    // pressure either may have been evicted by the operations above.
+    // Mutating an evicted buffer is silently lost because it is no
+    // longer linked into the page cache.
     final buf2 = await file.getForWrite(pageNo);
     final oldNext = _u32(buf2, 4);
-    _setU32(rightBuf, 4, oldNext);
     _setU32(buf2, 4, rightPage);
+    final rightBuf2 = await file.getForWrite(rightPage);
+    _setU32(rightBuf2, 4, oldNext);
 
     return _SplitResult(rightPage, rightEntries.first.key);
   }
@@ -523,8 +535,7 @@ class PagedBTree {
       for (final e in entries.sublist(0, insertAt))
         (key: e.key, child: e.child),
       (key: key, child: rightChild),
-      for (final e in entries.sublist(insertAt))
-        (key: e.key, child: e.child),
+      for (final e in entries.sublist(insertAt)) (key: e.key, child: e.child),
     ];
     final mid = all.length ~/ 2;
     final promoted = all[mid];
@@ -554,8 +565,8 @@ class PagedBTree {
     var current = split;
     while (stack.isNotEmpty) {
       final parent = stack.removeLast();
-      final next =
-          await _internalInsert(parent, current.separatorKey, current.newRightPage);
+      final next = await _internalInsert(
+          parent, current.separatorKey, current.newRightPage);
       if (next == null) return;
       current = next;
     }

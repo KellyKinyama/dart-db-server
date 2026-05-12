@@ -129,6 +129,12 @@ class PagedFile {
   /// The page is zero-filled, cached, and marked dirty.
   Future<int> allocatePage() async {
     _ensureOpen();
+    // Make room BEFORE inserting — otherwise the just-allocated page
+    // (clean for an instant before we mark it dirty) can be picked as
+    // the LRU clean victim by [_evictIfNeeded] and dropped, leaving
+    // the caller's reference detached from the cache so future writes
+    // are silently lost.
+    await _makeRoomForOneMore();
     final pageNo = _pageCount;
     _pageCount += 1;
     final buf = Uint8List(pageSize);
@@ -139,7 +145,6 @@ class PagedFile {
     // didn't exist", which our truncate-on-rollback handles separately.
     _journaled.add(pageNo);
     _dirty.add(pageNo);
-    await _evictIfNeeded();
     return pageNo;
   }
 
@@ -156,7 +161,12 @@ class PagedFile {
       _touch(pageNo);
       return cached;
     }
-    // Cache miss: fault in from disk.
+    // Make room BEFORE inserting the just-faulted page; otherwise it
+    // would be eligible for immediate eviction as the only clean page
+    // and the caller would be handed back a buffer no longer linked
+    // to the cache (so [getForWrite]/[markDirty] mutations would be
+    // silently lost).
+    await _makeRoomForOneMore();
     final buf = Uint8List(pageSize);
     await _data!.setPosition(pageNo * pageSize);
     final n = await _data!.readInto(buf);
@@ -166,7 +176,6 @@ class PagedFile {
     }
     _cache[pageNo] = buf;
     _touch(pageNo);
-    await _evictIfNeeded();
     return buf;
   }
 
@@ -306,42 +315,55 @@ class PagedFile {
 
   Future<void> _evictIfNeeded() async {
     while (_cache.length > cacheCapacity) {
-      // Find the LRU clean page.
-      int? victim;
-      for (final k in _cache.keys) {
-        if (!_dirty.contains(k)) {
-          victim = k;
-          break;
-        }
+      await _evictOne();
+    }
+  }
+
+  /// Ensure there is room for at least one more page in the cache,
+  /// evicting if necessary. Used by the cache-miss paths in [read] and
+  /// [allocatePage] BEFORE the new page is inserted, so the new page
+  /// is never itself eligible for the eviction it triggers.
+  Future<void> _makeRoomForOneMore() async {
+    while (_cache.length >= cacheCapacity) {
+      await _evictOne();
+    }
+  }
+
+  Future<void> _evictOne() async {
+    // Find the LRU clean page.
+    int? victim;
+    for (final k in _cache.keys) {
+      if (!_dirty.contains(k)) {
+        victim = k;
+        break;
       }
-      if (victim != null) {
-        _cache.remove(victim);
-        continue;
-      }
-      // Every cached page is dirty — flush them all under the journal
-      // so we can free space. The journal still gates commit/rollback,
-      // so writing dirty pages through to disk is safe: rollback will
-      // replay the undo records and restore the originals.
-      final sorted = _dirty.toList()..sort();
-      final needLen = _pageCount * pageSize;
-      if (await _data!.length() < needLen) {
-        await _data!.truncate(needLen);
-      }
-      for (final p in sorted) {
-        final buf = _cache[p];
-        if (buf == null) continue;
-        await _data!.setPosition(p * pageSize);
-        await _data!.writeFrom(buf);
-      }
-      await _data!.flush();
-      // Drop the LRU half of dirty pages from cache to free room.
-      // Pages stay in [_dirty] (they're uncommitted) but their bytes
-      // are safely on disk and the journal preserves rollback.
-      final dropTarget = (cacheCapacity ~/ 2).clamp(1, _cache.length);
-      final keys = _cache.keys.toList();
-      for (var i = 0; i < dropTarget; i++) {
-        _cache.remove(keys[i]);
-      }
+    }
+    if (victim != null) {
+      _cache.remove(victim);
+      return;
+    }
+    // Every cached page is dirty — flush them all under the journal so
+    // we can free space. The journal still gates commit/rollback, so
+    // writing dirty pages through to disk is safe: rollback will
+    // replay the undo records and restore the originals.
+    final sorted = _dirty.toList()..sort();
+    final needLen = _pageCount * pageSize;
+    if (await _data!.length() < needLen) {
+      await _data!.truncate(needLen);
+    }
+    for (final p in sorted) {
+      final buf = _cache[p];
+      if (buf == null) continue;
+      await _data!.setPosition(p * pageSize);
+      await _data!.writeFrom(buf);
+    }
+    await _data!.flush();
+    // Drop the LRU half of cached pages to free room. Pages stay in
+    // [_dirty] (still uncommitted) but their bytes are safely on disk.
+    final dropTarget = (cacheCapacity ~/ 2).clamp(1, _cache.length);
+    final keys = _cache.keys.toList();
+    for (var i = 0; i < dropTarget; i++) {
+      _cache.remove(keys[i]);
     }
   }
 

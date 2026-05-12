@@ -153,8 +153,7 @@ void main() {
 
       // Open upper bound.
       final tail = <int>[];
-      await for (final e in t.range(
-          lower: kInt(197), lowerInclusive: false)) {
+      await for (final e in t.range(lower: kInt(197), lowerInclusive: false)) {
         tail.add(int.parse(String.fromCharCodes(e.key)));
       }
       expect(tail, [198, 199]);

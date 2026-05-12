@@ -247,8 +247,7 @@ void main() {
       {
         final pf = await PagedFile.open(p, pageSize: 512, cacheCapacity: 4);
         final heap = await PagedHeap.open(pf);
-        expect(heap.length, 1,
-            reason: 'only the committed row must survive');
+        expect(heap.length, 1, reason: 'only the committed row must survive');
         expect(stringOf((await heap.get(idCommitted))!), 'committed');
         await pf.close();
       }

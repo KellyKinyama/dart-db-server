@@ -143,8 +143,12 @@ implemented:
   or `.db` are read and written in the real SQLite on-disk format
   (validated by package:sqlite3 round-trip tests). The SQLite C API
   itself is not linked.
-- **Out-of-core datasets**: the working set must fit in RAM. There is no
-  paged buffer pool that spills cold pages to disk.
+- **Out-of-core datasets**: tables created through SQL still load into
+  RAM; for true out-of-core storage use the dedicated `PagedTable` API
+  (`lib/server/paged_table.dart`), which layers a primary-keyed typed
+  table over an LRU page cache + B+-tree index + slotted-page row heap
+  with a crash-safe undo journal. The SQL executor itself does not yet
+  use the paged store; that wiring is a future change.
 - **SQLite wire protocol**: clients speak this engine's JSON line protocol,
   not SQLite's native protocol.
 - **Production-grade FTS5 / R*Tree**: `CREATE VIRTUAL TABLE ... USING fts5`n  and `USING rtree` are accepted and create regular tables; `MATCH` does a

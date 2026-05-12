@@ -102,6 +102,11 @@ class PagedHeap {
   /// hint is stale.
   int _allocHintPage = 0;
 
+  /// True when there *might* be reclaimable space on a page other than
+  /// the alloc hint — set by [delete], cleared by a fruitless scan.
+  /// Avoids an O(N) page scan on every insert into a write-heavy heap.
+  bool _hasReclaimableSpace = false;
+
   /// Cached row-count for [length]; refreshed lazily.
   int _rowCount = 0;
 
@@ -142,12 +147,10 @@ class PagedHeap {
     final slotCount = _u16(buf, 2);
     if (slotIdx >= slotCount) return null;
     final off = _u16(buf, _dataPageHeaderSize + slotIdx * _slotEntrySize);
-    final len =
-        _u16(buf, _dataPageHeaderSize + slotIdx * _slotEntrySize + 2);
+    final len = _u16(buf, _dataPageHeaderSize + slotIdx * _slotEntrySize + 2);
     if (len == _tombstoneLen) return null;
     final payload = Uint8List.sublistView(buf, off, off + len);
-    if (len >= _overflowPointerSize &&
-        _u32(payload, 0) == _overflowMarker) {
+    if (len >= _overflowPointerSize && _u32(payload, 0) == _overflowMarker) {
       return _readOverflowChain(payload);
     }
     // Return a copy so callers can't see future mutations of the cached
@@ -170,8 +173,7 @@ class PagedHeap {
     final len = _u16(buf, slotPos + 2);
     if (len == _tombstoneLen) return;
     // If overflow, free the chain too.
-    if (len >= _overflowPointerSize &&
-        _u32(buf, off) == _overflowMarker) {
+    if (len >= _overflowPointerSize && _u32(buf, off) == _overflowMarker) {
       final firstOv = _u32(buf, off + 4);
       await _freeOverflowChain(firstOv);
     }
@@ -194,6 +196,8 @@ class PagedHeap {
     _setU16(buf, slotPos + 2, _tombstoneLen);
     _rowCount -= 1;
     await _bumpRowCount(-1);
+    // A page other than the alloc hint may now have free space.
+    _hasReclaimableSpace = true;
   }
 
   /// Replace [rowId] with [bytes]. Equivalent to delete + re-insert if
@@ -220,8 +224,7 @@ class PagedHeap {
       throw StateError('rowId $rowId was deleted');
     }
     // Free any old overflow chain.
-    if (len >= _overflowPointerSize &&
-        _u32(buf, off) == _overflowMarker) {
+    if (len >= _overflowPointerSize && _u32(buf, off) == _overflowMarker) {
       final firstOv = _u32(buf, off + 4);
       await _freeOverflowChain(firstOv);
     }
@@ -287,16 +290,15 @@ class PagedHeap {
         final len = _u16(buf, slotPos + 2);
         if (len == _tombstoneLen) continue;
         Uint8List bytes;
-        if (len >= _overflowPointerSize &&
-            _u32(buf, off) == _overflowMarker) {
+        if (len >= _overflowPointerSize && _u32(buf, off) == _overflowMarker) {
           // We need to re-read the page after each overflow walk,
           // because the overflow chain may have evicted it from cache.
-          final payload = Uint8List.fromList(
-              Uint8List.sublistView(buf, off, off + len));
+          final payload =
+              Uint8List.fromList(Uint8List.sublistView(buf, off, off + len));
           bytes = (await _readOverflowChain(payload))!;
         } else {
-          bytes = Uint8List.fromList(
-              Uint8List.sublistView(buf, off, off + len));
+          bytes =
+              Uint8List.fromList(Uint8List.sublistView(buf, off, off + len));
         }
         yield (rowId: _makeRowId(pageNo, i), bytes: bytes);
       }
@@ -363,16 +365,22 @@ class PagedHeap {
         return _allocHintPage;
       }
     }
-    // Linear scan; on a full table this hint is updated to the most
-    // recently allocated page, so the scan is short in practice.
-    for (var p = 1; p < file.pageCount; p++) {
-      if (p == _allocHintPage) continue;
-      final buf = await file.read(p);
-      if (_byteAt(buf, 0) != _pageKindData) continue;
-      if (fits(buf)) {
-        _allocHintPage = p;
-        return p;
+    // Only do the linear scan when a previous [delete] told us there
+    // might be space outside the hint — otherwise every insert into a
+    // monotonically growing heap would be O(pageCount), which is
+    // O(N²) total.
+    if (_hasReclaimableSpace) {
+      for (var p = 1; p < file.pageCount; p++) {
+        if (p == _allocHintPage) continue;
+        final buf = await file.read(p);
+        if (_byteAt(buf, 0) != _pageKindData) continue;
+        if (fits(buf)) {
+          _allocHintPage = p;
+          return p;
+        }
       }
+      // Fruitless scan: don't repeat it until the next delete.
+      _hasReclaimableSpace = false;
     }
     // No room anywhere: allocate a fresh data page.
     final pageNo = await file.allocatePage();
@@ -475,8 +483,8 @@ class PagedHeap {
       final next = (i == pageNos.length - 1) ? 0 : pageNos[i + 1];
       _setU32(buf, 4, next);
       if (n > 0) {
-        buf.setRange(_overflowPageHeaderSize, _overflowPageHeaderSize + n,
-            bytes, off);
+        buf.setRange(
+            _overflowPageHeaderSize, _overflowPageHeaderSize + n, bytes, off);
       }
     }
     return pageNos.first;
@@ -530,8 +538,7 @@ class PagedHeap {
   // Byte helpers
   // ---------------------------------------------------------------------------
   static int _byteAt(Uint8List buf, int off) => buf[off];
-  static int _u16(Uint8List buf, int off) =>
-      buf[off] | (buf[off + 1] << 8);
+  static int _u16(Uint8List buf, int off) => buf[off] | (buf[off + 1] << 8);
   static void _setU16(Uint8List buf, int off, int v) {
     buf[off] = v & 0xff;
     buf[off + 1] = (v >> 8) & 0xff;
