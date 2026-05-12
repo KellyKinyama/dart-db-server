@@ -2400,36 +2400,137 @@ class Database {
       matches.add(row);
     }
     var affected = 0;
-    for (final row in matches) {
-      final pkVal = row[pkName];
-      if (pkVal == null) continue;
-      // Evaluate each assignment against the *current* row so
-      // expressions like `qty = qty + 1` see the pre-update value.
-      final updated = Map<String, Object?>.from(row);
-      assignExprs.forEach((col, expr) {
-        updated[col] = expr.eval(row);
-      });
-      if (reassignsPk) {
+    if (reassignsPk && matches.isNotEmpty) {
+      // Two-phase apply so chained reassignments like `UPDATE t SET
+      // id = id + 1` (which would otherwise collide row-by-row) work:
+      //   1. Compute every (oldPk, newRow) pair from the *original*
+      //      row values, without mutating anything.
+      //   2. Pre-validate the post-update state for PK and UNIQUE
+      //      collisions — both against rows untouched by this UPDATE
+      //      and within the new-row set itself.
+      //   3. Delete every old row whose PK actually changes.
+      //   4. Insert every new row.
+      //
+      // Rows whose PK is unchanged are still applied via plain
+      // update so secondary-index entries aren't needlessly torn
+      // down and rebuilt.
+      final plan = <({Object oldPk, Object newPk, Map<String, Object?> row})>[];
+      for (final row in matches) {
+        final pkVal = row[pkName];
+        if (pkVal == null) continue;
+        final updated = Map<String, Object?>.from(row);
+        assignExprs.forEach((col, expr) {
+          updated[col] = expr.eval(row);
+        });
         final newPk = updated[pkName];
         if (newPk == null) {
           throw StateError(
               'UPDATE on paged table ${s.table}: primary key column '
               '"$pkName" cannot be set to NULL.');
         }
-        if (_compareLiteral(newPk, pkVal) != 0) {
-          // PK actually changed: reassignPrimaryKey enforces PK and
-          // UNIQUE-index uniqueness atomically before any mutation,
-          // so a conflict leaves the table untouched.
-          await pt.reassignPrimaryKey(pkVal, updated);
-        } else {
-          await pt.update(pkVal, updated);
-        }
-      } else {
-        await pt.update(pkVal, updated);
+        plan.add((oldPk: pkVal, newPk: newPk, row: updated));
       }
-      affected++;
+      // Pre-validation phase. Only rows whose PK actually moves
+      // participate in the cross-row checks (same-PK rows are
+      // handled via in-place update and PagedTable.update already
+      // enforces UNIQUE-index constraints).
+      final moving = [
+        for (final p in plan)
+          if (_compareLiteral(p.oldPk, p.newPk) != 0) p
+      ];
+      // Set of oldPks being vacated by this UPDATE. JSON-encode for
+      // stable equality on heterogeneous PK types.
+      final vacated = <String>{
+        for (final p in moving) jsonEncode(p.oldPk),
+      };
+      // 1. New PKs must be distinct within the plan and must not
+      //    already exist outside the vacated set.
+      final seenNewPk = <String>{};
+      for (final p in moving) {
+        final tag = jsonEncode(p.newPk);
+        if (!seenNewPk.add(tag)) {
+          throw StateError(
+              'UPDATE on paged table ${s.table}: multiple rows would '
+              'be assigned primary key ${jsonEncode(p.newPk)}.');
+        }
+        if (vacated.contains(tag)) continue;
+        if ((await pt.get(p.newPk)) != null) {
+          throw StateError('UPDATE on paged table ${s.table}: cannot reassign '
+              'primary key to ${jsonEncode(p.newPk)} — row already exists.');
+        }
+      }
+      // 2. UNIQUE-index pre-check: per index, ensure new prefixes
+      //    don't collide with non-vacated existing rows or with
+      //    each other.
+      for (final idxName in pt.secondaryIndexNames) {
+        if (!pt.isIndexUnique(idxName)) continue;
+        final cols = pt.indexColumns(idxName)!;
+        final seenPrefix = <String>{};
+        for (final p in moving) {
+          // Skip rows whose indexed tuple contains a NULL — those
+          // don't participate in the UNIQUE constraint.
+          var anyNull = false;
+          final parts = <Object?>[];
+          for (final c in cols) {
+            final v = p.row[c];
+            if (v == null) {
+              anyNull = true;
+              break;
+            }
+            parts.add(v);
+          }
+          if (anyNull) continue;
+          final tag = jsonEncode(parts);
+          if (!seenPrefix.add(tag)) {
+            throw StateError(
+                'UPDATE on paged table ${s.table}: UNIQUE constraint '
+                'violated on index $idxName (${cols.join(", ")}) — '
+                'multiple updated rows share the same value.');
+          }
+          final hitPk = await pt.findConflictByUniqueIndex(idxName, p.row);
+          if (hitPk == null) continue;
+          if (vacated.contains(jsonEncode(hitPk))) continue;
+          throw StateError(
+              'UPDATE on paged table ${s.table}: UNIQUE constraint '
+              'violated on index $idxName (${cols.join(", ")}).');
+        }
+      }
+      // Phase 1: in-place updates for rows whose PK didn't change.
+      for (final p in plan) {
+        if (_compareLiteral(p.oldPk, p.newPk) == 0) {
+          await pt.update(p.oldPk, p.row);
+        }
+      }
+      // Phase 2: delete every row whose PK is moving away.
+      for (final p in moving) {
+        await pt.delete(p.oldPk);
+      }
+      // Phase 3: insert every moved row. After the pre-validation
+      // above these inserts are guaranteed not to conflict.
+      for (final p in moving) {
+        await pt.insert(p.row);
+      }
+      affected = plan.length;
       if (returningExprs.isNotEmpty) {
-        returnedRows.add([for (final e in returningExprs) e.eval(updated)]);
+        for (final p in plan) {
+          returnedRows.add([for (final e in returningExprs) e.eval(p.row)]);
+        }
+      }
+    } else {
+      for (final row in matches) {
+        final pkVal = row[pkName];
+        if (pkVal == null) continue;
+        // Evaluate each assignment against the *current* row so
+        // expressions like `qty = qty + 1` see the pre-update value.
+        final updated = Map<String, Object?>.from(row);
+        assignExprs.forEach((col, expr) {
+          updated[col] = expr.eval(row);
+        });
+        await pt.update(pkVal, updated);
+        affected++;
+        if (returningExprs.isNotEmpty) {
+          returnedRows.add([for (final e in returningExprs) e.eval(updated)]);
+        }
       }
     }
     if (affected > 0) {

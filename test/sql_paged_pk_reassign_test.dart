@@ -103,6 +103,44 @@ void main() {
     );
   });
 
+  test('chained PK shift (id = id + 1) works without false collisions',
+      () async {
+    final db = await Database.open(dbPath());
+    addTearDown(() async => db.close());
+    await db.execute('CREATE TABLE t ('
+        'id INTEGER PRIMARY KEY, name TEXT) USING paged');
+    await db.execute("INSERT INTO t VALUES (1, 'a')");
+    await db.execute("INSERT INTO t VALUES (2, 'b')");
+    await db.execute("INSERT INTO t VALUES (3, 'c')");
+
+    // Shift every row's PK up by one. Naive row-by-row would hit a
+    // collision when row 1 tries to become id=2 (still occupied).
+    final r = await db.execute('UPDATE t SET id = id + 1');
+    expect(r.affected, 3);
+    final all = await db.execute('SELECT id, name FROM t ORDER BY id');
+    expect(all.rows, [
+      [2, 'a'],
+      [3, 'b'],
+      [4, 'c'],
+    ]);
+  });
+
+  test('chained PK shift that would converge is rejected', () async {
+    final db = await Database.open(dbPath());
+    addTearDown(() async => db.close());
+    await db.execute('CREATE TABLE t ('
+        'id INTEGER PRIMARY KEY, name TEXT) USING paged');
+    await db.execute("INSERT INTO t VALUES (1, 'a')");
+    await db.execute("INSERT INTO t VALUES (2, 'b')");
+
+    // Both rows trying to become id=5 — the second insert collides
+    // with the first.
+    await expectLater(
+      db.execute('UPDATE t SET id = 5'),
+      throwsA(isA<StateError>()),
+    );
+  });
+
   test('PK reassignment survives close + reopen', () async {
     final db1 = await seeded();
     await db1.execute('UPDATE t SET id = 100 WHERE id = 1');
