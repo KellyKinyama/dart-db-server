@@ -20,6 +20,7 @@ import 'schema.dart';
 import 'sqlite_format.dart';
 import 'statement.dart';
 import 'table.dart';
+import 'paged_table.dart';
 
 /// Outcome of an [AuthorizerCallback] invocation. Mirrors the
 /// SQLITE_OK / SQLITE_DENY / SQLITE_IGNORE constants of the C API.
@@ -86,6 +87,18 @@ class Database {
   /// Cross-process advisory lock on the JSON file. Created (and acquired)
   /// by [Database.open] when [path] is non-null.
   DbFileLock? _fileLock;
+
+  /// Out-of-core paged-table registry. A `CREATE TABLE … USING paged`
+  /// statement creates an entry here instead of in [_tables]; statements
+  /// targeting these names are routed through the async PagedTable API
+  /// in [_executePagedStmt] rather than the in-memory dispatch path.
+  final Map<String, PagedTable> _pagedTables = {};
+
+  /// Directory where each paged table's `.heap` / `.idx` / `.meta.json`
+  /// sidecar files live. Derived from [path] (e.g. `mydb.json` →
+  /// `mydb.paged/`). `null` for in-memory databases — those refuse
+  /// `USING paged`.
+  String? _pagedDir;
 
   /// In-process multi-reader / single-writer lock that wraps every call
   /// to [executeStmt]. Reads (SELECT, EXPLAIN, PRAGMA queries, SHOW,
@@ -400,8 +413,54 @@ class Database {
           db._persistAsSqlite = true;
         }
       }
+      // Compute paged-table directory: strip a single known extension.
+      db._pagedDir = _derivePagedDir(path);
+      await db._restorePagedTables();
     }
     return db;
+  }
+
+  /// Derive the sibling directory that hosts every `USING paged` table's
+  /// `.heap` / `.idx` / `.meta.json` files. `mydb.json` →
+  /// `mydb.paged/`; `mydb.sqlite` → `mydb.paged/`; bare `mydb` →
+  /// `mydb.paged/`.
+  static String _derivePagedDir(String path) {
+    final lower = path.toLowerCase();
+    for (final ext in const [
+      '.json',
+      '.sqlite3',
+      '.sqlite',
+      '.db',
+    ]) {
+      if (lower.endsWith(ext)) {
+        return '${path.substring(0, path.length - ext.length)}.paged';
+      }
+    }
+    return '$path.paged';
+  }
+
+  /// Re-open every paged table found under [_pagedDir]. Called once at
+  /// [open] time. Missing dir is fine (no paged tables yet).
+  Future<void> _restorePagedTables() async {
+    final dir = _pagedDir;
+    if (dir == null) return;
+    final d = Directory(dir);
+    if (!await d.exists()) return;
+    await for (final ent in d.list(followLinks: false)) {
+      if (ent is! File) continue;
+      final name = ent.uri.pathSegments.last;
+      if (!name.endsWith('.meta.json')) continue;
+      final tableName = name.substring(0, name.length - '.meta.json'.length);
+      final base = '$dir/$tableName';
+      try {
+        final pt = await PagedTable.open(base);
+        _pagedTables[tableName] = pt;
+      } catch (e) {
+        // Don't take the whole DB down for one corrupt sidecar — but do
+        // surface it so the operator notices.
+        stderr.writeln('paged table $tableName at $base failed to open: $e');
+      }
+    }
   }
 
   /// Release the cross-process file lock. Idempotent. Always call this
@@ -409,6 +468,18 @@ class Database {
   /// `<path>.lock` sidecar will keep readers/writers blocked until the
   /// process exits.
   Future<void> close() async {
+    // Flush + close every paged table first; their journals must be
+    // gone before we drop the file lock so a subsequent open sees a
+    // clean state.
+    for (final pt in _pagedTables.values) {
+      try {
+        await pt.commit();
+      } catch (_) {}
+      try {
+        await pt.close();
+      } catch (_) {}
+    }
+    _pagedTables.clear();
     final fl = _fileLock;
     _fileLock = null;
     if (fl != null) await fl.release();
@@ -492,7 +563,17 @@ class Database {
       _executionStack.add(this);
       QueryResult result;
       try {
-        result = _dispatch(stmt);
+        // Paged-table fast path: a `CREATE TABLE … USING paged` lives
+        // in [_pagedTables] rather than [_tables], and statements that
+        // target one of those names use the async PagedTable API. Both
+        // need to run before the synchronous [_dispatch] so they can
+        // await disk I/O.
+        final paged = await _maybeRunPagedStmt(stmt);
+        if (paged != null) {
+          result = paged;
+        } else {
+          result = _dispatch(stmt);
+        }
       } finally {
         _executionStack.removeLast();
       }
@@ -684,6 +765,387 @@ class Database {
     if (s is SelectStmt) return s.fromTable;
     if (s is CreateTriggerStmt) return s.table;
     return null;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Paged-table dispatch (out-of-core `USING paged` backend)
+  // ---------------------------------------------------------------------------
+
+  /// If [stmt] is either a `CREATE TABLE … USING paged` or a DML/SELECT
+  /// targeting a registered paged table, execute it via the async
+  /// PagedTable API and return the result. Returns null when the
+  /// caller should fall through to the regular synchronous dispatch.
+  Future<QueryResult?> _maybeRunPagedStmt(Statement stmt) async {
+    if (stmt is CreateTableStmt && stmt.usingPaged) {
+      return _createPagedTable(stmt);
+    }
+    final tname = _statementTable(stmt);
+    if (tname == null) return null;
+    final pt = _pagedTables[tname];
+    if (pt == null) return null;
+    if (stmt is InsertStmt) return _pagedInsert(stmt, pt);
+    if (stmt is SelectStmt) return _pagedSelect(stmt, pt);
+    if (stmt is UpdateStmt) return _pagedUpdate(stmt, pt);
+    if (stmt is DeleteStmt) return _pagedDelete(stmt, pt);
+    if (stmt is DropTableStmt) return _pagedDrop(stmt, pt);
+    if (stmt is TruncateTableStmt) return _pagedTruncate(stmt, pt);
+    if (stmt is DescribeStmt) {
+      // Cheap: synthesize a Table row-set off the paged columns.
+      return QueryResult(columns: const [
+        'name',
+        'type',
+      ], rows: [
+        for (final c in pt.columns) [c.name, c.type.name],
+      ]);
+    }
+    throw UnsupportedError(
+        'Statement ${stmt.runtimeType} not supported on USING paged table '
+        '"$tname". Paged tables currently support: INSERT, SELECT (full '
+        'scan or WHERE pk = literal), UPDATE/DELETE WHERE pk = literal, '
+        'DROP TABLE, TRUNCATE TABLE, DESCRIBE.');
+  }
+
+  /// Map a SQL [DataType] to the PagedTable column-type enum.
+  PagedColumnType _toPagedType(DataType t) {
+    switch (t) {
+      case DataType.integer:
+        return PagedColumnType.intType;
+      case DataType.real:
+      case DataType.numeric:
+        return PagedColumnType.realType;
+      case DataType.boolean:
+        return PagedColumnType.boolType;
+      case DataType.blob:
+        return PagedColumnType.blobType;
+      case DataType.text:
+      case DataType.any:
+        return PagedColumnType.textType;
+    }
+  }
+
+  Future<QueryResult> _createPagedTable(CreateTableStmt s) async {
+    if (_pagedDir == null) {
+      throw StateError(
+          'CREATE TABLE ${s.name} USING paged: requires a path-backed '
+          'database (in-memory databases cannot host paged tables).');
+    }
+    if (_tables.containsKey(s.name) ||
+        _views.containsKey(s.name) ||
+        _pagedTables.containsKey(s.name)) {
+      if (s.ifNotExists) return QueryResult.message('table exists');
+      throw StateError('Object ${s.name} already exists');
+    }
+    // Resolve PRIMARY KEY: column-level flag, or a single-column
+    // table-level PRIMARY KEY constraint. Composite PKs aren't yet
+    // supported by PagedTable.
+    String? pkName;
+    for (final c in s.columns) {
+      if (c.primaryKey) {
+        if (pkName != null) {
+          throw StateError(
+              'CREATE TABLE ${s.name} USING paged: composite primary '
+              'keys are not supported (already had $pkName).');
+        }
+        pkName = c.name;
+      }
+    }
+    for (final tc in s.constraints) {
+      if (tc is PrimaryKeyConstraint) {
+        if (tc.columns.length != 1) {
+          throw StateError(
+              'CREATE TABLE ${s.name} USING paged: composite primary '
+              'keys are not supported.');
+        }
+        if (pkName != null && pkName != tc.columns.single) {
+          throw StateError(
+              'CREATE TABLE ${s.name} USING paged: conflicting primary '
+              'keys ($pkName vs ${tc.columns.single}).');
+        }
+        pkName = tc.columns.single;
+      }
+    }
+    if (pkName == null) {
+      throw StateError(
+          'CREATE TABLE ${s.name} USING paged: a single-column PRIMARY '
+          'KEY is required.');
+    }
+    final cols = [
+      for (final c in s.columns) PagedColumn(c.name, _toPagedType(c.type)),
+    ];
+    final dir = Directory(_pagedDir!);
+    if (!await dir.exists()) await dir.create(recursive: true);
+    final pt = await PagedTable.create(
+      '${_pagedDir!}/${s.name}',
+      columns: cols,
+      primaryKey: pkName,
+    );
+    _pagedTables[s.name] = pt;
+    return QueryResult.message('paged table ${s.name} created');
+  }
+
+  Future<QueryResult> _pagedDrop(DropTableStmt s, PagedTable pt) async {
+    await pt.commit();
+    await pt.close();
+    _pagedTables.remove(s.name);
+    final base = '${_pagedDir!}/${s.name}';
+    for (final ext in const [
+      '.heap',
+      '.heap.journal',
+      '.idx',
+      '.idx.journal',
+      '.meta.json',
+      '.meta.json.tmp',
+    ]) {
+      final f = File('$base$ext');
+      if (await f.exists()) {
+        try {
+          await f.delete();
+        } catch (_) {}
+      }
+    }
+    return QueryResult.message('paged table ${s.name} dropped');
+  }
+
+  Future<QueryResult> _pagedTruncate(TruncateTableStmt s, PagedTable pt) async {
+    // No bulk-truncate primitive yet — drop and re-create with the same
+    // schema. Callers see this as a single statement; if the process
+    // crashes between the two halves the meta.json deletion is the
+    // commit point so a retry works.
+    final cols = pt.columns;
+    final pkName = cols[pt.primaryKeyIndex].name;
+    await pt.commit();
+    await pt.close();
+    _pagedTables.remove(s.name);
+    final base = '${_pagedDir!}/${s.name}';
+    for (final ext in const [
+      '.heap',
+      '.heap.journal',
+      '.idx',
+      '.idx.journal',
+      '.meta.json',
+      '.meta.json.tmp',
+    ]) {
+      final f = File('$base$ext');
+      if (await f.exists()) {
+        try {
+          await f.delete();
+        } catch (_) {}
+      }
+    }
+    final fresh =
+        await PagedTable.create(base, columns: cols, primaryKey: pkName);
+    _pagedTables[s.name] = fresh;
+    return QueryResult.message('paged table ${s.name} truncated');
+  }
+
+  /// Reduce an expression to a Dart literal, refusing column references
+  /// or anything that needs row context. Bind parameters were already
+  /// substituted by [PreparedStatement].
+  Object? _evalLiteral(Expr e, String context) {
+    try {
+      return e.eval(const <String, Object?>{});
+    } catch (_) {
+      throw UnsupportedError(
+          '$context: only literal values are supported on paged tables.');
+    }
+  }
+
+  /// Extract a single equality `<pkName> = <literal>` from [where].
+  /// Returns the literal PK value, or null when [where] is null. Throws
+  /// when the predicate is anything else.
+  Object? _pagedExtractPkEq(Expr? where, String pkName, String context) {
+    if (where == null) return null;
+    if (where is BinaryExpr && where.op == '=') {
+      ColumnExpr? col;
+      Expr? lit;
+      if (where.left is ColumnExpr) {
+        col = where.left as ColumnExpr;
+        lit = where.right;
+      } else if (where.right is ColumnExpr) {
+        col = where.right as ColumnExpr;
+        lit = where.left;
+      }
+      if (col != null && lit != null) {
+        if (col.name.toLowerCase() != pkName.toLowerCase()) {
+          throw UnsupportedError(
+              '$context: WHERE on paged tables must reference the '
+              'primary key column "$pkName".');
+        }
+        return _evalLiteral(lit, context);
+      }
+    }
+    throw UnsupportedError(
+        '$context: only `WHERE $pkName = <literal>` is supported on '
+        'paged tables.');
+  }
+
+  Future<QueryResult> _pagedInsert(InsertStmt s, PagedTable pt) async {
+    if (s.mode != InsertMode.normal) {
+      throw UnsupportedError(
+          'INSERT OR ${s.mode.name.toUpperCase()} is not supported on '
+          'paged table ${s.table}.');
+    }
+    if (s.select != null || s.onConflict != null || s.returning != null) {
+      throw UnsupportedError(
+          'INSERT … SELECT / ON CONFLICT / RETURNING are not supported '
+          'on paged table ${s.table}.');
+    }
+    final rows = s.rows;
+    if (rows == null) {
+      throw UnsupportedError(
+          'INSERT into paged table ${s.table} requires VALUES rows.');
+    }
+    final colNames = s.columns ?? [for (final c in pt.columns) c.name];
+    if (colNames.length != pt.columns.length) {
+      // Allow positional INSERT with explicit column list shorter than
+      // the schema — but every paged column must appear (PagedTable.insert
+      // requires a complete row map).
+      // Keep the diagnostic strict for now; relax later if needed.
+      throw UnsupportedError(
+          'INSERT into paged table ${s.table}: every column must be '
+          'supplied (got ${colNames.length}, want ${pt.columns.length}).');
+    }
+    var affected = 0;
+    for (final r in rows) {
+      if (r.length != colNames.length) {
+        throw StateError(
+            'INSERT into ${s.table}: row arity ${r.length} ≠ column '
+            'count ${colNames.length}.');
+      }
+      final map = <String, Object?>{};
+      for (var i = 0; i < colNames.length; i++) {
+        map[colNames[i]] =
+            _evalLiteral(r[i], 'INSERT into paged table ${s.table}');
+      }
+      await pt.insert(map);
+      affected++;
+    }
+    await pt.commit();
+    return QueryResult(affected: affected, message: '$affected row(s)');
+  }
+
+  Future<QueryResult> _pagedSelect(SelectStmt s, PagedTable pt) async {
+    if (s.fromSubquery != null ||
+        s.joins.isNotEmpty ||
+        s.groupBy.isNotEmpty ||
+        s.having != null) {
+      throw UnsupportedError(
+          'SELECT on paged table ${s.fromTable}: joins, GROUP BY and '
+          'HAVING are not supported.');
+    }
+    // Only `SELECT *` or a list of bare column names. Aggregates and
+    // expressions are out for now.
+    final colNames = pt.columns.map((c) => c.name).toList();
+    List<String> outCols;
+    bool selectAll = false;
+    if (s.projection.length == 1 && s.projection.single.isStar) {
+      selectAll = true;
+      outCols = colNames;
+    } else {
+      outCols = <String>[];
+      for (final p in s.projection) {
+        final e = p.expr;
+        if (e is ColumnExpr) {
+          outCols.add(p.alias ?? e.name);
+        } else {
+          throw UnsupportedError(
+              'SELECT on paged table ${s.fromTable}: only `*` or bare '
+              'column references are supported.');
+        }
+      }
+    }
+    final pkName = pt.columns[pt.primaryKeyIndex].name;
+    final pkVal = _pagedExtractPkEq(
+        s.where, pkName, 'SELECT on paged table ${s.fromTable}');
+    final rows = <List<Object?>>[];
+    if (pkVal != null) {
+      final row = await pt.get(pkVal);
+      if (row != null) {
+        rows.add([
+          for (final c in (selectAll ? colNames : _projectionCols(s, colNames)))
+            row[c],
+        ]);
+      }
+    } else {
+      await for (final row in pt.scan()) {
+        rows.add([
+          for (final c in (selectAll ? colNames : _projectionCols(s, colNames)))
+            row[c],
+        ]);
+      }
+    }
+    return QueryResult(columns: outCols, rows: rows);
+  }
+
+  List<String> _projectionCols(SelectStmt s, List<String> tableCols) {
+    final out = <String>[];
+    for (final p in s.projection) {
+      final e = p.expr;
+      if (e is ColumnExpr) {
+        // Lower-cased lookup against table cols.
+        final hit = tableCols.firstWhere(
+            (c) => c.toLowerCase() == e.name.toLowerCase(),
+            orElse: () => throw StateError(
+                'SELECT on paged table: unknown column ${e.name}'));
+        out.add(hit);
+      } else {
+        throw UnsupportedError(
+            'SELECT on paged table: only bare column refs supported.');
+      }
+    }
+    return out;
+  }
+
+  Future<QueryResult> _pagedUpdate(UpdateStmt s, PagedTable pt) async {
+    if (s.returning != null) {
+      throw UnsupportedError(
+          'UPDATE … RETURNING is not supported on paged table ${s.table}.');
+    }
+    final pkName = pt.columns[pt.primaryKeyIndex].name;
+    final pkVal =
+        _pagedExtractPkEq(s.where, pkName, 'UPDATE on paged table ${s.table}');
+    if (pkVal == null) {
+      throw UnsupportedError(
+          'UPDATE on paged table ${s.table} requires `WHERE $pkName = '
+          '<literal>` (bulk updates not supported).');
+    }
+    final existing = await pt.get(pkVal);
+    if (existing == null) {
+      return QueryResult(affected: 0, message: '0 row(s)');
+    }
+    final updated = Map<String, Object?>.from(existing);
+    s.assignments.forEach((col, expr) {
+      // Honour case-insensitive column lookup.
+      final hit = pt.columns.firstWhere(
+        (c) => c.name.toLowerCase() == col.toLowerCase(),
+        orElse: () => throw StateError(
+            'UPDATE on paged table ${s.table}: unknown column $col'),
+      );
+      updated[hit.name] =
+          _evalLiteral(expr, 'UPDATE on paged table ${s.table}');
+    });
+    await pt.update(pkVal, updated);
+    await pt.commit();
+    return QueryResult(affected: 1, message: '1 row(s)');
+  }
+
+  Future<QueryResult> _pagedDelete(DeleteStmt s, PagedTable pt) async {
+    if (s.returning != null) {
+      throw UnsupportedError(
+          'DELETE … RETURNING is not supported on paged table ${s.table}.');
+    }
+    final pkName = pt.columns[pt.primaryKeyIndex].name;
+    final pkVal =
+        _pagedExtractPkEq(s.where, pkName, 'DELETE on paged table ${s.table}');
+    if (pkVal == null) {
+      throw UnsupportedError(
+          'DELETE on paged table ${s.table} requires `WHERE $pkName = '
+          '<literal>` (bulk deletes not supported).');
+    }
+    final removed = await pt.delete(pkVal);
+    if (removed) await pt.commit();
+    return QueryResult(
+        affected: removed ? 1 : 0, message: '${removed ? 1 : 0} row(s)');
   }
 
   // ---------------------------------------------------------------------------

@@ -143,12 +143,19 @@ implemented:
   or `.db` are read and written in the real SQLite on-disk format
   (validated by package:sqlite3 round-trip tests). The SQLite C API
   itself is not linked.
-- **Out-of-core datasets**: tables created through SQL still load into
-  RAM; for true out-of-core storage use the dedicated `PagedTable` API
-  (`lib/server/paged_table.dart`), which layers a primary-keyed typed
-  table over an LRU page cache + B+-tree index + slotted-page row heap
-  with a crash-safe undo journal. The SQL executor itself does not yet
-  use the paged store; that wiring is a future change.
+- **Out-of-core datasets**: regular SQL tables still load into RAM,
+  but you can now opt a single table into the out-of-core backend with
+  `CREATE TABLE name (...) USING paged` (path-backed databases only).
+  Such a table is stored as `<dbpath>.paged/<name>.{heap,idx,meta.json}`,
+  is opened on demand from disk through an LRU page cache + B+-tree
+  index + slotted-page row heap with a crash-safe undo journal, and is
+  not loaded into the in-memory `_tables` map. The SQL surface for
+  paged tables is currently restricted to: INSERT VALUES, full-scan
+  `SELECT *`, point queries `SELECT|UPDATE|DELETE WHERE pk = literal`,
+  `DROP TABLE`, `TRUNCATE TABLE`, and `DESCRIBE`. Joins, GROUP BY,
+  bulk UPDATE/DELETE, RETURNING, INSERT … SELECT, and triggers all
+  raise `UnsupportedError`. The lower-level `PagedTable` API in
+  `lib/server/paged_table.dart` exposes the full primitives directly.
 - **SQLite wire protocol**: clients speak this engine's JSON line protocol,
   not SQLite's native protocol.
 - **Production-grade FTS5 / R*Tree**: `CREATE VIRTUAL TABLE ... USING fts5`n  and `USING rtree` are accepted and create regular tables; `MATCH` does a

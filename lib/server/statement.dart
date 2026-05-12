@@ -13,11 +13,19 @@ class CreateTableStmt extends Statement {
   final bool ifNotExists;
   final bool strict;
   final bool withoutRowid;
+
+  /// True for `CREATE TABLE name (...) USING paged`. Routes the table
+  /// to the out-of-core PagedTable backend instead of the in-memory
+  /// Table store. Restricts the supported query surface (see
+  /// Database._executePagedStmt).
+  final bool usingPaged;
+
   CreateTableStmt(this.name, this.columns,
       {this.constraints = const [],
       this.ifNotExists = false,
       this.strict = false,
-      this.withoutRowid = false});
+      this.withoutRowid = false,
+      this.usingPaged = false});
 }
 
 class DropTableStmt extends Statement {

@@ -313,15 +313,25 @@ class Parser {
     } while (_match(TokType.punct, ','));
     _expect(TokType.punct, ')');
     // Optional table-options trailer: WITHOUT ROWID and/or STRICT, in
-    // any order, optionally separated by commas.
+    // any order, optionally separated by commas. Then an optional
+    // engine selector `USING paged` (this engine's extension; routes
+    // the table to the out-of-core PagedTable backend).
     bool strict = false;
     bool withoutRowid = false;
+    bool usingPaged = false;
     while (true) {
       if (_matchKw('WITHOUT')) {
         _expectKw('ROWID');
         withoutRowid = true;
       } else if (_matchKw('STRICT')) {
         strict = true;
+      } else if (_matchKw('USING')) {
+        final mod = _expectIdent().text;
+        if (mod.toLowerCase() != 'paged') {
+          throw FormatException(
+              'CREATE TABLE $name USING $mod: only "paged" is supported');
+        }
+        usingPaged = true;
       } else {
         break;
       }
@@ -342,7 +352,8 @@ class Parser {
         constraints: constraints,
         ifNotExists: ifNotExists,
         strict: strict,
-        withoutRowid: withoutRowid);
+        withoutRowid: withoutRowid,
+        usingPaged: usingPaged);
   }
 
   bool _isTableLevelConstraintStart() {
