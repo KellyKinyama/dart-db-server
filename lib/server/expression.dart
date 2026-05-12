@@ -222,6 +222,8 @@ class BinaryExpr extends Expr {
         return _glob(l.toString(), r.toString());
       case 'MATCH':
         return _match(l.toString(), r.toString());
+      case 'REGEXP':
+        return _regexp(l.toString(), r.toString());
     }
     throw StateError('Unknown binary op: $op');
   }
@@ -231,6 +233,11 @@ class BinaryExpr extends Expr {
   /// against the tokens of [haystack]. See [fts5Match] for syntax.
   static bool _match(String haystack, String pattern) =>
       fts5Match(haystack, pattern);
+
+  /// REGEXP operator. Returns true when [pattern] matches anywhere in
+  /// [value] using Dart's `RegExp` (PCRE-like). Invalid patterns raise.
+  static bool _regexp(String value, String pattern) =>
+      RegExp(pattern).hasMatch(value);
 
   static String _stringify(Object v) {
     if (v is bool) return v ? 'true' : 'false';
@@ -1050,6 +1057,29 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
   'DEGREES': (a) =>
       _propagateNull(a, () => (a[0] as num).toDouble() * 180 / math.pi),
   'TRUNC': (a) => _propagateNull(a, () => (a[0] as num).truncate()),
+  // REGEXP family. SQLite's REGEXP operator desugars to regexp(pat, val);
+  // we accept both forms. Pattern is Dart's RegExp (PCRE-like).
+  'REGEXP': (a) {
+    if (a.length < 2 || a[0] == null || a[1] == null) return null;
+    return RegExp(a[0].toString()).hasMatch(a[1].toString());
+  },
+  'REGEXP_LIKE': (a) {
+    if (a.length < 2 || a[0] == null || a[1] == null) return null;
+    return RegExp(a[1].toString()).hasMatch(a[0].toString());
+  },
+  'REGEXP_SUBSTR': (a) {
+    if (a.length < 2 || a[0] == null || a[1] == null) return null;
+    final m = RegExp(a[1].toString()).firstMatch(a[0].toString());
+    return m?.group(0);
+  },
+  'REGEXP_REPLACE': (a) {
+    if (a.length < 3 || a[0] == null || a[1] == null || a[2] == null) {
+      return null;
+    }
+    return a[0]
+        .toString()
+        .replaceAll(RegExp(a[1].toString()), a[2].toString());
+  },
   'RANDOM': (a) => _rng.nextInt(1 << 31),
   'INSTR': (a) {
     if (a.length < 2 || a[0] == null || a[1] == null) return null;

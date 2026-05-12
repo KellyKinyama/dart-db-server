@@ -140,6 +140,7 @@ const Set<String> _keywords = {
   'RECURSIVE',
   'RETURNING',
   'GLOB',
+  'REGEXP',
   // --- misc ---
   'NULLS',
   'FIRST',

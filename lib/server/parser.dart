@@ -1442,6 +1442,11 @@ class Parser {
       if (negated) m = UnaryExpr('NOT', m);
       return m;
     }
+    if (_matchKw('REGEXP')) {
+      Expr r = BinaryExpr('REGEXP', left, _parseConcat());
+      if (negated) r = UnaryExpr('NOT', r);
+      return r;
+    }
     if (negated) {
       throw FormatException('Unexpected NOT before "${_peek().text}"');
     }
