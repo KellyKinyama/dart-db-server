@@ -949,6 +949,19 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
   'REPLACE': (a) => _propagateNull(
       a, () => a[0].toString().replaceAll(a[1].toString(), a[2].toString())),
   'CONCAT': (a) => a.map((v) => v ?? '').join(),
+  // CONCAT_WS(sep, args...) — joins non-NULL args with the given separator.
+  // If sep is NULL, returns NULL (matches MySQL/PostgreSQL semantics).
+  'CONCAT_WS': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final sep = a[0].toString();
+    final parts = <String>[];
+    for (var i = 1; i < a.length; i++) {
+      final v = a[i];
+      if (v == null) continue;
+      parts.add(v.toString());
+    }
+    return parts.join(sep);
+  },
   'COALESCE': (a) {
     for (final v in a) {
       if (v != null) return v;
@@ -1778,9 +1791,12 @@ double _pow10(int n) {
 const Set<String> kAggregateFunctions = {
   'COUNT',
   'SUM',
+  'TOTAL',
   'AVG',
   'MIN',
   'MAX',
+  'GROUP_CONCAT',
+  'STRING_AGG',
   'JSON_GROUP_ARRAY',
   'JSON_GROUP_OBJECT',
 };

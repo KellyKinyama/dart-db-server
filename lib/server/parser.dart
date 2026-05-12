@@ -1116,6 +1116,7 @@ class Parser {
       }
       return SelectStmt(projection: proj, orderBy: const []);
     }
+
     // Build a right-recursive UNION ALL tail from rows[1..].
     SelectStmt? tail;
     for (var i = rows.length - 1; i >= 1; i--) {

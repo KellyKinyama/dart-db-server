@@ -3684,6 +3684,52 @@ class Database {
           if (!any) return null;
           return allInt ? acc.toInt() : acc;
         }
+      case 'TOTAL':
+        {
+          // SQLite TOTAL: always returns a float, returns 0.0 on empty.
+          var acc = 0.0;
+          for (final v in _aggValues(e, grp)) {
+            if (v == null) continue;
+            if (v is! num) {
+              throw StateError('TOTAL requires numeric, got ${v.runtimeType}');
+            }
+            acc += v.toDouble();
+          }
+          return acc;
+        }
+      case 'GROUP_CONCAT':
+      case 'STRING_AGG':
+        {
+          // GROUP_CONCAT(expr [, sep]) -- defaults to ','.
+          // STRING_AGG(expr, sep) -- separator is required, but we accept
+          // a missing one too for symmetry.
+          String sep = ',';
+          if (e.args.length > 1) {
+            final s = _bindExpr(e.args[1]).eval(grp.isEmpty ? {} : grp.first);
+            sep = s?.toString() ?? ',';
+          }
+          final parts = <String>[];
+          if (e.args.isNotEmpty) {
+            final arg = _bindExpr(e.args.first);
+            if (e.distinct) {
+              final seen = <String>{};
+              for (final r in grp) {
+                final v = arg.eval(r);
+                if (v == null) continue;
+                final s = v.toString();
+                if (seen.add(s)) parts.add(s);
+              }
+            } else {
+              for (final r in grp) {
+                final v = arg.eval(r);
+                if (v == null) continue;
+                parts.add(v.toString());
+              }
+            }
+          }
+          if (parts.isEmpty) return null;
+          return parts.join(sep);
+        }
       case 'AVG':
         {
           var acc = 0.0;
@@ -4087,6 +4133,7 @@ class Database {
         case 'MAX':
         case 'TOTAL':
         case 'GROUP_CONCAT':
+        case 'STRING_AGG':
         case 'JSON_GROUP_ARRAY':
         case 'JSON_GROUP_OBJECT':
           {
