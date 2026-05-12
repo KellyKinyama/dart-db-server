@@ -932,6 +932,7 @@ class Parser {
     final recursive = _matchKw('RECURSIVE');
     final ctes = <String, SelectStmt>{};
     final cteColumns = <String, List<String>>{};
+    final cteMaterialized = <String, bool>{};
     do {
       final name = _expectIdent().text;
       // Optional column list. When present, used to rename the CTE's
@@ -946,11 +947,12 @@ class Parser {
         cteColumns[name] = cols;
       }
       _expectKw('AS');
-      // Optional MATERIALIZED / NOT MATERIALIZED hint — accept and ignore.
+      // Optional MATERIALIZED / NOT MATERIALIZED hint.
       if (_matchKw('NOT')) {
         _expectKw('MATERIALIZED');
-      } else {
-        _matchKw('MATERIALIZED');
+        cteMaterialized[name] = false;
+      } else if (_matchKw('MATERIALIZED')) {
+        cteMaterialized[name] = true;
       }
       _expect(TokType.punct, '(');
       final body = _parseSelect();
@@ -983,6 +985,7 @@ class Parser {
           ctes: ctes,
           cteColumns: cteColumns,
           ctesRecursive: recursive,
+          cteMaterialized: cteMaterialized,
         );
       case 'INSERT':
         final s = _parseInsert();
@@ -1376,7 +1379,8 @@ class Parser {
 
   Expr _parseMulDiv() {
     var left = _parseUnary();
-    while (_check(TokType.op) && (_peek().text == '*' || _peek().text == '/')) {
+    while (_check(TokType.op) &&
+        (_peek().text == '*' || _peek().text == '/' || _peek().text == '%')) {
       final op = _advance().text;
       left = BinaryExpr(op, left, _parseUnary());
     }

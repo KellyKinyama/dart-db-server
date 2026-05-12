@@ -348,6 +348,13 @@ class Database {
   List<String> _planTrace = const [];
   List<String> get lastPlanTrace => List.unmodifiable(_planTrace);
 
+  /// Last per-CTE materialization decision the dispatcher saw. Entries
+  /// are `name` -> `true` for `MATERIALIZED`, `false` for
+  /// `NOT MATERIALIZED`, or absent when no hint was given (default).
+  /// Exposed for test introspection.
+  Map<String, bool> _lastCteHints = const {};
+  Map<String, bool> get lastCteHints => Map.unmodifiable(_lastCteHints);
+
   /// Cumulative count of index-only (covering) scans the executor has
   /// served. Reset by [resetCounters]. Tests use this to assert that a
   /// query took the covering path.
@@ -557,6 +564,8 @@ class Database {
 
   /// Synchronous dispatch \u2014 used directly by trigger bodies (which must run\n  /// in-line with their host INSERT/UPDATE/DELETE).
   QueryResult _dispatch(Statement stmt) {
+    // Reset per-statement observability state.
+    _lastCteHints = const {};
     QueryResult result;
     if (stmt is CreateTableStmt) {
       result = _createTable(stmt);
@@ -1191,7 +1200,12 @@ class Database {
         }
       }
       final returnedRows = <List<Object?>>[];
-      for (var ri = 0; ri < t.rows.length; ri++) {
+      // INDEXED BY: resolve a candidate rowId set up-front. NOT INDEXED
+      // and the absence of any hint both fall through to a full scan.
+      final hintedRows = _resolveHintedRowIds(t, s.where, s.indexedBy);
+      final rowOrder = hintedRows ??
+          List<int>.generate(t.rows.length, (i) => i, growable: false);
+      for (final ri in rowOrder) {
         final row = t.rows[ri];
         final view = t.rowToMap(row);
         if (s.where != null && !evalPredicate(_bindExpr(s.where!), view)) {
@@ -1256,17 +1270,40 @@ class Database {
         }
       }
       final returnedRows = <List<Object?>>[];
-      for (final row in t.rows) {
-        final view = t.rowToMap(row);
-        final shouldDelete =
-            s.where == null || evalPredicate(_bindExpr(s.where!), view);
-        if (shouldDelete) {
-          deleted.add(row);
-          if (returningExprs.isNotEmpty) {
-            returnedRows.add(returningExprs.map((e) => e.eval(view)).toList());
+      final hintedRows = _resolveHintedRowIds(t, s.where, s.indexedBy);
+      if (hintedRows != null) {
+        final toDelete = <int>{};
+        for (final ri in hintedRows) {
+          final row = t.rows[ri];
+          final view = t.rowToMap(row);
+          final shouldDelete =
+              s.where == null || evalPredicate(_bindExpr(s.where!), view);
+          if (shouldDelete) {
+            deleted.add(row);
+            toDelete.add(ri);
+            if (returningExprs.isNotEmpty) {
+              returnedRows
+                  .add(returningExprs.map((e) => e.eval(view)).toList());
+            }
           }
-        } else {
-          keep.add(row);
+        }
+        for (var i = 0; i < t.rows.length; i++) {
+          if (!toDelete.contains(i)) keep.add(t.rows[i]);
+        }
+      } else {
+        for (final row in t.rows) {
+          final view = t.rowToMap(row);
+          final shouldDelete =
+              s.where == null || evalPredicate(_bindExpr(s.where!), view);
+          if (shouldDelete) {
+            deleted.add(row);
+            if (returningExprs.isNotEmpty) {
+              returnedRows
+                  .add(returningExprs.map((e) => e.eval(view)).toList());
+            }
+          } else {
+            keep.add(row);
+          }
         }
       }
       for (final row in deleted) {
@@ -1543,6 +1580,9 @@ class Database {
   // ---------------------------------------------------------------------------
   QueryResult _selectTopLevel(SelectStmt s,
       [Map<String, Object?> outer = const {}]) {
+    if (s.cteMaterialized.isNotEmpty) {
+      _lastCteHints = Map<String, bool>.from(s.cteMaterialized);
+    }
     final pushed = _pushCtes(s.ctes,
         recursive: s.ctesRecursive, columnsOverride: s.cteColumns);
     try {
@@ -2412,6 +2452,54 @@ class Database {
         for (final ri in rowIds)
           {...outer, ...t.rowToMap(t.rows[ri], alias: s.fromAlias)},
       ];
+    } finally {
+      _currentScanConjuncts = prevConjuncts;
+    }
+  }
+
+  /// Resolve `INDEXED BY name` / `NOT INDEXED` for UPDATE / DELETE on
+  /// table [t]. Returns:
+  ///   * `null` to scan all rows (no hint or `NOT INDEXED`);
+  ///   * the rowIds produced by the named index plan when `INDEXED BY`
+  ///     is given and the WHERE has a classifiable predicate using it;
+  /// Throws FormatException when `INDEXED BY name` cannot be satisfied,
+  /// matching SQLite's "no query solution" behaviour.
+  List<int>? _resolveHintedRowIds(Table t, Expr? where, IndexHint? hint) {
+    if (hint == null) return null;
+    if (hint.notIndexed) return null;
+    if (hint.indexName == null) return null;
+    final wanted = hint.indexName!.toLowerCase();
+    // Validate the index name exists on this table at all.
+    final indexExists =
+        t.indexDefs.values.any((ix) => ix.name.toLowerCase() == wanted);
+    if (!indexExists) {
+      throw FormatException('no such index: ${hint.indexName} on ${t.name}');
+    }
+    if (where == null) {
+      throw FormatException(
+          'no query solution for INDEXED BY ${hint.indexName} on ${t.name}');
+    }
+    final conjuncts = _splitAndConjuncts(where);
+    final prevConjuncts = _currentScanConjuncts;
+    _currentScanConjuncts = conjuncts;
+    try {
+      final candidates = <_IndexPlan>[];
+      for (final c in conjuncts) {
+        final p = _classifyConjunct(t, c);
+        if (p != null) candidates.add(p);
+      }
+      candidates.addAll(_classifyMultiColumnPlans(t, conjuncts));
+      candidates.addAll(_classifyExpressionIndexPlans(t, conjuncts));
+      final usable =
+          candidates.where((p) => p.index.toLowerCase() == wanted).toList();
+      if (usable.isEmpty) {
+        throw FormatException(
+            'no query solution for INDEXED BY ${hint.indexName} on ${t.name}');
+      }
+      usable.sort((a, b) => a.estHits.compareTo(b.estHits));
+      final best = usable.first;
+      _planTrace = [best.describe()];
+      return _executeIndexPlan(t, best);
     } finally {
       _currentScanConjuncts = prevConjuncts;
     }

@@ -178,6 +178,10 @@ class BinaryExpr extends Expr {
         return (l as num) * (r as num);
       case '/':
         return (l as num) / (r as num);
+      case '%':
+        // SQLite uses C-style truncated modulo (sign follows the dividend),
+        // not Dart's Euclidean `%` which is always non-negative.
+        return (l as num).remainder(r as num);
       case '||':
         return _stringify(l) + _stringify(r);
       case 'LIKE':

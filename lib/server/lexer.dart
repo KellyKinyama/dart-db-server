@@ -412,7 +412,7 @@ class Lexer {
       _pos += 2;
       return Token(TokType.op, '->', start);
     }
-    if ('=<>+-*/'.contains(c)) {
+    if ('=<>+-*/%'.contains(c)) {
       _pos++;
       return Token(TokType.op, c, start);
     }

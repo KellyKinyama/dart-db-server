@@ -240,6 +240,11 @@ class SelectStmt extends Statement {
   /// True when introduced via `WITH RECURSIVE ...`.
   final bool ctesRecursive;
 
+  /// Per-CTE materialization hint. Key = CTE name, value = `true` for
+  /// `MATERIALIZED`, `false` for `NOT MATERIALIZED`. CTEs without an
+  /// explicit hint are absent from the map (default = planner's choice).
+  final Map<String, bool> cteMaterialized;
+
   /// When the FROM clause is a table-valued function call (e.g.
   /// `json_each(...)`), the call is captured here. Mutually exclusive with
   /// [fromTable] / [fromSubquery].
@@ -270,6 +275,7 @@ class SelectStmt extends Statement {
     this.ctes = const {},
     this.cteColumns = const {},
     this.ctesRecursive = false,
+    this.cteMaterialized = const {},
     this.fromFunction,
     this.namedWindows = const {},
     this.indexedBy,
