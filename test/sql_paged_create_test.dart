@@ -122,19 +122,19 @@ void main() {
       db.execute("SELECT * FROM t WHERE name = 'a'"),
       throwsA(isA<UnsupportedError>()),
     );
-    // Bulk DELETE.
-    await expectLater(
-      db.execute('DELETE FROM t'),
-      throwsA(isA<UnsupportedError>()),
-    );
-    // Bulk UPDATE.
-    await expectLater(
-      db.execute("UPDATE t SET name = 'x'"),
-      throwsA(isA<UnsupportedError>()),
-    );
     // INSERT … SELECT.
     await expectLater(
       db.execute('INSERT INTO t SELECT * FROM t'),
+      throwsA(isA<UnsupportedError>()),
+    );
+    // UPDATE that tries to reassign the primary key.
+    await expectLater(
+      db.execute('UPDATE t SET id = 99 WHERE id = 1'),
+      throwsA(isA<UnsupportedError>()),
+    );
+    // RETURNING is not wired.
+    await expectLater(
+      db.execute('DELETE FROM t WHERE id = 1 RETURNING *'),
       throwsA(isA<UnsupportedError>()),
     );
   });

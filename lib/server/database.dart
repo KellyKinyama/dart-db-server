@@ -979,6 +979,179 @@ class Database {
         'paged tables.');
   }
 
+  /// Parsed shape of a paged-table WHERE clause. Either [eq] is set
+  /// (point lookup) or the lower/upper bounds describe a contiguous
+  /// PK-ordered range. Any field may be null. A `null` everywhere
+  /// means no predicate (full scan).
+  ///
+  /// Bounds are tightened by intersecting all AND-connected
+  /// comparisons against the PK column. We do not attempt to prove
+  /// emptiness — if `lower > upper` the caller will simply see an
+  /// empty stream from PagedTable.range.
+  _PagedRange _pagedExtractPkRange(
+      Expr? where, String pkName, String context) {
+    final r = _PagedRange();
+    if (where == null) return r;
+    void merge(_PagedRange other) {
+      if (other.eq != null) {
+        if (r.eq != null && r.eq != other.eq) {
+          // Two distinct equalities AND-ed → empty; preserve the
+          // contradiction so the executor returns zero rows.
+          r.eq = other.eq;
+          r.contradiction = true;
+        } else {
+          r.eq = other.eq;
+        }
+      }
+      if (other.lower != null) {
+        if (r.lower == null || _compareLiteral(other.lower, r.lower!) > 0) {
+          r.lower = other.lower;
+          r.lowerInclusive = other.lowerInclusive;
+        } else if (_compareLiteral(other.lower, r.lower!) == 0 &&
+            !other.lowerInclusive) {
+          r.lowerInclusive = false;
+        }
+      }
+      if (other.upper != null) {
+        if (r.upper == null || _compareLiteral(other.upper, r.upper!) < 0) {
+          r.upper = other.upper;
+          r.upperInclusive = other.upperInclusive;
+        } else if (_compareLiteral(other.upper, r.upper!) == 0 &&
+            !other.upperInclusive) {
+          r.upperInclusive = false;
+        }
+      }
+    }
+
+    void walk(Expr e) {
+      if (e is BinaryExpr && e.op == 'AND') {
+        walk(e.left);
+        walk(e.right);
+        return;
+      }
+      merge(_extractSingle(e, pkName, context));
+    }
+
+    walk(where);
+    return r;
+  }
+
+  /// Parse a single comparison or BETWEEN against the PK column into
+  /// a [_PagedRange] fragment.
+  _PagedRange _extractSingle(Expr e, String pkName, String context) {
+    final r = _PagedRange();
+    bool isPk(Expr x) =>
+        x is ColumnExpr && x.name.toLowerCase() == pkName.toLowerCase();
+    if (e is BinaryExpr) {
+      final op = e.op;
+      final lp = isPk(e.left);
+      final rp = isPk(e.right);
+      if (!lp && !rp) {
+        throw UnsupportedError(
+            '$context: WHERE on paged tables must reference the primary '
+            'key column "$pkName".');
+      }
+      // Normalise so the PK is on the left: rewrite `lit OP pk` as
+      // `pk OP' lit` with op reversed.
+      String nop = op;
+      Expr litExpr;
+      if (lp) {
+        litExpr = e.right;
+      } else {
+        litExpr = e.left;
+        switch (op) {
+          case '<':
+            nop = '>';
+            break;
+          case '<=':
+            nop = '>=';
+            break;
+          case '>':
+            nop = '<';
+            break;
+          case '>=':
+            nop = '<=';
+            break;
+          // '=' stays '='.
+        }
+      }
+      final lit = _evalLiteral(litExpr, context);
+      switch (nop) {
+        case '=':
+          r.eq = lit;
+          return r;
+        case '<':
+          r.upper = lit;
+          r.upperInclusive = false;
+          return r;
+        case '<=':
+          r.upper = lit;
+          r.upperInclusive = true;
+          return r;
+        case '>':
+          r.lower = lit;
+          r.lowerInclusive = false;
+          return r;
+        case '>=':
+          r.lower = lit;
+          r.lowerInclusive = true;
+          return r;
+        default:
+          throw UnsupportedError(
+              '$context: operator $op on the primary key is not '
+              'supported on paged tables.');
+      }
+    }
+    if (e is BetweenExpr) {
+      if (!isPk(e.value) || e.negated) {
+        throw UnsupportedError(
+            '$context: only `$pkName BETWEEN <lit> AND <lit>` is '
+            'supported on paged tables.');
+      }
+      r.lower = _evalLiteral(e.low, context);
+      r.lowerInclusive = true;
+      r.upper = _evalLiteral(e.high, context);
+      r.upperInclusive = true;
+      return r;
+    }
+    throw UnsupportedError(
+        '$context: predicate not supported on paged tables. Allowed: '
+        '`$pkName = lit`, `$pkName </<=/>/>= lit`, `$pkName BETWEEN lo '
+        'AND hi`, and AND-chains thereof.');
+  }
+
+  /// Compare two PK literals using SQL-ish semantics. Numbers compare
+  /// numerically, strings lexicographically. Mixed types are rejected.
+  int _compareLiteral(Object? a, Object? b) {
+    if (a is num && b is num) return a.compareTo(b);
+    if (a is String && b is String) return a.compareTo(b);
+    throw UnsupportedError(
+        'paged table: cannot compare ${a.runtimeType} with ${b.runtimeType}.');
+  }
+
+  /// Stream rows matching a parsed range. Honours [_PagedRange.eq] as
+  /// a single point lookup; otherwise calls PagedTable.range.
+  Stream<Map<String, Object?>> _pagedRangeStream(
+      PagedTable pt, _PagedRange r) async* {
+    if (r.contradiction) return;
+    final eq = r.eq;
+    if (eq != null) {
+      final row = await pt.get(eq);
+      if (row != null) yield row;
+      return;
+    }
+    if (r.lower == null && r.upper == null) {
+      yield* pt.scan();
+      return;
+    }
+    yield* pt.range(
+      lower: r.lower,
+      lowerInclusive: r.lowerInclusive,
+      upper: r.upper,
+      upperInclusive: r.upperInclusive,
+    );
+  }
+
   Future<QueryResult> _pagedInsert(InsertStmt s, PagedTable pt) async {
     if (s.mode != InsertMode.normal) {
       throw UnsupportedError(
@@ -1028,72 +1201,141 @@ class Database {
     if (s.fromSubquery != null ||
         s.joins.isNotEmpty ||
         s.groupBy.isNotEmpty ||
-        s.having != null) {
+        s.having != null ||
+        s.setOp != null ||
+        s.distinct ||
+        s.fromFunction != null) {
       throw UnsupportedError(
-          'SELECT on paged table ${s.fromTable}: joins, GROUP BY and '
-          'HAVING are not supported.');
+          'SELECT on paged table ${s.fromTable}: joins, GROUP BY, '
+          'HAVING, DISTINCT and set ops are not supported.');
     }
-    // Only `SELECT *` or a list of bare column names. Aggregates and
-    // expressions are out for now.
     final colNames = pt.columns.map((c) => c.name).toList();
+    final pkName = pt.columns[pt.primaryKeyIndex].name;
+
+    // ORDER BY: only `ORDER BY <pk> [ASC|DESC]`. ASC is the native
+    // PagedTable iteration order; DESC buffers the matched rows and
+    // reverses them, which is fine for the LIMIT-paired use case but
+    // not for streaming a whole large table.
+    bool descending = false;
+    if (s.orderBy.isNotEmpty) {
+      if (s.orderBy.length > 1) {
+        throw UnsupportedError(
+            'SELECT on paged table ${s.fromTable}: ORDER BY may only '
+            'reference a single column (the primary key).');
+      }
+      final ob = s.orderBy.single;
+      final e = ob.expr;
+      if (e is! ColumnExpr ||
+          e.name.toLowerCase() != pkName.toLowerCase()) {
+        throw UnsupportedError(
+            'SELECT on paged table ${s.fromTable}: ORDER BY must '
+            'reference the primary key column "$pkName".');
+      }
+      descending = ob.descending;
+    }
+
+    // Detect COUNT(*) sole-projection.
+    bool isCountStar = false;
+    String countAlias = 'count(*)';
+    if (s.projection.length == 1) {
+      final p = s.projection.single;
+      final e = p.expr;
+      if (e is FunctionCallExpr &&
+          e.name.toUpperCase() == 'COUNT' &&
+          e.isStarArg &&
+          !e.distinct &&
+          e.window == null &&
+          e.filterExpr == null) {
+        isCountStar = true;
+        if (p.alias != null) countAlias = p.alias!;
+      }
+    }
+
+    // Normal projection (only `*` or bare column refs).
     List<String> outCols;
+    List<String> sourceCols; // table column names to read for each row
     bool selectAll = false;
-    if (s.projection.length == 1 && s.projection.single.isStar) {
+    if (isCountStar) {
+      outCols = [countAlias];
+      sourceCols = const [];
+    } else if (s.projection.length == 1 && s.projection.single.isStar) {
       selectAll = true;
       outCols = colNames;
+      sourceCols = colNames;
     } else {
       outCols = <String>[];
+      sourceCols = <String>[];
       for (final p in s.projection) {
         final e = p.expr;
         if (e is ColumnExpr) {
+          final hit = colNames.firstWhere(
+            (c) => c.toLowerCase() == e.name.toLowerCase(),
+            orElse: () => throw StateError(
+                'SELECT on paged table ${s.fromTable}: unknown column '
+                '${e.name}'),
+          );
           outCols.add(p.alias ?? e.name);
+          sourceCols.add(hit);
         } else {
           throw UnsupportedError(
-              'SELECT on paged table ${s.fromTable}: only `*` or bare '
-              'column references are supported.');
+              'SELECT on paged table ${s.fromTable}: only `*`, bare '
+              'column references and `COUNT(*)` are supported.');
         }
       }
     }
-    final pkName = pt.columns[pt.primaryKeyIndex].name;
-    final pkVal = _pagedExtractPkEq(
-        s.where, pkName, 'SELECT on paged table ${s.fromTable}');
-    final rows = <List<Object?>>[];
-    if (pkVal != null) {
-      final row = await pt.get(pkVal);
-      if (row != null) {
-        rows.add([
-          for (final c in (selectAll ? colNames : _projectionCols(s, colNames)))
-            row[c],
-        ]);
-      }
-    } else {
-      await for (final row in pt.scan()) {
-        rows.add([
-          for (final c in (selectAll ? colNames : _projectionCols(s, colNames)))
-            row[c],
-        ]);
-      }
-    }
-    return QueryResult(columns: outCols, rows: rows);
-  }
 
-  List<String> _projectionCols(SelectStmt s, List<String> tableCols) {
-    final out = <String>[];
-    for (final p in s.projection) {
-      final e = p.expr;
-      if (e is ColumnExpr) {
-        // Lower-cased lookup against table cols.
-        final hit = tableCols.firstWhere(
-            (c) => c.toLowerCase() == e.name.toLowerCase(),
-            orElse: () => throw StateError(
-                'SELECT on paged table: unknown column ${e.name}'));
-        out.add(hit);
-      } else {
-        throw UnsupportedError(
-            'SELECT on paged table: only bare column refs supported.');
+    final range = _pagedExtractPkRange(
+        s.where, pkName, 'SELECT on paged table ${s.fromTable}');
+
+    // LIMIT / OFFSET. Negative LIMIT means "no limit" (SQLite-ish).
+    final offset = (s.offset ?? 0) < 0 ? 0 : (s.offset ?? 0);
+    final limit = s.limit;
+    final unlimited = limit == null || limit < 0;
+
+    if (isCountStar) {
+      // Pure count: walk the matched stream without materialising
+      // anything, then apply OFFSET / LIMIT to the single output row
+      // (degenerate but matches SQLite when COUNT(*) is bare).
+      var n = 0;
+      await for (final _ in _pagedRangeStream(pt, range)) {
+        n++;
       }
+      final rows = (offset == 0 && (unlimited || limit > 0))
+          ? [
+              [n],
+            ]
+          : <List<Object?>>[];
+      return QueryResult(columns: outCols, rows: rows);
     }
-    return out;
+
+    // Streaming projection.
+    final rows = <List<Object?>>[];
+    if (descending) {
+      // Buffer the matched rows so we can reverse; OFFSET/LIMIT apply
+      // after the reverse.
+      await for (final row in _pagedRangeStream(pt, range)) {
+        rows.add(selectAll
+            ? [for (final c in sourceCols) row[c]]
+            : [for (final c in sourceCols) row[c]]);
+      }
+      final reversed = rows.reversed.toList();
+      final start = offset.clamp(0, reversed.length);
+      final end =
+          unlimited ? reversed.length : (start + limit).clamp(0, reversed.length);
+      return QueryResult(
+          columns: outCols, rows: reversed.sublist(start, end));
+    } else {
+      var skipped = 0;
+      await for (final row in _pagedRangeStream(pt, range)) {
+        if (skipped < offset) {
+          skipped++;
+          continue;
+        }
+        if (!unlimited && rows.length >= limit) break;
+        rows.add([for (final c in sourceCols) row[c]]);
+      }
+      return QueryResult(columns: outCols, rows: rows);
+    }
   }
 
   Future<QueryResult> _pagedUpdate(UpdateStmt s, PagedTable pt) async {
@@ -1102,31 +1344,52 @@ class Database {
           'UPDATE … RETURNING is not supported on paged table ${s.table}.');
     }
     final pkName = pt.columns[pt.primaryKeyIndex].name;
-    final pkVal =
-        _pagedExtractPkEq(s.where, pkName, 'UPDATE on paged table ${s.table}');
-    if (pkVal == null) {
-      throw UnsupportedError(
-          'UPDATE on paged table ${s.table} requires `WHERE $pkName = '
-          '<literal>` (bulk updates not supported).');
-    }
-    final existing = await pt.get(pkVal);
-    if (existing == null) {
-      return QueryResult(affected: 0, message: '0 row(s)');
-    }
-    final updated = Map<String, Object?>.from(existing);
+    final range = _pagedExtractPkRange(
+        s.where, pkName, 'UPDATE on paged table ${s.table}');
+    // Resolve assignment columns once.
+    final assigns = <String, Object?>{};
     s.assignments.forEach((col, expr) {
-      // Honour case-insensitive column lookup.
       final hit = pt.columns.firstWhere(
         (c) => c.name.toLowerCase() == col.toLowerCase(),
         orElse: () => throw StateError(
             'UPDATE on paged table ${s.table}: unknown column $col'),
       );
-      updated[hit.name] =
+      assigns[hit.name] =
           _evalLiteral(expr, 'UPDATE on paged table ${s.table}');
     });
-    await pt.update(pkVal, updated);
-    await pt.commit();
-    return QueryResult(affected: 1, message: '1 row(s)');
+    // Refuse to mutate the primary key column — PagedTable.update keeps
+    // the pk fixed; changing it would require delete+insert and is not
+    // worth the complexity here.
+    if (assigns.containsKey(pkName)) {
+      throw UnsupportedError(
+          'UPDATE on paged table ${s.table}: cannot reassign the '
+          'primary key column "$pkName".');
+    }
+    // Materialise matching rows first (PK + current values) so we
+    // don't mutate while iterating the index.
+    final matches = <Map<String, Object?>>[];
+    if (range.contradiction) {
+      return QueryResult(affected: 0, message: '0 row(s)');
+    }
+    if (range.eq != null) {
+      final eq = range.eq!;
+      final row = await pt.get(eq);
+      if (row != null) matches.add(row);
+    } else {
+      await for (final row in _pagedRangeStream(pt, range)) {
+        matches.add(row);
+      }
+    }
+    var affected = 0;
+    for (final row in matches) {
+      final pkVal = row[pkName];
+      if (pkVal == null) continue;
+      final updated = Map<String, Object?>.from(row)..addAll(assigns);
+      await pt.update(pkVal, updated);
+      affected++;
+    }
+    if (affected > 0) await pt.commit();
+    return QueryResult(affected: affected, message: '$affected row(s)');
   }
 
   Future<QueryResult> _pagedDelete(DeleteStmt s, PagedTable pt) async {
@@ -1135,17 +1398,29 @@ class Database {
           'DELETE … RETURNING is not supported on paged table ${s.table}.');
     }
     final pkName = pt.columns[pt.primaryKeyIndex].name;
-    final pkVal =
-        _pagedExtractPkEq(s.where, pkName, 'DELETE on paged table ${s.table}');
-    if (pkVal == null) {
-      throw UnsupportedError(
-          'DELETE on paged table ${s.table} requires `WHERE $pkName = '
-          '<literal>` (bulk deletes not supported).');
+    final range = _pagedExtractPkRange(
+        s.where, pkName, 'DELETE on paged table ${s.table}');
+    if (range.contradiction) {
+      return QueryResult(affected: 0, message: '0 row(s)');
     }
-    final removed = await pt.delete(pkVal);
-    if (removed) await pt.commit();
-    return QueryResult(
-        affected: removed ? 1 : 0, message: '${removed ? 1 : 0} row(s)');
+    // Materialise matching PKs first (don't mutate during traversal).
+    final pks = <Object>[];
+    if (range.eq != null) {
+      final eq = range.eq!;
+      final row = await pt.get(eq);
+      if (row != null) pks.add(eq);
+    } else {
+      await for (final row in _pagedRangeStream(pt, range)) {
+        final pk = row[pkName];
+        if (pk != null) pks.add(pk);
+      }
+    }
+    var affected = 0;
+    for (final pk in pks) {
+      if (await pt.delete(pk)) affected++;
+    }
+    if (affected > 0) await pt.commit();
+    return QueryResult(affected: affected, message: '$affected row(s)');
   }
 
   // ---------------------------------------------------------------------------
@@ -6614,4 +6889,22 @@ class _DeferredFk {
   final String childTable;
   final List<Object?> row;
   _DeferredFk(this.childTable, this.row);
+}
+
+/// Parsed shape of a paged-table WHERE clause. Used by the executor
+/// helpers to drive either a `PagedTable.get` point lookup or a
+/// `PagedTable.range` streaming scan. See [Database._pagedExtractPkRange].
+class _PagedRange {
+  /// When non-null, a single primary-key equality. Mutually exclusive
+  /// with [lower] / [upper] in the success path.
+  Object? eq;
+  Object? lower;
+  bool lowerInclusive = true;
+  Object? upper;
+  bool upperInclusive = true;
+
+  /// Set when AND-merging produced an unsatisfiable predicate (e.g.
+  /// two distinct equalities on the same PK). The executor returns an
+  /// empty result without touching disk.
+  bool contradiction = false;
 }
