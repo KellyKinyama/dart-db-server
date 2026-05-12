@@ -158,17 +158,26 @@ implemented:
   `LIMIT` / `OFFSET`; `COUNT(*)`; scalar projection expressions
   (`SELECT id + 1, upper(name) FROM t`); bulk UPDATE / DELETE under
   the same predicates; `DROP TABLE`, `TRUNCATE TABLE`, and `DESCRIBE`.
-  Single-column secondary indexes are supported via
-  `CREATE INDEX idx ON t(col)` / `DROP INDEX idx`; equality predicates
-  on indexed columns (`WHERE col = literal`) are routed through the
-  index instead of a full scan, and any remaining residual conjuncts
-  are still re-applied per row. `UNIQUE`, composite, expression, and
-  partial indexes on paged tables raise `UnsupportedError`.
-  Joins, `GROUP BY`, range queries on indexed non-PK columns,
-  non-COUNT aggregates, `RETURNING`, `INSERT … SELECT`, primary-key
-  reassignment, and triggers all raise `UnsupportedError`. The lower-level `PagedTable`
-  API in `lib/server/paged_table.dart` exposes the full primitives
-  directly.
+  Secondary indexes are supported via
+  `CREATE INDEX idx ON t(col1, col2, ...)` / `DROP INDEX idx`,
+  including composite indexes. Equality predicates on indexed columns
+  (`WHERE col = literal`, or a leading-column equality prefix) are
+  routed through the index, and an equality prefix followed by a
+  range comparison (`<`, `<=`, `>`, `>=`, or `BETWEEN`) on the next
+  indexed column drives an index range scan; remaining residual
+  conjuncts are re-applied per row. `GROUP BY`, `HAVING`, and the
+  full aggregate set (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, including
+  `COUNT(DISTINCT ...)`) work on paged tables. Joins involving paged
+  tables (any combination of `INNER` / `LEFT` / `RIGHT` / `FULL` /
+  `CROSS` / `NATURAL` / `USING`, including joins between two paged
+  tables) work by snapshotting each paged participant into a
+  transient in-memory table for the duration of the query; the
+  out-of-core benefit on those joins is therefore partial.
+  `UNIQUE`, expression, and partial indexes on paged tables raise
+  `UnsupportedError`; so do `RETURNING`, `INSERT … SELECT`,
+  primary-key reassignment, and triggers. The lower-level
+  `PagedTable` API in `lib/server/paged_table.dart` exposes the full
+  primitives directly.
 - **SQLite wire protocol**: clients speak this engine's JSON line protocol,
   not SQLite's native protocol.
 - **Production-grade FTS5 / R*Tree**: `CREATE VIRTUAL TABLE ... USING fts5`n  and `USING rtree` are accepted and create regular tables; `MATCH` does a
