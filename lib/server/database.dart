@@ -1008,16 +1008,33 @@ class Database {
     }
   }
 
-  /// Handle a SELECT that joins one or more paged tables. We snapshot
-  /// each referenced paged table into a transient in-memory [Table]
-  /// installed under the original name, run the in-memory executor,
-  /// then remove the temporaries. This intentionally trades the
-  /// out-of-core benefit on those participants for correctness; large
-  /// joins are not the use case paged tables target.
+  /// Handle a SELECT that joins one or more paged tables.
+  ///
+  /// Optimisation: when there is exactly one paged participant and the
+  /// query carries an equi-join predicate `paged.col = mem.col` (in an
+  /// ON or WHERE clause) against an in-memory table, we only snapshot
+  /// the paged rows whose `col` value appears in the in-memory side's
+  /// distinct value set. If the paged table has an index (PK or
+  /// secondary) on that column, the matched rows are pulled by
+  /// `get` / `indexLookup` per key; otherwise we scan and filter. The
+  /// matched rows are installed as a transient in-memory `Table` and
+  /// the query is then dispatched to the regular in-memory executor,
+  /// which still handles ORDER BY / GROUP BY / projection.
+  ///
+  /// We bail out and snapshot the paged side in full when:
+  ///   - more than one paged participant is referenced (would require
+  ///     bootstrapping one side from the other);
+  ///   - any LEFT / RIGHT / FULL join is involved (preserving-side
+  ///     rows can't be safely dropped);
+  ///   - no usable equi-join column reference for the paged side is
+  ///     found.
+  /// Falling back preserves correctness in every case.
   Future<QueryResult> _pagedJoinSelect(
       SelectStmt s, List<String> pagedNames) async {
     final installed = <String>[];
     try {
+      // Decide pre-filter eligibility for each paged participant.
+      final filters = _pagedJoinFilters(s, pagedNames);
       for (final name in pagedNames) {
         if (!_pagedTables.containsKey(name)) continue;
         if (_tables.containsKey(name)) {
@@ -1035,8 +1052,13 @@ class Database {
             ),
         ];
         final tbl = Table(name, colDefs);
-        await for (final row in pt.scan()) {
-          tbl.rows.add([for (final c in pt.columns) row[c.name]]);
+        final filter = filters[name];
+        if (filter != null) {
+          await _populateFilteredPagedSnapshot(pt, filter, tbl);
+        } else {
+          await for (final row in pt.scan()) {
+            tbl.rows.add([for (final c in pt.columns) row[c.name]]);
+          }
         }
         _tables[name] = tbl;
         installed.add(name);
@@ -1046,6 +1068,135 @@ class Database {
     } finally {
       for (final name in installed) {
         _tables.remove(name);
+      }
+    }
+  }
+
+  /// For each paged participant whose snapshot can be safely
+  /// restricted by an equi-join key set, return a record describing
+  /// the paged column to filter on and the set of keys observed on
+  /// the in-memory side. Returns an empty map if no participant is
+  /// eligible — callers fall back to the full-scan path.
+  Map<String, ({String pagedCol, Set<Object> keys})> _pagedJoinFilters(
+      SelectStmt s, List<String> pagedNames) {
+    final result = <String, ({String pagedCol, Set<Object> keys})>{};
+    // Only safe when no preserving-side semantics are involved.
+    for (final j in s.joins) {
+      final t = j.type.toUpperCase();
+      if (t != 'INNER' && t != 'CROSS') return result;
+    }
+    if (pagedNames.length != 1) return result;
+    final pname = pagedNames.single;
+    final pt = _pagedTables[pname];
+    if (pt == null) return result;
+    final pagedCols = {for (final c in pt.columns) c.name.toLowerCase()};
+
+    // Collect every AND-conjunct from every join's ON clause and from
+    // the top-level WHERE.
+    final conjuncts = <Expr>[];
+    void splitAnd(Expr? e) {
+      if (e == null) return;
+      if (e is BinaryExpr && e.op.toUpperCase() == 'AND') {
+        splitAnd(e.left);
+        splitAnd(e.right);
+      } else {
+        conjuncts.add(e);
+      }
+    }
+
+    for (final j in s.joins) {
+      splitAnd(j.on);
+    }
+    splitAnd(s.where);
+
+    // Find the first `paged.col = mem.col` conjunct.
+    for (final c in conjuncts) {
+      if (c is! BinaryExpr || c.op != '=') continue;
+      final l = c.left;
+      final r = c.right;
+      if (l is! ColumnExpr || r is! ColumnExpr) continue;
+      final lt = l.table?.toLowerCase();
+      final rt = r.table?.toLowerCase();
+      if (lt == null || rt == null) continue;
+      String? memName;
+      String? memCol;
+      String? pgCol;
+      if (lt == pname.toLowerCase() &&
+          pagedCols.contains(l.name.toLowerCase())) {
+        memName = r.table;
+        memCol = r.name;
+        pgCol = l.name;
+      } else if (rt == pname.toLowerCase() &&
+          pagedCols.contains(r.name.toLowerCase())) {
+        memName = l.table;
+        memCol = l.name;
+        pgCol = r.name;
+      } else {
+        continue;
+      }
+      if (memName == null) continue;
+      final mem = _tables[memName];
+      if (mem == null) continue; // not in-memory, or unknown
+      final colIdx = mem.columns
+          .indexWhere((cd) => cd.name.toLowerCase() == memCol!.toLowerCase());
+      if (colIdx < 0) continue;
+      final keys = <Object>{};
+      for (final row in mem.rows) {
+        final v = row[colIdx];
+        if (v != null) keys.add(v);
+      }
+      result[pname] = (pagedCol: pgCol!, keys: keys);
+      return result;
+    }
+    return result;
+  }
+
+  /// Snapshot only the rows of [pt] whose `filter.pagedCol` value is
+  /// in `filter.keys`. Uses the cheapest available access path:
+  /// primary-key point lookup, secondary-index lookup, or a filtered
+  /// full scan.
+  Future<void> _populateFilteredPagedSnapshot(
+    PagedTable pt,
+    ({String pagedCol, Set<Object> keys}) filter,
+    Table tbl,
+  ) async {
+    if (filter.keys.isEmpty) return;
+    final pkName = pt.primaryKey.name.toLowerCase();
+    final colLower = filter.pagedCol.toLowerCase();
+    // Primary-key fast path.
+    if (colLower == pkName) {
+      for (final k in filter.keys) {
+        final row = await pt.get(k);
+        if (row == null) continue;
+        tbl.rows.add([for (final c in pt.columns) row[c.name]]);
+      }
+      return;
+    }
+    // Secondary-index fast path: look for a single-column index on
+    // this column.
+    String? matchIdx;
+    for (final idxName in pt.secondaryIndexNames) {
+      final cols = pt.indexColumns(idxName);
+      if (cols != null &&
+          cols.length == 1 &&
+          cols.single.toLowerCase() == colLower) {
+        matchIdx = idxName;
+        break;
+      }
+    }
+    if (matchIdx != null) {
+      for (final k in filter.keys) {
+        await for (final row in pt.indexLookup(matchIdx, [k])) {
+          tbl.rows.add([for (final c in pt.columns) row[c.name]]);
+        }
+      }
+      return;
+    }
+    // Fallback: streaming scan with residual filter.
+    await for (final row in pt.scan()) {
+      final v = row[filter.pagedCol];
+      if (v != null && filter.keys.contains(v)) {
+        tbl.rows.add([for (final c in pt.columns) row[c.name]]);
       }
     }
   }

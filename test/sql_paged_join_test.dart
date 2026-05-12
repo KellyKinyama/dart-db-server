@@ -119,4 +119,112 @@ void main() {
     await db.execute('DROP TABLE emp');
     await db.execute('CREATE TABLE emp (id INTEGER PRIMARY KEY) USING paged');
   });
+
+  // ---------------------------------------------------------------------------
+  // Equi-join pre-filter (paged side restricted to in-memory build keys).
+  // ---------------------------------------------------------------------------
+
+  test('pre-filter via primary-key lookup on paged side', () async {
+    final db = await Database.open(dbPath());
+    addTearDown(() async => db.close());
+    await db.execute(
+        'CREATE TABLE big (id INTEGER PRIMARY KEY, v TEXT) USING paged');
+    // 100 paged rows — only 3 will be relevant after the join.
+    for (var i = 1; i <= 100; i++) {
+      await db.execute("INSERT INTO big VALUES ($i, 'r$i')");
+    }
+    await db.execute('CREATE TABLE picks (k INTEGER PRIMARY KEY)');
+    await db.execute('INSERT INTO picks VALUES (7)');
+    await db.execute('INSERT INTO picks VALUES (42)');
+    await db.execute('INSERT INTO picks VALUES (99)');
+
+    final r = await db.execute('SELECT big.id, big.v FROM big '
+        'INNER JOIN picks ON big.id = picks.k ORDER BY big.id');
+    expect(r.rows, [
+      [7, 'r7'],
+      [42, 'r42'],
+      [99, 'r99'],
+    ]);
+  });
+
+  test('pre-filter via secondary-index lookup on paged side', () async {
+    final db = await Database.open(dbPath());
+    addTearDown(() async => db.close());
+    await db.execute('CREATE TABLE big '
+        '(id INTEGER PRIMARY KEY, tag TEXT) USING paged');
+    for (var i = 1; i <= 50; i++) {
+      final tag = (i % 5 == 0)
+          ? 'x'
+          : (i % 5 == 1)
+              ? 'y'
+              : 'z';
+      await db.execute("INSERT INTO big VALUES ($i, '$tag')");
+    }
+    await db.execute('CREATE INDEX big_tag ON big(tag)');
+    await db.execute('CREATE TABLE picks (k TEXT PRIMARY KEY)');
+    await db.execute("INSERT INTO picks VALUES ('x')");
+
+    final r = await db.execute('SELECT big.id FROM big '
+        'INNER JOIN picks ON big.tag = picks.k ORDER BY big.id');
+    // tag='x' fires for i in {5,10,15,...,50}.
+    expect(r.rows, [
+      for (var i = 5; i <= 50; i += 5) [i],
+    ]);
+  });
+
+  test('pre-filter via filtered scan when no index on paged column', () async {
+    final db = await Database.open(dbPath());
+    addTearDown(() async => db.close());
+    await db.execute('CREATE TABLE big '
+        '(id INTEGER PRIMARY KEY, label TEXT) USING paged');
+    for (var i = 1; i <= 20; i++) {
+      await db.execute("INSERT INTO big VALUES ($i, 'L${i % 4}')");
+    }
+    await db.execute('CREATE TABLE picks (k TEXT PRIMARY KEY)');
+    await db.execute("INSERT INTO picks VALUES ('L1')");
+    await db.execute("INSERT INTO picks VALUES ('L3')");
+
+    final r = await db.execute('SELECT big.id FROM big '
+        'INNER JOIN picks ON big.label = picks.k ORDER BY big.id');
+    // i%4==1 → 1,5,9,13,17; i%4==3 → 3,7,11,15,19.
+    expect(r.rows, [
+      for (final i in [1, 3, 5, 7, 9, 11, 13, 15, 17, 19]) [i],
+    ]);
+  });
+
+  test('pre-filter handles empty in-memory build side', () async {
+    final db = await Database.open(dbPath());
+    addTearDown(() async => db.close());
+    await db.execute('CREATE TABLE big (id INTEGER PRIMARY KEY) USING paged');
+    for (var i = 1; i <= 10; i++) {
+      await db.execute('INSERT INTO big VALUES ($i)');
+    }
+    await db.execute('CREATE TABLE picks (k INTEGER PRIMARY KEY)');
+
+    final r = await db.execute('SELECT big.id FROM big '
+        'INNER JOIN picks ON big.id = picks.k');
+    expect(r.rows, isEmpty);
+  });
+
+  test('LEFT JOIN bypasses pre-filter and keeps unmatched paged rows',
+      () async {
+    final db = await Database.open(dbPath());
+    addTearDown(() async => db.close());
+    await db.execute('CREATE TABLE big (id INTEGER PRIMARY KEY) USING paged');
+    for (var i = 1; i <= 5; i++) {
+      await db.execute('INSERT INTO big VALUES ($i)');
+    }
+    await db.execute('CREATE TABLE picks (k INTEGER PRIMARY KEY)');
+    await db.execute('INSERT INTO picks VALUES (3)');
+
+    final r = await db.execute('SELECT big.id, picks.k FROM big '
+        'LEFT JOIN picks ON big.id = picks.k ORDER BY big.id');
+    expect(r.rows, [
+      [1, null],
+      [2, null],
+      [3, 3],
+      [4, null],
+      [5, null],
+    ]);
+  });
 }
