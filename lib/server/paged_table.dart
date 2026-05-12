@@ -93,6 +93,11 @@ class PagedTable {
   final PagedHeap _heap;
   final PagedBTree _index;
 
+  /// Open secondary indexes, keyed by user-visible index name. Each
+  /// entry owns its own [PagedFile] (`<base>.idx_<name>`) and
+  /// [PagedBTree]. Empty for tables that have no secondary indexes.
+  final Map<String, _SecondaryIndex> _secondary = {};
+
   PagedTable._(
     this.basePath,
     this.columns,
@@ -102,6 +107,14 @@ class PagedTable {
     this._heap,
     this._index,
   );
+
+  /// Names of every secondary index on this table. Order is the order
+  /// they were registered.
+  List<String> get secondaryIndexNames => _secondary.keys.toList();
+
+  /// Column name that secondary index [indexName] is built on, or null
+  /// when there is no such index.
+  String? indexColumn(String indexName) => _secondary[indexName]?.column;
 
   /// Open an existing paged table from `<basePath>.meta.json`. Throws
   /// if the metadata file does not exist.
@@ -114,7 +127,7 @@ class PagedTable {
     if (meta == null) {
       throw StateError('PagedTable: no metadata at $basePath.meta.json');
     }
-    return _openWith(basePath, meta.columns, meta.pkIndex,
+    return _openWith(basePath, meta.columns, meta.pkIndex, meta.indexes,
         pageSize: pageSize, cacheCapacity: cacheCapacity);
   }
 
@@ -139,8 +152,8 @@ class PagedTable {
     }
     // Write schema first so a crash before any heap/index writes leaves
     // a recoverable empty table.
-    await _writeMeta(basePath, columns, pkIdx);
-    return _openWith(basePath, columns, pkIdx,
+    await _writeMeta(basePath, columns, pkIdx, const []);
+    return _openWith(basePath, columns, pkIdx, const [],
         pageSize: pageSize, cacheCapacity: cacheCapacity);
   }
 
@@ -155,7 +168,7 @@ class PagedTable {
   }) async {
     final meta = await _readMeta(basePath);
     if (meta != null) {
-      return _openWith(basePath, meta.columns, meta.pkIndex,
+      return _openWith(basePath, meta.columns, meta.pkIndex, meta.indexes,
           pageSize: pageSize, cacheCapacity: cacheCapacity);
     }
     return create(basePath,
@@ -168,7 +181,8 @@ class PagedTable {
   static Future<PagedTable> _openWith(
     String basePath,
     List<PagedColumn> columns,
-    int pkIdx, {
+    int pkIdx,
+    List<({String name, String column})> indexes, {
     required int pageSize,
     required int cacheCapacity,
   }) async {
@@ -188,7 +202,7 @@ class PagedTable {
     );
     final heap = await PagedHeap.open(heapFile);
     final index = await PagedBTree.open(idxFile);
-    return PagedTable._(
+    final pt = PagedTable._(
       basePath,
       columns,
       pkIdx,
@@ -197,6 +211,31 @@ class PagedTable {
       heap,
       index,
     );
+    // Re-open secondary indexes. Each one gets a small per-index
+    // cache; under heavy mixed reads the OS page cache and the
+    // primary heap cache absorb most of the cost.
+    for (final ent in indexes) {
+      final col = columns.firstWhere(
+        (c) => c.name == ent.column,
+        orElse: () => throw StateError(
+            'PagedTable: index ${ent.name} references unknown column '
+            '${ent.column}'),
+      );
+      final f = await PagedFile.open(
+        '$basePath.idx_${ent.name}',
+        pageSize: pageSize,
+        cacheCapacity: 8,
+      );
+      final b = await PagedBTree.open(f);
+      pt._secondary[ent.name] = _SecondaryIndex(
+        name: ent.name,
+        column: ent.column,
+        columnType: col.type,
+        file: f,
+        btree: b,
+      );
+    }
+    return pt;
   }
 
   /// Number of rows currently in the table.
@@ -218,6 +257,12 @@ class PagedTable {
     final rowBytes = _encodeRow(row);
     final rowId = await _heap.insert(rowBytes);
     await _index.put(pkBytes, rowId);
+    // Maintain every secondary index.
+    for (final si in _secondary.values) {
+      final v = row[si.column];
+      if (v == null) continue; // NULL values aren't indexed (SQL-ish)
+      await si.btree.put(_encodeSecondaryKey(v, si.columnType, pkBytes), rowId);
+    }
   }
 
   /// Look up a row by primary key. Returns null if absent.
@@ -248,6 +293,27 @@ class PagedTable {
       throw ArgumentError(
           'PagedTable.update: cannot rewrite primary key (delete + insert instead)');
     }
+    // Refresh secondary-index entries: read the old row, compare each
+    // indexed column, and only rewrite the ones whose value changed.
+    if (_secondary.isNotEmpty) {
+      final oldBytes = await _heap.get(rowId);
+      if (oldBytes != null) {
+        final oldRow = _decodeRow(oldBytes);
+        for (final si in _secondary.values) {
+          final oldV = oldRow[si.column];
+          final newV = row[si.column];
+          if (_valuesEqual(oldV, newV)) continue;
+          if (oldV != null) {
+            await si.btree
+                .remove(_encodeSecondaryKey(oldV, si.columnType, pkBytes));
+          }
+          if (newV != null) {
+            await si.btree
+                .put(_encodeSecondaryKey(newV, si.columnType, pkBytes), rowId);
+          }
+        }
+      }
+    }
     final rowBytes = _encodeRow(row);
     await _heap.update(rowId, rowBytes);
   }
@@ -257,6 +323,17 @@ class PagedTable {
     final pkBytes = _encodePrimaryKey(pkVal);
     final rowId = await _index.get(pkBytes);
     if (rowId == null) return false;
+    if (_secondary.isNotEmpty) {
+      final oldBytes = await _heap.get(rowId);
+      if (oldBytes != null) {
+        final oldRow = _decodeRow(oldBytes);
+        for (final si in _secondary.values) {
+          final v = oldRow[si.column];
+          if (v == null) continue;
+          await si.btree.remove(_encodeSecondaryKey(v, si.columnType, pkBytes));
+        }
+      }
+    }
     await _heap.delete(rowId);
     await _index.remove(pkBytes);
     return true;
@@ -297,20 +374,142 @@ class PagedTable {
   Future<void> commit() async {
     await _heap.commit();
     await _index.commit();
+    for (final si in _secondary.values) {
+      await si.btree.commit();
+    }
   }
 
   /// Close both backing files. Implicitly commits.
   Future<void> close() async {
     await _heapFile.close();
     await _idxFile.close();
+    for (final si in _secondary.values) {
+      await si.file.close();
+    }
+    _secondary.clear();
   }
+
+  // ---------------------------------------------------------------------------
+  // Secondary indexes (equality lookup)
+  // ---------------------------------------------------------------------------
+
+  /// Build a new secondary index [name] over column [columnName]. Walks
+  /// every existing row, populates the index, commits everything, and
+  /// rewrites `meta.json` so the index survives reopen. Throws when
+  /// [name] is already taken or [columnName] is unknown.
+  ///
+  /// Index names must match `^[A-Za-z0-9_]+$` so they can become a
+  /// safe filename suffix (`<base>.idx_<name>`).
+  Future<void> createIndex(String name, String columnName) async {
+    if (!RegExp(r'^[A-Za-z0-9_]+$').hasMatch(name)) {
+      throw ArgumentError.value(
+          name, 'name', 'index name must match [A-Za-z0-9_]+');
+    }
+    if (_secondary.containsKey(name)) {
+      throw StateError('PagedTable: index $name already exists');
+    }
+    final col = columns.firstWhere(
+      (c) => c.name == columnName,
+      orElse: () =>
+          throw ArgumentError.value(columnName, 'columnName', 'no such column'),
+    );
+    if (columnName == primaryKey.name) {
+      throw ArgumentError(
+          'PagedTable: column $columnName is already the primary key');
+    }
+    final f = await PagedFile.open(
+      '$basePath.idx_$name',
+      pageSize: _heapFile.pageSize,
+      cacheCapacity: 8,
+    );
+    final b = await PagedBTree.open(f);
+    final si = _SecondaryIndex(
+      name: name,
+      column: columnName,
+      columnType: col.type,
+      file: f,
+      btree: b,
+    );
+    // Backfill: walk every existing row through the primary index and
+    // populate the new tree. Skip NULLs.
+    await for (final entry in _index.scan()) {
+      final bytes = await _heap.get(entry.value);
+      if (bytes == null) continue;
+      final row = _decodeRow(bytes);
+      final v = row[columnName];
+      if (v == null) continue;
+      // entry.key is the encoded PK bytes for this row.
+      await b.put(_encodeSecondaryKey(v, col.type, entry.key), entry.value);
+    }
+    await b.commit();
+    _secondary[name] = si;
+    // Persist the schema change *after* the backfilled index is on disk;
+    // a crash before this point leaves an orphan file the next open will
+    // ignore (since meta.json doesn't list it).
+    await _writeMeta(basePath, columns, primaryKeyIndex, _indexDescriptors());
+  }
+
+  /// Drop secondary index [name]. Removes the on-disk files and
+  /// rewrites `meta.json`. Idempotent — returns false if the index
+  /// didn't exist.
+  Future<bool> dropIndex(String name) async {
+    final si = _secondary.remove(name);
+    if (si == null) return false;
+    await si.file.close();
+    // Persist schema first so a crash mid-delete still removes the
+    // index from the next opener's view.
+    await _writeMeta(basePath, columns, primaryKeyIndex, _indexDescriptors());
+    for (final ext in const ['', '.journal']) {
+      final f = File('$basePath.idx_$name$ext');
+      if (await f.exists()) {
+        try {
+          await f.delete();
+        } catch (_) {/* best-effort */}
+      }
+    }
+    return true;
+  }
+
+  /// Stream every row whose [columnName] value (under index [indexName])
+  /// equals [value]. Yields rows in the order the index stores them
+  /// (effectively unordered for the caller's purposes — currently sorts
+  /// by primary key within a single value bucket).
+  ///
+  /// Returns an empty stream when no such index exists, when [value] is
+  /// null (NULLs aren't indexed), or when no rows match.
+  Stream<Map<String, Object?>> indexLookup(
+      String indexName, Object? value) async* {
+    if (value == null) return;
+    final si = _secondary[indexName];
+    if (si == null) return;
+    final prefix = _encodeIndexValue(value, si.columnType);
+    final upper = _bumpPrefix(prefix);
+    await for (final entry in si.btree.range(
+      lower: prefix,
+      lowerInclusive: true,
+      upper: upper,
+      upperInclusive: false,
+    )) {
+      final bytes = await _heap.get(entry.value);
+      if (bytes == null) continue;
+      yield _decodeRow(bytes);
+    }
+  }
+
+  List<({String name, String column})> _indexDescriptors() => [
+        for (final si in _secondary.values) (name: si.name, column: si.column),
+      ];
 
   // ---------------------------------------------------------------------------
   // Metadata
   // ---------------------------------------------------------------------------
 
-  static Future<({List<PagedColumn> columns, int pkIndex})?> _readMeta(
-      String basePath) async {
+  static Future<
+      ({
+        List<PagedColumn> columns,
+        int pkIndex,
+        List<({String name, String column})> indexes,
+      })?> _readMeta(String basePath) async {
     final f = File('$basePath.meta.json');
     if (!await f.exists()) return null;
     final j = jsonDecode(await f.readAsString()) as Map<String, Object?>;
@@ -319,15 +518,28 @@ class PagedTable {
         .map(PagedColumn.fromJson)
         .toList();
     final pkIdx = (j['pkIndex'] as num).toInt();
-    return (columns: cols, pkIndex: pkIdx);
+    final rawIdx = j['indexes'];
+    final indexes = <({String name, String column})>[];
+    if (rawIdx is List) {
+      for (final raw in rawIdx) {
+        if (raw is Map) {
+          indexes.add(
+              (name: raw['name'] as String, column: raw['column'] as String));
+        }
+      }
+    }
+    return (columns: cols, pkIndex: pkIdx, indexes: indexes);
   }
 
-  static Future<void> _writeMeta(
-      String basePath, List<PagedColumn> columns, int pkIndex) async {
+  static Future<void> _writeMeta(String basePath, List<PagedColumn> columns,
+      int pkIndex, List<({String name, String column})> indexes) async {
     final j = jsonEncode({
       'version': 1,
       'columns': [for (final c in columns) c.toJson()],
       'pkIndex': pkIndex,
+      'indexes': [
+        for (final ent in indexes) {'name': ent.name, 'column': ent.column},
+      ],
     });
     final dest = '$basePath.meta.json';
     final tmp = '$dest.tmp';
@@ -496,4 +708,119 @@ class PagedTable {
     }
     return a.length - b.length;
   }
+
+  // ---------------------------------------------------------------------------
+  // Secondary-index codec — equality-only.
+  //
+  // A secondary key is `[u32 valLen][valBytes][pkBytes]`. The length
+  // prefix groups by length first, then by raw value bytes within a
+  // length, then by primary key for disambiguation. This is NOT a
+  // byte-wise-order-preserving encoding across different value
+  // lengths, so we expose only equality lookups (no `WHERE col < 'x'`
+  // index ranges). A point lookup translates to a prefix range:
+  //   lower = `[len][val]`  (inclusive)
+  //   upper = bumpPrefix(lower)  (exclusive)
+  // which captures exactly the keys whose value half equals `val`.
+  // ---------------------------------------------------------------------------
+
+  /// Encode just the value part of a secondary index key. Length-prefixed
+  /// so that two different-length values can never share a common
+  /// prefix and confuse the range-bound trick used by [indexLookup].
+  static Uint8List _encodeIndexValue(Object value, PagedColumnType type) {
+    final raw = _encodeValueOnly(value, type);
+    final out = Uint8List(4 + raw.length);
+    final bd = ByteData.view(out.buffer);
+    bd.setUint32(0, raw.length, Endian.big);
+    out.setRange(4, 4 + raw.length, raw);
+    return out;
+  }
+
+  /// Composite secondary-index key: value prefix + already-encoded PK
+  /// bytes. The PK suffix disambiguates duplicates so PagedBTree (which
+  /// rejects duplicate keys) can index a non-unique column.
+  static Uint8List _encodeSecondaryKey(
+      Object value, PagedColumnType type, Uint8List pkBytes) {
+    final prefix = _encodeIndexValue(value, type);
+    final out = Uint8List(prefix.length + pkBytes.length);
+    out.setRange(0, prefix.length, prefix);
+    out.setRange(prefix.length, out.length, pkBytes);
+    return out;
+  }
+
+  /// Raw value bytes for a single column value, without length prefix
+  /// or type tag. Used by the secondary-index codec.
+  static Uint8List _encodeValueOnly(Object value, PagedColumnType type) {
+    switch (type) {
+      case PagedColumnType.intType:
+        final n = (value as num).toInt();
+        final flipped = n ^ 0x8000000000000000;
+        final bd = ByteData(8)..setUint64(0, flipped, Endian.big);
+        return bd.buffer.asUint8List();
+      case PagedColumnType.realType:
+        final d = (value as num).toDouble();
+        final bd = ByteData(8)..setFloat64(0, d, Endian.big);
+        var bits = bd.getUint64(0, Endian.big);
+        if ((bits & 0x8000000000000000) != 0) {
+          bits = ~bits & 0xFFFFFFFFFFFFFFFF;
+        } else {
+          bits ^= 0x8000000000000000;
+        }
+        final out = ByteData(8)..setUint64(0, bits, Endian.big);
+        return out.buffer.asUint8List();
+      case PagedColumnType.textType:
+        return Uint8List.fromList(utf8.encode(value as String));
+      case PagedColumnType.blobType:
+        return Uint8List.fromList(value as List<int>);
+      case PagedColumnType.boolType:
+        return Uint8List.fromList([(value == true || value == 1) ? 1 : 0]);
+    }
+  }
+
+  /// Smallest byte sequence that's strictly greater than [p] and shares
+  /// no prefix with it: increment the last non-`0xFF` byte and drop
+  /// everything after it. Returns null when every byte is 0xFF (no
+  /// upper bound exists in the 256-symbol alphabet).
+  static Uint8List? _bumpPrefix(Uint8List p) {
+    for (var i = p.length - 1; i >= 0; i--) {
+      if (p[i] != 0xFF) {
+        final out = Uint8List(i + 1);
+        out.setRange(0, i + 1, p);
+        out[i]++;
+        return out;
+      }
+    }
+    return null;
+  }
+
+  /// SQL-ish value equality used to decide whether a secondary-index
+  /// entry needs to be rewritten on UPDATE. Mirrors Dart's `==` for the
+  /// concrete types we store, treating two nulls as equal.
+  static bool _valuesEqual(Object? a, Object? b) {
+    if (identical(a, b)) return true;
+    if (a == null || b == null) return false;
+    if (a is List<int> && b is List<int>) {
+      if (a.length != b.length) return false;
+      for (var i = 0; i < a.length; i++) {
+        if (a[i] != b[i]) return false;
+      }
+      return true;
+    }
+    return a == b;
+  }
+}
+
+/// Runtime state for one open secondary index.
+class _SecondaryIndex {
+  final String name;
+  final String column;
+  final PagedColumnType columnType;
+  final PagedFile file;
+  final PagedBTree btree;
+  _SecondaryIndex({
+    required this.name,
+    required this.column,
+    required this.columnType,
+    required this.file,
+    required this.btree,
+  });
 }

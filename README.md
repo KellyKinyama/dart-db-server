@@ -158,9 +158,15 @@ implemented:
   `LIMIT` / `OFFSET`; `COUNT(*)`; scalar projection expressions
   (`SELECT id + 1, upper(name) FROM t`); bulk UPDATE / DELETE under
   the same predicates; `DROP TABLE`, `TRUNCATE TABLE`, and `DESCRIBE`.
-  Joins, `GROUP BY`, secondary indexes, non-COUNT aggregates,
-  `RETURNING`, `INSERT … SELECT`, primary-key reassignment, and
-  triggers all raise `UnsupportedError`. The lower-level `PagedTable`
+  Single-column secondary indexes are supported via
+  `CREATE INDEX idx ON t(col)` / `DROP INDEX idx`; equality predicates
+  on indexed columns (`WHERE col = literal`) are routed through the
+  index instead of a full scan, and any remaining residual conjuncts
+  are still re-applied per row. `UNIQUE`, composite, expression, and
+  partial indexes on paged tables raise `UnsupportedError`.
+  Joins, `GROUP BY`, range queries on indexed non-PK columns,
+  non-COUNT aggregates, `RETURNING`, `INSERT … SELECT`, primary-key
+  reassignment, and triggers all raise `UnsupportedError`. The lower-level `PagedTable`
   API in `lib/server/paged_table.dart` exposes the full primitives
   directly.
 - **SQLite wire protocol**: clients speak this engine's JSON line protocol,

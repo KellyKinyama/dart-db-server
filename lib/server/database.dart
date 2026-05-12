@@ -94,6 +94,11 @@ class Database {
   /// in [_executePagedStmt] rather than the in-memory dispatch path.
   final Map<String, PagedTable> _pagedTables = {};
 
+  /// Maps a paged secondary-index name back to the table it lives on,
+  /// so `DROP INDEX <name>` can route to the right [PagedTable]. The
+  /// index name is the user-visible name from `CREATE INDEX`.
+  final Map<String, String> _pagedIndexOwners = {};
+
   /// Directory where each paged table's `.heap` / `.idx` / `.meta.json`
   /// sidecar files live. Derived from [path] (e.g. `mydb.json` →
   /// `mydb.paged/`). `null` for in-memory databases — those refuse
@@ -455,6 +460,11 @@ class Database {
       try {
         final pt = await PagedTable.open(base);
         _pagedTables[tableName] = pt;
+        // Re-register every secondary index this table owns so
+        // `DROP INDEX <name>` can route to the right paged table.
+        for (final idxName in pt.secondaryIndexNames) {
+          _pagedIndexOwners[idxName] = tableName;
+        }
       } catch (e) {
         // Don't take the whole DB down for one corrupt sidecar — but do
         // surface it so the operator notices.
@@ -779,6 +789,21 @@ class Database {
     if (stmt is CreateTableStmt && stmt.usingPaged) {
       return _createPagedTable(stmt);
     }
+    // CREATE INDEX may target a paged table; we look up by table name.
+    if (stmt is CreateIndexStmt) {
+      final pt = _pagedTables[stmt.table];
+      if (pt != null) return _pagedCreateIndex(stmt, pt);
+      return null;
+    }
+    // DROP INDEX routes through the registered-owner map.
+    if (stmt is DropIndexStmt) {
+      final ownerTable = _pagedIndexOwners[stmt.indexName];
+      if (ownerTable != null) {
+        final pt = _pagedTables[ownerTable];
+        if (pt != null) return _pagedDropIndex(stmt, pt);
+      }
+      return null;
+    }
     final tname = _statementTable(stmt);
     if (tname == null) return null;
     final pt = _pagedTables[tname];
@@ -803,6 +828,45 @@ class Database {
         '"$tname". Paged tables currently support: INSERT, SELECT (full '
         'scan or WHERE pk = literal), UPDATE/DELETE WHERE pk = literal, '
         'DROP TABLE, TRUNCATE TABLE, DESCRIBE.');
+  }
+
+  Future<QueryResult> _pagedCreateIndex(
+      CreateIndexStmt s, PagedTable pt) async {
+    if (s.unique) {
+      throw UnsupportedError(
+          'CREATE UNIQUE INDEX on paged table ${s.table}: unique '
+          'constraints on secondary indexes are not supported.');
+    }
+    if (s.exprSql != null) {
+      throw UnsupportedError(
+          'CREATE INDEX on paged table ${s.table}: expression indexes '
+          'are not supported.');
+    }
+    if (s.whereSql != null) {
+      throw UnsupportedError(
+          'CREATE INDEX on paged table ${s.table}: partial indexes are '
+          'not supported.');
+    }
+    if (s.columns.length != 1) {
+      throw UnsupportedError(
+          'CREATE INDEX on paged table ${s.table}: composite indexes '
+          'are not supported (got ${s.columns.length} columns).');
+    }
+    if (_pagedIndexOwners.containsKey(s.indexName)) {
+      throw StateError('Index ${s.indexName} already exists on paged table '
+          '${_pagedIndexOwners[s.indexName]}');
+    }
+    await pt.createIndex(s.indexName, s.column);
+    _pagedIndexOwners[s.indexName] = s.table;
+    return QueryResult.message(
+        'index ${s.indexName} created on ${s.table}(${s.column})');
+  }
+
+  Future<QueryResult> _pagedDropIndex(DropIndexStmt s, PagedTable pt) async {
+    final dropped = await pt.dropIndex(s.indexName);
+    if (dropped) _pagedIndexOwners.remove(s.indexName);
+    return QueryResult.message(
+        dropped ? 'index ${s.indexName} dropped' : 'no such index');
   }
 
   /// Map a SQL [DataType] to the PagedTable column-type enum.
@@ -884,18 +948,24 @@ class Database {
   }
 
   Future<QueryResult> _pagedDrop(DropTableStmt s, PagedTable pt) async {
+    final secNames = List<String>.from(pt.secondaryIndexNames);
     await pt.commit();
     await pt.close();
     _pagedTables.remove(s.name);
+    for (final n in secNames) {
+      _pagedIndexOwners.remove(n);
+    }
     final base = '${_pagedDir!}/${s.name}';
-    for (final ext in const [
+    final extras = <String>[
       '.heap',
       '.heap.journal',
       '.idx',
       '.idx.journal',
       '.meta.json',
       '.meta.json.tmp',
-    ]) {
+      for (final n in secNames) ...['.idx_$n', '.idx_$n.journal'],
+    ];
+    for (final ext in extras) {
       final f = File('$base$ext');
       if (await f.exists()) {
         try {
@@ -910,21 +980,28 @@ class Database {
     // No bulk-truncate primitive yet — drop and re-create with the same
     // schema. Callers see this as a single statement; if the process
     // crashes between the two halves the meta.json deletion is the
-    // commit point so a retry works.
+    // commit point so a retry works. Secondary indexes are NOT carried
+    // across truncate — equivalent to DROP+CREATE.
     final cols = pt.columns;
     final pkName = cols[pt.primaryKeyIndex].name;
+    final secNames = List<String>.from(pt.secondaryIndexNames);
     await pt.commit();
     await pt.close();
     _pagedTables.remove(s.name);
+    for (final n in secNames) {
+      _pagedIndexOwners.remove(n);
+    }
     final base = '${_pagedDir!}/${s.name}';
-    for (final ext in const [
+    final extras = <String>[
       '.heap',
       '.heap.journal',
       '.idx',
       '.idx.journal',
       '.meta.json',
       '.meta.json.tmp',
-    ]) {
+      for (final n in secNames) ...['.idx_$n', '.idx_$n.journal'],
+    ];
+    for (final ext in extras) {
       final f = File('$base$ext');
       if (await f.exists()) {
         try {
@@ -1157,6 +1234,12 @@ class Database {
   /// [_PagedRange.residual] is set, each streamed row is also fed
   /// through `residual.eval(row)` and dropped unless the result is
   /// truthy. Mirrors SQL NULL-as-false semantics.
+  ///
+  /// When the residual contains an `indexed_col = literal` conjunct
+  /// AND no PK bounds were given, we route the candidate stream
+  /// through `PagedTable.indexLookup` instead of a full table scan.
+  /// The residual still runs on every yielded row, so any remaining
+  /// conjuncts (`age > 25` etc.) keep filtering correctly.
   Stream<Map<String, Object?>> _pagedRangeStream(
       PagedTable pt, _PagedRange r) async* {
     if (r.contradiction) return;
@@ -1173,6 +1256,16 @@ class Database {
       if (row != null && passes(row)) yield row;
       return;
     }
+    // No PK predicate: see if we can route through a secondary index.
+    if (r.lower == null && r.upper == null && residual != null) {
+      final hit = _findIndexedEquality(pt, residual);
+      if (hit != null) {
+        await for (final row in pt.indexLookup(hit.indexName, hit.value)) {
+          if (passes(row)) yield row;
+        }
+        return;
+      }
+    }
     if (r.lower == null && r.upper == null) {
       await for (final row in pt.scan()) {
         if (passes(row)) yield row;
@@ -1187,6 +1280,47 @@ class Database {
     )) {
       if (passes(row)) yield row;
     }
+  }
+
+  /// Walk the residual AND-tree looking for `indexed_col = literal`.
+  /// Returns the first hit (which index to use, and the literal to
+  /// probe with). The original residual is left intact and re-applied
+  /// per-row by the caller — index lookup is a *candidate-narrowing*
+  /// optimisation, not a substitution.
+  ({String indexName, Object value})? _findIndexedEquality(
+      PagedTable pt, Expr e) {
+    if (e is BinaryExpr && e.op == 'AND') {
+      return _findIndexedEquality(pt, e.left) ??
+          _findIndexedEquality(pt, e.right);
+    }
+    if (e is BinaryExpr && e.op == '=') {
+      ColumnExpr? col;
+      Expr? lit;
+      if (e.left is ColumnExpr) {
+        col = e.left as ColumnExpr;
+        lit = e.right;
+      } else if (e.right is ColumnExpr) {
+        col = e.right as ColumnExpr;
+        lit = e.left;
+      }
+      if (col != null && lit != null) {
+        Object? v;
+        try {
+          v = lit.eval(const <String, Object?>{});
+        } catch (_) {
+          return null;
+        }
+        if (v == null) return null;
+        // Find an index on this column. First match wins.
+        for (final name in pt.secondaryIndexNames) {
+          final ic = pt.indexColumn(name);
+          if (ic != null && ic.toLowerCase() == col.name.toLowerCase()) {
+            return (indexName: name, value: v);
+          }
+        }
+      }
+    }
+    return null;
   }
 
   Future<QueryResult> _pagedInsert(InsertStmt s, PagedTable pt) async {
