@@ -1515,17 +1515,221 @@ class Database {
     return QueryResult(affected: affected, message: '$affected row(s)');
   }
 
+  /// Aggregate / GROUP BY path for `USING paged` SELECTs. Materialises
+  /// every matched row into memory (the only place we deliberately do
+  /// so on paged tables, since aggregation needs random access by
+  /// group), then groups, computes aggregates, applies HAVING, ORDER
+  /// BY and LIMIT/OFFSET.
+  ///
+  /// Supports COUNT / SUM / AVG / MIN / MAX / TOTAL / GROUP_CONCAT /
+  /// STRING_AGG including DISTINCT and FILTER variants — same coverage
+  /// as the in-memory executor's [_aggregateValue].
+  Future<QueryResult> _pagedAggregateSelect(SelectStmt s, PagedTable pt) async {
+    final pkName = pt.columns[pt.primaryKeyIndex].name;
+
+    for (final p in s.projection) {
+      if (p.isStar) {
+        throw UnsupportedError(
+            'SELECT on paged table ${s.fromTable}: SELECT * with '
+            'GROUP BY / aggregates is not supported.');
+      }
+    }
+
+    // Buffer all matched rows. Aggregation needs to revisit rows
+    // per-group, so streaming isn't enough.
+    final range = _pagedExtractPkRange(
+        s.where, pkName, 'SELECT on paged table ${s.fromTable}');
+    final rows = <Map<String, Object?>>[];
+    await for (final row in _pagedRangeStream(pt, range)) {
+      rows.add(row);
+    }
+
+    // Build group key per row. Empty GROUP BY = single global group.
+    final groupExprs = s.groupBy;
+    final groups = <String, List<Map<String, Object?>>>{};
+    final groupOrder = <String>[];
+    if (groupExprs.isEmpty) {
+      groups[''] = rows;
+      groupOrder.add('');
+    } else {
+      for (final row in rows) {
+        final keyVals = <Object?>[
+          for (final ge in groupExprs) ge.eval(row),
+        ];
+        final keyStr = jsonEncode(keyVals);
+        groups.putIfAbsent(keyStr, () {
+          groupOrder.add(keyStr);
+          return <Map<String, Object?>>[];
+        }).add(row);
+      }
+    }
+
+    // Evaluator that recognises aggregate-function calls inside an
+    // expression tree and routes them through [_aggregateValue], while
+    // ordinary column refs / literals / non-aggregate functions are
+    // evaluated against [sample] (the first row of the group).
+    Object? evalInGroup(
+        Expr e, List<Map<String, Object?>> grp, Map<String, Object?> sample) {
+      if (e is FunctionCallExpr && e.isAggregate) {
+        return _aggregateValue(e, grp);
+      }
+      if (e is BinaryExpr) {
+        final l = evalInGroup(e.left, grp, sample);
+        final r = evalInGroup(e.right, grp, sample);
+        return BinaryExpr(e.op, LiteralExpr(l), LiteralExpr(r)).eval(const {});
+      }
+      if (e is UnaryExpr) {
+        final v = evalInGroup(e.operand, grp, sample);
+        return UnaryExpr(e.op, LiteralExpr(v)).eval(const {});
+      }
+      if (e is FunctionCallExpr) {
+        final args = [
+          for (final a in e.args) LiteralExpr(evalInGroup(a, grp, sample)),
+        ];
+        return FunctionCallExpr(e.name, args).eval(const {});
+      }
+      return e.eval(sample);
+    }
+
+    final outCols = <String>[
+      for (final p in s.projection) p.alias ?? _exprLabel(p.expr!),
+    ];
+
+    // Build per-group output rows, applying HAVING.
+    final survivors = <({
+      List<Object?> outRow,
+      List<Map<String, Object?>> grp,
+      Map<String, Object?> sample,
+    })>[];
+    final having = s.having;
+    for (final keyStr in groupOrder) {
+      final grp = groups[keyStr]!;
+      final sample = grp.isEmpty ? <String, Object?>{} : grp.first;
+      if (having != null) {
+        final v = evalInGroup(having, grp, sample);
+        if (v != true) continue;
+      }
+      final outRow = <Object?>[
+        for (final p in s.projection) evalInGroup(p.expr!, grp, sample),
+      ];
+      survivors.add((outRow: outRow, grp: grp, sample: sample));
+    }
+
+    // ORDER BY: evaluate each ORDER BY expression per-group. Column
+    // references to projection aliases (e.g. `ORDER BY total` where
+    // `SUM(salary) AS total` is in the projection) are resolved to
+    // the original projection expression so aggregates work.
+    if (s.orderBy.isNotEmpty) {
+      final aliasMap = <String, Expr>{
+        for (final p in s.projection)
+          if (p.alias != null) p.alias!.toLowerCase(): p.expr!,
+      };
+      Expr resolveAlias(Expr e) {
+        if (e is ColumnExpr) {
+          final hit = aliasMap[e.name.toLowerCase()];
+          if (hit != null) return hit;
+        }
+        return e;
+      }
+
+      survivors.sort((a, b) {
+        for (final ob in s.orderBy) {
+          final expr = resolveAlias(ob.expr);
+          final av = evalInGroup(expr, a.grp, a.sample);
+          final bv = evalInGroup(expr, b.grp, b.sample);
+          int c;
+          if (av == null && bv == null) {
+            c = 0;
+          } else if (av == null) {
+            c = -1;
+          } else if (bv == null) {
+            c = 1;
+          } else {
+            c = _compareLiteral(av, bv);
+          }
+          if (c != 0) return ob.descending ? -c : c;
+        }
+        return 0;
+      });
+    }
+
+    final offset = (s.offset ?? 0) < 0 ? 0 : (s.offset ?? 0);
+    final limit = s.limit;
+    final unlimited = limit == null || limit < 0;
+    final start = offset.clamp(0, survivors.length);
+    final end = unlimited
+        ? survivors.length
+        : (start + limit).clamp(0, survivors.length);
+    return QueryResult(
+      columns: outCols,
+      rows: [for (var i = start; i < end; i++) survivors[i].outRow],
+    );
+  }
+
   Future<QueryResult> _pagedSelect(SelectStmt s, PagedTable pt) async {
     if (s.fromSubquery != null ||
         s.joins.isNotEmpty ||
-        s.groupBy.isNotEmpty ||
-        s.having != null ||
         s.setOp != null ||
         s.distinct ||
         s.fromFunction != null) {
       throw UnsupportedError(
-          'SELECT on paged table ${s.fromTable}: joins, GROUP BY, '
-          'HAVING, DISTINCT and set ops are not supported.');
+          'SELECT on paged table ${s.fromTable}: joins, DISTINCT and '
+          'set ops are not supported.');
+    }
+    // Detect aggregation: any aggregate function call in the
+    // projection, in HAVING, in ORDER BY, or any explicit GROUP BY.
+    bool isAggregate(Expr? e) {
+      if (e == null) return false;
+      var found = false;
+      void walk(Expr x) {
+        if (found) return;
+        if (x is FunctionCallExpr && x.isAggregate) {
+          found = true;
+          return;
+        }
+        if (x is BinaryExpr) {
+          walk(x.left);
+          walk(x.right);
+        } else if (x is UnaryExpr) {
+          walk(x.operand);
+        } else if (x is FunctionCallExpr) {
+          for (final a in x.args) {
+            walk(a);
+          }
+        }
+      }
+
+      walk(e);
+      return found;
+    }
+
+    final hasAggregates = s.groupBy.isNotEmpty ||
+        s.having != null ||
+        s.projection.any((p) => p.expr != null && isAggregate(p.expr)) ||
+        s.orderBy.any((o) => isAggregate(o.expr));
+    // Fast path: bare `SELECT COUNT(*) FROM t [WHERE …]` with no
+    // GROUP BY / HAVING — count without materialising rows.
+    bool isBareCountStar = false;
+    String bareCountAlias = 'count(*)';
+    if (hasAggregates &&
+        s.groupBy.isEmpty &&
+        s.having == null &&
+        s.orderBy.isEmpty &&
+        s.projection.length == 1) {
+      final p = s.projection.single;
+      final e = p.expr;
+      if (e is FunctionCallExpr &&
+          e.name.toUpperCase() == 'COUNT' &&
+          e.isStarArg &&
+          !e.distinct &&
+          e.window == null &&
+          e.filterExpr == null) {
+        isBareCountStar = true;
+        if (p.alias != null) bareCountAlias = p.alias!;
+      }
+    }
+    if (hasAggregates && !isBareCountStar) {
+      return _pagedAggregateSelect(s, pt);
     }
     final colNames = pt.columns.map((c) => c.name).toList();
     final pkName = pt.columns[pt.primaryKeyIndex].name;
@@ -1556,22 +1760,11 @@ class Database {
       descending = ob.descending;
     }
 
-    // Detect COUNT(*) sole-projection.
-    bool isCountStar = false;
-    String countAlias = 'count(*)';
-    if (s.projection.length == 1) {
-      final p = s.projection.single;
-      final e = p.expr;
-      if (e is FunctionCallExpr &&
-          e.name.toUpperCase() == 'COUNT' &&
-          e.isStarArg &&
-          !e.distinct &&
-          e.window == null &&
-          e.filterExpr == null) {
-        isCountStar = true;
-        if (p.alias != null) countAlias = p.alias!;
-      }
-    }
+    // Detect COUNT(*) sole-projection (the bare fast path we set up
+    // above). When [isBareCountStar] is true we skip projection setup
+    // since the only output is the integer count.
+    final isCountStar = isBareCountStar;
+    final countAlias = bareCountAlias;
 
     // Normal projection. Supports:
     //   * `*` (all columns)

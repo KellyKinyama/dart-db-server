@@ -177,21 +177,19 @@ void main() {
     ]);
   });
 
-  test('aggregates other than COUNT(*) are still rejected', () async {
+  test('SUM / AVG / MAX aggregates are supported (step 11)', () async {
     final db = await seeded();
     addTearDown(() async => db.close());
 
-    await expectLater(
-      db.execute('SELECT SUM(age) FROM t'),
-      throwsA(isA<UnsupportedError>()),
-    );
-    await expectLater(
-      db.execute('SELECT AVG(age) FROM t'),
-      throwsA(isA<UnsupportedError>()),
-    );
-    await expectLater(
-      db.execute('SELECT MAX(age) FROM t'),
-      throwsA(isA<UnsupportedError>()),
-    );
+    // Seed data: ages 30, 25, 40, 25, 30 -> sum=150, avg=30, max=40.
+    expect((await db.execute('SELECT SUM(age) FROM t')).rows, [
+      [150],
+    ]);
+    expect((await db.execute('SELECT AVG(age) FROM t')).rows, [
+      [30.0],
+    ]);
+    expect((await db.execute('SELECT MAX(age) FROM t')).rows, [
+      [40],
+    ]);
   });
 }
