@@ -1786,11 +1786,6 @@ class Database {
   }
 
   Future<QueryResult> _pagedInsert(InsertStmt s, PagedTable pt) async {
-    if (s.mode != InsertMode.normal) {
-      throw UnsupportedError(
-          'INSERT OR ${s.mode.name.toUpperCase()} is not supported on '
-          'paged table ${s.table}.');
-    }
     if (s.onConflict != null) {
       throw UnsupportedError(
           'INSERT … ON CONFLICT is not supported on paged table '
@@ -1852,10 +1847,32 @@ class Database {
         map[colNames[i]] =
             _evalLiteral(r[i], 'INSERT into paged table ${s.table}');
       }
-      await pt.insert(map);
-      affected++;
-      if (returningExprs.isNotEmpty) {
-        returnedRows.add([for (final e in returningExprs) e.eval(map)]);
+      switch (s.mode) {
+        case InsertMode.normal:
+          await pt.insert(map);
+          affected++;
+          if (returningExprs.isNotEmpty) {
+            returnedRows.add([for (final e in returningExprs) e.eval(map)]);
+          }
+        case InsertMode.orIgnore:
+          // Silently skip rows that would conflict with PK or a
+          // UNIQUE index. SQLite excludes ignored rows from the
+          // affected count and from RETURNING.
+          final inserted = await pt.insertOrIgnore(map);
+          if (inserted) {
+            affected++;
+            if (returningExprs.isNotEmpty) {
+              returnedRows.add([for (final e in returningExprs) e.eval(map)]);
+            }
+          }
+        case InsertMode.orReplace:
+          // Delete every conflicting row, then insert. SQLite counts
+          // only the inserted row in `changes()`, so we do the same.
+          await pt.insertOrReplace(map);
+          affected++;
+          if (returningExprs.isNotEmpty) {
+            returnedRows.add([for (final e in returningExprs) e.eval(map)]);
+          }
       }
     }
     if (inTransaction) {

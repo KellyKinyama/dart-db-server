@@ -289,6 +289,78 @@ class PagedTable {
     }
   }
 
+  /// SQLite `INSERT OR IGNORE`: if the row would conflict with the
+  /// PK or any UNIQUE secondary index, skip the insert and return
+  /// `false`. Returns `true` if the row was inserted.
+  Future<bool> insertOrIgnore(Map<String, Object?> row) async {
+    final pkVal = row[primaryKey.name];
+    if (pkVal == null) {
+      throw ArgumentError(
+          'PagedTable.insertOrIgnore: primary-key value is null');
+    }
+    final pkBytes = _encodePrimaryKey(pkVal);
+    if ((await _index.get(pkBytes)) != null) return false;
+    for (final si in _secondary.values) {
+      if (!si.unique) continue;
+      final prefix = _encodeSecondaryPrefix(si, row);
+      if (prefix == null) continue;
+      if (await _uniqueConflict(si, prefix, null)) return false;
+    }
+    final rowBytes = _encodeRow(row);
+    final rowId = await _heap.insert(rowBytes);
+    await _index.put(pkBytes, rowId);
+    for (final si in _secondary.values) {
+      final key = _encodeSecondaryKey(si, row, pkBytes);
+      if (key == null) continue;
+      await si.btree.put(key, rowId);
+    }
+    return true;
+  }
+
+  /// SQLite `INSERT OR REPLACE`: delete every existing row that would
+  /// conflict (PK match or any UNIQUE-index match), then insert the
+  /// new row. Returns the number of rows deleted in service of the
+  /// insert (0 when no conflict existed).
+  Future<int> insertOrReplace(Map<String, Object?> row) async {
+    final pkVal = row[primaryKey.name];
+    if (pkVal == null) {
+      throw ArgumentError(
+          'PagedTable.insertOrReplace: primary-key value is null');
+    }
+    final pkBytes = _encodePrimaryKey(pkVal);
+    // Collect distinct PK values that need to be evicted. The set is
+    // keyed by the JSON-encoded PK so int/string/etc. dedup correctly.
+    final toDelete = <String, Object>{};
+    if ((await _index.get(pkBytes)) != null) {
+      toDelete[jsonEncode(pkVal)] = pkVal;
+    }
+    for (final si in _secondary.values) {
+      if (!si.unique) continue;
+      final prefix = _encodeSecondaryPrefix(si, row);
+      if (prefix == null) continue;
+      final upper = _bumpPrefix(prefix);
+      // Buffer rowIds first to avoid mutating the tree mid-iteration.
+      final rowIds = <int>[];
+      await for (final e in si.btree
+          .range(lower: prefix, lowerInclusive: true, upper: upper)) {
+        rowIds.add(e.value);
+      }
+      for (final rid in rowIds) {
+        final bytes = await _heap.get(rid);
+        if (bytes == null) continue;
+        final r = _decodeRow(bytes);
+        final pk = r[primaryKey.name];
+        if (pk == null) continue;
+        toDelete[jsonEncode(pk)] = pk;
+      }
+    }
+    for (final pk in toDelete.values) {
+      await delete(pk);
+    }
+    await insert(row);
+    return toDelete.length;
+  }
+
   /// Look up a row by primary key. Returns null if absent.
   Future<Map<String, Object?>?> get(Object pkVal) async {
     final pkBytes = _encodePrimaryKey(pkVal);

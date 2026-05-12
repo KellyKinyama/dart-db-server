@@ -122,12 +122,6 @@ void main() {
       db.execute('UPDATE t SET id = 99 WHERE id = 1'),
       throwsA(isA<UnsupportedError>()),
     );
-    // INSERT OR REPLACE is still not supported (paged tables can't
-    // upsert atomically).
-    await expectLater(
-      db.execute("INSERT OR REPLACE INTO t VALUES (1, 'x')"),
-      throwsA(isA<UnsupportedError>()),
-    );
   });
 
   test('rejects USING paged on in-memory database', () async {
