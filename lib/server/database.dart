@@ -807,9 +807,35 @@ class Database {
     final tname = _statementTable(stmt);
     if (tname == null) return null;
     final pt = _pagedTables[tname];
-    if (pt == null) return null;
+    if (pt == null) {
+      // The FROM table is in-memory — but a SELECT can still join
+      // *to* a paged table. Detect that and run the join through
+      // the in-memory executor with snapshot-materialised paged
+      // participants.
+      if (stmt is SelectStmt && stmt.joins.isNotEmpty) {
+        final pagedJoined = <String>[
+          for (final j in stmt.joins)
+            if (j.table != null && _pagedTables.containsKey(j.table)) j.table!,
+        ];
+        if (pagedJoined.isNotEmpty) {
+          return _pagedJoinSelect(stmt, [tname, ...pagedJoined]);
+        }
+      }
+      return null;
+    }
     if (stmt is InsertStmt) return _pagedInsert(stmt, pt);
-    if (stmt is SelectStmt) return _pagedSelect(stmt, pt);
+    if (stmt is SelectStmt) {
+      // Paged FROM with joins: needs the materialise-then-join path.
+      if (stmt.joins.isNotEmpty) {
+        final referenced = <String>{
+          tname,
+          for (final j in stmt.joins)
+            if (j.table != null) j.table!,
+        };
+        return _pagedJoinSelect(stmt, referenced.toList());
+      }
+      return _pagedSelect(stmt, pt);
+    }
     if (stmt is UpdateStmt) return _pagedUpdate(stmt, pt);
     if (stmt is DeleteStmt) return _pagedDelete(stmt, pt);
     if (stmt is DropTableStmt) return _pagedDrop(stmt, pt);
@@ -879,6 +905,65 @@ class Database {
       case DataType.text:
       case DataType.any:
         return PagedColumnType.textType;
+    }
+  }
+
+  /// Inverse of [_toPagedType] — used when snapshotting a paged table
+  /// into a transient in-memory [Table] for join queries.
+  DataType _fromPagedType(PagedColumnType t) {
+    switch (t) {
+      case PagedColumnType.intType:
+        return DataType.integer;
+      case PagedColumnType.realType:
+        return DataType.real;
+      case PagedColumnType.boolType:
+        return DataType.boolean;
+      case PagedColumnType.blobType:
+        return DataType.blob;
+      case PagedColumnType.textType:
+        return DataType.text;
+    }
+  }
+
+  /// Handle a SELECT that joins one or more paged tables. We snapshot
+  /// each referenced paged table into a transient in-memory [Table]
+  /// installed under the original name, run the in-memory executor,
+  /// then remove the temporaries. This intentionally trades the
+  /// out-of-core benefit on those participants for correctness; large
+  /// joins are not the use case paged tables target.
+  Future<QueryResult> _pagedJoinSelect(
+      SelectStmt s, List<String> pagedNames) async {
+    final installed = <String>[];
+    try {
+      for (final name in pagedNames) {
+        if (!_pagedTables.containsKey(name)) continue;
+        if (_tables.containsKey(name)) {
+          throw StateError(
+              'paged join: name collision with in-memory table $name '
+              '(should not happen — names are unique across maps)');
+        }
+        final pt = _pagedTables[name]!;
+        final colDefs = <ColumnDef>[
+          for (var i = 0; i < pt.columns.length; i++)
+            ColumnDef(
+              pt.columns[i].name,
+              _fromPagedType(pt.columns[i].type),
+              primaryKey: i == pt.primaryKeyIndex,
+            ),
+        ];
+        final tbl = Table(name, colDefs);
+        await for (final row in pt.scan()) {
+          tbl.rows.add([for (final c in pt.columns) row[c.name]]);
+        }
+        _tables[name] = tbl;
+        installed.add(name);
+      }
+      // Now defer to the regular in-memory executor.
+      return _selectTopLevel(s);
+    } finally {
+      for (final name in installed) {
+        _tables.remove(name);
+      }
     }
   }
 
