@@ -122,7 +122,7 @@ void main() {
         // And reopening must succeed without throwing.
         final db3 = await Database.open(p);
         final rows = (await db3.execute('SELECT id FROM t')).rows;
-          expect(rows.map((r) => r.single).toSet(), contains(1));
+        expect(rows.map((r) => r.single).toSet(), contains(1));
         await db3.close();
         // Suppress unused warning when the branch is not the one taken.
         // ignore: unused_local_variable
@@ -162,8 +162,7 @@ void main() {
       expect(String.fromCharCodes(bytes.sublist(0, 15)), 'SQLite format 3');
     });
 
-    test('stale .tmp from a crashed sqlite write is cleaned on open',
-        () async {
+    test('stale .tmp from a crashed sqlite write is cleaned on open', () async {
       final p = tmpPath('native_crash.sqlite');
       addTearDown(() => cleanup(p));
 
