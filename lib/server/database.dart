@@ -1258,10 +1258,22 @@ class Database {
     }
     // No PK predicate: see if we can route through a secondary index.
     if (r.lower == null && r.upper == null && residual != null) {
-      final hit = _findIndexedEquality(pt, residual);
-      if (hit != null) {
-        await for (final row in pt.indexLookup(hit.indexName, hit.value)) {
-          if (passes(row)) yield row;
+      final plan = _findIndexPlan(pt, residual);
+      if (plan != null) {
+        if (plan.isEquality) {
+          await for (final row in pt.indexLookup(plan.indexName, plan.lower)) {
+            if (passes(row)) yield row;
+          }
+        } else {
+          await for (final row in pt.indexRange(
+            plan.indexName,
+            lower: plan.lower,
+            lowerInclusive: plan.lowerInclusive,
+            upper: plan.upper,
+            upperInclusive: plan.upperInclusive,
+          )) {
+            if (passes(row)) yield row;
+          }
         }
         return;
       }
@@ -1282,43 +1294,139 @@ class Database {
     }
   }
 
-  /// Walk the residual AND-tree looking for `indexed_col = literal`.
-  /// Returns the first hit (which index to use, and the literal to
-  /// probe with). The original residual is left intact and re-applied
-  /// per-row by the caller — index lookup is a *candidate-narrowing*
-  /// optimisation, not a substitution.
-  ({String indexName, Object value})? _findIndexedEquality(
-      PagedTable pt, Expr e) {
-    if (e is BinaryExpr && e.op == 'AND') {
-      return _findIndexedEquality(pt, e.left) ??
-          _findIndexedEquality(pt, e.right);
-    }
-    if (e is BinaryExpr && e.op == '=') {
+  /// Walk the residual AND-tree looking for predicates against an
+  /// indexed column. Returns the strongest plan we can build:
+  ///  - an equality `col = lit` becomes an [indexLookup] (isEquality);
+  ///  - a chain of `<`, `<=`, `>`, `>=` (and/or `BETWEEN` flattened
+  ///    into two conjuncts by the parser) on a single indexed column
+  ///    becomes an [indexRange] with the tightest combined bounds.
+  /// The first indexable column found wins; the original residual is
+  /// left intact and re-applied per-row by the caller, so this is
+  /// purely a candidate-narrowing optimisation.
+  _PagedIndexPlan? _findIndexPlan(PagedTable pt, Expr e) {
+    // Group conjuncts by column-name (case-insensitive) → list of
+    // (op, literal) pairs. Skip anything that isn't `col OP literal`.
+    final byCol = <String, List<({String op, Object value})>>{};
+    void visit(Expr expr) {
+      if (expr is BinaryExpr && expr.op == 'AND') {
+        visit(expr.left);
+        visit(expr.right);
+        return;
+      }
+      if (expr is! BinaryExpr) return;
+      const ops = {'=', '<', '<=', '>', '>='};
+      if (!ops.contains(expr.op)) return;
       ColumnExpr? col;
       Expr? lit;
-      if (e.left is ColumnExpr) {
-        col = e.left as ColumnExpr;
-        lit = e.right;
-      } else if (e.right is ColumnExpr) {
-        col = e.right as ColumnExpr;
-        lit = e.left;
-      }
-      if (col != null && lit != null) {
-        Object? v;
-        try {
-          v = lit.eval(const <String, Object?>{});
-        } catch (_) {
-          return null;
+      String op = expr.op;
+      if (expr.left is ColumnExpr) {
+        col = expr.left as ColumnExpr;
+        lit = expr.right;
+      } else if (expr.right is ColumnExpr) {
+        col = expr.right as ColumnExpr;
+        lit = expr.left;
+        // Flip operator since `lit OP col` ≡ `col FLIP(OP) lit`.
+        switch (op) {
+          case '<':
+            op = '>';
+            break;
+          case '<=':
+            op = '>=';
+            break;
+          case '>':
+            op = '<';
+            break;
+          case '>=':
+            op = '<=';
+            break;
+          // '=' is symmetric
         }
-        if (v == null) return null;
-        // Find an index on this column. First match wins.
-        for (final name in pt.secondaryIndexNames) {
-          final ic = pt.indexColumn(name);
-          if (ic != null && ic.toLowerCase() == col.name.toLowerCase()) {
-            return (indexName: name, value: v);
-          }
+      }
+      if (col == null || lit == null) return;
+      Object? v;
+      try {
+        v = lit.eval(const <String, Object?>{});
+      } catch (_) {
+        return;
+      }
+      if (v == null) return;
+      byCol
+          .putIfAbsent(col.name.toLowerCase(), () => [])
+          .add((op: op, value: v!));
+    }
+
+    visit(e);
+    if (byCol.isEmpty) return null;
+
+    // Find the first indexed column that has at least one usable
+    // predicate.
+    for (final name in pt.secondaryIndexNames) {
+      final ic = pt.indexColumn(name);
+      if (ic == null) continue;
+      final preds = byCol[ic.toLowerCase()];
+      if (preds == null) continue;
+
+      // Equality is strictest; if any conjunct on this column is `=`,
+      // route through indexLookup with that value.
+      for (final p in preds) {
+        if (p.op == '=') {
+          return _PagedIndexPlan(
+            indexName: name,
+            isEquality: true,
+            lower: p.value,
+            lowerInclusive: true,
+            upper: null,
+            upperInclusive: false,
+          );
         }
       }
+
+      // Otherwise combine into the tightest range bounds.
+      Object? lo;
+      bool loInc = true;
+      Object? hi;
+      bool hiInc = false;
+      for (final p in preds) {
+        switch (p.op) {
+          case '>=':
+            if (lo == null || _compareLiteral(p.value, lo) > 0) {
+              lo = p.value;
+              loInc = true;
+            }
+            break;
+          case '>':
+            if (lo == null ||
+                _compareLiteral(p.value, lo) > 0 ||
+                (_compareLiteral(p.value, lo) == 0 && loInc)) {
+              lo = p.value;
+              loInc = false;
+            }
+            break;
+          case '<=':
+            if (hi == null || _compareLiteral(p.value, hi) < 0) {
+              hi = p.value;
+              hiInc = true;
+            }
+            break;
+          case '<':
+            if (hi == null ||
+                _compareLiteral(p.value, hi) < 0 ||
+                (_compareLiteral(p.value, hi) == 0 && hiInc)) {
+              hi = p.value;
+              hiInc = false;
+            }
+            break;
+        }
+      }
+      if (lo == null && hi == null) continue;
+      return _PagedIndexPlan(
+        indexName: name,
+        isEquality: false,
+        lower: lo,
+        lowerInclusive: loInc,
+        upper: hi,
+        upperInclusive: hiInc,
+      );
     }
     return null;
   }
@@ -1386,9 +1494,14 @@ class Database {
     // ORDER BY: only `ORDER BY <pk> [ASC|DESC]`. ASC is the native
     // PagedTable iteration order; DESC buffers the matched rows and
     // reverses them, which is fine for the LIMIT-paired use case but
-    // not for streaming a whole large table.
+    // not for streaming a whole large table. Either direction also
+    // forces a buffer-and-sort when the chosen access path is a
+    // secondary-index range, because those stream in index order
+    // rather than PK order.
     bool descending = false;
+    bool hasOrderBy = false;
     if (s.orderBy.isNotEmpty) {
+      hasOrderBy = true;
       if (s.orderBy.length > 1) {
         throw UnsupportedError(
             'SELECT on paged table ${s.fromTable}: ORDER BY may only '
@@ -1497,19 +1610,25 @@ class Database {
     }
 
     final rows = <List<Object?>>[];
-    if (descending) {
-      // Buffer the matched rows so we can reverse; OFFSET/LIMIT apply
-      // after the reverse.
+    if (hasOrderBy) {
+      // Buffer all matched rows, sort by PK, apply OFFSET/LIMIT. The
+      // PK column is always present in the streamed row maps.
+      final buf = <Map<String, Object?>>[];
       await for (final row in _pagedRangeStream(pt, range)) {
-        rows.add(project(row));
+        buf.add(row);
       }
-      final reversed = rows.reversed.toList();
-      final start = offset.clamp(0, reversed.length);
-      final end = unlimited
-          ? reversed.length
-          : (start + limit).clamp(0, reversed.length);
-      return QueryResult(columns: outCols, rows: reversed.sublist(start, end));
-    } else {
+      buf.sort((a, b) {
+        final c = _compareLiteral(a[pkName], b[pkName]);
+        return descending ? -c : c;
+      });
+      final start = offset.clamp(0, buf.length);
+      final end = unlimited ? buf.length : (start + limit).clamp(0, buf.length);
+      for (var i = start; i < end; i++) {
+        rows.add(project(buf[i]));
+      }
+      return QueryResult(columns: outCols, rows: rows);
+    }
+    {
       var skipped = 0;
       await for (final row in _pagedRangeStream(pt, range)) {
         if (skipped < offset) {
@@ -7088,4 +7207,26 @@ class _PagedRange {
   /// rows from the index. `null` means "no residual" — every streamed
   /// row passes.
   Expr? residual;
+}
+
+/// Index-driven access plan for a `USING paged` table. Produced by
+/// [Database._findIndexPlan] when the WHERE residual contains
+/// indexable predicates. `isEquality` flips between `indexLookup` and
+/// `indexRange`; the residual is still re-applied per row by the
+/// caller.
+class _PagedIndexPlan {
+  final String indexName;
+  final bool isEquality;
+  final Object? lower;
+  final bool lowerInclusive;
+  final Object? upper;
+  final bool upperInclusive;
+  _PagedIndexPlan({
+    required this.indexName,
+    required this.isEquality,
+    required this.lower,
+    required this.lowerInclusive,
+    required this.upper,
+    required this.upperInclusive,
+  });
 }

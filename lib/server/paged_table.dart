@@ -496,6 +496,62 @@ class PagedTable {
     }
   }
 
+  /// Range-scan a secondary index. Any of [lower] / [upper] may be
+  /// null to indicate an unbounded side. The encoded value-keys are
+  /// byte-order-preserving, so SQL semantics carry through.
+  ///
+  /// Returns rows in **index order**: ascending by the indexed value,
+  /// ties broken by encoded primary key. Yields nothing when the index
+  /// does not exist; NULL bounds are not allowed (NULLs aren't indexed
+  /// so `WHERE col > NULL` etc. are filtered at the SQL layer).
+  Stream<Map<String, Object?>> indexRange(
+    String indexName, {
+    Object? lower,
+    bool lowerInclusive = true,
+    Object? upper,
+    bool upperInclusive = false,
+  }) async* {
+    final si = _secondary[indexName];
+    if (si == null) return;
+    Uint8List? lo;
+    Uint8List? hi;
+    if (lower != null) {
+      final l = _encodeIndexValue(lower, si.columnType);
+      // Inclusive lower: the smallest composite key whose value half
+      // is [lower] is just `l` (any pk suffix sorts after). Exclusive
+      // lower: skip everything whose value equals [lower], i.e. start
+      // at bumpPrefix(l).
+      lo = lowerInclusive ? l : _bumpPrefix(l);
+    }
+    if (upper != null) {
+      final u = _encodeIndexValue(upper, si.columnType);
+      // Inclusive upper: include every composite key whose value half
+      // is [upper], i.e. stop at bumpPrefix(u) exclusive. Exclusive
+      // upper: stop at `u` (anything with that value half starts at
+      // `u` and is excluded).
+      hi = upperInclusive ? _bumpPrefix(u) : u;
+    }
+    if (lo == null && hi == null) {
+      // Unbounded both sides: full index scan.
+      await for (final entry in si.btree.scan()) {
+        final bytes = await _heap.get(entry.value);
+        if (bytes == null) continue;
+        yield _decodeRow(bytes);
+      }
+      return;
+    }
+    await for (final entry in si.btree.range(
+      lower: lo,
+      lowerInclusive: true,
+      upper: hi,
+      upperInclusive: false,
+    )) {
+      final bytes = await _heap.get(entry.value);
+      if (bytes == null) continue;
+      yield _decodeRow(bytes);
+    }
+  }
+
   List<({String name, String column})> _indexDescriptors() => [
         for (final si in _secondary.values) (name: si.name, column: si.column),
       ];
@@ -723,16 +779,42 @@ class PagedTable {
   // which captures exactly the keys whose value half equals `val`.
   // ---------------------------------------------------------------------------
 
-  /// Encode just the value part of a secondary index key. Length-prefixed
-  /// so that two different-length values can never share a common
-  /// prefix and confuse the range-bound trick used by [indexLookup].
+  /// Encode just the value part of a secondary-index key in a
+  /// **byte-order-preserving** form. Two encoded values compare as
+  /// `Uint8List` in the same order as the original values compare in
+  /// SQL semantics. Critically, no encoded value is a prefix of any
+  /// other distinct encoded value, so concatenating a PK suffix yields
+  /// unambiguous composite keys (the PK boundary is always recoverable
+  /// implicitly from the value type).
+  ///
+  /// - Fixed-width types (int / real / bool) reuse [_encodeValueOnly];
+  ///   each value has a constant length so there is nothing to escape.
+  /// - Variable-length types (text / blob) escape every `0x00` byte as
+  ///   `0x00 0x01` and append `0x00 0x00` as a terminator. This keeps
+  ///   lexicographic order intact while making boundaries unambiguous.
   static Uint8List _encodeIndexValue(Object value, PagedColumnType type) {
-    final raw = _encodeValueOnly(value, type);
-    final out = Uint8List(4 + raw.length);
-    final bd = ByteData.view(out.buffer);
-    bd.setUint32(0, raw.length, Endian.big);
-    out.setRange(4, 4 + raw.length, raw);
-    return out;
+    switch (type) {
+      case PagedColumnType.intType:
+      case PagedColumnType.realType:
+      case PagedColumnType.boolType:
+        return _encodeValueOnly(value, type);
+      case PagedColumnType.textType:
+      case PagedColumnType.blobType:
+        final raw = _encodeValueOnly(value, type);
+        // Worst case every byte is 0x00 → doubles. Plus 2-byte terminator.
+        final out = BytesBuilder(copy: false);
+        for (final b in raw) {
+          if (b == 0x00) {
+            out.addByte(0x00);
+            out.addByte(0x01);
+          } else {
+            out.addByte(b);
+          }
+        }
+        out.addByte(0x00);
+        out.addByte(0x00);
+        return out.toBytes();
+    }
   }
 
   /// Composite secondary-index key: value prefix + already-encoded PK
