@@ -1589,6 +1589,11 @@ class Parser {
       }
     }
     _expect(TokType.punct, ')');
+    // IIF(cond, a, b) desugars to CASE WHEN cond THEN a ELSE b END so
+    // that branches short-circuit, matching SQLite semantics.
+    if (upper == 'IIF' && args.length == 3) {
+      return CaseExpr([args[0]], [args[1]], args[2]);
+    }
     Expr? filterExpr;
     if (_matchKw('FILTER')) {
       _expect(TokType.punct, '(');

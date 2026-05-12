@@ -37,8 +37,7 @@ void main() {
       final db = await Database.open();
       try {
         await db.execute('CREATE TABLE t (s TEXT)');
-        await db.execute(
-            "INSERT INTO t VALUES ('100%'), ('200%'), ('abc')");
+        await db.execute("INSERT INTO t VALUES ('100%'), ('200%'), ('abc')");
         final r = await db.execute(
             "SELECT s FROM t WHERE s LIKE '%!%' ESCAPE '!' ORDER BY s");
         expect(r.rows.map((r) => r.first).toList(), ['100%', '200%']);
@@ -52,8 +51,8 @@ void main() {
       try {
         await db.execute('CREATE TABLE t (s TEXT)');
         await db.execute("INSERT INTO t VALUES ('100%'), ('abc')");
-        final r = await db.execute(
-            "SELECT s FROM t WHERE s NOT LIKE '100!%' ESCAPE '!'");
+        final r = await db
+            .execute("SELECT s FROM t WHERE s NOT LIKE '100!%' ESCAPE '!'");
         expect(r.rows.map((r) => r.first).toList(), ['abc']);
       } finally {
         await db.close();
@@ -63,8 +62,7 @@ void main() {
     test('NULL pattern / value / escape return NULL', () async {
       final db = await Database.open();
       try {
-        final r = await db.execute(
-            "SELECT 'abc' LIKE NULL ESCAPE '!', "
+        final r = await db.execute("SELECT 'abc' LIKE NULL ESCAPE '!', "
             "       NULL LIKE 'abc' ESCAPE '!', "
             "       'abc' LIKE 'abc' ESCAPE NULL");
         expect(r.rows.first, [null, null, null]);
@@ -88,8 +86,7 @@ void main() {
     test('%d basic integer', () async {
       final db = await Database.open();
       try {
-        final r =
-            await db.execute("SELECT PRINTF('%d / %d / %d', 1, -42, 0)");
+        final r = await db.execute("SELECT PRINTF('%d / %d / %d', 1, -42, 0)");
         expect(r.rows.first.first, '1 / -42 / 0');
       } finally {
         await db.close();
@@ -110,8 +107,7 @@ void main() {
     test('hex / octal conversion', () async {
       final db = await Database.open();
       try {
-        final r = await db.execute(
-            "SELECT PRINTF('%x %X %o', 255, 255, 8)");
+        final r = await db.execute("SELECT PRINTF('%x %X %o', 255, 255, 8)");
         expect(r.rows.first.first, 'ff FF 10');
       } finally {
         await db.close();
@@ -132,8 +128,8 @@ void main() {
     test('%f / %e / %g precision', () async {
       final db = await Database.open();
       try {
-        final r = await db.execute(
-            "SELECT PRINTF('%.2f', 3.14159), PRINTF('%.3e', 1234.5)");
+        final r = await db
+            .execute("SELECT PRINTF('%.2f', 3.14159), PRINTF('%.3e', 1234.5)");
         expect(r.rows.first[0], '3.14');
         expect(r.rows.first[1], '1.235e+3');
       } finally {

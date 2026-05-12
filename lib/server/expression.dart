@@ -2,6 +2,7 @@
 library;
 
 import 'dart:convert';
+import 'dart:math' as math;
 
 import 'fts5.dart';
 import 'schema.dart';
@@ -772,9 +773,7 @@ String _sqlitePrintf(String fmt, List<Object?> args) {
         break;
       case 'x':
       case 'X':
-        var hex = _toIntArg(nextArg())
-            .toUnsigned(64)
-            .toRadixString(16);
+        var hex = _toIntArg(nextArg()).toUnsigned(64).toRadixString(16);
         if (conv == 'X') hex = hex.toUpperCase();
         if (precision != null && hex.length < precision) {
           hex = hex.padLeft(precision, '0');
@@ -880,7 +879,8 @@ String _sqlitePrintf(String fmt, List<Object?> args) {
   return out.toString();
 }
 
-bool _isDigitChar(String c) => c.codeUnitAt(0) >= 0x30 && c.codeUnitAt(0) <= 0x39;
+bool _isDigitChar(String c) =>
+    c.codeUnitAt(0) >= 0x30 && c.codeUnitAt(0) <= 0x39;
 
 int _toIntArg(Object? v) {
   if (v == null) return 0;
@@ -979,6 +979,77 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
         if (v == 0) return 0;
         return v > 0 ? 1 : -1;
       }),
+  // SQLite 3.35+ math functions. All operate in double precision and
+  // return NULL on NULL input. Domain errors (e.g. LN(0), SQRT(-1))
+  // return NULL to match SQLite.
+  'PI': (a) => math.pi,
+  'EXP': (a) => _propagateNull(a, () => math.exp((a[0] as num).toDouble())),
+  'LN': (a) => _propagateNull(a, () {
+        final v = (a[0] as num).toDouble();
+        if (v <= 0) return null;
+        return math.log(v);
+      }),
+  'LOG10': (a) => _propagateNull(a, () {
+        final v = (a[0] as num).toDouble();
+        if (v <= 0) return null;
+        return math.log(v) / math.ln10;
+      }),
+  'LOG2': (a) => _propagateNull(a, () {
+        final v = (a[0] as num).toDouble();
+        if (v <= 0) return null;
+        return math.log(v) / math.ln2;
+      }),
+  // LOG(x) == LOG10(x); LOG(b, x) == log base b of x (SQLite semantics).
+  'LOG': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    if (a.length == 1) {
+      final v = (a[0] as num).toDouble();
+      if (v <= 0) return null;
+      return math.log(v) / math.ln10;
+    }
+    if (a[1] == null) return null;
+    final b = (a[0] as num).toDouble();
+    final v = (a[1] as num).toDouble();
+    if (b <= 0 || b == 1 || v <= 0) return null;
+    return math.log(v) / math.log(b);
+  },
+  'SIN': (a) => _propagateNull(a, () => math.sin((a[0] as num).toDouble())),
+  'COS': (a) => _propagateNull(a, () => math.cos((a[0] as num).toDouble())),
+  'TAN': (a) => _propagateNull(a, () => math.tan((a[0] as num).toDouble())),
+  'ASIN': (a) => _propagateNull(a, () {
+        final v = (a[0] as num).toDouble();
+        if (v < -1 || v > 1) return null;
+        return math.asin(v);
+      }),
+  'ACOS': (a) => _propagateNull(a, () {
+        final v = (a[0] as num).toDouble();
+        if (v < -1 || v > 1) return null;
+        return math.acos(v);
+      }),
+  'ATAN': (a) => _propagateNull(a, () => math.atan((a[0] as num).toDouble())),
+  'ATAN2': (a) => _propagateNull(
+      a, () => math.atan2((a[0] as num).toDouble(), (a[1] as num).toDouble())),
+  'SINH': (a) => _propagateNull(a, () {
+        final x = (a[0] as num).toDouble();
+        return (math.exp(x) - math.exp(-x)) / 2;
+      }),
+  'COSH': (a) => _propagateNull(a, () {
+        final x = (a[0] as num).toDouble();
+        return (math.exp(x) + math.exp(-x)) / 2;
+      }),
+  'TANH': (a) => _propagateNull(a, () {
+        final x = (a[0] as num).toDouble();
+        if (x > 20) return 1.0;
+        if (x < -20) return -1.0;
+        final ep = math.exp(x);
+        final en = math.exp(-x);
+        return (ep - en) / (ep + en);
+      }),
+  'RADIANS': (a) =>
+      _propagateNull(a, () => (a[0] as num).toDouble() * math.pi / 180),
+  'DEGREES': (a) =>
+      _propagateNull(a, () => (a[0] as num).toDouble() * 180 / math.pi),
+  'TRUNC': (a) => _propagateNull(a, () => (a[0] as num).truncate()),
   'RANDOM': (a) => _rng.nextInt(1 << 31),
   'INSTR': (a) {
     if (a.length < 2 || a[0] == null || a[1] == null) return null;
