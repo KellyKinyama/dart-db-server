@@ -988,15 +988,21 @@ class Database {
   /// comparisons against the PK column. We do not attempt to prove
   /// emptiness — if `lower > upper` the caller will simply see an
   /// empty stream from PagedTable.range.
-  _PagedRange _pagedExtractPkRange(
-      Expr? where, String pkName, String context) {
+  ///
+  /// Any AND-conjuncts that don't simplify to a PK-range fragment are
+  /// preserved verbatim in [_PagedRange.residual] and applied as a
+  /// post-filter (`Expr.eval`) on each row the scan produces. So a
+  /// query like `WHERE id BETWEEN 10 AND 20 AND name = 'x'` does the
+  /// efficient index range on the PK *and* the cheap column filter on
+  /// the residual half. OR-trees and BETWEEN on a non-PK column fall
+  /// entirely into the residual.
+  _PagedRange _pagedExtractPkRange(Expr? where, String pkName, String context) {
     final r = _PagedRange();
     if (where == null) return r;
+    final residuals = <Expr>[];
     void merge(_PagedRange other) {
       if (other.eq != null) {
         if (r.eq != null && r.eq != other.eq) {
-          // Two distinct equalities AND-ed → empty; preserve the
-          // contradiction so the executor returns zero rows.
           r.eq = other.eq;
           r.contradiction = true;
         } else {
@@ -1029,16 +1035,31 @@ class Database {
         walk(e.right);
         return;
       }
-      merge(_extractSingle(e, pkName, context));
+      final piece = _extractSingle(e, pkName);
+      if (piece == null) {
+        residuals.add(e);
+      } else {
+        merge(piece);
+      }
     }
 
     walk(where);
+    if (residuals.isNotEmpty) {
+      Expr combined = residuals.first;
+      for (var i = 1; i < residuals.length; i++) {
+        combined = BinaryExpr('AND', combined, residuals[i]);
+      }
+      r.residual = combined;
+    }
     return r;
   }
 
-  /// Parse a single comparison or BETWEEN against the PK column into
-  /// a [_PagedRange] fragment.
-  _PagedRange _extractSingle(Expr e, String pkName, String context) {
+  /// Parse a single AND-conjunct. Returns a [_PagedRange] fragment if
+  /// it can be turned into a PK comparison; returns null when the
+  /// conjunct doesn't reference the PK at all (or references it in a
+  /// shape we don't index-prune on, e.g. function calls). The caller
+  /// keeps the original expression as a residual post-filter.
+  _PagedRange? _extractSingle(Expr e, String pkName) {
     final r = _PagedRange();
     bool isPk(Expr x) =>
         x is ColumnExpr && x.name.toLowerCase() == pkName.toLowerCase();
@@ -1046,11 +1067,7 @@ class Database {
       final op = e.op;
       final lp = isPk(e.left);
       final rp = isPk(e.right);
-      if (!lp && !rp) {
-        throw UnsupportedError(
-            '$context: WHERE on paged tables must reference the primary '
-            'key column "$pkName".');
-      }
+      if (!lp && !rp) return null;
       // Normalise so the PK is on the left: rewrite `lit OP pk` as
       // `pk OP' lit` with op reversed.
       String nop = op;
@@ -1072,10 +1089,16 @@ class Database {
           case '>=':
             nop = '<=';
             break;
-          // '=' stays '='.
         }
       }
-      final lit = _evalLiteral(litExpr, context);
+      // If the literal side isn't a constant (e.g. `pk = other_col`),
+      // skip index-pruning and let it become a residual post-filter.
+      Object? lit;
+      try {
+        lit = litExpr.eval(const <String, Object?>{});
+      } catch (_) {
+        return null;
+      }
       switch (nop) {
         case '=':
           r.eq = lit;
@@ -1097,27 +1120,27 @@ class Database {
           r.lowerInclusive = true;
           return r;
         default:
-          throw UnsupportedError(
-              '$context: operator $op on the primary key is not '
-              'supported on paged tables.');
+          // Other binary ops (!=, LIKE, IS, …) on the PK fall through
+          // to the residual evaluator.
+          return null;
       }
     }
     if (e is BetweenExpr) {
-      if (!isPk(e.value) || e.negated) {
-        throw UnsupportedError(
-            '$context: only `$pkName BETWEEN <lit> AND <lit>` is '
-            'supported on paged tables.');
+      if (!isPk(e.value) || e.negated) return null;
+      Object? lo, hi;
+      try {
+        lo = e.low.eval(const <String, Object?>{});
+        hi = e.high.eval(const <String, Object?>{});
+      } catch (_) {
+        return null;
       }
-      r.lower = _evalLiteral(e.low, context);
+      r.lower = lo;
       r.lowerInclusive = true;
-      r.upper = _evalLiteral(e.high, context);
+      r.upper = hi;
       r.upperInclusive = true;
       return r;
     }
-    throw UnsupportedError(
-        '$context: predicate not supported on paged tables. Allowed: '
-        '`$pkName = lit`, `$pkName </<=/>/>= lit`, `$pkName BETWEEN lo '
-        'AND hi`, and AND-chains thereof.');
+    return null;
   }
 
   /// Compare two PK literals using SQL-ish semantics. Numbers compare
@@ -1130,26 +1153,40 @@ class Database {
   }
 
   /// Stream rows matching a parsed range. Honours [_PagedRange.eq] as
-  /// a single point lookup; otherwise calls PagedTable.range.
+  /// a single point lookup; otherwise calls PagedTable.range. When
+  /// [_PagedRange.residual] is set, each streamed row is also fed
+  /// through `residual.eval(row)` and dropped unless the result is
+  /// truthy. Mirrors SQL NULL-as-false semantics.
   Stream<Map<String, Object?>> _pagedRangeStream(
       PagedTable pt, _PagedRange r) async* {
     if (r.contradiction) return;
+    final residual = r.residual;
+    bool passes(Map<String, Object?> row) {
+      if (residual == null) return true;
+      final v = residual.eval(row);
+      return v == true;
+    }
+
     final eq = r.eq;
     if (eq != null) {
       final row = await pt.get(eq);
-      if (row != null) yield row;
+      if (row != null && passes(row)) yield row;
       return;
     }
     if (r.lower == null && r.upper == null) {
-      yield* pt.scan();
+      await for (final row in pt.scan()) {
+        if (passes(row)) yield row;
+      }
       return;
     }
-    yield* pt.range(
+    await for (final row in pt.range(
       lower: r.lower,
       lowerInclusive: r.lowerInclusive,
       upper: r.upper,
       upperInclusive: r.upperInclusive,
-    );
+    )) {
+      if (passes(row)) yield row;
+    }
   }
 
   Future<QueryResult> _pagedInsert(InsertStmt s, PagedTable pt) async {
@@ -1225,8 +1262,7 @@ class Database {
       }
       final ob = s.orderBy.single;
       final e = ob.expr;
-      if (e is! ColumnExpr ||
-          e.name.toLowerCase() != pkName.toLowerCase()) {
+      if (e is! ColumnExpr || e.name.toLowerCase() != pkName.toLowerCase()) {
         throw UnsupportedError(
             'SELECT on paged table ${s.fromTable}: ORDER BY must '
             'reference the primary key column "$pkName".');
@@ -1251,22 +1287,35 @@ class Database {
       }
     }
 
-    // Normal projection (only `*` or bare column refs).
+    // Normal projection. Supports:
+    //   * `*` (all columns)
+    //   * bare column references (`name`, `t.name`)
+    //   * arbitrary scalar expressions (`id + 1`, `upper(name)`,
+    //     `name || '!'`) — evaluated via Expr.eval on each row map.
+    // Aggregates other than COUNT(*) are still rejected.
     List<String> outCols;
-    List<String> sourceCols; // table column names to read for each row
     bool selectAll = false;
+    List<Object? Function(Map<String, Object?>)>? projectors;
     if (isCountStar) {
       outCols = [countAlias];
-      sourceCols = const [];
     } else if (s.projection.length == 1 && s.projection.single.isStar) {
       selectAll = true;
       outCols = colNames;
-      sourceCols = colNames;
     } else {
       outCols = <String>[];
-      sourceCols = <String>[];
+      projectors = <Object? Function(Map<String, Object?>)>[];
       for (final p in s.projection) {
-        final e = p.expr;
+        if (p.isStar) {
+          throw UnsupportedError(
+              'SELECT on paged table ${s.fromTable}: mixed `*` with '
+              'other projections is not supported.');
+        }
+        final e = p.expr!;
+        if (e is FunctionCallExpr && e.isAggregate) {
+          throw UnsupportedError(
+              'SELECT on paged table ${s.fromTable}: aggregate '
+              '${e.name}() is not supported (only bare COUNT(*) is).');
+        }
         if (e is ColumnExpr) {
           final hit = colNames.firstWhere(
             (c) => c.toLowerCase() == e.name.toLowerCase(),
@@ -1275,11 +1324,10 @@ class Database {
                 '${e.name}'),
           );
           outCols.add(p.alias ?? e.name);
-          sourceCols.add(hit);
+          projectors.add((row) => row[hit]);
         } else {
-          throw UnsupportedError(
-              'SELECT on paged table ${s.fromTable}: only `*`, bare '
-              'column references and `COUNT(*)` are supported.');
+          outCols.add(p.alias ?? _exprLabel(e));
+          projectors.add(e.eval);
         }
       }
     }
@@ -1309,21 +1357,24 @@ class Database {
     }
 
     // Streaming projection.
+    List<Object?> project(Map<String, Object?> row) {
+      if (selectAll) return [for (final c in colNames) row[c]];
+      return [for (final fn in projectors!) fn(row)];
+    }
+
     final rows = <List<Object?>>[];
     if (descending) {
       // Buffer the matched rows so we can reverse; OFFSET/LIMIT apply
       // after the reverse.
       await for (final row in _pagedRangeStream(pt, range)) {
-        rows.add(selectAll
-            ? [for (final c in sourceCols) row[c]]
-            : [for (final c in sourceCols) row[c]]);
+        rows.add(project(row));
       }
       final reversed = rows.reversed.toList();
       final start = offset.clamp(0, reversed.length);
-      final end =
-          unlimited ? reversed.length : (start + limit).clamp(0, reversed.length);
-      return QueryResult(
-          columns: outCols, rows: reversed.sublist(start, end));
+      final end = unlimited
+          ? reversed.length
+          : (start + limit).clamp(0, reversed.length);
+      return QueryResult(columns: outCols, rows: reversed.sublist(start, end));
     } else {
       var skipped = 0;
       await for (final row in _pagedRangeStream(pt, range)) {
@@ -1332,7 +1383,7 @@ class Database {
           continue;
         }
         if (!unlimited && rows.length >= limit) break;
-        rows.add([for (final c in sourceCols) row[c]]);
+        rows.add(project(row));
       }
       return QueryResult(columns: outCols, rows: rows);
     }
@@ -1366,19 +1417,14 @@ class Database {
           'primary key column "$pkName".');
     }
     // Materialise matching rows first (PK + current values) so we
-    // don't mutate while iterating the index.
-    final matches = <Map<String, Object?>>[];
+    // don't mutate while iterating the index. _pagedRangeStream
+    // handles both the eq fast-path and any residual post-filter.
     if (range.contradiction) {
       return QueryResult(affected: 0, message: '0 row(s)');
     }
-    if (range.eq != null) {
-      final eq = range.eq!;
-      final row = await pt.get(eq);
-      if (row != null) matches.add(row);
-    } else {
-      await for (final row in _pagedRangeStream(pt, range)) {
-        matches.add(row);
-      }
+    final matches = <Map<String, Object?>>[];
+    await for (final row in _pagedRangeStream(pt, range)) {
+      matches.add(row);
     }
     var affected = 0;
     for (final row in matches) {
@@ -1404,16 +1450,11 @@ class Database {
       return QueryResult(affected: 0, message: '0 row(s)');
     }
     // Materialise matching PKs first (don't mutate during traversal).
+    // _pagedRangeStream handles both eq and residual filtering.
     final pks = <Object>[];
-    if (range.eq != null) {
-      final eq = range.eq!;
-      final row = await pt.get(eq);
-      if (row != null) pks.add(eq);
-    } else {
-      await for (final row in _pagedRangeStream(pt, range)) {
-        final pk = row[pkName];
-        if (pk != null) pks.add(pk);
-      }
+    await for (final row in _pagedRangeStream(pt, range)) {
+      final pk = row[pkName];
+      if (pk != null) pks.add(pk);
     }
     var affected = 0;
     for (final pk in pks) {
@@ -6907,4 +6948,10 @@ class _PagedRange {
   /// two distinct equalities on the same PK). The executor returns an
   /// empty result without touching disk.
   bool contradiction = false;
+
+  /// AND-conjunct(s) that didn't reduce to a PK-range fragment.
+  /// Evaluated row-by-row via [Expr.eval] after streaming candidate
+  /// rows from the index. `null` means "no residual" — every streamed
+  /// row passes.
+  Expr? residual;
 }

@@ -117,11 +117,6 @@ void main() {
         'id INTEGER PRIMARY KEY, name TEXT) USING paged');
     await db.execute("INSERT INTO t VALUES (1, 'a')");
 
-    // Non-PK WHERE.
-    await expectLater(
-      db.execute("SELECT * FROM t WHERE name = 'a'"),
-      throwsA(isA<UnsupportedError>()),
-    );
     // INSERT … SELECT.
     await expectLater(
       db.execute('INSERT INTO t SELECT * FROM t'),

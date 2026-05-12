@@ -150,15 +150,19 @@ implemented:
   is opened on demand from disk through an LRU page cache + B+-tree
   index + slotted-page row heap with a crash-safe undo journal, and is
   not loaded into the in-memory `_tables` map. The SQL surface for
-  paged tables currently supports: INSERT VALUES, full-scan / point /
-  range `SELECT *` (PK comparisons `= < <= > >=`, `BETWEEN`, and
-  AND-chains), `ORDER BY <pk> [ASC|DESC]` paired with `LIMIT` /
-  `OFFSET`, `COUNT(*)`, bulk UPDATE / DELETE across the same PK
-  predicates, `DROP TABLE`, `TRUNCATE TABLE`, and `DESCRIBE`. Joins,
-  `GROUP BY`, secondary indexes, non-PK `WHERE`, `RETURNING`,
-  `INSERT … SELECT`, and triggers all raise `UnsupportedError`. The
-  lower-level `PagedTable` API in `lib/server/paged_table.dart`
-  exposes the full primitives directly.
+  paged tables currently supports: INSERT VALUES; arbitrary `WHERE`
+  predicates (PK comparisons `= < <= > >=`, `BETWEEN`, and AND-chains
+  drive an index range; everything else — non-PK `=`, `LIKE`, `IN`,
+  `IS NULL`, OR-trees, function calls — is evaluated row-by-row as a
+  residual post-filter); `ORDER BY <pk> [ASC|DESC]` paired with
+  `LIMIT` / `OFFSET`; `COUNT(*)`; scalar projection expressions
+  (`SELECT id + 1, upper(name) FROM t`); bulk UPDATE / DELETE under
+  the same predicates; `DROP TABLE`, `TRUNCATE TABLE`, and `DESCRIBE`.
+  Joins, `GROUP BY`, secondary indexes, non-COUNT aggregates,
+  `RETURNING`, `INSERT … SELECT`, primary-key reassignment, and
+  triggers all raise `UnsupportedError`. The lower-level `PagedTable`
+  API in `lib/server/paged_table.dart` exposes the full primitives
+  directly.
 - **SQLite wire protocol**: clients speak this engine's JSON line protocol,
   not SQLite's native protocol.
 - **Production-grade FTS5 / R*Tree**: `CREATE VIRTUAL TABLE ... USING fts5`n  and `USING rtree` are accepted and create regular tables; `MATCH` does a
