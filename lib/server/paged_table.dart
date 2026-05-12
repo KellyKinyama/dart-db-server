@@ -475,6 +475,49 @@ class PagedTable {
     await _heap.update(rowId, rowBytes);
   }
 
+  /// Replace the row at primary key [oldPkVal] with [row], possibly
+  /// rewriting the primary key. The new PK value (read from
+  /// `row[primaryKey.name]`) must not already belong to a different
+  /// row; UNIQUE secondary indexes are checked against the new row
+  /// before any mutation, so a conflict leaves the table untouched.
+  /// Equivalent to [delete] + [insert] but atomic w.r.t. uniqueness
+  /// probing.
+  Future<void> reassignPrimaryKey(
+      Object oldPkVal, Map<String, Object?> row) async {
+    final newPk = row[primaryKey.name];
+    if (newPk == null) {
+      throw ArgumentError(
+          'PagedTable.reassignPrimaryKey: new primary key is null');
+    }
+    final oldPkBytes = _encodePrimaryKey(oldPkVal);
+    if ((await _index.get(oldPkBytes)) == null) {
+      throw StateError('PagedTable.reassignPrimaryKey: no row with primary key '
+          '${jsonEncode(oldPkVal)}');
+    }
+    final newPkBytes = _encodePrimaryKey(newPk);
+    final samePk = _compareBytes(oldPkBytes, newPkBytes) == 0;
+    if (!samePk && (await _index.get(newPkBytes)) != null) {
+      throw StateError('PagedTable.reassignPrimaryKey: primary key '
+          '${jsonEncode(newPk)} already exists');
+    }
+    // Probe every UNIQUE secondary index for a non-self conflict.
+    // [_uniqueConflict] excludes the row currently at oldPkBytes via
+    // the self-PK tail trick.
+    for (final si in _secondary.values) {
+      if (!si.unique) continue;
+      final prefix = _encodeSecondaryPrefix(si, row);
+      if (prefix == null) continue;
+      if (await _uniqueConflict(si, prefix, oldPkBytes)) {
+        throw StateError(
+            'PagedTable.reassignPrimaryKey: UNIQUE constraint violated '
+            'on index ${si.name} (${si.columns.join(", ")})');
+      }
+    }
+    // All checks passed — delete the old row, insert the new one.
+    await delete(oldPkVal);
+    await insert(row);
+  }
+
   /// Delete the row with primary key [pkVal]. Returns true if it existed.
   Future<bool> delete(Object pkVal) async {
     final pkBytes = _encodePrimaryKey(pkVal);

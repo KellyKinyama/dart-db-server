@@ -186,12 +186,13 @@ implemented:
   benefit is preserved on selective joins. `CREATE UNIQUE INDEX` on
   paged tables is supported (NULL components don't participate in the
   constraint, matching SQLite); expression and partial indexes on
-  paged tables raise `UnsupportedError`; so do
-  primary-key reassignment and triggers. `INSERT OR IGNORE`,
-  `INSERT OR REPLACE` (including the `REPLACE INTO …` alias), and
-  `INSERT … ON CONFLICT (cols) DO NOTHING | DO UPDATE SET … [WHERE …]`
-  are supported on paged tables and respect both PK and UNIQUE-index
-  conflicts. The lower-level `PagedTable` API in
+  paged tables raise `UnsupportedError`; so do triggers. `UPDATE …
+  SET pk = …` reassigns the primary key on paged tables (rejected on
+  collision with another existing row, or on NULL). `INSERT OR
+  IGNORE`, `INSERT OR REPLACE` (including the `REPLACE INTO …`
+  alias), and `INSERT … ON CONFLICT (cols) DO NOTHING | DO UPDATE
+  SET … [WHERE …]` are supported on paged tables and respect both PK
+  and UNIQUE-index conflicts. The lower-level `PagedTable` API in
   `lib/server/paged_table.dart` exposes the full primitives directly.
 - **SQLite wire protocol**: clients speak this engine's JSON line protocol,
   not SQLite's native protocol.

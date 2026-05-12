@@ -2364,14 +2364,9 @@ class Database {
       );
       assignExprs[hit.name] = expr;
     });
-    // Refuse to mutate the primary key column — PagedTable.update keeps
-    // the pk fixed; changing it would require delete+insert and is not
-    // worth the complexity here.
-    if (assignExprs.containsKey(pkName)) {
-      throw UnsupportedError(
-          'UPDATE on paged table ${s.table}: cannot reassign the '
-          'primary key column "$pkName".');
-    }
+    // PK reassignment is allowed: when the SET list touches the PK
+    // column, we re-route that row through delete + insert below.
+    final reassignsPk = assignExprs.containsKey(pkName);
     // Set up RETURNING projection, if any. SQLite returns the *new*
     // row values for UPDATE … RETURNING.
     final returningCols = <String>[];
@@ -2414,7 +2409,24 @@ class Database {
       assignExprs.forEach((col, expr) {
         updated[col] = expr.eval(row);
       });
-      await pt.update(pkVal, updated);
+      if (reassignsPk) {
+        final newPk = updated[pkName];
+        if (newPk == null) {
+          throw StateError(
+              'UPDATE on paged table ${s.table}: primary key column '
+              '"$pkName" cannot be set to NULL.');
+        }
+        if (_compareLiteral(newPk, pkVal) != 0) {
+          // PK actually changed: reassignPrimaryKey enforces PK and
+          // UNIQUE-index uniqueness atomically before any mutation,
+          // so a conflict leaves the table untouched.
+          await pt.reassignPrimaryKey(pkVal, updated);
+        } else {
+          await pt.update(pkVal, updated);
+        }
+      } else {
+        await pt.update(pkVal, updated);
+      }
       affected++;
       if (returningExprs.isNotEmpty) {
         returnedRows.add([for (final e in returningExprs) e.eval(updated)]);

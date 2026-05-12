@@ -110,18 +110,43 @@ void main() {
     ]);
   });
 
-  test('rejects unsupported query shapes with helpful errors', () async {
+  test('UPDATE can reassign primary key when no collision', () async {
     final db = await Database.open(dbPath());
     addTearDown(() async => db.close());
     await db.execute('CREATE TABLE t ('
         'id INTEGER PRIMARY KEY, name TEXT) USING paged');
     await db.execute("INSERT INTO t VALUES (1, 'a')");
 
-    // UPDATE that tries to reassign the primary key.
+    final r = await db.execute('UPDATE t SET id = 99 WHERE id = 1');
+    expect(r.affected, 1);
+    final row = await db.execute('SELECT id, name FROM t');
+    expect(row.rows, [
+      [99, 'a'],
+    ]);
+    // Old PK is gone.
+    final old = await db.execute('SELECT * FROM t WHERE id = 1');
+    expect(old.rows, isEmpty);
+  });
+
+  test('UPDATE primary-key reassignment rejects collision with existing row',
+      () async {
+    final db = await Database.open(dbPath());
+    addTearDown(() async => db.close());
+    await db.execute('CREATE TABLE t ('
+        'id INTEGER PRIMARY KEY, name TEXT) USING paged');
+    await db.execute("INSERT INTO t VALUES (1, 'a')");
+    await db.execute("INSERT INTO t VALUES (2, 'b')");
+
     await expectLater(
-      db.execute('UPDATE t SET id = 99 WHERE id = 1'),
-      throwsA(isA<UnsupportedError>()),
+      db.execute('UPDATE t SET id = 2 WHERE id = 1'),
+      throwsA(isA<StateError>()),
     );
+    // Both rows still intact.
+    final all = await db.execute('SELECT id FROM t ORDER BY id');
+    expect(all.rows, [
+      [1],
+      [2],
+    ]);
   });
 
   test('rejects USING paged on in-memory database', () async {
