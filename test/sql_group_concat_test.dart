@@ -49,8 +49,7 @@ void main() {
       try {
         await db.execute('CREATE TABLE t (s TEXT)');
         await db.execute("INSERT INTO t VALUES ('a'),('b'),('c')");
-        final r =
-            await db.execute("SELECT GROUP_CONCAT(s, ' | ') FROM t");
+        final r = await db.execute("SELECT GROUP_CONCAT(s, ' | ') FROM t");
         expect(r.rows.first.first, 'a | b | c');
       } finally {
         await db.close();
@@ -62,8 +61,7 @@ void main() {
       try {
         await db.execute('CREATE TABLE t (s TEXT)');
         await db.execute("INSERT INTO t VALUES ('x'),('y'),('z')");
-        final r =
-            await db.execute("SELECT STRING_AGG(s, '-') FROM t");
+        final r = await db.execute("SELECT STRING_AGG(s, '-') FROM t");
         expect(r.rows.first.first, 'x-y-z');
       } finally {
         await db.close();
@@ -91,10 +89,8 @@ void main() {
       final db = await Database.open();
       try {
         await db.execute('CREATE TABLE t (s TEXT)');
-        await db
-            .execute("INSERT INTO t VALUES ('a'),('b'),('a'),('c'),('b')");
-        final r =
-            await db.execute("SELECT GROUP_CONCAT(DISTINCT s) FROM t");
+        await db.execute("INSERT INTO t VALUES ('a'),('b'),('a'),('c'),('b')");
+        final r = await db.execute("SELECT GROUP_CONCAT(DISTINCT s) FROM t");
         expect(r.rows.first.first, 'a,b,c');
       } finally {
         await db.close();
@@ -105,8 +101,7 @@ void main() {
       final db = await Database.open();
       try {
         await db.execute('CREATE TABLE t (g TEXT, v TEXT)');
-        await db.execute(
-            "INSERT INTO t VALUES ('A','1'),('A','2'),('B','3')");
+        await db.execute("INSERT INTO t VALUES ('A','1'),('A','2'),('B','3')");
         final r = await db.execute(
             "SELECT g, GROUP_CONCAT(v, ';') FROM t GROUP BY g ORDER BY g");
         expect(r.rows, [
@@ -123,8 +118,8 @@ void main() {
     test('skips NULLs, joins with separator', () async {
       final db = await Database.open();
       try {
-        final r = await db.execute(
-            "SELECT CONCAT_WS('-', 'a', NULL, 'b', 'c')");
+        final r =
+            await db.execute("SELECT CONCAT_WS('-', 'a', NULL, 'b', 'c')");
         expect(r.rows.first.first, 'a-b-c');
       } finally {
         await db.close();

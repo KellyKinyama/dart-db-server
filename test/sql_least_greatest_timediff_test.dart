@@ -9,8 +9,7 @@ void main() {
     test('basic numeric', () async {
       final db = await Database.open();
       try {
-        final r = await db
-            .execute('SELECT LEAST(3, 1, 2), GREATEST(3, 1, 2)');
+        final r = await db.execute('SELECT LEAST(3, 1, 2), GREATEST(3, 1, 2)');
         expect(r.rows.first, [1, 3]);
       } finally {
         await db.close();
@@ -31,8 +30,8 @@ void main() {
     test('all NULL returns NULL', () async {
       final db = await Database.open();
       try {
-        final r = await db
-            .execute('SELECT LEAST(NULL, NULL), GREATEST(NULL, NULL)');
+        final r =
+            await db.execute('SELECT LEAST(NULL, NULL), GREATEST(NULL, NULL)');
         expect(r.rows.first, [null, null]);
       } finally {
         await db.close();
@@ -42,8 +41,8 @@ void main() {
     test('strings use SQL comparison', () async {
       final db = await Database.open();
       try {
-        final r = await db.execute(
-            "SELECT LEAST('c', 'a', 'b'), GREATEST('c', 'a', 'b')");
+        final r = await db
+            .execute("SELECT LEAST('c', 'a', 'b'), GREATEST('c', 'a', 'b')");
         expect(r.rows.first, ['a', 'c']);
       } finally {
         await db.close();
@@ -67,8 +66,7 @@ void main() {
       final db = await Database.open();
       try {
         // 'é' = 2 bytes in UTF-8, 'a' = 1 byte.
-        final r =
-            await db.execute("SELECT OCTET_LENGTH('aé'), LENGTH('aé')");
+        final r = await db.execute("SELECT OCTET_LENGTH('aé'), LENGTH('aé')");
         expect(r.rows.first, [3, 2]);
       } finally {
         await db.close();
@@ -78,8 +76,8 @@ void main() {
     test('NULL input', () async {
       final db = await Database.open();
       try {
-        final r = await db
-            .execute('SELECT OCTET_LENGTH(NULL), BIT_LENGTH(NULL)');
+        final r =
+            await db.execute('SELECT OCTET_LENGTH(NULL), BIT_LENGTH(NULL)');
         expect(r.rows.first, [null, null]);
       } finally {
         await db.close();

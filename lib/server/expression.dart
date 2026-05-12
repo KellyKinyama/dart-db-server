@@ -1119,9 +1119,7 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     if (a.length < 3 || a[0] == null || a[1] == null || a[2] == null) {
       return null;
     }
-    return a[0]
-        .toString()
-        .replaceAll(RegExp(a[1].toString()), a[2].toString());
+    return a[0].toString().replaceAll(RegExp(a[1].toString()), a[2].toString());
   },
   'RANDOM': (a) => _rng.nextInt(1 << 31),
   'INSTR': (a) {
@@ -1172,6 +1170,42 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     }
     return sb.toString();
   },
+  // ZEROBLOB(n) -- BLOB of n zero bytes.
+  'ZEROBLOB': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final n = (a[0] as num).toInt();
+    if (n < 0) return <int>[];
+    return List<int>.filled(n, 0);
+  },
+  // RANDOMBLOB(n) -- BLOB of n random bytes.
+  'RANDOMBLOB': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final n = (a[0] as num).toInt();
+    if (n <= 0) return <int>[];
+    return List<int>.generate(n, (_) => _rng.nextInt(256));
+  },
+  // QUOTE(X) -- SQL literal form of X. Strings become 'escaped',
+  // BLOBs become X'hex', NULL becomes 'NULL', numbers stringified.
+  'QUOTE': (a) {
+    if (a.isEmpty) return null;
+    final v = a[0];
+    if (v == null) return 'NULL';
+    if (v is List<int>) {
+      final sb = StringBuffer("X'");
+      for (final b in v) {
+        sb.write((b & 0xFF).toRadixString(16).padLeft(2, '0').toUpperCase());
+      }
+      sb.write("'");
+      return sb.toString();
+    }
+    if (v is num || v is bool) return v.toString();
+    return "'${v.toString().replaceAll("'", "''")}'";
+  },
+  // LIKELY(X), UNLIKELY(X), LIKELIHOOD(X, _) -- optimizer hints; we just
+  // return X. The constant probability arg to LIKELIHOOD is ignored.
+  'LIKELY': (a) => a.isEmpty ? null : a[0],
+  'UNLIKELY': (a) => a.isEmpty ? null : a[0],
+  'LIKELIHOOD': (a) => a.isEmpty ? null : a[0],
   // UNHEX(X[, ignored]) — inverse of HEX. Returns NULL on malformed input
   // (matches SQLite). Optional second arg lists characters to skip; we
   // honor the SQLite default of allowing whitespace.

@@ -124,13 +124,27 @@ This engine targets SQL surface compatibility, not byte-for-byte SQLite parity.
 The following SQLite features are intentionally out of scope and will not be
 implemented:
 
-- **Storage engine**: no B-tree pages, no page cache, no WAL, no mmap.
-  Persistence is a single JSON document re-serialised on every mutation.
-- **Crash safety**: no journal, no rollback log, no fsync ordering guarantees.
-- **Concurrency**: no multi-process locking and no internal MVCC; the engine
-  assumes a single writer at a time.
-- **SQLite C API & file format**: not produced or consumed; database files
-  are not interchangeable with sqlite3.
+- **Storage engine**: no B-tree pages, no page cache, no mmap. JSON-backed
+  databases re-serialise the whole document on every mutation; SQLite-format
+  databases (`.sqlite` / `.db`) write incremental `-wal` page diffs and
+  auto-checkpoint when the change ratio exceeds 75%.
+- **Crash safety**: every persist (JSON or SQLite-format, main file or
+  `-wal`) goes through `<path>.tmp` + fsync + atomic rename, so a crash
+  mid-write leaves the previous good file fully intact. Stale `.tmp`
+  siblings from a crashed writer are reaped on the next `Database.open`.
+  There is still no per-statement journal, so an uncommitted in-memory
+  transaction is lost if the process dies before `_persist` runs.
+- **Concurrency**: a sidecar `<path>.lock` file gives best-effort
+  cross-process advisory locking via `RandomAccessFile.lock()` (shared
+  for readers, exclusive for writers); within a process an
+  `AsyncRwLock` serialises executor mutations. There is no internal
+  MVCC — readers see the writer's committed state.
+- **SQLite C API & file format**: paths ending in `.sqlite`, `.sqlite3`,
+  or `.db` are read and written in the real SQLite on-disk format
+  (validated by package:sqlite3 round-trip tests). The SQLite C API
+  itself is not linked.
+- **Out-of-core datasets**: the working set must fit in RAM. There is no
+  paged buffer pool that spills cold pages to disk.
 - **SQLite wire protocol**: clients speak this engine's JSON line protocol,
   not SQLite's native protocol.
 - **Production-grade FTS5 / R*Tree**: `CREATE VIRTUAL TABLE ... USING fts5`n  and `USING rtree` are accepted and create regular tables; `MATCH` does a

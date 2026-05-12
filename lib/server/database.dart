@@ -386,6 +386,9 @@ class Database {
       // Acquire the cross-process file lock before touching the file.
       db._fileLock = DbFileLock(path);
       await db._fileLock!.acquire();
+      // Reap any half-written temp files left behind by a crashed
+      // writer (sibling `<path>.tmp` / `<path>-wal.tmp`).
+      await db._reapStaleTempFiles();
       if (await File(path).exists()) {
         await db._load();
       } else {
@@ -5127,7 +5130,56 @@ class Database {
       'tables': {for (final e in _tables.entries) e.key: e.value.toJson()},
       'views': {for (final e in _viewSql.entries) e.key: e.value},
     };
-    await File(path!).writeAsString(jsonEncode(out));
+    await _atomicWriteBytes(
+        path!, Uint8List.fromList(utf8.encode(jsonEncode(out))));
+  }
+
+  /// Crash-safe write: writes to `<dest>.tmp`, fsyncs the temp file's
+  /// contents, then atomically renames it over `dest`. On Windows the
+  /// rename can't overwrite an existing file, so we delete the
+  /// destination first; the surrounding [DbFileLock] keeps other
+  /// processes out of the brief gap.
+  ///
+  /// A torn write therefore manifests as either:
+  ///  * the original file unchanged (rename never ran); or
+  ///  * the new file fully written (rename completed),
+  /// and never as a half-written destination.
+  static Future<void> _atomicWriteBytes(String dest, List<int> bytes) async {
+    final tmp = '$dest.tmp';
+    final raf = await File(tmp).open(mode: FileMode.write);
+    try {
+      await raf.writeFrom(bytes);
+      await raf.flush(); // request fsync
+    } finally {
+      await raf.close();
+    }
+    if (Platform.isWindows) {
+      final destFile = File(dest);
+      if (await destFile.exists()) {
+        try {
+          await destFile.delete();
+        } catch (_) {/* best-effort */}
+      }
+    }
+    await File(tmp).rename(dest);
+  }
+
+  /// Recover from a previous crash mid-[_atomicWriteBytes]: if a stale
+  /// `<path>.tmp` is sitting next to the data file, it's an incomplete
+  /// write that never made it to the rename step — discard it.
+  Future<void> _reapStaleTempFiles() async {
+    if (path == null) return;
+    for (final p in [
+      '$path.tmp',
+      '${path!}-wal.tmp',
+    ]) {
+      final f = File(p);
+      if (await f.exists()) {
+        try {
+          await f.delete();
+        } catch (_) {/* best-effort */}
+      }
+    }
   }
 
   /// Maximum fraction of pages that may change before we abandon the
@@ -5152,7 +5204,7 @@ class Database {
         current.length >= baseline.length;
     if (!canDiff) {
       // Full rewrite path.
-      await File(path!).writeAsBytes(current);
+      await _atomicWriteBytes(path!, current);
       _sqliteBaselineBytes = Uint8List.fromList(current);
       final wf = File(walPath);
       if (await wf.exists()) await wf.delete();
@@ -5179,7 +5231,7 @@ class Database {
     final ratio = overrides.length / pages;
     if (ratio >= _walAutoCheckpointThreshold) {
       // Too churny: rewrite the main file and reset baseline.
-      await File(path!).writeAsBytes(current);
+      await _atomicWriteBytes(path!, current);
       _sqliteBaselineBytes = Uint8List.fromList(current);
       final wf = File(walPath);
       if (await wf.exists()) await wf.delete();
@@ -5190,7 +5242,7 @@ class Database {
       pageOverrides: overrides,
       dbSizeAfterCommit: pages,
     );
-    await File(walPath).writeAsBytes(wal);
+    await _atomicWriteBytes(walPath, wal);
     // Baseline stays at the on-disk main image; we do NOT update it
     // here, so subsequent incremental writes keep diffing against the
     // last full snapshot.
@@ -5210,7 +5262,7 @@ class Database {
   Future<void> checkpointSqlite() async {
     if (path == null || !_persistAsSqlite) return;
     final bytes = _buildSqliteBytes(pageSize: _sqlitePageSize);
-    await File(path!).writeAsBytes(bytes);
+    await _atomicWriteBytes(path!, bytes);
     _sqliteBaselineBytes = Uint8List.fromList(bytes);
     final wf = File('${path!}-wal');
     if (await wf.exists()) await wf.delete();
@@ -5306,7 +5358,7 @@ class Database {
       {int pageSize = 4096, bool includeIndexes = true}) async {
     final bytes =
         _buildSqliteBytes(pageSize: pageSize, includeIndexes: includeIndexes);
-    await File(path).writeAsBytes(bytes);
+    await _atomicWriteBytes(path, bytes);
   }
 
   /// Build the SQLite-format byte image for the current in-memory state.
