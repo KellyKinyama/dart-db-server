@@ -1298,8 +1298,22 @@ class Parser {
     var left = _parseConcat();
     if (_matchKw('IS')) {
       final negated = _matchKw('NOT');
-      _expectKw('NULL');
-      return UnaryExpr(negated ? 'IS NOT NULL' : 'IS NULL', left);
+      // IS [NOT] DISTINCT FROM <expr> — NULL-safe (in)equality.
+      if (_matchKw('DISTINCT')) {
+        _expectKw('FROM');
+        final right = _parseConcat();
+        return BinaryExpr(
+            negated ? 'IS NOT DISTINCT FROM' : 'IS DISTINCT FROM',
+            left,
+            right);
+      }
+      // IS [NOT] NULL.
+      if (_matchKw('NULL')) {
+        return UnaryExpr(negated ? 'IS NOT NULL' : 'IS NULL', left);
+      }
+      // Bare IS / IS NOT <expr> — NULL-safe (in)equality (SQLite extension).
+      final right = _parseConcat();
+      return BinaryExpr(negated ? 'IS NOT' : 'IS', left, right);
     }
     bool negated = false;
     if (_matchKw('NOT')) negated = true;
@@ -1360,8 +1374,20 @@ class Parser {
 
   /// JSON extract operators (`->` returns JSON text, `->>` returns SQL value).
   Expr _parseJsonExtract() {
-    var left = _parseAddSub();
+    var left = _parseBitwise();
     while (_check(TokType.op, '->') || _check(TokType.op, '->>')) {
+      final op = _advance().text;
+      left = BinaryExpr(op, left, _parseBitwise());
+    }
+    return left;
+  }
+
+  /// Bitwise binary operators: `&`, `|`, `<<`, `>>`. Bind tighter than
+  /// comparisons but looser than `+`/`-`, matching SQLite precedence.
+  Expr _parseBitwise() {
+    var left = _parseAddSub();
+    while (_check(TokType.op) &&
+        const {'&', '|', '<<', '>>'}.contains(_peek().text)) {
       final op = _advance().text;
       left = BinaryExpr(op, left, _parseAddSub());
     }
@@ -1395,6 +1421,10 @@ class Parser {
     if (_check(TokType.op, '+')) {
       _advance();
       return _parseUnary();
+    }
+    if (_check(TokType.op, '~')) {
+      _advance();
+      return UnaryExpr('~', _parseUnary());
     }
     return _parsePrimary();
   }

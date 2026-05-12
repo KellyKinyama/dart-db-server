@@ -404,6 +404,14 @@ class Lexer {
       _pos += 2;
       return Token(TokType.op, '||', start);
     }
+    if (c == '<' && _peek(1) == '<') {
+      _pos += 2;
+      return Token(TokType.op, '<<', start);
+    }
+    if (c == '>' && _peek(1) == '>') {
+      _pos += 2;
+      return Token(TokType.op, '>>', start);
+    }
     if (c == '-' && _peek(1) == '>' && _peek(2) == '>') {
       _pos += 3;
       return Token(TokType.op, '->>', start);
@@ -412,7 +420,7 @@ class Lexer {
       _pos += 2;
       return Token(TokType.op, '->', start);
     }
-    if ('=<>+-*/%'.contains(c)) {
+    if ('=<>+-*/%&|~'.contains(c)) {
       _pos++;
       return Token(TokType.op, c, start);
     }

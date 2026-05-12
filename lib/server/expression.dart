@@ -118,6 +118,9 @@ class UnaryExpr extends Expr {
       case '-':
         if (v == null) return null;
         return -(v as num);
+      case '~':
+        if (v == null) return null;
+        return ~((v as num).toInt());
       case 'IS NULL':
         return v == null;
       case 'IS NOT NULL':
@@ -145,6 +148,26 @@ class BinaryExpr extends Expr {
       return op == 'AND'
           ? (l as bool) && (r as bool)
           : (l as bool) || (r as bool);
+    }
+    // NULL-safe equality (mirrors SQLite's IS / IS NOT and the standard
+    // IS DISTINCT FROM / IS NOT DISTINCT FROM). These must run before the
+    // generic null-propagation below.
+    if (op == 'IS' ||
+        op == 'IS NOT' ||
+        op == 'IS DISTINCT FROM' ||
+        op == 'IS NOT DISTINCT FROM') {
+      final l = left.eval(row);
+      final r = right.eval(row);
+      final same = (l == null && r == null) ||
+          (l != null && r != null && _eq(l, r));
+      switch (op) {
+        case 'IS':
+        case 'IS NOT DISTINCT FROM':
+          return same;
+        case 'IS NOT':
+        case 'IS DISTINCT FROM':
+          return !same;
+      }
     }
     final l = left.eval(row);
     final r = right.eval(row);
@@ -182,6 +205,14 @@ class BinaryExpr extends Expr {
         // SQLite uses C-style truncated modulo (sign follows the dividend),
         // not Dart's Euclidean `%` which is always non-negative.
         return (l as num).remainder(r as num);
+      case '&':
+        return (l as num).toInt() & (r as num).toInt();
+      case '|':
+        return (l as num).toInt() | (r as num).toInt();
+      case '<<':
+        return (l as num).toInt() << (r as num).toInt();
+      case '>>':
+        return (l as num).toInt() >> (r as num).toInt();
       case '||':
         return _stringify(l) + _stringify(r);
       case 'LIKE':
