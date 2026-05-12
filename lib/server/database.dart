@@ -149,6 +149,22 @@ class Database {
   /// Stack of savepoints (name + table snapshot).
   final List<_Savepoint> _savepoints = <_Savepoint>[];
 
+  /// Paged tables that have been mutated by the currently active
+  /// transaction. Used by [_commit] / [_rollback] to flush or undo all
+  /// of them at the transaction boundary; individual DML statements
+  /// skip calling [PagedTable.commit] while [inTransaction] is true
+  /// and instead register themselves here.
+  final Set<PagedTable> _pagedDirty = <PagedTable>{};
+
+  /// Drained by [executeStmt] right after [_dispatch] returns: tables
+  /// in [_pendingPagedCommit] get [PagedTable.commit] awaited; tables
+  /// in [_pendingPagedRollback] get [PagedTable.rollback] awaited.
+  /// They exist because [_commit] / [_rollback] are sync (they're
+  /// invoked from the sync trigger dispatch path) but the underlying
+  /// paged-file work is async.
+  final List<PagedTable> _pendingPagedCommit = <PagedTable>[];
+  final List<PagedTable> _pendingPagedRollback = <PagedTable>[];
+
   /// ATTACH DATABASE: alias -> file path. Tables loaded from each attached
   /// database are stored in [_tables] keyed `alias.tablename`.
   final Map<String, String> _attached = <String, String>{};
@@ -586,6 +602,27 @@ class Database {
         }
       } finally {
         _executionStack.removeLast();
+        // Drain any paged commit/rollback queued by a sync _commit /
+        // _rollback. Rollbacks always run before commits — and run
+        // unconditionally, including on the exception path — so a
+        // deferred-FK-failed COMMIT (which calls _rollback internally
+        // and rethrows) still undoes the paged side.
+        if (_pendingPagedRollback.isNotEmpty) {
+          final pending = List<PagedTable>.from(_pendingPagedRollback);
+          _pendingPagedRollback.clear();
+          for (final pt in pending) {
+            try {
+              await pt.rollback();
+            } catch (_) {/* best-effort */}
+          }
+        }
+        if (_pendingPagedCommit.isNotEmpty) {
+          final pending = List<PagedTable>.from(_pendingPagedCommit);
+          _pendingPagedCommit.clear();
+          for (final pt in pending) {
+            await pt.commit();
+          }
+        }
       }
       if (_isMutation(stmt)) {
         // Conservatively drop FTS5 caches for the statement's target
@@ -781,18 +818,46 @@ class Database {
   // Paged-table dispatch (out-of-core `USING paged` backend)
   // ---------------------------------------------------------------------------
 
+  /// Disallow DDL on paged tables inside a transaction. Paged DDL
+  /// touches multiple files (heap, indexes, sidecar metadata, plus
+  /// directory entries on CREATE/DROP/TRUNCATE) and isn't covered by
+  /// the per-file undo journal, so we can't roll it back atomically.
+  void _assertNoPagedDdlInTx(String action) {
+    if (inTransaction) {
+      throw UnsupportedError(
+          '$action is not supported inside an active transaction. '
+          'COMMIT or ROLLBACK first.');
+    }
+  }
+
+  /// Disallow paged DML while a SAVEPOINT is open. Paged-table writes
+  /// inside a savepoint can't be selectively rolled back by
+  /// `ROLLBACK TO`; that would silently leave the on-disk paged side
+  /// ahead of the in-memory snapshot, so we refuse the write up-front.
+  void _assertPagedWriteAllowed(String action) {
+    if (_savepoints.isNotEmpty) {
+      throw UnsupportedError(
+          '$action is not supported while a SAVEPOINT is open. '
+          'RELEASE the savepoint first.');
+    }
+  }
+
   /// If [stmt] is either a `CREATE TABLE … USING paged` or a DML/SELECT
   /// targeting a registered paged table, execute it via the async
   /// PagedTable API and return the result. Returns null when the
   /// caller should fall through to the regular synchronous dispatch.
   Future<QueryResult?> _maybeRunPagedStmt(Statement stmt) async {
     if (stmt is CreateTableStmt && stmt.usingPaged) {
+      _assertNoPagedDdlInTx('CREATE TABLE … USING paged');
       return _createPagedTable(stmt);
     }
     // CREATE INDEX may target a paged table; we look up by table name.
     if (stmt is CreateIndexStmt) {
       final pt = _pagedTables[stmt.table];
-      if (pt != null) return _pagedCreateIndex(stmt, pt);
+      if (pt != null) {
+        _assertNoPagedDdlInTx('CREATE INDEX on paged table ${stmt.table}');
+        return _pagedCreateIndex(stmt, pt);
+      }
       return null;
     }
     // DROP INDEX routes through the registered-owner map.
@@ -800,7 +865,10 @@ class Database {
       final ownerTable = _pagedIndexOwners[stmt.indexName];
       if (ownerTable != null) {
         final pt = _pagedTables[ownerTable];
-        if (pt != null) return _pagedDropIndex(stmt, pt);
+        if (pt != null) {
+          _assertNoPagedDdlInTx('DROP INDEX on paged table $ownerTable');
+          return _pagedDropIndex(stmt, pt);
+        }
       }
       return null;
     }
@@ -823,7 +891,10 @@ class Database {
       }
       return null;
     }
-    if (stmt is InsertStmt) return _pagedInsert(stmt, pt);
+    if (stmt is InsertStmt) {
+      _assertPagedWriteAllowed('INSERT into paged table $tname');
+      return _pagedInsert(stmt, pt);
+    }
     if (stmt is SelectStmt) {
       // Paged FROM with joins: needs the materialise-then-join path.
       if (stmt.joins.isNotEmpty) {
@@ -836,10 +907,22 @@ class Database {
       }
       return _pagedSelect(stmt, pt);
     }
-    if (stmt is UpdateStmt) return _pagedUpdate(stmt, pt);
-    if (stmt is DeleteStmt) return _pagedDelete(stmt, pt);
-    if (stmt is DropTableStmt) return _pagedDrop(stmt, pt);
-    if (stmt is TruncateTableStmt) return _pagedTruncate(stmt, pt);
+    if (stmt is UpdateStmt) {
+      _assertPagedWriteAllowed('UPDATE on paged table $tname');
+      return _pagedUpdate(stmt, pt);
+    }
+    if (stmt is DeleteStmt) {
+      _assertPagedWriteAllowed('DELETE on paged table $tname');
+      return _pagedDelete(stmt, pt);
+    }
+    if (stmt is DropTableStmt) {
+      _assertNoPagedDdlInTx('DROP TABLE on paged table $tname');
+      return _pagedDrop(stmt, pt);
+    }
+    if (stmt is TruncateTableStmt) {
+      _assertNoPagedDdlInTx('TRUNCATE on paged table $tname');
+      return _pagedTruncate(stmt, pt);
+    }
     if (stmt is DescribeStmt) {
       // Cheap: synthesize a Table row-set off the paged columns.
       return QueryResult(columns: const [
@@ -1596,7 +1679,11 @@ class Database {
       await pt.insert(map);
       affected++;
     }
-    await pt.commit();
+    if (inTransaction) {
+      _pagedDirty.add(pt);
+    } else {
+      await pt.commit();
+    }
     return QueryResult(affected: affected, message: '$affected row(s)');
   }
 
@@ -2004,7 +2091,13 @@ class Database {
       await pt.update(pkVal, updated);
       affected++;
     }
-    if (affected > 0) await pt.commit();
+    if (affected > 0) {
+      if (inTransaction) {
+        _pagedDirty.add(pt);
+      } else {
+        await pt.commit();
+      }
+    }
     return QueryResult(affected: affected, message: '$affected row(s)');
   }
 
@@ -2030,7 +2123,13 @@ class Database {
     for (final pk in pks) {
       if (await pt.delete(pk)) affected++;
     }
-    if (affected > 0) await pt.commit();
+    if (affected > 0) {
+      if (inTransaction) {
+        _pagedDirty.add(pt);
+      } else {
+        await pt.commit();
+      }
+    }
     return QueryResult(affected: affected, message: '$affected row(s)');
   }
 
@@ -5624,6 +5723,7 @@ class Database {
     if (inTransaction) throw StateError('Already in a transaction');
     _snapshot = {for (final e in _tables.entries) e.key: e.value.clone()};
     _viewSnapshot = Map<String, SelectStmt>.from(_views);
+    _pagedDirty.clear();
     return QueryResult.message('Transaction started');
   }
 
@@ -5709,6 +5809,10 @@ class Database {
       _liveViews = null;
       _readOnlySnapshot = false;
     }
+    // Hand the dirty paged tables to the async drainer so executeStmt
+    // can await their commits after _dispatch returns.
+    _pendingPagedCommit.addAll(_pagedDirty);
+    _pagedDirty.clear();
     _snapshot = null;
     _viewSnapshot = null;
     return QueryResult.message('Transaction committed');
@@ -5736,6 +5840,10 @@ class Database {
         ..clear()
         ..addAll(_viewSnapshot!);
     }
+    // Hand the dirty paged tables to the async drainer so executeStmt
+    // can await their rollbacks after _dispatch returns.
+    _pendingPagedRollback.addAll(_pagedDirty);
+    _pagedDirty.clear();
     _snapshot = null;
     _viewSnapshot = null;
     return QueryResult.message('Transaction rolled back');

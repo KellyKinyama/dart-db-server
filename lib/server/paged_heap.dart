@@ -319,6 +319,28 @@ class PagedHeap {
   int _pageOf(RowId id) => id >> 16;
   int _slotOf(RowId id) => id & 0xFFFF;
 
+  /// Discard pending mutations on the underlying file and reload the
+  /// in-memory header fields ([_rowCount], [_allocHintPage]) from the
+  /// (now-restored) header page. Safe to call when there is nothing
+  /// to roll back.
+  Future<void> rollback() async {
+    await file.rollback();
+    if (file.pageCount == 0) {
+      _rowCount = 0;
+      _allocHintPage = 0;
+      _hasReclaimableSpace = false;
+      return;
+    }
+    final buf = await file.read(0);
+    final bd = ByteData.sublistView(buf);
+    _rowCount = bd.getUint32(4, Endian.little);
+    _allocHintPage = bd.getUint32(8, Endian.little);
+    // Be conservative: a rolled-back delete leaves us unsure whether
+    // reclaimable space exists, so re-enable the scan path until the
+    // next fruitless pass clears it.
+    _hasReclaimableSpace = true;
+  }
+
   Future<void> _initIfNeeded() async {
     if (file.pageCount == 0) {
       // Brand new file: write the header page.

@@ -190,6 +190,23 @@ class PagedBTree {
   /// Persist pending mutations.
   Future<void> commit() => file.commit();
 
+  /// Discard pending mutations on the underlying file and reload the
+  /// in-memory header fields ([_rootPage], [_entryCount]) from the
+  /// (now-restored) header page. Safe to call when there is nothing
+  /// to roll back.
+  Future<void> rollback() async {
+    await file.rollback();
+    if (file.pageCount == 0) {
+      _rootPage = 0;
+      _entryCount = 0;
+      return;
+    }
+    final hdr = await file.read(0);
+    final bd = ByteData.sublistView(hdr);
+    _rootPage = bd.getUint32(4, Endian.little);
+    _entryCount = bd.getUint32(8, Endian.little);
+  }
+
   // ---------------------------------------------------------------------------
   // Init
   // ---------------------------------------------------------------------------

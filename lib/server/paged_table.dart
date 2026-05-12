@@ -392,6 +392,17 @@ class PagedTable {
     }
   }
 
+  /// Discard pending mutations on every backing file (heap, primary
+  /// B+-tree, and any open secondary indexes). After this call the
+  /// table reflects the on-disk state as of the last [commit].
+  Future<void> rollback() async {
+    await _heap.rollback();
+    await _index.rollback();
+    for (final si in _secondary.values) {
+      await si.btree.rollback();
+    }
+  }
+
   /// Close both backing files. Implicitly commits.
   Future<void> close() async {
     await _heapFile.close();
