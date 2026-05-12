@@ -847,19 +847,14 @@ class Database {
           'CREATE INDEX on paged table ${s.table}: partial indexes are '
           'not supported.');
     }
-    if (s.columns.length != 1) {
-      throw UnsupportedError(
-          'CREATE INDEX on paged table ${s.table}: composite indexes '
-          'are not supported (got ${s.columns.length} columns).');
-    }
     if (_pagedIndexOwners.containsKey(s.indexName)) {
       throw StateError('Index ${s.indexName} already exists on paged table '
           '${_pagedIndexOwners[s.indexName]}');
     }
-    await pt.createIndex(s.indexName, s.column);
+    await pt.createIndex(s.indexName, s.columns);
     _pagedIndexOwners[s.indexName] = s.table;
     return QueryResult.message(
-        'index ${s.indexName} created on ${s.table}(${s.column})');
+        'index ${s.indexName} created on ${s.table}(${s.columns.join(', ')})');
   }
 
   Future<QueryResult> _pagedDropIndex(DropIndexStmt s, PagedTable pt) async {
@@ -1261,12 +1256,14 @@ class Database {
       final plan = _findIndexPlan(pt, residual);
       if (plan != null) {
         if (plan.isEquality) {
-          await for (final row in pt.indexLookup(plan.indexName, plan.lower)) {
+          await for (final row
+              in pt.indexLookup(plan.indexName, plan.equalPrefix)) {
             if (passes(row)) yield row;
           }
         } else {
           await for (final row in pt.indexRange(
             plan.indexName,
+            equalPrefix: plan.equalPrefix,
             lower: plan.lower,
             lowerInclusive: plan.lowerInclusive,
             upper: plan.upper,
@@ -1294,18 +1291,15 @@ class Database {
     }
   }
 
-  /// Walk the residual AND-tree looking for predicates against an
-  /// indexed column. Returns the strongest plan we can build:
-  ///  - an equality `col = lit` becomes an [indexLookup] (isEquality);
-  ///  - a chain of `<`, `<=`, `>`, `>=` (and/or `BETWEEN` flattened
-  ///    into two conjuncts by the parser) on a single indexed column
-  ///    becomes an [indexRange] with the tightest combined bounds.
-  /// The first indexable column found wins; the original residual is
-  /// left intact and re-applied per-row by the caller, so this is
-  /// purely a candidate-narrowing optimisation.
+  /// Walk the residual AND-tree looking for predicates against the
+  /// columns of a secondary index. For each index, we try to match as
+  /// many *leading* columns as possible with equality predicates; if
+  /// the next column past the equality prefix has a range predicate
+  /// (`<`, `<=`, `>`, `>=`), we fold that in too. The first index
+  /// covered by at least its leading column wins. The residual is
+  /// left intact and re-applied per row by the caller.
   _PagedIndexPlan? _findIndexPlan(PagedTable pt, Expr e) {
-    // Group conjuncts by column-name (case-insensitive) → list of
-    // (op, literal) pairs. Skip anything that isn't `col OP literal`.
+    // Group conjuncts by column-name (lower-cased) → list of (op, lit).
     final byCol = <String, List<({String op, Object value})>>{};
     void visit(Expr expr) {
       if (expr is BinaryExpr && expr.op == 'AND') {
@@ -1325,7 +1319,6 @@ class Database {
       } else if (expr.right is ColumnExpr) {
         col = expr.right as ColumnExpr;
         lit = expr.left;
-        // Flip operator since `lit OP col` ≡ `col FLIP(OP) lit`.
         switch (op) {
           case '<':
             op = '>';
@@ -1339,7 +1332,6 @@ class Database {
           case '>=':
             op = '<=';
             break;
-          // '=' is symmetric
         }
       }
       if (col == null || lit == null) return;
@@ -1358,70 +1350,117 @@ class Database {
     visit(e);
     if (byCol.isEmpty) return null;
 
-    // Find the first indexed column that has at least one usable
-    // predicate.
-    for (final name in pt.secondaryIndexNames) {
-      final ic = pt.indexColumn(name);
-      if (ic == null) continue;
-      final preds = byCol[ic.toLowerCase()];
-      if (preds == null) continue;
+    // Collect columns that have an `IS NULL` predicate anywhere in
+    // the residual. We can't use a secondary index for those because
+    // NULLs aren't indexed — the index would silently miss matching
+    // rows.
+    final nullCols = <String>{};
+    void scanNulls(Expr expr) {
+      if (expr is BinaryExpr && expr.op == 'AND') {
+        scanNulls(expr.left);
+        scanNulls(expr.right);
+        return;
+      }
+      if (expr is UnaryExpr && expr.op == 'IS NULL') {
+        final inner = expr.operand;
+        if (inner is ColumnExpr) nullCols.add(inner.name.toLowerCase());
+      }
+    }
 
-      // Equality is strictest; if any conjunct on this column is `=`,
-      // route through indexLookup with that value.
-      for (final p in preds) {
-        if (p.op == '=') {
-          return _PagedIndexPlan(
-            indexName: name,
-            isEquality: true,
-            lower: p.value,
-            lowerInclusive: true,
-            upper: null,
-            upperInclusive: false,
-          );
+    scanNulls(e);
+
+    // For each index in registration order, try to build the strongest
+    // plan it supports.
+    for (final name in pt.secondaryIndexNames) {
+      final idxCols = pt.indexColumns(name);
+      if (idxCols == null || idxCols.isEmpty) continue;
+
+      // If any indexed column has an IS NULL predicate in the residual,
+      // routing through this index is unsound (it would miss the very
+      // rows the predicate wants to match).
+      final disqualified =
+          idxCols.any((c) => nullCols.contains(c.toLowerCase()));
+      if (disqualified) continue;
+
+      // Walk leading columns collecting equality values.
+      final equalPrefix = <Object>[];
+      int rangeColIdx = -1;
+      for (var i = 0; i < idxCols.length; i++) {
+        final preds = byCol[idxCols[i].toLowerCase()];
+        if (preds == null) {
+          break;
         }
+        // Equality wins; if not present, fall back to range on this
+        // column and stop the prefix walk.
+        Object? eqVal;
+        for (final p in preds) {
+          if (p.op == '=') {
+            eqVal = p.value;
+            break;
+          }
+        }
+        if (eqVal != null) {
+          equalPrefix.add(eqVal);
+          continue;
+        }
+        rangeColIdx = i;
+        break;
       }
 
-      // Otherwise combine into the tightest range bounds.
+      // We need at least one usable predicate.
+      if (equalPrefix.isEmpty && rangeColIdx < 0) continue;
+
+      // Build the range bounds on the column at rangeColIdx (if any).
       Object? lo;
       bool loInc = true;
       Object? hi;
       bool hiInc = false;
-      for (final p in preds) {
-        switch (p.op) {
-          case '>=':
-            if (lo == null || _compareLiteral(p.value, lo) > 0) {
-              lo = p.value;
-              loInc = true;
-            }
-            break;
-          case '>':
-            if (lo == null ||
-                _compareLiteral(p.value, lo) > 0 ||
-                (_compareLiteral(p.value, lo) == 0 && loInc)) {
-              lo = p.value;
-              loInc = false;
-            }
-            break;
-          case '<=':
-            if (hi == null || _compareLiteral(p.value, hi) < 0) {
-              hi = p.value;
-              hiInc = true;
-            }
-            break;
-          case '<':
-            if (hi == null ||
-                _compareLiteral(p.value, hi) < 0 ||
-                (_compareLiteral(p.value, hi) == 0 && hiInc)) {
-              hi = p.value;
-              hiInc = false;
-            }
-            break;
+      if (rangeColIdx >= 0) {
+        final preds = byCol[idxCols[rangeColIdx].toLowerCase()]!;
+        for (final p in preds) {
+          switch (p.op) {
+            case '>=':
+              if (lo == null || _compareLiteral(p.value, lo) > 0) {
+                lo = p.value;
+                loInc = true;
+              }
+              break;
+            case '>':
+              if (lo == null ||
+                  _compareLiteral(p.value, lo) > 0 ||
+                  (_compareLiteral(p.value, lo) == 0 && loInc)) {
+                lo = p.value;
+                loInc = false;
+              }
+              break;
+            case '<=':
+              if (hi == null || _compareLiteral(p.value, hi) < 0) {
+                hi = p.value;
+                hiInc = true;
+              }
+              break;
+            case '<':
+              if (hi == null ||
+                  _compareLiteral(p.value, hi) < 0 ||
+                  (_compareLiteral(p.value, hi) == 0 && hiInc)) {
+                hi = p.value;
+                hiInc = false;
+              }
+              break;
+          }
+        }
+        if (lo == null && hi == null) {
+          // No usable range predicates on this column after all.
+          if (equalPrefix.isEmpty) continue;
         }
       }
-      if (lo == null && hi == null) continue;
+
+      final isEquality =
+          rangeColIdx < 0 && equalPrefix.length == idxCols.length;
       return _PagedIndexPlan(
         indexName: name,
-        isEquality: false,
+        isEquality: isEquality,
+        equalPrefix: equalPrefix,
         lower: lo,
         lowerInclusive: loInc,
         upper: hi,
@@ -7214,9 +7253,15 @@ class _PagedRange {
 /// indexable predicates. `isEquality` flips between `indexLookup` and
 /// `indexRange`; the residual is still re-applied per row by the
 /// caller.
+///
+/// [equalPrefix] pins the leading columns by equality. When
+/// `isEquality` is true, every indexed column is covered by
+/// [equalPrefix] (and [lower] / [upper] are null). Otherwise the next
+/// column after the prefix is range-scanned using [lower] / [upper].
 class _PagedIndexPlan {
   final String indexName;
   final bool isEquality;
+  final List<Object> equalPrefix;
   final Object? lower;
   final bool lowerInclusive;
   final Object? upper;
@@ -7224,6 +7269,7 @@ class _PagedIndexPlan {
   _PagedIndexPlan({
     required this.indexName,
     required this.isEquality,
+    required this.equalPrefix,
     required this.lower,
     required this.lowerInclusive,
     required this.upper,

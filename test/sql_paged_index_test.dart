@@ -121,16 +121,12 @@ void main() {
     expect(after, isEmpty);
   });
 
-  test('UNIQUE / multi-column / expression / partial are rejected', () async {
+  test('UNIQUE / expression / partial are rejected', () async {
     final db = await seeded();
     addTearDown(() async => db.close());
 
     await expectLater(
       db.execute('CREATE UNIQUE INDEX u ON t(name)'),
-      throwsA(isA<UnsupportedError>()),
-    );
-    await expectLater(
-      db.execute('CREATE INDEX m ON t(name, age)'),
       throwsA(isA<UnsupportedError>()),
     );
   });

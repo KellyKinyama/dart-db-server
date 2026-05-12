@@ -112,9 +112,18 @@ class PagedTable {
   /// they were registered.
   List<String> get secondaryIndexNames => _secondary.keys.toList();
 
-  /// Column name that secondary index [indexName] is built on, or null
-  /// when there is no such index.
+  /// First (leading) column name of secondary index [indexName], or
+  /// null when there is no such index. Kept for the single-column
+  /// callers that pre-date composite indexes; prefer [indexColumns].
   String? indexColumn(String indexName) => _secondary[indexName]?.column;
+
+  /// All indexed column names (in order) for secondary index
+  /// [indexName], or null when there is no such index.
+  List<String>? indexColumns(String indexName) {
+    final si = _secondary[indexName];
+    if (si == null) return null;
+    return List.unmodifiable(si.columns);
+  }
 
   /// Open an existing paged table from `<basePath>.meta.json`. Throws
   /// if the metadata file does not exist.
@@ -182,7 +191,7 @@ class PagedTable {
     String basePath,
     List<PagedColumn> columns,
     int pkIdx,
-    List<({String name, String column})> indexes, {
+    List<({String name, List<String> columns})> indexes, {
     required int pageSize,
     required int cacheCapacity,
   }) async {
@@ -215,12 +224,15 @@ class PagedTable {
     // cache; under heavy mixed reads the OS page cache and the
     // primary heap cache absorb most of the cost.
     for (final ent in indexes) {
-      final col = columns.firstWhere(
-        (c) => c.name == ent.column,
-        orElse: () => throw StateError(
-            'PagedTable: index ${ent.name} references unknown column '
-            '${ent.column}'),
-      );
+      final types = <PagedColumnType>[];
+      for (final cn in ent.columns) {
+        final col = columns.firstWhere(
+          (c) => c.name == cn,
+          orElse: () => throw StateError(
+              'PagedTable: index ${ent.name} references unknown column $cn'),
+        );
+        types.add(col.type);
+      }
       final f = await PagedFile.open(
         '$basePath.idx_${ent.name}',
         pageSize: pageSize,
@@ -229,8 +241,8 @@ class PagedTable {
       final b = await PagedBTree.open(f);
       pt._secondary[ent.name] = _SecondaryIndex(
         name: ent.name,
-        column: ent.column,
-        columnType: col.type,
+        columns: List<String>.from(ent.columns),
+        columnTypes: types,
         file: f,
         btree: b,
       );
@@ -257,11 +269,12 @@ class PagedTable {
     final rowBytes = _encodeRow(row);
     final rowId = await _heap.insert(rowBytes);
     await _index.put(pkBytes, rowId);
-    // Maintain every secondary index.
+    // Maintain every secondary index. Composite indexes are skipped
+    // entirely when ANY component is NULL (SQL-ish: NULLs don't index).
     for (final si in _secondary.values) {
-      final v = row[si.column];
-      if (v == null) continue; // NULL values aren't indexed (SQL-ish)
-      await si.btree.put(_encodeSecondaryKey(v, si.columnType, pkBytes), rowId);
+      final key = _encodeSecondaryKey(si, row, pkBytes);
+      if (key == null) continue;
+      await si.btree.put(key, rowId);
     }
   }
 
@@ -293,24 +306,24 @@ class PagedTable {
       throw ArgumentError(
           'PagedTable.update: cannot rewrite primary key (delete + insert instead)');
     }
-    // Refresh secondary-index entries: read the old row, compare each
-    // indexed column, and only rewrite the ones whose value changed.
+    // Refresh secondary-index entries: compare the old vs new tuple
+    // of indexed-column values; only rewrite indexes whose tuple
+    // changed. NULL-containing tuples have no index entry.
     if (_secondary.isNotEmpty) {
       final oldBytes = await _heap.get(rowId);
       if (oldBytes != null) {
         final oldRow = _decodeRow(oldBytes);
         for (final si in _secondary.values) {
-          final oldV = oldRow[si.column];
-          final newV = row[si.column];
-          if (_valuesEqual(oldV, newV)) continue;
-          if (oldV != null) {
-            await si.btree
-                .remove(_encodeSecondaryKey(oldV, si.columnType, pkBytes));
+          final oldKey = _encodeSecondaryKey(si, oldRow, pkBytes);
+          final newKey = _encodeSecondaryKey(si, row, pkBytes);
+          if (oldKey == null && newKey == null) continue;
+          if (oldKey != null &&
+              newKey != null &&
+              _compareBytes(oldKey, newKey) == 0) {
+            continue;
           }
-          if (newV != null) {
-            await si.btree
-                .put(_encodeSecondaryKey(newV, si.columnType, pkBytes), rowId);
-          }
+          if (oldKey != null) await si.btree.remove(oldKey);
+          if (newKey != null) await si.btree.put(newKey, rowId);
         }
       }
     }
@@ -328,9 +341,9 @@ class PagedTable {
       if (oldBytes != null) {
         final oldRow = _decodeRow(oldBytes);
         for (final si in _secondary.values) {
-          final v = oldRow[si.column];
-          if (v == null) continue;
-          await si.btree.remove(_encodeSecondaryKey(v, si.columnType, pkBytes));
+          final key = _encodeSecondaryKey(si, oldRow, pkBytes);
+          if (key == null) continue;
+          await si.btree.remove(key);
         }
       }
     }
@@ -400,7 +413,12 @@ class PagedTable {
   ///
   /// Index names must match `^[A-Za-z0-9_]+$` so they can become a
   /// safe filename suffix (`<base>.idx_<name>`).
-  Future<void> createIndex(String name, String columnName) async {
+  /// Create a secondary index named [name] on [columnNames] (one or
+  /// more). The new index is built by backfilling every existing row.
+  /// Rejects: invalid name, duplicate, unknown column, the PK column,
+  /// or an empty/duplicate column list. NULLs in any indexed component
+  /// cause that row to be omitted from the index (SQL-ish semantics).
+  Future<void> createIndex(String name, List<String> columnNames) async {
     if (!RegExp(r'^[A-Za-z0-9_]+$').hasMatch(name)) {
       throw ArgumentError.value(
           name, 'name', 'index name must match [A-Za-z0-9_]+');
@@ -408,14 +426,27 @@ class PagedTable {
     if (_secondary.containsKey(name)) {
       throw StateError('PagedTable: index $name already exists');
     }
-    final col = columns.firstWhere(
-      (c) => c.name == columnName,
-      orElse: () =>
-          throw ArgumentError.value(columnName, 'columnName', 'no such column'),
-    );
-    if (columnName == primaryKey.name) {
-      throw ArgumentError(
-          'PagedTable: column $columnName is already the primary key');
+    if (columnNames.isEmpty) {
+      throw ArgumentError('PagedTable.createIndex: no columns');
+    }
+    final seen = <String>{};
+    final cols = <PagedColumn>[];
+    for (final cn in columnNames) {
+      final lower = cn.toLowerCase();
+      if (!seen.add(lower)) {
+        throw ArgumentError(
+            'PagedTable.createIndex: duplicate column $cn in index $name');
+      }
+      final col = columns.firstWhere(
+        (c) => c.name == cn,
+        orElse: () =>
+            throw ArgumentError.value(cn, 'columnName', 'no such column'),
+      );
+      if (cn == primaryKey.name) {
+        throw ArgumentError(
+            'PagedTable: column $cn is already the primary key');
+      }
+      cols.add(col);
     }
     final f = await PagedFile.open(
       '$basePath.idx_$name',
@@ -425,21 +456,20 @@ class PagedTable {
     final b = await PagedBTree.open(f);
     final si = _SecondaryIndex(
       name: name,
-      column: columnName,
-      columnType: col.type,
+      columns: [for (final c in cols) c.name],
+      columnTypes: [for (final c in cols) c.type],
       file: f,
       btree: b,
     );
     // Backfill: walk every existing row through the primary index and
-    // populate the new tree. Skip NULLs.
+    // populate the new tree. Tuples containing any NULL are skipped.
     await for (final entry in _index.scan()) {
       final bytes = await _heap.get(entry.value);
       if (bytes == null) continue;
       final row = _decodeRow(bytes);
-      final v = row[columnName];
-      if (v == null) continue;
-      // entry.key is the encoded PK bytes for this row.
-      await b.put(_encodeSecondaryKey(v, col.type, entry.key), entry.value);
+      final key = _encodeSecondaryKey(si, row, entry.key);
+      if (key == null) continue;
+      await b.put(key, entry.value);
     }
     await b.commit();
     _secondary[name] = si;
@@ -470,19 +500,27 @@ class PagedTable {
     return true;
   }
 
-  /// Stream every row whose [columnName] value (under index [indexName])
-  /// equals [value]. Yields rows in the order the index stores them
-  /// (effectively unordered for the caller's purposes — currently sorts
-  /// by primary key within a single value bucket).
+  /// Stream every row that matches the leading prefix `[values]` of
+  /// the indexed columns. For a single-column index, `values` has one
+  /// entry — this is point equality. For a composite index, you may
+  /// supply fewer values than the index has columns to do a prefix
+  /// probe (e.g. `[country]` against an `(country, city)` index).
   ///
-  /// Returns an empty stream when no such index exists, when [value] is
-  /// null (NULLs aren't indexed), or when no rows match.
+  /// Returns an empty stream when no such index exists, when any
+  /// supplied value is null (NULLs aren't indexed), or when nothing
+  /// matches.
   Stream<Map<String, Object?>> indexLookup(
-      String indexName, Object? value) async* {
-    if (value == null) return;
+      String indexName, List<Object?> values) async* {
     final si = _secondary[indexName];
     if (si == null) return;
-    final prefix = _encodeIndexValue(value, si.columnType);
+    if (values.isEmpty || values.length > si.columns.length) return;
+    final bb = BytesBuilder(copy: false);
+    for (var i = 0; i < values.length; i++) {
+      final v = values[i];
+      if (v == null) return;
+      bb.add(_encodeIndexValue(v, si.columnTypes[i]));
+    }
+    final prefix = bb.toBytes();
     final upper = _bumpPrefix(prefix);
     await for (final entry in si.btree.range(
       lower: prefix,
@@ -496,16 +534,19 @@ class PagedTable {
     }
   }
 
-  /// Range-scan a secondary index. Any of [lower] / [upper] may be
-  /// null to indicate an unbounded side. The encoded value-keys are
-  /// byte-order-preserving, so SQL semantics carry through.
+  /// Range-scan a secondary index. [equalPrefix] (optional) pins
+  /// leading columns by equality; [lower] / [upper] then apply to the
+  /// next column after that prefix. For a single-column index, pass
+  /// an empty [equalPrefix] and bounds on the only column. The encoded
+  /// value-keys are byte-order-preserving, so SQL semantics carry
+  /// through.
   ///
-  /// Returns rows in **index order**: ascending by the indexed value,
+  /// Returns rows in index order: ascending by indexed-column tuple,
   /// ties broken by encoded primary key. Yields nothing when the index
-  /// does not exist; NULL bounds are not allowed (NULLs aren't indexed
-  /// so `WHERE col > NULL` etc. are filtered at the SQL layer).
+  /// does not exist or any prefix value is null.
   Stream<Map<String, Object?>> indexRange(
     String indexName, {
+    List<Object?> equalPrefix = const [],
     Object? lower,
     bool lowerInclusive = true,
     Object? upper,
@@ -513,26 +554,51 @@ class PagedTable {
   }) async* {
     final si = _secondary[indexName];
     if (si == null) return;
+    if (equalPrefix.length >= si.columns.length &&
+        lower == null &&
+        upper == null) {
+      // Pure prefix-equality = lookup.
+      yield* indexLookup(indexName, equalPrefix);
+      return;
+    }
+    // Build the fixed prefix from equalPrefix values.
+    final bb = BytesBuilder(copy: false);
+    for (var i = 0; i < equalPrefix.length; i++) {
+      final v = equalPrefix[i];
+      if (v == null) return;
+      bb.add(_encodeIndexValue(v, si.columnTypes[i]));
+    }
+    final fixed = bb.toBytes();
+    final rangeColIdx = equalPrefix.length;
     Uint8List? lo;
     Uint8List? hi;
-    if (lower != null) {
-      final l = _encodeIndexValue(lower, si.columnType);
-      // Inclusive lower: the smallest composite key whose value half
-      // is [lower] is just `l` (any pk suffix sorts after). Exclusive
-      // lower: skip everything whose value equals [lower], i.e. start
-      // at bumpPrefix(l).
-      lo = lowerInclusive ? l : _bumpPrefix(l);
-    }
-    if (upper != null) {
-      final u = _encodeIndexValue(upper, si.columnType);
-      // Inclusive upper: include every composite key whose value half
-      // is [upper], i.e. stop at bumpPrefix(u) exclusive. Exclusive
-      // upper: stop at `u` (anything with that value half starts at
-      // `u` and is excluded).
-      hi = upperInclusive ? _bumpPrefix(u) : u;
+    if (rangeColIdx >= si.columns.length) {
+      // No range column available — bounds must be null. Fall back to
+      // prefix-only range scan.
+      lo = fixed;
+      hi = _bumpPrefix(fixed);
+    } else {
+      final t = si.columnTypes[rangeColIdx];
+      if (lower != null) {
+        final l = _encodeIndexValue(lower, t);
+        final combined = Uint8List(fixed.length + l.length)
+          ..setRange(0, fixed.length, fixed)
+          ..setRange(fixed.length, fixed.length + l.length, l);
+        lo = lowerInclusive ? combined : _bumpPrefix(combined);
+      } else if (fixed.isNotEmpty) {
+        lo = fixed;
+      }
+      if (upper != null) {
+        final u = _encodeIndexValue(upper, t);
+        final combined = Uint8List(fixed.length + u.length)
+          ..setRange(0, fixed.length, fixed)
+          ..setRange(fixed.length, fixed.length + u.length, u);
+        hi = upperInclusive ? _bumpPrefix(combined) : combined;
+      } else if (fixed.isNotEmpty) {
+        hi = _bumpPrefix(fixed);
+      }
     }
     if (lo == null && hi == null) {
-      // Unbounded both sides: full index scan.
       await for (final entry in si.btree.scan()) {
         final bytes = await _heap.get(entry.value);
         if (bytes == null) continue;
@@ -552,8 +618,9 @@ class PagedTable {
     }
   }
 
-  List<({String name, String column})> _indexDescriptors() => [
-        for (final si in _secondary.values) (name: si.name, column: si.column),
+  List<({String name, List<String> columns})> _indexDescriptors() => [
+        for (final si in _secondary.values)
+          (name: si.name, columns: List<String>.from(si.columns)),
       ];
 
   // ---------------------------------------------------------------------------
@@ -564,7 +631,7 @@ class PagedTable {
       ({
         List<PagedColumn> columns,
         int pkIndex,
-        List<({String name, String column})> indexes,
+        List<({String name, List<String> columns})> indexes,
       })?> _readMeta(String basePath) async {
     final f = File('$basePath.meta.json');
     if (!await f.exists()) return null;
@@ -575,12 +642,20 @@ class PagedTable {
         .toList();
     final pkIdx = (j['pkIndex'] as num).toInt();
     final rawIdx = j['indexes'];
-    final indexes = <({String name, String column})>[];
+    final indexes = <({String name, List<String> columns})>[];
     if (rawIdx is List) {
       for (final raw in rawIdx) {
         if (raw is Map) {
-          indexes.add(
-              (name: raw['name'] as String, column: raw['column'] as String));
+          final n = raw['name'] as String;
+          // Accept both the new "columns" array AND the legacy single
+          // "column" field for forward-compat with step-8 sidecars.
+          final colsField = raw['columns'];
+          if (colsField is List) {
+            indexes.add(
+                (name: n, columns: colsField.map((e) => e as String).toList()));
+          } else if (raw['column'] is String) {
+            indexes.add((name: n, columns: [raw['column'] as String]));
+          }
         }
       }
     }
@@ -588,13 +663,13 @@ class PagedTable {
   }
 
   static Future<void> _writeMeta(String basePath, List<PagedColumn> columns,
-      int pkIndex, List<({String name, String column})> indexes) async {
+      int pkIndex, List<({String name, List<String> columns})> indexes) async {
     final j = jsonEncode({
       'version': 1,
       'columns': [for (final c in columns) c.toJson()],
       'pkIndex': pkIndex,
       'indexes': [
-        for (final ent in indexes) {'name': ent.name, 'column': ent.column},
+        for (final ent in indexes) {'name': ent.name, 'columns': ent.columns},
       ],
     });
     final dest = '$basePath.meta.json';
@@ -817,16 +892,20 @@ class PagedTable {
     }
   }
 
-  /// Composite secondary-index key: value prefix + already-encoded PK
-  /// bytes. The PK suffix disambiguates duplicates so PagedBTree (which
-  /// rejects duplicate keys) can index a non-unique column.
-  static Uint8List _encodeSecondaryKey(
-      Object value, PagedColumnType type, Uint8List pkBytes) {
-    final prefix = _encodeIndexValue(value, type);
-    final out = Uint8List(prefix.length + pkBytes.length);
-    out.setRange(0, prefix.length, prefix);
-    out.setRange(prefix.length, out.length, pkBytes);
-    return out;
+  /// Composite secondary-index key: byte-order-preserving encoding of
+  /// each indexed column (concatenated) plus the already-encoded PK
+  /// bytes as a tie-breaker. Returns null when ANY indexed value in
+  /// [row] is NULL, signalling "do not index this row".
+  static Uint8List? _encodeSecondaryKey(
+      _SecondaryIndex si, Map<String, Object?> row, Uint8List pkBytes) {
+    final bb = BytesBuilder(copy: false);
+    for (var i = 0; i < si.columns.length; i++) {
+      final v = row[si.columns[i]];
+      if (v == null) return null;
+      bb.add(_encodeIndexValue(v, si.columnTypes[i]));
+    }
+    bb.add(pkBytes);
+    return bb.toBytes();
   }
 
   /// Raw value bytes for a single column value, without length prefix
@@ -894,15 +973,19 @@ class PagedTable {
 /// Runtime state for one open secondary index.
 class _SecondaryIndex {
   final String name;
-  final String column;
-  final PagedColumnType columnType;
+  final List<String> columns;
+  final List<PagedColumnType> columnTypes;
   final PagedFile file;
   final PagedBTree btree;
   _SecondaryIndex({
     required this.name,
-    required this.column,
-    required this.columnType,
+    required this.columns,
+    required this.columnTypes,
     required this.file,
     required this.btree,
   });
+
+  /// Convenience: first indexed column (the common single-column case).
+  String get column => columns.first;
+  PagedColumnType get columnType => columnTypes.first;
 }
