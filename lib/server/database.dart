@@ -1786,10 +1786,36 @@ class Database {
   }
 
   Future<QueryResult> _pagedInsert(InsertStmt s, PagedTable pt) async {
-    if (s.onConflict != null) {
+    final onConflict = s.onConflict;
+    if (onConflict != null && s.mode != InsertMode.normal) {
       throw UnsupportedError(
-          'INSERT … ON CONFLICT is not supported on paged table '
-          '${s.table}.');
+          'INSERT OR ${s.mode.name} … ON CONFLICT is not supported on '
+          'paged table ${s.table}; pick one conflict resolution.');
+    }
+    // Resolve the conflict target to a concrete probe strategy:
+    //   - null         : no ON CONFLICT clause
+    //   - 'pk'         : PK-only probe
+    //   - 'any'        : PK then every UNIQUE secondary index
+    //   - any other s  : name of a UNIQUE secondary index
+    final pkName = pt.columns[pt.primaryKeyIndex].name;
+    String? conflictProbe;
+    if (onConflict != null) {
+      if (onConflict.targetColumns.isEmpty) {
+        conflictProbe = 'any';
+      } else if (onConflict.targetColumns.length == 1 &&
+          onConflict.targetColumns.first.toLowerCase() ==
+              pkName.toLowerCase()) {
+        conflictProbe = 'pk';
+      } else {
+        final idx = pt.findUniqueIndexByColumns(onConflict.targetColumns);
+        if (idx == null) {
+          throw UnsupportedError(
+              'INSERT … ON CONFLICT (${onConflict.targetColumns.join(", ")}) '
+              'on paged table ${s.table}: no matching primary key or UNIQUE '
+              'index covers exactly those columns.');
+        }
+        conflictProbe = idx;
+      }
     }
     // Materialise the source rows. For INSERT … SELECT we run the
     // inner SELECT through the regular executor first and convert
@@ -1847,6 +1873,57 @@ class Database {
         map[colNames[i]] =
             _evalLiteral(r[i], 'INSERT into paged table ${s.table}');
       }
+      // ON CONFLICT path takes precedence over INSERT-mode handling
+      // (we already rejected the two combined upstream).
+      if (onConflict != null) {
+        final hitPk =
+            await _pagedFindConflictPk(pt, map, conflictProbe!, pkName);
+        if (hitPk == null) {
+          await pt.insert(map);
+          affected++;
+          if (returningExprs.isNotEmpty) {
+            returnedRows.add([for (final e in returningExprs) e.eval(map)]);
+          }
+        } else if (onConflict.doNothing) {
+          // DO NOTHING: leave the existing row alone; not counted.
+        } else {
+          // DO UPDATE: build evaluation context with existing.col
+          // (bare names) and excluded.col (proposed insert), apply
+          // WHERE filter if any, evaluate assignments, then update.
+          final existing = (await pt.get(hitPk))!;
+          final ctx = <String, Object?>{...existing};
+          for (final c in pt.columns) {
+            final v = map[c.name];
+            ctx['excluded.${c.name}'] = v;
+            ctx['EXCLUDED.${c.name}'] = v;
+          }
+          final w = onConflict.where;
+          if (w == null || evalPredicate(_bindExpr(w), ctx)) {
+            final newRow = <String, Object?>{...existing};
+            onConflict.assignments.forEach((col, expr) {
+              final hit = pt.columns.firstWhere(
+                (c) => c.name.toLowerCase() == col.toLowerCase(),
+                orElse: () => throw StateError(
+                    'ON CONFLICT DO UPDATE on paged table ${s.table}: '
+                    'unknown column $col'),
+              );
+              newRow[hit.name] = _bindExpr(expr).eval(ctx);
+            });
+            if (newRow[pkName] != existing[pkName]) {
+              throw UnsupportedError(
+                  'ON CONFLICT DO UPDATE on paged table ${s.table}: '
+                  'cannot reassign the primary key column "$pkName".');
+            }
+            await pt.update(hitPk, newRow);
+            affected++;
+            if (returningExprs.isNotEmpty) {
+              returnedRows
+                  .add([for (final e in returningExprs) e.eval(newRow)]);
+            }
+          }
+        }
+        continue;
+      }
       switch (s.mode) {
         case InsertMode.normal:
           await pt.insert(map);
@@ -1885,6 +1962,31 @@ class Database {
           columns: returningCols, rows: returnedRows, affected: affected);
     }
     return QueryResult(affected: affected, message: '$affected row(s)');
+  }
+
+  /// Locate an existing row that conflicts with the proposed-insert
+  /// [row] under the resolved ON CONFLICT probe [probe]. Returns the
+  /// conflicting row's primary-key value, or null when none exists.
+  /// [probe] is one of: `pk` (PK only), `any` (PK then every UNIQUE
+  /// secondary index, first hit wins), or a UNIQUE secondary-index
+  /// name.
+  Future<Object?> _pagedFindConflictPk(PagedTable pt, Map<String, Object?> row,
+      String probe, String pkName) async {
+    if (probe == 'pk' || probe == 'any') {
+      final pk = row[pkName];
+      if (pk != null && (await pt.get(pk)) != null) return pk;
+      if (probe == 'pk') return null;
+    }
+    if (probe == 'any') {
+      for (final name in pt.secondaryIndexNames) {
+        if (!pt.isIndexUnique(name)) continue;
+        final hit = await pt.findConflictByUniqueIndex(name, row);
+        if (hit != null) return hit;
+      }
+      return null;
+    }
+    // Named UNIQUE index.
+    return pt.findConflictByUniqueIndex(probe, row);
   }
 
   /// Aggregate / GROUP BY path for `USING paged` SELECTs. Materialises

@@ -125,6 +125,53 @@ class PagedTable {
     return List.unmodifiable(si.columns);
   }
 
+  /// True iff the secondary index [indexName] was declared UNIQUE.
+  /// Returns false for non-unique indexes and for unknown names.
+  bool isIndexUnique(String indexName) =>
+      _secondary[indexName]?.unique ?? false;
+
+  /// If a UNIQUE secondary index exists whose column list is exactly
+  /// [columnNames] (case-insensitive, order-sensitive), return its
+  /// name. Used by INSERT … ON CONFLICT (cols) to resolve the
+  /// conflict target to a unique constraint.
+  String? findUniqueIndexByColumns(List<String> columnNames) {
+    final lower = [for (final c in columnNames) c.toLowerCase()];
+    for (final si in _secondary.values) {
+      if (!si.unique) continue;
+      if (si.columns.length != lower.length) continue;
+      var match = true;
+      for (var i = 0; i < lower.length; i++) {
+        if (si.columns[i].toLowerCase() != lower[i]) {
+          match = false;
+          break;
+        }
+      }
+      if (match) return si.name;
+    }
+    return null;
+  }
+
+  /// Look up the (single) row that conflicts with [row] on the UNIQUE
+  /// secondary index named [indexName]. Returns the existing row's
+  /// PK value, or null when there is no conflict (including when any
+  /// indexed component of [row] is NULL).
+  Future<Object?> findConflictByUniqueIndex(
+      String indexName, Map<String, Object?> row) async {
+    final si = _secondary[indexName];
+    if (si == null || !si.unique) return null;
+    final prefix = _encodeSecondaryPrefix(si, row);
+    if (prefix == null) return null;
+    final upper = _bumpPrefix(prefix);
+    await for (final e
+        in si.btree.range(lower: prefix, lowerInclusive: true, upper: upper)) {
+      final bytes = await _heap.get(e.value);
+      if (bytes == null) continue;
+      final r = _decodeRow(bytes);
+      return r[primaryKey.name];
+    }
+    return null;
+  }
+
   /// Open an existing paged table from `<basePath>.meta.json`. Throws
   /// if the metadata file does not exist.
   static Future<PagedTable> open(
