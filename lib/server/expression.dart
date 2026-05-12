@@ -158,8 +158,8 @@ class BinaryExpr extends Expr {
         op == 'IS NOT DISTINCT FROM') {
       final l = left.eval(row);
       final r = right.eval(row);
-      final same = (l == null && r == null) ||
-          (l != null && r != null && _eq(l, r));
+      final same =
+          (l == null && r == null) || (l != null && r != null && _eq(l, r));
       switch (op) {
         case 'IS':
         case 'IS NOT DISTINCT FROM':
@@ -315,6 +315,57 @@ class InExpr extends Expr {
       if (ev != null && BinaryExpr._eq(v, ev)) return !negated;
     }
     return negated;
+  }
+}
+
+/// `expr LIKE pattern ESCAPE esc` — `esc` is an optional single-character
+/// escape used to literalise the next character of [pattern] (typically
+/// `%` or `_`).
+class LikeExpr extends Expr {
+  final Expr value;
+  final Expr pattern;
+  final Expr? escape;
+  final bool negated;
+  LikeExpr(this.value, this.pattern, {this.escape, this.negated = false});
+  @override
+  Object? eval(Map<String, Object?> row) {
+    final v = value.eval(row);
+    final p = pattern.eval(row);
+    if (v == null || p == null) return null;
+    String? esc;
+    if (escape != null) {
+      final ev = escape!.eval(row);
+      if (ev == null) return null;
+      final es = ev.toString();
+      if (es.length != 1) {
+        throw FormatException('LIKE ESCAPE expects a single-character string');
+      }
+      esc = es;
+    }
+    final m = _likeWithEscape(v.toString(), p.toString(), esc);
+    return negated ? !m : m;
+  }
+
+  static bool _likeWithEscape(String value, String pattern, String? esc) {
+    final buf = StringBuffer('^');
+    for (var i = 0; i < pattern.length; i++) {
+      final ch = pattern[i];
+      if (esc != null && ch == esc && i + 1 < pattern.length) {
+        // The next character is treated as a literal.
+        buf.write(RegExp.escape(pattern[i + 1]));
+        i++;
+        continue;
+      }
+      if (ch == '%') {
+        buf.write('.*');
+      } else if (ch == '_') {
+        buf.write('.');
+      } else {
+        buf.write(RegExp.escape(ch));
+      }
+    }
+    buf.write(r'$');
+    return RegExp(buf.toString()).hasMatch(value);
   }
 }
 
@@ -634,6 +685,215 @@ int _hexDigit(int cu) {
   return -1;
 }
 
+/// Implements the SQLite-compatible PRINTF / FORMAT subset. Supports
+/// the conversions %d %i %u %x %X %o %c %s %f %e %g %p %% %q %Q with
+/// optional flags (`-+ 0#`), field width, and precision.
+String _sqlitePrintf(String fmt, List<Object?> args) {
+  final out = StringBuffer();
+  var argIdx = 0;
+  Object? nextArg() => argIdx < args.length ? args[argIdx++] : null;
+
+  var i = 0;
+  while (i < fmt.length) {
+    final ch = fmt[i];
+    if (ch != '%') {
+      out.write(ch);
+      i++;
+      continue;
+    }
+    i++;
+    if (i >= fmt.length) break;
+    // Flags.
+    var leftAlign = false;
+    var plus = false;
+    var space = false;
+    var zero = false;
+    var alt = false;
+    while (i < fmt.length) {
+      final c = fmt[i];
+      if (c == '-') {
+        leftAlign = true;
+      } else if (c == '+') {
+        plus = true;
+      } else if (c == ' ') {
+        space = true;
+      } else if (c == '0') {
+        zero = true;
+      } else if (c == '#') {
+        alt = true;
+      } else {
+        break;
+      }
+      i++;
+    }
+    // Width.
+    var width = 0;
+    while (i < fmt.length && _isDigitChar(fmt[i])) {
+      width = width * 10 + (fmt.codeUnitAt(i) - 0x30);
+      i++;
+    }
+    // Precision.
+    int? precision;
+    if (i < fmt.length && fmt[i] == '.') {
+      i++;
+      precision = 0;
+      while (i < fmt.length && _isDigitChar(fmt[i])) {
+        precision = precision! * 10 + (fmt.codeUnitAt(i) - 0x30);
+        i++;
+      }
+    }
+    if (i >= fmt.length) break;
+    final conv = fmt[i++];
+    String body;
+    switch (conv) {
+      case '%':
+        out.write('%');
+        continue;
+      case 'd':
+      case 'i':
+        final n = _toIntArg(nextArg());
+        body = n.abs().toString();
+        if (precision != null && body.length < precision) {
+          body = body.padLeft(precision, '0');
+        }
+        if (n < 0) {
+          body = '-$body';
+        } else if (plus) {
+          body = '+$body';
+        } else if (space) {
+          body = ' $body';
+        }
+        break;
+      case 'u':
+        body = _toIntArg(nextArg()).toUnsigned(64).toString();
+        if (precision != null && body.length < precision) {
+          body = body.padLeft(precision, '0');
+        }
+        break;
+      case 'x':
+      case 'X':
+        var hex = _toIntArg(nextArg())
+            .toUnsigned(64)
+            .toRadixString(16);
+        if (conv == 'X') hex = hex.toUpperCase();
+        if (precision != null && hex.length < precision) {
+          hex = hex.padLeft(precision, '0');
+        }
+        if (alt && hex != '0') hex = (conv == 'X' ? '0X' : '0x') + hex;
+        body = hex;
+        break;
+      case 'o':
+        body = _toIntArg(nextArg()).toUnsigned(64).toRadixString(8);
+        if (alt && !body.startsWith('0')) body = '0$body';
+        if (precision != null && body.length < precision) {
+          body = body.padLeft(precision, '0');
+        }
+        break;
+      case 'c':
+        final v = nextArg();
+        body = v == null
+            ? ''
+            : (v is num
+                ? String.fromCharCode(v.toInt())
+                : v.toString().isEmpty
+                    ? ''
+                    : v.toString()[0]);
+        break;
+      case 's':
+        final v = nextArg();
+        body = v == null ? '' : v.toString();
+        if (precision != null && body.length > precision) {
+          body = body.substring(0, precision);
+        }
+        break;
+      case 'f':
+      case 'e':
+      case 'g':
+        final n = _toDoubleArg(nextArg());
+        final p = precision ?? 6;
+        if (conv == 'f') {
+          body = n.toStringAsFixed(p);
+        } else if (conv == 'e') {
+          body = n.toStringAsExponential(p);
+        } else {
+          body = n.toStringAsPrecision(p == 0 ? 1 : p);
+        }
+        if (n >= 0) {
+          if (plus) {
+            body = '+$body';
+          } else if (space) {
+            body = ' $body';
+          }
+        }
+        break;
+      case 'q':
+        // Single-quote-escape: doubles every embedded single quote.
+        final v = nextArg();
+        body = v == null ? '' : v.toString().replaceAll("'", "''");
+        break;
+      case 'Q':
+        // Like %q but also wraps in single quotes; NULL renders as
+        // the literal word NULL (unquoted).
+        final v = nextArg();
+        if (v == null) {
+          body = 'NULL';
+        } else {
+          body = "'${v.toString().replaceAll("'", "''")}'";
+        }
+        break;
+      case 'p':
+        body = _toIntArg(nextArg()).toRadixString(16);
+        break;
+      default:
+        // Unknown conversion — echo verbatim (SQLite passes it through).
+        out.write('%');
+        out.write(conv);
+        continue;
+    }
+    if (width > body.length) {
+      if (leftAlign) {
+        body = body.padRight(width);
+      } else if (zero &&
+          (conv == 'd' ||
+              conv == 'i' ||
+              conv == 'u' ||
+              conv == 'x' ||
+              conv == 'X' ||
+              conv == 'o' ||
+              conv == 'f' ||
+              conv == 'e' ||
+              conv == 'g')) {
+        // Preserve leading sign when zero-padding numerics.
+        if (body.startsWith('-') ||
+            body.startsWith('+') ||
+            body.startsWith(' ')) {
+          body = body[0] + body.substring(1).padLeft(width - 1, '0');
+        } else {
+          body = body.padLeft(width, '0');
+        }
+      } else {
+        body = body.padLeft(width);
+      }
+    }
+    out.write(body);
+  }
+  return out.toString();
+}
+
+bool _isDigitChar(String c) => c.codeUnitAt(0) >= 0x30 && c.codeUnitAt(0) <= 0x39;
+
+int _toIntArg(Object? v) {
+  if (v == null) return 0;
+  if (v is num) return v.toInt();
+  return int.tryParse(v.toString()) ?? 0;
+}
+
+double _toDoubleArg(Object? v) {
+  if (v == null) return 0.0;
+  if (v is num) return v.toDouble();
+  return double.tryParse(v.toString()) ?? 0.0;
+}
+
 /// Thrown by `RAISE(action, message)` inside a trigger. The trigger
 /// executor catches this and decides whether to silently ignore the
 /// current operation (IGNORE), abort it (ABORT/FAIL), or roll back the
@@ -809,6 +1069,16 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     }
     return String.fromCharCodes(cps);
   },
+  // PRINTF(format, args...) and its alias FORMAT(...). Implements the
+  // SQLite printf subset: %d %i %u %x %X %o %c %s %f %e %g %p %% %q %Q
+  // with optional flags (`-+ 0#`), width, and precision. NULL format
+  // returns NULL; NULL substitution args are rendered as 'NULL' for %s
+  // and 0 for numerics, matching SQLite.
+  'PRINTF': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    return _sqlitePrintf(a[0].toString(), a.sublist(1));
+  },
+  'FORMAT': (a) => kScalarFunctions['PRINTF']!(a),
   // --- Datetime --------------------------------------------------------
   'CURRENT_TIMESTAMP': (a) => _fmtDateTime(DateTime.now().toUtc(), full: true),
   'CURRENT_DATE': (a) => _fmtDate(DateTime.now().toUtc()),

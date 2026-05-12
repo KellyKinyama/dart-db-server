@@ -41,6 +41,7 @@ const Set<String> _keywords = {
   'IN',
   'BETWEEN',
   'LIKE',
+  'ESCAPE',
   'AS',
   'ORDER',
   'BY',

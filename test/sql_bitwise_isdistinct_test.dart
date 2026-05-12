@@ -65,8 +65,8 @@ void main() {
     test('bitwise propagates NULL', () async {
       final db = await Database.open();
       try {
-        final r = await db.execute(
-            'SELECT NULL & 1, 1 | NULL, NULL << 1, 1 >> NULL, ~NULL');
+        final r = await db
+            .execute('SELECT NULL & 1, 1 | NULL, NULL << 1, 1 >> NULL, ~NULL');
         expect(r.rows.first, [null, null, null, null, null]);
       } finally {
         await db.close();
@@ -111,8 +111,8 @@ void main() {
     test('IS against NULL is NULL-safe', () async {
       final db = await Database.open();
       try {
-        final r = await db
-            .execute('SELECT NULL IS NULL, NULL IS 1, 1 IS NULL, NULL IS NOT 1');
+        final r = await db.execute(
+            'SELECT NULL IS NULL, NULL IS 1, 1 IS NULL, NULL IS NOT 1');
         expect(r.rows.first, [true, false, false, true]);
       } finally {
         await db.close();
@@ -124,8 +124,7 @@ void main() {
     test('IS DISTINCT FROM treats NULLs as equal', () async {
       final db = await Database.open();
       try {
-        final r = await db.execute(
-            'SELECT NULL IS DISTINCT FROM NULL, '
+        final r = await db.execute('SELECT NULL IS DISTINCT FROM NULL, '
             '       1 IS DISTINCT FROM NULL, '
             '       1 IS DISTINCT FROM 1, '
             '       1 IS DISTINCT FROM 2');
@@ -138,8 +137,7 @@ void main() {
     test('IS NOT DISTINCT FROM is the inverse', () async {
       final db = await Database.open();
       try {
-        final r = await db.execute(
-            'SELECT NULL IS NOT DISTINCT FROM NULL, '
+        final r = await db.execute('SELECT NULL IS NOT DISTINCT FROM NULL, '
             '       1 IS NOT DISTINCT FROM NULL, '
             '       1 IS NOT DISTINCT FROM 1');
         expect(r.rows.first, [true, false, true]);
@@ -154,9 +152,9 @@ void main() {
         await db.execute('CREATE TABLE t (a INTEGER, b INTEGER)');
         await db.execute(
             'INSERT INTO t VALUES (1, 1), (1, 2), (NULL, NULL), (1, NULL)');
-        final r = await db.execute(
-            'SELECT a, b FROM t WHERE a IS NOT DISTINCT FROM b '
-            'ORDER BY a NULLS FIRST, b NULLS FIRST');
+        final r = await db
+            .execute('SELECT a, b FROM t WHERE a IS NOT DISTINCT FROM b '
+                'ORDER BY a NULLS FIRST, b NULLS FIRST');
         // Equal pairs: (NULL,NULL), (1,1).
         expect(r.rows, [
           [null, null],

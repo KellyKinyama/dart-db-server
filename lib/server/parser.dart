@@ -1303,9 +1303,7 @@ class Parser {
         _expectKw('FROM');
         final right = _parseConcat();
         return BinaryExpr(
-            negated ? 'IS NOT DISTINCT FROM' : 'IS DISTINCT FROM',
-            left,
-            right);
+            negated ? 'IS NOT DISTINCT FROM' : 'IS DISTINCT FROM', left, right);
       }
       // IS [NOT] NULL.
       if (_matchKw('NULL')) {
@@ -1338,7 +1336,12 @@ class Parser {
       return InExpr(left, values, negated: negated);
     }
     if (_matchKw('LIKE')) {
-      Expr like = BinaryExpr('LIKE', left, _parseConcat());
+      final pat = _parseConcat();
+      if (_matchKw('ESCAPE')) {
+        final esc = _parseConcat();
+        return LikeExpr(left, pat, escape: esc, negated: negated);
+      }
+      Expr like = BinaryExpr('LIKE', left, pat);
       if (negated) like = UnaryExpr('NOT', like);
       return like;
     }
