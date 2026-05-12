@@ -1988,9 +1988,20 @@ class Database {
               bv = boundExpr.eval(b.src);
             }
           } else {
+            // For composite ORDER BY expressions, build an evaluation scope
+            // that overlays projected aliases on top of the source row so
+            // `ORDER BY alias + 1` (where `alias` was introduced in the
+            // SELECT list) works the same way SQLite does.
+            Map<String, Object?> scope(_Pair p) {
+              final m = Map<String, Object?>.from(p.src);
+              for (var j = 0; j < outCols.length && j < p.row.length; j++) {
+                m[outCols[j]] = p.row[j];
+              }
+              return m;
+            }
             try {
-              av = boundExpr.eval(a.src);
-              bv = boundExpr.eval(b.src);
+              av = boundExpr.eval(scope(a));
+              bv = boundExpr.eval(scope(b));
             } catch (_) {
               // Fall back to projected column lookup if expression refers
               // only to a projected alias.

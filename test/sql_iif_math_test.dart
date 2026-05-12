@@ -43,8 +43,8 @@ void main() {
         await db.execute('INSERT INTO t VALUES (1), (2), (3), (4)');
         final r = await db.execute(
             "SELECT x, IIF(x % 2 = 0, 'even', 'odd') AS p FROM t ORDER BY x");
-        expect(r.rows.map((r) => r[1]).toList(),
-            ['odd', 'even', 'odd', 'even']);
+        expect(
+            r.rows.map((r) => r[1]).toList(), ['odd', 'even', 'odd', 'even']);
       } finally {
         await db.close();
       }
@@ -121,8 +121,8 @@ void main() {
     test('ASIN / ACOS / ATAN inverse', () async {
       final db = await Database.open();
       try {
-        final r = await db.execute(
-            'SELECT ASIN(1), ACOS(0), ATAN(1), ATAN2(1, 1)');
+        final r =
+            await db.execute('SELECT ASIN(1), ACOS(0), ATAN(1), ATAN2(1, 1)');
         expect(r.rows.first[0] as num, closeTo(mathPi / 2, 1e-10));
         expect(r.rows.first[1] as num, closeTo(mathPi / 2, 1e-10));
         expect(r.rows.first[2] as num, closeTo(mathPi / 4, 1e-10));
@@ -180,8 +180,8 @@ void main() {
     test('NULL inputs propagate', () async {
       final db = await Database.open();
       try {
-        final r = await db.execute(
-            'SELECT EXP(NULL), LN(NULL), SIN(NULL), ATAN2(NULL, 1)');
+        final r = await db
+            .execute('SELECT EXP(NULL), LN(NULL), SIN(NULL), ATAN2(NULL, 1)');
         expect(r.rows.first, [null, null, null, null]);
       } finally {
         await db.close();
