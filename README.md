@@ -183,10 +183,11 @@ implemented:
   restricts that snapshot to rows whose join-key value appears on
   the in-memory side (via primary-key lookup, secondary-index
   lookup, or filtered scan, whichever applies), so the out-of-core
-  benefit is preserved on selective joins. `UNIQUE`, expression, and
-  partial indexes on paged tables raise `UnsupportedError`; so do
-  `INSERT OR REPLACE`, `ON CONFLICT`, primary-key reassignment, and
-  triggers. The lower-level `PagedTable` API in
+  benefit is preserved on selective joins. `CREATE UNIQUE INDEX` on
+  paged tables is supported (NULL components don't participate in the
+  constraint, matching SQLite); expression and partial indexes on
+  paged tables raise `UnsupportedError`; so do `INSERT OR REPLACE`,
+  `ON CONFLICT`, primary-key reassignment, and triggers. The lower-level `PagedTable` API in
   `lib/server/paged_table.dart` exposes the full primitives directly.
 - **SQLite wire protocol**: clients speak this engine's JSON line protocol,
   not SQLite's native protocol.

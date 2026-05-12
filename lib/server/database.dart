@@ -941,11 +941,6 @@ class Database {
 
   Future<QueryResult> _pagedCreateIndex(
       CreateIndexStmt s, PagedTable pt) async {
-    if (s.unique) {
-      throw UnsupportedError(
-          'CREATE UNIQUE INDEX on paged table ${s.table}: unique '
-          'constraints on secondary indexes are not supported.');
-    }
     if (s.exprSql != null) {
       throw UnsupportedError(
           'CREATE INDEX on paged table ${s.table}: expression indexes '
@@ -960,10 +955,11 @@ class Database {
       throw StateError('Index ${s.indexName} already exists on paged table '
           '${_pagedIndexOwners[s.indexName]}');
     }
-    await pt.createIndex(s.indexName, s.columns);
+    await pt.createIndex(s.indexName, s.columns, unique: s.unique);
     _pagedIndexOwners[s.indexName] = s.table;
-    return QueryResult.message(
-        'index ${s.indexName} created on ${s.table}(${s.columns.join(', ')})');
+    return QueryResult.message('index ${s.indexName} '
+        '${s.unique ? "(unique) " : ""}'
+        'created on ${s.table}(${s.columns.join(', ')})');
   }
 
   Future<QueryResult> _pagedDropIndex(DropIndexStmt s, PagedTable pt) async {

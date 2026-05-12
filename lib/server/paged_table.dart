@@ -191,7 +191,7 @@ class PagedTable {
     String basePath,
     List<PagedColumn> columns,
     int pkIdx,
-    List<({String name, List<String> columns})> indexes, {
+    List<({String name, List<String> columns, bool unique})> indexes, {
     required int pageSize,
     required int cacheCapacity,
   }) async {
@@ -245,6 +245,7 @@ class PagedTable {
         columnTypes: types,
         file: f,
         btree: b,
+        unique: ent.unique,
       );
     }
     return pt;
@@ -265,6 +266,16 @@ class PagedTable {
     if ((await _index.get(pkBytes)) != null) {
       throw StateError(
           'PagedTable.insert: duplicate primary key ${jsonEncode(pkVal)}');
+    }
+    // Uniqueness pre-check on every UNIQUE secondary index.
+    for (final si in _secondary.values) {
+      if (!si.unique) continue;
+      final prefix = _encodeSecondaryPrefix(si, row);
+      if (prefix == null) continue; // NULL components don't constrain
+      if (await _uniqueConflict(si, prefix, null)) {
+        throw StateError('PagedTable.insert: UNIQUE constraint violated on '
+            'index ${si.name} (${si.columns.join(", ")})');
+      }
     }
     final rowBytes = _encodeRow(row);
     final rowId = await _heap.insert(rowBytes);
@@ -313,6 +324,20 @@ class PagedTable {
       final oldBytes = await _heap.get(rowId);
       if (oldBytes != null) {
         final oldRow = _decodeRow(oldBytes);
+        // Uniqueness pre-check before any mutation.
+        for (final si in _secondary.values) {
+          if (!si.unique) continue;
+          final newPrefix = _encodeSecondaryPrefix(si, row);
+          if (newPrefix == null) continue;
+          final oldPrefix = _encodeSecondaryPrefix(si, oldRow);
+          if (oldPrefix != null && _compareBytes(oldPrefix, newPrefix) == 0) {
+            continue; // unchanged prefix, no conflict possible
+          }
+          if (await _uniqueConflict(si, newPrefix, pkBytes)) {
+            throw StateError('PagedTable.update: UNIQUE constraint violated on '
+                'index ${si.name} (${si.columns.join(", ")})');
+          }
+        }
         for (final si in _secondary.values) {
           final oldKey = _encodeSecondaryKey(si, oldRow, pkBytes);
           final newKey = _encodeSecondaryKey(si, row, pkBytes);
@@ -429,7 +454,13 @@ class PagedTable {
   /// Rejects: invalid name, duplicate, unknown column, the PK column,
   /// or an empty/duplicate column list. NULLs in any indexed component
   /// cause that row to be omitted from the index (SQL-ish semantics).
-  Future<void> createIndex(String name, List<String> columnNames) async {
+  ///
+  /// When [unique] is true, two rows with the same indexed-column
+  /// tuple are rejected (the build fails with a [StateError] and the
+  /// half-built index file is removed). NULL-containing tuples never
+  /// participate in the uniqueness check — matching SQLite semantics.
+  Future<void> createIndex(String name, List<String> columnNames,
+      {bool unique = false}) async {
     if (!RegExp(r'^[A-Za-z0-9_]+$').hasMatch(name)) {
       throw ArgumentError.value(
           name, 'name', 'index name must match [A-Za-z0-9_]+');
@@ -471,16 +502,45 @@ class PagedTable {
       columnTypes: [for (final c in cols) c.type],
       file: f,
       btree: b,
+      unique: unique,
     );
     // Backfill: walk every existing row through the primary index and
     // populate the new tree. Tuples containing any NULL are skipped.
-    await for (final entry in _index.scan()) {
-      final bytes = await _heap.get(entry.value);
-      if (bytes == null) continue;
-      final row = _decodeRow(bytes);
-      final key = _encodeSecondaryKey(si, row, entry.key);
-      if (key == null) continue;
-      await b.put(key, entry.value);
+    // For UNIQUE indexes we additionally track the prefix bytes we've
+    // already inserted and reject a second occurrence.
+    final seenPrefixes = unique ? <String>{} : null;
+    try {
+      await for (final entry in _index.scan()) {
+        final bytes = await _heap.get(entry.value);
+        if (bytes == null) continue;
+        final row = _decodeRow(bytes);
+        final key = _encodeSecondaryKey(si, row, entry.key);
+        if (key == null) continue;
+        if (seenPrefixes != null) {
+          final prefix = _encodeSecondaryPrefix(si, row)!;
+          final tag = base64Encode(prefix);
+          if (!seenPrefixes.add(tag)) {
+            throw StateError(
+                'CREATE UNIQUE INDEX $name on ${cols.map((c) => c.name).join(", ")}: '
+                'duplicate value in existing rows');
+          }
+        }
+        await b.put(key, entry.value);
+      }
+    } catch (e) {
+      // Tear down the half-built file so the next open doesn't see a
+      // ghost index — meta.json hasn't been updated yet, so the file
+      // is "orphan" in the same sense as any failed createIndex.
+      await f.close();
+      for (final ext in const ['', '.journal']) {
+        final junk = File('$basePath.idx_$name$ext');
+        if (await junk.exists()) {
+          try {
+            await junk.delete();
+          } catch (_) {/* best-effort */}
+        }
+      }
+      rethrow;
     }
     await b.commit();
     _secondary[name] = si;
@@ -629,10 +689,15 @@ class PagedTable {
     }
   }
 
-  List<({String name, List<String> columns})> _indexDescriptors() => [
-        for (final si in _secondary.values)
-          (name: si.name, columns: List<String>.from(si.columns)),
-      ];
+  List<({String name, List<String> columns, bool unique})>
+      _indexDescriptors() => [
+            for (final si in _secondary.values)
+              (
+                name: si.name,
+                columns: List<String>.from(si.columns),
+                unique: si.unique,
+              ),
+          ];
 
   // ---------------------------------------------------------------------------
   // Metadata
@@ -642,7 +707,7 @@ class PagedTable {
       ({
         List<PagedColumn> columns,
         int pkIndex,
-        List<({String name, List<String> columns})> indexes,
+        List<({String name, List<String> columns, bool unique})> indexes,
       })?> _readMeta(String basePath) async {
     final f = File('$basePath.meta.json');
     if (!await f.exists()) return null;
@@ -653,19 +718,27 @@ class PagedTable {
         .toList();
     final pkIdx = (j['pkIndex'] as num).toInt();
     final rawIdx = j['indexes'];
-    final indexes = <({String name, List<String> columns})>[];
+    final indexes = <({String name, List<String> columns, bool unique})>[];
     if (rawIdx is List) {
       for (final raw in rawIdx) {
         if (raw is Map) {
           final n = raw['name'] as String;
+          final uniq = raw['unique'] == true;
           // Accept both the new "columns" array AND the legacy single
           // "column" field for forward-compat with step-8 sidecars.
           final colsField = raw['columns'];
           if (colsField is List) {
-            indexes.add(
-                (name: n, columns: colsField.map((e) => e as String).toList()));
+            indexes.add((
+              name: n,
+              columns: colsField.map((e) => e as String).toList(),
+              unique: uniq,
+            ));
           } else if (raw['column'] is String) {
-            indexes.add((name: n, columns: [raw['column'] as String]));
+            indexes.add((
+              name: n,
+              columns: [raw['column'] as String],
+              unique: uniq,
+            ));
           }
         }
       }
@@ -673,14 +746,22 @@ class PagedTable {
     return (columns: cols, pkIndex: pkIdx, indexes: indexes);
   }
 
-  static Future<void> _writeMeta(String basePath, List<PagedColumn> columns,
-      int pkIndex, List<({String name, List<String> columns})> indexes) async {
+  static Future<void> _writeMeta(
+      String basePath,
+      List<PagedColumn> columns,
+      int pkIndex,
+      List<({String name, List<String> columns, bool unique})> indexes) async {
     final j = jsonEncode({
       'version': 1,
       'columns': [for (final c in columns) c.toJson()],
       'pkIndex': pkIndex,
       'indexes': [
-        for (final ent in indexes) {'name': ent.name, 'columns': ent.columns},
+        for (final ent in indexes)
+          {
+            'name': ent.name,
+            'columns': ent.columns,
+            if (ent.unique) 'unique': true,
+          },
       ],
     });
     final dest = '$basePath.meta.json';
@@ -919,6 +1000,44 @@ class PagedTable {
     return bb.toBytes();
   }
 
+  /// Just the indexed-column portion of a secondary-index key — no
+  /// PK tie-breaker. Used for uniqueness probing: two rows collide
+  /// on a UNIQUE index iff their prefixes match exactly, regardless
+  /// of their (different) PKs. Returns null if any indexed value is
+  /// NULL.
+  static Uint8List? _encodeSecondaryPrefix(
+      _SecondaryIndex si, Map<String, Object?> row) {
+    final bb = BytesBuilder(copy: false);
+    for (var i = 0; i < si.columns.length; i++) {
+      final v = row[si.columns[i]];
+      if (v == null) return null;
+      bb.add(_encodeIndexValue(v, si.columnTypes[i]));
+    }
+    return bb.toBytes();
+  }
+
+  /// Return true when [si] (declared UNIQUE) already has an entry
+  /// whose indexed-column bytes equal [prefix], excluding the
+  /// optional [selfPkBytes] (the row currently being updated, so its
+  /// own pre-existing entry doesn't count as a conflict). Probes the
+  /// B-tree with a `[prefix, bumpPrefix(prefix))` range and walks
+  /// until a non-self entry is found.
+  Future<bool> _uniqueConflict(
+      _SecondaryIndex si, Uint8List prefix, Uint8List? selfPkBytes) async {
+    final upper = _bumpPrefix(prefix);
+    await for (final e
+        in si.btree.range(lower: prefix, lowerInclusive: true, upper: upper)) {
+      if (selfPkBytes == null) return true;
+      // Entry key is `prefix + pkBytes`. Extract the tail and
+      // compare to selfPkBytes; an equal tail means "this is my own
+      // entry", which is not a conflict.
+      if (e.key.length <= prefix.length) return true; // shouldn't happen
+      final tail = Uint8List.sublistView(e.key, prefix.length);
+      if (_compareBytes(tail, selfPkBytes) != 0) return true;
+    }
+    return false;
+  }
+
   /// Raw value bytes for a single column value, without length prefix
   /// or type tag. Used by the secondary-index codec.
   static Uint8List _encodeValueOnly(Object value, PagedColumnType type) {
@@ -988,12 +1107,21 @@ class _SecondaryIndex {
   final List<PagedColumnType> columnTypes;
   final PagedFile file;
   final PagedBTree btree;
+
+  /// When true, the engine refuses any insert/update that would
+  /// create two index entries sharing the same indexed-column
+  /// tuple (excluding the PK tie-breaker). NULL-containing tuples
+  /// are still skipped entirely — SQLite-compatible: `NULL != NULL`
+  /// in unique constraints.
+  final bool unique;
+
   _SecondaryIndex({
     required this.name,
     required this.columns,
     required this.columnTypes,
     required this.file,
     required this.btree,
+    this.unique = false,
   });
 
   /// Convenience: first indexed column (the common single-column case).

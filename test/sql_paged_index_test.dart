@@ -11,7 +11,7 @@ import 'package:test/test.dart';
 ///    SELECT returns matching rows.
 ///  - INSERT/UPDATE/DELETE keep the index consistent.
 ///  - DROP INDEX removes the sidecar files and the index name.
-///  - Unsupported variants (UNIQUE, multi-column, expression, partial)
+///  - Unsupported variants (expression, partial)
 ///    are rejected.
 ///  - Index-routed lookup respects any extra residual conjuncts.
 void main() {
@@ -121,12 +121,16 @@ void main() {
     expect(after, isEmpty);
   });
 
-  test('UNIQUE / expression / partial are rejected', () async {
+  test('expression / partial indexes are rejected', () async {
     final db = await seeded();
     addTearDown(() async => db.close());
 
     await expectLater(
-      db.execute('CREATE UNIQUE INDEX u ON t(name)'),
+      db.execute('CREATE INDEX e ON t(LOWER(name))'),
+      throwsA(isA<UnsupportedError>()),
+    );
+    await expectLater(
+      db.execute('CREATE INDEX p ON t(name) WHERE age > 0'),
       throwsA(isA<UnsupportedError>()),
     );
   });
