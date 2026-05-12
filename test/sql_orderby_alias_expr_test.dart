@@ -10,10 +10,8 @@ void main() {
       final db = await Database.open();
       try {
         await db.execute('CREATE TABLE t (a INTEGER, b INTEGER)');
-        await db
-            .execute('INSERT INTO t VALUES (1,10),(2,5),(3,20),(4,1)');
-        final r = await db
-            .execute('SELECT a+b AS s FROM t ORDER BY s');
+        await db.execute('INSERT INTO t VALUES (1,10),(2,5),(3,20),(4,1)');
+        final r = await db.execute('SELECT a+b AS s FROM t ORDER BY s');
         expect(r.rows.map((r) => r.first).toList(), [5, 7, 11, 23]);
       } finally {
         await db.close();
@@ -24,10 +22,9 @@ void main() {
       final db = await Database.open();
       try {
         await db.execute('CREATE TABLE t (a INTEGER, b INTEGER)');
-        await db
-            .execute('INSERT INTO t VALUES (1,10),(2,5),(3,20),(4,1)');
-        final r = await db
-            .execute('SELECT a+b AS s FROM t ORDER BY s + 0 DESC');
+        await db.execute('INSERT INTO t VALUES (1,10),(2,5),(3,20),(4,1)');
+        final r =
+            await db.execute('SELECT a+b AS s FROM t ORDER BY s + 0 DESC');
         expect(r.rows.map((r) => r.first).toList(), [23, 11, 7, 5]);
       } finally {
         await db.close();
@@ -39,8 +36,7 @@ void main() {
       try {
         await db.execute('CREATE TABLE t (a INTEGER)');
         await db.execute('INSERT INTO t VALUES (-3),(1),(-2),(4)');
-        final r = await db
-            .execute('SELECT a AS x FROM t ORDER BY ABS(x)');
+        final r = await db.execute('SELECT a AS x FROM t ORDER BY ABS(x)');
         expect(r.rows.map((r) => r.first).toList(), [1, -2, -3, 4]);
       } finally {
         await db.close();
@@ -53,8 +49,7 @@ void main() {
         await db.execute('CREATE TABLE t (a INTEGER)');
         await db.execute('INSERT INTO t VALUES (1),(2),(3)');
         // `a` is also the alias; the alias value (4-a) wins for ORDER BY.
-        final r = await db.execute(
-            'SELECT 4 - a AS a FROM t ORDER BY a + 0');
+        final r = await db.execute('SELECT 4 - a AS a FROM t ORDER BY a + 0');
         expect(r.rows.map((r) => r.first).toList(), [1, 2, 3]);
       } finally {
         await db.close();

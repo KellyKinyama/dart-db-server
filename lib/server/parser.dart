@@ -140,6 +140,8 @@ class Parser {
       switch (t.upper) {
         case 'SELECT':
           return _parseSelect();
+        case 'VALUES':
+          return _parseValuesAsSelect();
         case 'INSERT':
           return _parseInsert();
         case 'REPLACE':
@@ -1026,6 +1028,9 @@ class Parser {
 
   // ---- SELECT -------------------------------------------------------------
   SelectStmt _parseSelect() {
+    if (_checkKw('VALUES')) {
+      return _parseValuesAsSelect();
+    }
     final base = _parseSimpleSelect();
     String? setOp;
     SelectStmt? right;
@@ -1056,6 +1061,88 @@ class Parser {
       ctes: base.ctes,
       setOp: setOp,
       setOpRight: right,
+    );
+  }
+
+  /// Parse standalone `VALUES (e1, e2, ...), (...), ...` and desugar
+  /// into a UNION ALL chain of single-row SELECTs. The head arm names
+  /// its columns `column1`, `column2`, ... matching SQLite's
+  /// convention. Optional trailing ORDER BY / LIMIT / OFFSET attach to
+  /// the head arm so the compound-clause logic finds them.
+  SelectStmt _parseValuesAsSelect() {
+    _expectKw('VALUES');
+    final rows = <List<Expr>>[];
+    _expect(TokType.punct, '(');
+    final first = <Expr>[_parseExpr()];
+    while (_match(TokType.punct, ',')) {
+      first.add(_parseExpr());
+    }
+    _expect(TokType.punct, ')');
+    rows.add(first);
+    while (_match(TokType.punct, ',')) {
+      _expect(TokType.punct, '(');
+      final r = <Expr>[_parseExpr()];
+      while (_match(TokType.punct, ',')) {
+        r.add(_parseExpr());
+      }
+      _expect(TokType.punct, ')');
+      if (r.length != first.length) {
+        throw FormatException(
+            'VALUES rows must all have the same number of columns');
+      }
+      rows.add(r);
+    }
+    final orderBy = <OrderByItem>[];
+    if (_matchKw('ORDER')) {
+      _expectKw('BY');
+      orderBy.add(_parseOrderByItem());
+      while (_match(TokType.punct, ',')) {
+        orderBy.add(_parseOrderByItem());
+      }
+    }
+    int? limit;
+    int? offset;
+    if (_matchKw('LIMIT')) {
+      limit = int.parse(_expect(TokType.number).text);
+    }
+    if (_matchKw('OFFSET')) {
+      offset = int.parse(_expect(TokType.number).text);
+    }
+    SelectStmt makeArm(List<Expr> vals, {bool nameCols = false}) {
+      final proj = <SelectItem>[];
+      for (var i = 0; i < vals.length; i++) {
+        proj.add(SelectItem.expr(vals[i],
+            alias: nameCols ? 'column${i + 1}' : null));
+      }
+      return SelectStmt(projection: proj, orderBy: const []);
+    }
+    // Build a right-recursive UNION ALL tail from rows[1..].
+    SelectStmt? tail;
+    for (var i = rows.length - 1; i >= 1; i--) {
+      final arm = makeArm(rows[i]);
+      tail = SelectStmt(
+        projection: arm.projection,
+        orderBy: const [],
+        setOp: tail == null ? null : 'UNION ALL',
+        setOpRight: tail,
+      );
+    }
+    final headProj = makeArm(rows.first, nameCols: true).projection;
+    if (rows.length == 1) {
+      return SelectStmt(
+        projection: headProj,
+        orderBy: orderBy,
+        limit: limit,
+        offset: offset,
+      );
+    }
+    return SelectStmt(
+      projection: headProj,
+      orderBy: orderBy,
+      limit: limit,
+      offset: offset,
+      setOp: 'UNION ALL',
+      setOpRight: tail,
     );
   }
 

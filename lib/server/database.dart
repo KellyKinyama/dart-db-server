@@ -1999,6 +1999,7 @@ class Database {
               }
               return m;
             }
+
             try {
               av = boundExpr.eval(scope(a));
               bv = boundExpr.eval(scope(b));
