@@ -944,11 +944,24 @@ class Parser {
       _expect(TokType.op, '=');
       assignments[col] = _parseExpr();
     } while (_match(TokType.punct, ','));
+    String? fromTable;
+    String? fromAlias;
+    if (_matchKw('FROM')) {
+      fromTable = _expectIdent().text;
+      if (_matchKw('AS')) {
+        fromAlias = _expectName();
+      } else if (_check(TokType.ident)) {
+        fromAlias = _advance().text;
+      }
+    }
     Expr? where;
     if (_matchKw('WHERE')) where = _parseExpr();
     final ret = _parseReturning();
     return UpdateStmt(table, assignments, where,
-        returning: ret, indexedBy: hint);
+        returning: ret,
+        indexedBy: hint,
+        fromTable: fromTable,
+        fromAlias: fromAlias);
   }
 
   // ---- DELETE -------------------------------------------------------------

@@ -3145,6 +3145,11 @@ class Database {
         }
       }
       final returnedRows = <List<Object?>>[];
+      // Optional FROM-table source for `UPDATE t SET ... FROM other`.
+      Table? fromT;
+      if (s.fromTable != null) {
+        fromT = _requireTable(s.fromTable!);
+      }
       // INDEXED BY: resolve a candidate rowId set up-front. NOT INDEXED
       // and the absence of any hint both fall through to a full scan.
       final hintedRows = _resolveHintedRowIds(t, s.where, s.indexedBy);
@@ -3153,8 +3158,27 @@ class Database {
       for (final ri in rowOrder) {
         final row = t.rows[ri];
         final view = t.rowToMap(row);
-        if (s.where != null && !evalPredicate(_bindExpr(s.where!), view)) {
-          continue;
+        // For UPDATE ... FROM other, look for the first `other` row that
+        // satisfies WHERE; bind its columns into the evaluation context.
+        Map<String, Object?>? matchedView;
+        if (fromT != null) {
+          for (final fr in fromT.rows) {
+            final joinView = <String, Object?>{
+              ...view,
+              ...fromT.rowToMap(fr, alias: s.fromAlias),
+            };
+            if (s.where == null ||
+                evalPredicate(_bindExpr(s.where!), joinView)) {
+              matchedView = joinView;
+              break;
+            }
+          }
+          if (matchedView == null) continue;
+        } else {
+          if (s.where != null && !evalPredicate(_bindExpr(s.where!), view)) {
+            continue;
+          }
+          matchedView = view;
         }
         final old = List<Object?>.from(row);
         _fireTriggers(t.name, 'UPDATE', 'BEFORE',
@@ -3162,7 +3186,7 @@ class Database {
         s.assignments.forEach((col, expr) {
           final colIdx = t.columnIndex(col);
           row[colIdx] = coerceForColumn(
-              _evalScalar(expr, view), t.columns[colIdx],
+              _evalScalar(expr, matchedView!), t.columns[colIdx],
               strict: t.strict);
         });
         _evaluateGenerated(t, row);
