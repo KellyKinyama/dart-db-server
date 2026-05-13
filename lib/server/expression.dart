@@ -1669,11 +1669,33 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
   'SQLITE_VERSION': (a) => kSqliteVersionString,
   // sqlite_source_id(): in real SQLite this is a build/source hash. We
   // return a stable identifier that names this engine.
-  'SQLITE_SOURCE_ID': (a) => 'dart-db-server (parity target $kSqliteVersionString)',
+  'SQLITE_SOURCE_ID': (a) =>
+      'dart-db-server (parity target $kSqliteVersionString)',
   // sqlite_compileoption_used(opt): always 0 — no compile options.
   'SQLITE_COMPILEOPTION_USED': (a) => 0,
   // sqlite_compileoption_get(n): always NULL — no compile options.
   'SQLITE_COMPILEOPTION_GET': (a) => null,
+  // sqlite_offset(col): SQLite returns the byte offset of the column's
+  // value in the DB file, or NULL when not on disk. We have no stable
+  // mapping for the in-memory engine; return NULL unconditionally.
+  'SQLITE_OFFSET': (a) => null,
+  // subtype(value): SQLite 3.45+. Returns the application-defined
+  // subtype of an SQL value. We have no subtype machinery, so 0.
+  'SUBTYPE': (a) => 0,
+  // json_error_position(json): SQLite 3.42+. Returns 0 when the input
+  // is a valid JSON value, otherwise the 1-based character position of
+  // the first parse error. NULL input yields NULL.
+  'JSON_ERROR_POSITION': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final s = a[0].toString();
+    try {
+      jsonDecode(s);
+      return 0;
+    } on FormatException catch (e) {
+      final off = e.offset;
+      return (off == null || off < 0) ? 1 : off + 1;
+    }
+  },
   // ---- FTS5 ranking ------------------------------------------------------
   'FTS5_TF': (a) {
     if (a.length < 2 || a[0] == null || a[1] == null) return 0;

@@ -648,9 +648,7 @@ class Database {
       }
       if (_isMutation(stmt)) {
         // Track changes()/total_changes() at the SQL function layer.
-        if (stmt is InsertStmt ||
-            stmt is UpdateStmt ||
-            stmt is DeleteStmt) {
+        if (stmt is InsertStmt || stmt is UpdateStmt || stmt is DeleteStmt) {
           _changesCount = result.affected;
           _totalChangesCount += result.affected;
         }
@@ -5229,6 +5227,9 @@ class Database {
       case 'JSON_TREE':
         rows = _jsonEachRows(args, recursive: true);
         break;
+      case 'GENERATE_SERIES':
+        rows = _generateSeriesRows(args);
+        break;
       default:
         throw StateError('Unknown table-valued function: ${fn.name}');
     }
@@ -5238,6 +5239,32 @@ class Database {
               for (final e in r.entries) '$qual.${e.key}': e.value,
             })
         .toList();
+  }
+
+  /// Implementation of `generate_series(start, stop[, step])` table-valued
+  /// function. Yields one row per integer with column `value`. `step`
+  /// defaults to 1; a negative step counts down. An empty/invalid range
+  /// yields no rows.
+  List<Map<String, Object?>> _generateSeriesRows(List<Object?> args) {
+    if (args.isEmpty || args[0] == null) return const [];
+    final start = (args[0] as num).toInt();
+    final stop = args.length >= 2 && args[1] != null
+        ? (args[1] as num).toInt()
+        : start;
+    final step =
+        args.length >= 3 && args[2] != null ? (args[2] as num).toInt() : 1;
+    if (step == 0) return const [];
+    final out = <Map<String, Object?>>[];
+    if (step > 0) {
+      for (var v = start; v <= stop; v += step) {
+        out.add({'value': v});
+      }
+    } else {
+      for (var v = start; v >= stop; v += step) {
+        out.add({'value': v});
+      }
+    }
+    return out;
   }
 
   /// Implementation of `json_each` / `json_tree`. Returns rows with the

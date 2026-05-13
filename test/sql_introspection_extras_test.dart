@@ -36,8 +36,7 @@ void main() {
       }
     });
 
-    test('changes() reflects last DML; total_changes() accumulates',
-        () async {
+    test('changes() reflects last DML; total_changes() accumulates', () async {
       final db = await Database.open();
       try {
         await db.execute('CREATE TABLE t(x INTEGER)');
@@ -57,14 +56,13 @@ void main() {
       }
     });
 
-    test('sqlite_version / sqlite_source_id / compileoption stubs',
-        () async {
+    test('sqlite_version / sqlite_source_id / compileoption stubs', () async {
       final db = await Database.open();
       try {
-        final r = await db.execute(
-            "SELECT sqlite_version(), sqlite_source_id(), "
-            "       sqlite_compileoption_used('FOO'), "
-            "       sqlite_compileoption_get(0)");
+        final r =
+            await db.execute("SELECT sqlite_version(), sqlite_source_id(), "
+                "       sqlite_compileoption_used('FOO'), "
+                "       sqlite_compileoption_get(0)");
         final row = r.rows.first;
         expect(row[0], isA<String>());
         expect((row[0] as String), matches(r'^\d+\.\d+\.\d+$'));
@@ -81,8 +79,7 @@ void main() {
     test('asinh / acosh / atanh basic values', () async {
       final db = await Database.open();
       try {
-        final r = await db.execute(
-            'SELECT asinh(0), acosh(1), atanh(0)');
+        final r = await db.execute('SELECT asinh(0), acosh(1), atanh(0)');
         expect(r.rows.first, [0.0, 0.0, 0.0]);
       } finally {
         await db.close();
@@ -106,8 +103,8 @@ void main() {
     test('domain errors return NULL', () async {
       final db = await Database.open();
       try {
-        final r = await db.execute(
-            'SELECT acosh(0.5), atanh(1), atanh(-1), asinh(NULL)');
+        final r = await db
+            .execute('SELECT acosh(0.5), atanh(1), atanh(-1), asinh(NULL)');
         expect(r.rows.first, [null, null, null, null]);
       } finally {
         await db.close();
@@ -119,11 +116,14 @@ void main() {
     test('default 2-space indent', () async {
       final db = await Database.open();
       try {
-        final r = await db
-            .execute("SELECT json_pretty('{\"a\":1,\"b\":[2,3]}')");
+        final r =
+            await db.execute("SELECT json_pretty('{\"a\":1,\"b\":[2,3]}')");
         final s = r.rows.first.first as String;
         // Re-parse to confirm it's still valid JSON with the same content.
-        expect(jsonDecode(s), {'a': 1, 'b': [2, 3]});
+        expect(jsonDecode(s), {
+          'a': 1,
+          'b': [2, 3]
+        });
         // Has a newline -> it really was indented.
         expect(s.contains('\n'), isTrue);
       } finally {
@@ -134,8 +134,7 @@ void main() {
     test('custom indent string', () async {
       final db = await Database.open();
       try {
-        final r = await db.execute(
-            "SELECT json_pretty('[1,2]', '\t')");
+        final r = await db.execute("SELECT json_pretty('[1,2]', '\t')");
         final s = r.rows.first.first as String;
         expect(s.contains('\t'), isTrue);
         expect(jsonDecode(s), [1, 2]);
@@ -147,8 +146,8 @@ void main() {
     test('invalid / NULL inputs', () async {
       final db = await Database.open();
       try {
-        final r = await db.execute(
-            "SELECT json_pretty('not json'), json_pretty(NULL)");
+        final r = await db
+            .execute("SELECT json_pretty('not json'), json_pretty(NULL)");
         expect(r.rows.first, [null, null]);
       } finally {
         await db.close();
