@@ -35,8 +35,8 @@ void main() {
     final db = await Database.open();
     try {
       await db.execute('CREATE TABLE foo(a INT)');
-      final r = await db.execute(
-          "SELECT name FROM pragma_table_list() WHERE type='table'");
+      final r = await db
+          .execute("SELECT name FROM pragma_table_list() WHERE type='table'");
       expect(r.rows.map((row) => row[0]).toList(), contains('foo'));
     } finally {
       await db.close();

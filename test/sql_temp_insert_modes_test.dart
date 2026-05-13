@@ -42,8 +42,7 @@ void main() {
         final r = await db.execute('SELECT count(*) FROM t');
         expect((r.rows.first.first as num).toInt(), 3);
         // Conflict on UNIQUE still throws (same as plain INSERT).
-        expect(
-            () => db.execute('INSERT OR ABORT INTO t VALUES (1)'),
+        expect(() => db.execute('INSERT OR ABORT INTO t VALUES (1)'),
             throwsA(isA<StateError>()));
       } finally {
         await db.close();

@@ -30,11 +30,11 @@ void main() {
   test('DECODE matches and falls through to default', () async {
     final db = await Database.open();
     try {
-      final r = await db.execute(
-          "SELECT DECODE(2, 1,'one', 2,'two', 3,'three', '?')");
+      final r = await db
+          .execute("SELECT DECODE(2, 1,'one', 2,'two', 3,'three', '?')");
       expect(r.rows.first[0], 'two');
-      final r2 = await db.execute(
-          "SELECT DECODE(9, 1,'one', 2,'two', 'other')");
+      final r2 =
+          await db.execute("SELECT DECODE(9, 1,'one', 2,'two', 'other')");
       expect(r2.rows.first[0], 'other');
       final r3 = await db.execute("SELECT DECODE(9, 1,'one')");
       expect(r3.rows.first[0], isNull);

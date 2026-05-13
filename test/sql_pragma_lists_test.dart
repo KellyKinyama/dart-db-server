@@ -35,7 +35,8 @@ void main() {
     try {
       final r = await db.execute('PRAGMA pragma_list');
       final names = r.rows.map((row) => row[0]).toSet();
-      expect(names, containsAll(['table_info', 'foreign_keys', 'journal_mode']));
+      expect(
+          names, containsAll(['table_info', 'foreign_keys', 'journal_mode']));
     } finally {
       await db.close();
     }

@@ -13,8 +13,8 @@ void main() {
             'CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT NOT NULL,'
             " age INTEGER DEFAULT 0)");
         final r = await db.execute('PRAGMA table_info(t)');
-        expect(r.columns,
-            ['cid', 'name', 'type', 'notnull', 'dflt_value', 'pk']);
+        expect(
+            r.columns, ['cid', 'name', 'type', 'notnull', 'dflt_value', 'pk']);
         expect(r.rows.length, 3);
         expect(r.rows[0][1], 'id');
         expect(r.rows[1][1], 'name');
@@ -63,8 +63,7 @@ void main() {
       final db = await Database.open();
       try {
         await db.execute('CREATE TABLE p(id INTEGER PRIMARY KEY)');
-        await db.execute(
-            'CREATE TABLE c(id INT, pid INT REFERENCES p(id))');
+        await db.execute('CREATE TABLE c(id INT, pid INT REFERENCES p(id))');
         final r = await db.execute('PRAGMA foreign_key_list(c)');
         expect(r.rows, isNotEmpty);
         final row = r.rows.first;

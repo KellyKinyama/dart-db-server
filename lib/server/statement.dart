@@ -322,6 +322,7 @@ class UpdateStmt extends Statement {
   final Map<String, List<String>> cteColumns;
   final bool ctesRecursive;
   final IndexHint? indexedBy;
+
   /// Optional `UPDATE t SET ... FROM <fromTable> [AS fromAlias]` source
   /// (SQLite ≥ 3.33). Columns of the FROM table are visible in both the
   /// SET expressions and the WHERE clause; the WHERE acts as the join

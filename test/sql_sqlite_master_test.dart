@@ -12,9 +12,9 @@ void main() {
         await db.execute('CREATE TABLE t(id INT, n TEXT)');
         await db.execute('CREATE INDEX ix_n ON t(n)');
         await db.execute('CREATE VIEW v AS SELECT id FROM t');
-        final r = await db.execute(
-            "SELECT type, name, tbl_name FROM sqlite_master "
-            'ORDER BY type, name');
+        final r =
+            await db.execute("SELECT type, name, tbl_name FROM sqlite_master "
+                'ORDER BY type, name');
         expect(r.rows, [
           ['index', 'ix_n', 't'],
           ['table', 't', 't'],

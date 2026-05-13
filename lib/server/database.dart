@@ -142,6 +142,12 @@ class Database {
   /// when no trigger is firing.
   Map<String, Object?>? _triggerScope;
 
+  /// Current recursive-trigger depth. Incremented when [_fireTriggers]
+  /// re-enters itself (a trigger body that fires another trigger).
+  /// Compared against the SQLite default cap of 1000 levels and the
+  /// PRAGMA `max_trigger_depth` value to abort runaway recursion.
+  int _triggerDepth = 0;
+
   /// Triggers attached to tables. Stored separately from [_tables] so they
   /// can persist alongside the schema.
   final Map<String, _TriggerSpec> _triggers = <String, _TriggerSpec>{};
@@ -2899,6 +2905,11 @@ class Database {
         }
         for (var i = 0; i < s.columns!.length; i++) {
           final colIdx = t.columnIndex(s.columns![i]);
+          // Generated columns cannot be assigned by an INSERT.
+          if (t.columns[colIdx].generatedExprSql != null) {
+            throw StateError(
+                'cannot INSERT into generated column "${t.columns[colIdx].name}"');
+          }
           row[colIdx] = coerceForColumn(
               _evalScalar(values[i]), t.columns[colIdx],
               strict: t.strict);
@@ -3196,6 +3207,10 @@ class Database {
             oldRow: old, newRow: row, sourceTable: t);
         s.assignments.forEach((col, expr) {
           final colIdx = t.columnIndex(col);
+          if (t.columns[colIdx].generatedExprSql != null) {
+            throw StateError(
+                'cannot UPDATE generated column "${t.columns[colIdx].name}"');
+          }
           row[colIdx] = coerceForColumn(
               _evalScalar(expr, matchedView!), t.columns[colIdx],
               strict: t.strict);
@@ -3265,6 +3280,7 @@ class Database {
         if (lim > 0 && deleted.length >= lim) return false;
         return true;
       }
+
       final hintedRows = _resolveHintedRowIds(t, s.where, s.indexedBy);
       if (hintedRows != null) {
         final toDelete = <int>{};
@@ -5238,6 +5254,12 @@ class Database {
         lower == 'sqlite_temp_schema') {
       return _sqliteMasterRows(name, alias, outer);
     }
+    if (lower == 'sqlite_stmt') {
+      return _sqliteStmtRows(name, alias, outer);
+    }
+    if (lower == 'sqlite_dbpage') {
+      return _sqliteDbpageRows(name, alias, outer);
+    }
     // CTE bindings shadow tables and views.
     final cte = _lookupCte(name);
     if (cte != null) {
@@ -5309,8 +5331,7 @@ class Database {
     final viewNames = _views.keys.toList()..sort();
     for (final vn in viewNames) {
       final sql = _viewSql[vn];
-      emit('view', vn, vn,
-          sql == null ? null : 'CREATE VIEW $vn AS $sql');
+      emit('view', vn, vn, sql == null ? null : 'CREATE VIEW $vn AS $sql');
     }
     return rows;
   }
@@ -5334,6 +5355,56 @@ class Database {
     if (t.strict) tail.add('STRICT');
     final tailStr = tail.isEmpty ? '' : ' ${tail.join(', ')}';
     return 'CREATE TABLE ${t.name}(${cols.join(', ')})$tailStr';
+  }
+
+  /// Synthesize SQLite's `sqlite_stmt` virtual table. We don't keep a
+  /// per-statement bytecode cache, so this is always empty but presents
+  /// the right column shape so SELECTs against it succeed.
+  List<Map<String, Object?>> _sqliteStmtRows(
+      String name, String? alias, Map<String, Object?> outer) {
+    const cols = <String>[
+      'sql',
+      'ncol',
+      'ro',
+      'busy',
+      'nscan',
+      'nsort',
+      'naidx',
+      'nstep',
+      'reprep',
+      'run',
+      'mem',
+    ];
+    final empty = <Map<String, Object?>>[];
+    // Column-shape advertisement only; rows always empty.
+    final qual = alias ?? name;
+    for (final r in empty) {
+      for (final c in cols) {
+        r['$qual.$c'] = r[c];
+      }
+    }
+    return empty;
+  }
+
+  /// Synthesize SQLite's `sqlite_dbpage` virtual table. We expose page
+  /// numbers 1..page_count with NULL data, so SELECT count(*) and
+  /// SELECT pgno work but raw page bytes are not surfaced.
+  List<Map<String, Object?>> _sqliteDbpageRows(
+      String name, String? alias, Map<String, Object?> outer) {
+    final pageCount = (_pragmas['page_count'] as num?)?.toInt() ?? 0;
+    final qual = alias ?? name;
+    final out = <Map<String, Object?>>[];
+    for (var p = 1; p <= pageCount; p++) {
+      final base = <String, Object?>{'pgno': p, 'data': null, 'schema': 'main'};
+      final m = <String, Object?>{...outer, ...base};
+      for (final e in base.entries) {
+        m['$name.${e.key}'] = e.value;
+        if (alias != null) m['$alias.${e.key}'] = e.value;
+      }
+      m['$qual.pgno'] = p;
+      out.add(m);
+    }
+    return out;
   }
 
   /// Materialize a table-valued function call (e.g. `json_each(...)`) into
@@ -5393,9 +5464,8 @@ class Database {
   List<Map<String, Object?>> _generateSeriesRows(List<Object?> args) {
     if (args.isEmpty || args[0] == null) return const [];
     final start = (args[0] as num).toInt();
-    final stop = args.length >= 2 && args[1] != null
-        ? (args[1] as num).toInt()
-        : start;
+    final stop =
+        args.length >= 2 && args[1] != null ? (args[1] as num).toInt() : start;
     final step =
         args.length >= 3 && args[2] != null ? (args[2] as num).toInt() : 1;
     if (step == 0) return const [];
@@ -6898,20 +6968,22 @@ class Database {
             ...kAggregateFunctions,
           }.toList()
             ..sort();
-          return QueryResult(
-              columns: const ['name'],
-              rows: [for (final n in names) [n.toLowerCase()]]);
+          return QueryResult(columns: const [
+            'name'
+          ], rows: [
+            for (final n in names) [n.toLowerCase()]
+          ]);
         }
       case 'module_list':
-        return QueryResult(
-            columns: const ['name'],
-            rows: const [
-              ['fts5'],
-              ['rtree'],
-              ['json_each'],
-              ['json_tree'],
-              ['generate_series'],
-            ]);
+        return QueryResult(columns: const [
+          'name'
+        ], rows: const [
+          ['fts5'],
+          ['rtree'],
+          ['json_each'],
+          ['json_tree'],
+          ['generate_series'],
+        ]);
       case 'pragma_list':
         {
           const names = <String>[
@@ -6968,9 +7040,11 @@ class Database {
             'wal_autocheckpoint',
             'wal_checkpoint',
           ];
-          return QueryResult(
-              columns: const ['name'],
-              rows: [for (final n in names) [n]]);
+          return QueryResult(columns: const [
+            'name'
+          ], rows: [
+            for (final n in names) [n]
+          ]);
         }
       case 'table_list':
         {
@@ -6981,14 +7055,63 @@ class Database {
           for (final v in _views.keys) {
             rows.add(['main', v, 'view', 0, 0, 0]);
           }
-          return QueryResult(columns: const [
-            'schema',
-            'name',
-            'type',
-            'ncol',
-            'wr',
-            'strict'
-          ], rows: rows);
+          return QueryResult(
+              columns: const ['schema', 'name', 'type', 'ncol', 'wr', 'strict'],
+              rows: rows);
+        }
+      case 'optimize':
+        {
+          // SQLite normally inspects each table and may run ANALYZE on
+          // those whose statistics are stale. We have no cost-driven
+          // planner that depends on stats, so PRAGMA optimize is a no-op
+          // that reports completion.
+          return QueryResult.message('optimize: 0 tables analyzed');
+        }
+      case 'vdbe_listing':
+      case 'vdbe_trace':
+      case 'vdbe_addoptrace':
+      case 'vdbe_debug':
+        {
+          // Bytecode VM introspection toggles. We have no VDBE bytecode,
+          // so accept and remember the value but emit no listing.
+          if (s.value != null) _pragmas[name] = s.value;
+          return QueryResult(
+              columns: const ['addr', 'opcode', 'p1', 'p2', 'p3', 'p4', 'p5'],
+              rows: const []);
+        }
+      case 'shrink_memory':
+      case 'incremental_vacuum':
+      case 'wal_checkpoint':
+        {
+          return QueryResult(
+              columns: const ['busy', 'log', 'checkpointed'],
+              rows: const [
+                [0, 0, 0]
+              ]);
+        }
+      case 'wal2_checkpoint':
+        {
+          // SQLite's experimental WAL2 mode keeps two WAL files. We don't
+          // implement the dual-log scheme, but accept the pragma and
+          // return a 3-column wal_checkpoint-shaped row so wrappers that
+          // poll it don't error out.
+          return QueryResult(
+              columns: const ['busy', 'log', 'checkpointed'],
+              rows: const [
+                [0, 0, 0]
+              ]);
+        }
+      case 'max_trigger_depth':
+        {
+          if (s.value != null) {
+            _pragmas[name] = s.value;
+            return QueryResult.message('max_trigger_depth = ${s.value}');
+          }
+          return QueryResult(
+              columns: const ['max_trigger_depth'],
+              rows: [
+                [_pragmas[name] ?? 1000]
+              ]);
         }
     }
     // Recognised PRAGMA names with sensible default return values when no
@@ -7176,6 +7299,18 @@ class Database {
     }
     final saved = _triggerScope;
     _triggerScope = {...?saved, ...scope};
+    final maxDepth =
+        (_pragmas['max_trigger_depth'] as num?)?.toInt() ?? 1000;
+    final recursive = _truthy(_pragmas['recursive_triggers'] ?? 1);
+    if (_triggerDepth >= maxDepth) {
+      _triggerScope = saved;
+      throw StateError('too many levels of trigger recursion');
+    }
+    if (!recursive && _triggerDepth > 0) {
+      _triggerScope = saved;
+      return; // recursive triggers disabled
+    }
+    _triggerDepth++;
     try {
       for (final tr in fired) {
         if (tr.when != null && !evalPredicate(_bindExpr(tr.when!), const {})) {
@@ -7200,6 +7335,7 @@ class Database {
         }
       }
     } finally {
+      _triggerDepth--;
       _triggerScope = saved;
     }
   }

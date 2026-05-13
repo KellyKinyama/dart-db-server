@@ -35,8 +35,7 @@ void main() {
     test('valid JSON returns 0', () async {
       final db = await Database.open();
       try {
-        final r = await db.execute(
-            "SELECT json_error_position('{\"a\":1}'),"
+        final r = await db.execute("SELECT json_error_position('{\"a\":1}'),"
             "       json_error_position('[1,2,3]'),"
             "       json_error_position('null')");
         expect(r.rows.first, [0, 0, 0]);
@@ -48,8 +47,7 @@ void main() {
     test('invalid JSON returns 1-based error position', () async {
       final db = await Database.open();
       try {
-        final r =
-            await db.execute("SELECT json_error_position('{not valid')");
+        final r = await db.execute("SELECT json_error_position('{not valid')");
         final pos = (r.rows.first.first as num).toInt();
         expect(pos, greaterThan(0));
       } finally {
@@ -72,8 +70,7 @@ void main() {
     test('ascending range', () async {
       final db = await Database.open();
       try {
-        final r =
-            await db.execute('SELECT value FROM generate_series(1, 5)');
+        final r = await db.execute('SELECT value FROM generate_series(1, 5)');
         expect(r.rows.map((e) => e.first).toList(), [1, 2, 3, 4, 5]);
       } finally {
         await db.close();
@@ -105,8 +102,8 @@ void main() {
     test('joinable in a query', () async {
       final db = await Database.open();
       try {
-        final r = await db.execute(
-            'SELECT sum(value) FROM generate_series(1, 100)');
+        final r =
+            await db.execute('SELECT sum(value) FROM generate_series(1, 100)');
         expect((r.rows.first.first as num).toInt(), 5050);
       } finally {
         await db.close();
@@ -116,8 +113,7 @@ void main() {
     test('empty range returns no rows', () async {
       final db = await Database.open();
       try {
-        final r =
-            await db.execute('SELECT value FROM generate_series(5, 1)');
+        final r = await db.execute('SELECT value FROM generate_series(5, 1)');
         expect(r.rows, isEmpty);
       } finally {
         await db.close();

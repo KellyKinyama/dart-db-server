@@ -19,8 +19,8 @@ void main() {
   test('LOAD_EXTENSION and SQLITE_LOG are no-op NULL', () async {
     final db = await Database.open();
     try {
-      final r = await db.execute(
-          "SELECT LOAD_EXTENSION('foo'), SQLITE_LOG(1,'hi')");
+      final r =
+          await db.execute("SELECT LOAD_EXTENSION('foo'), SQLITE_LOG(1,'hi')");
       expect(r.rows.first, [null, null]);
     } finally {
       await db.close();

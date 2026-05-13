@@ -10,10 +10,9 @@ void main() {
     try {
       await db.execute('CREATE TABLE t(x REAL, y REAL)');
       // y = 2x for x in 1..5.
-      await db.execute(
-          'INSERT INTO t VALUES(1,2),(2,4),(3,6),(4,8),(5,10)');
-      final r = await db.execute(
-          'SELECT COVAR_POP(x,y), COVAR_SAMP(x,y), CORR(x,y) FROM t');
+      await db.execute('INSERT INTO t VALUES(1,2),(2,4),(3,6),(4,8),(5,10)');
+      final r = await db
+          .execute('SELECT COVAR_POP(x,y), COVAR_SAMP(x,y), CORR(x,y) FROM t');
       // var_pop(x)=2, covar_pop=4. covar_samp=5. CORR=1.
       expect((r.rows.first[0] as num).toDouble(), closeTo(4.0, 1e-9));
       expect((r.rows.first[1] as num).toDouble(), closeTo(5.0, 1e-9));

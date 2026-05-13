@@ -55,8 +55,8 @@ void main() {
       await db.execute('CREATE TABLE t(x REAL)');
       await db.execute('INSERT INTO t VALUES(1),(2),(3),(4),(5)');
       final r = await db.execute('SELECT STDDEV_SAMP(x) FROM t');
-      expect((r.rows.first[0] as num).toDouble(),
-          closeTo(math.sqrt(2.5), 1e-9));
+      expect(
+          (r.rows.first[0] as num).toDouble(), closeTo(math.sqrt(2.5), 1e-9));
     } finally {
       await db.close();
     }

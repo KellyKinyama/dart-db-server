@@ -2207,16 +2207,13 @@ String _strftime(String fmt, DateTime d) {
           final firstMonday =
               start.weekday == DateTime.monday ? 1 : (9 - start.weekday) % 7;
           final doy = _dayOfYear(d);
-          final w = doy < firstMonday
-              ? 0
-              : ((doy - firstMonday) ~/ 7) + 1;
+          final w = doy < firstMonday ? 0 : ((doy - firstMonday) ~/ 7) + 1;
           buf.write(w.toString().padLeft(2, '0'));
           break;
         }
       case 'f':
         {
-          final secs = d.second + d.millisecond / 1000.0 +
-              d.microsecond / 1e6;
+          final secs = d.second + d.millisecond / 1000.0 + d.microsecond / 1e6;
           buf.write(secs.toStringAsFixed(3).padLeft(6, '0'));
           break;
         }

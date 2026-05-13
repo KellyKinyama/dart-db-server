@@ -51,8 +51,7 @@ void main() {
       final db = await Database.open();
       try {
         await db.execute('CREATE TABLE t(x INT)');
-        expect(
-            () => db.execute('DROP INDEX no_such_index'),
+        expect(() => db.execute('DROP INDEX no_such_index'),
             throwsA(isA<StateError>()));
       } finally {
         await db.close();
