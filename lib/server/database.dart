@@ -5236,6 +5236,54 @@ class Database {
       // calling it per (l, r) pair turned a 1k x 1k join into a million
       // tree rebuilds.
       final boundOn = onExpr == null ? null : _bindExpr(onExpr);
+
+      // Hash-join fast path: when ON is a conjunction of equalities and
+      // every equality has one side that is a bare ColumnExpr qualified
+      // by the right-hand alias / table, we can index `right` by the
+      // tuple of those right-side keys and probe per left row instead of
+      // doing a full nested loop.
+      final rightAlias = (j.alias ?? j.table)?.toLowerCase();
+      final hashPlan = (j.type == 'INNER' || j.type == 'LEFT') &&
+              boundOn != null &&
+              rightAlias != null
+          ? _tryEquiHashPlan(boundOn, rightAlias)
+          : null;
+      if (hashPlan != null) {
+        // Build hash on right side keyed by the tuple of right-side
+        // ColumnExpr values.
+        final rightKeyExprs = hashPlan.rightKeyExprs;
+        final leftKeyExprs = hashPlan.leftKeyExprs;
+        final residual = hashPlan.residual;
+        final hash = <_TupleKey, List<Map<String, Object?>>>{};
+        for (final r in right) {
+          final keyVals = [for (final ke in rightKeyExprs) ke.eval(r)];
+          if (keyVals.contains(null)) continue; // SQL NULL never equi-matches
+          final k = _TupleKey(keyVals);
+          (hash[k] ??= []).add(r);
+        }
+        for (final l in working) {
+          final probeVals = [for (final ke in leftKeyExprs) ke.eval(l)];
+          var matched = false;
+          if (!probeVals.contains(null)) {
+            final bucket = hash[_TupleKey(probeVals)];
+            if (bucket != null) {
+              for (final r in bucket) {
+                final combined = {...l, ...r};
+                if (residual == null || evalPredicate(residual, combined)) {
+                  next.add(combined);
+                  matched = true;
+                }
+              }
+            }
+          }
+          if (!matched && j.type == 'LEFT') {
+            next.add({...l, ..._nullsForJoin(j)});
+          }
+        }
+        working = next;
+        continue;
+      }
+
       switch (j.type) {
         case 'CROSS':
           for (final l in working) {
@@ -5329,6 +5377,91 @@ class Database {
       return const [];
     }
     return working.first.keys.where((k) => !k.contains('.')).toList();
+  }
+
+  /// Walks an AND-conjunction. Returns a hash-join plan iff every leaf
+  /// is `=` with one side being a bare ColumnExpr qualified by [rightAlias]
+  /// (and the other side referencing the left set, i.e. NOT qualified by
+  /// the right alias). Otherwise returns null and the caller falls back
+  /// to nested-loop. Non-equality conjuncts are collected into [residual]
+  /// and re-evaluated after the hash probe matches a bucket.
+  _HashJoinPlan? _tryEquiHashPlan(Expr boundOn, String rightAlias) {
+    final leftKeys = <Expr>[];
+    final rightKeys = <Expr>[];
+    final residuals = <Expr>[];
+    bool walk(Expr e) {
+      if (e is BinaryExpr && e.op == 'AND') {
+        return walk(e.left) && walk(e.right);
+      }
+      if (e is BinaryExpr && e.op == '=') {
+        final lIsRight = _isQualifiedBy(e.left, rightAlias);
+        final rIsRight = _isQualifiedBy(e.right, rightAlias);
+        if (lIsRight && !rIsRight && !_referencesAlias(e.right, rightAlias)) {
+          rightKeys.add(e.left);
+          leftKeys.add(e.right);
+          return true;
+        }
+        if (rIsRight && !lIsRight && !_referencesAlias(e.left, rightAlias)) {
+          rightKeys.add(e.right);
+          leftKeys.add(e.left);
+          return true;
+        }
+      }
+      // Anything else is a residual filter — only safe if it doesn't
+      // need both sides correlated through the hash key (which it
+      // might). We allow residuals that DO reference the right alias
+      // because they'll still be evaluated against `combined`.
+      residuals.add(e);
+      return true;
+    }
+
+    final ok = walk(boundOn);
+    if (!ok || rightKeys.isEmpty) return null;
+    Expr? residual;
+    for (final r in residuals) {
+      residual = residual == null ? r : BinaryExpr('AND', residual, r);
+    }
+    return _HashJoinPlan(leftKeys, rightKeys, residual);
+  }
+
+  /// True iff [e] is a bare `ColumnExpr` whose `.table` (case-insensitive)
+  /// equals [alias].
+  bool _isQualifiedBy(Expr e, String alias) {
+    return e is ColumnExpr &&
+        e.table != null &&
+        e.table!.toLowerCase() == alias;
+  }
+
+  /// True iff any ColumnExpr inside [e] is qualified by [alias].
+  bool _referencesAlias(Expr e, String alias) {
+    if (e is ColumnExpr) {
+      return e.table != null && e.table!.toLowerCase() == alias;
+    }
+    if (e is BinaryExpr) {
+      return _referencesAlias(e.left, alias) ||
+          _referencesAlias(e.right, alias);
+    }
+    if (e is UnaryExpr) return _referencesAlias(e.operand, alias);
+    if (e is FunctionCallExpr) {
+      for (final a in e.args) {
+        if (_referencesAlias(a, alias)) return true;
+      }
+      return false;
+    }
+    if (e is CastExpr) return _referencesAlias(e.expr, alias);
+    if (e is BetweenExpr) {
+      return _referencesAlias(e.value, alias) ||
+          _referencesAlias(e.low, alias) ||
+          _referencesAlias(e.high, alias);
+    }
+    if (e is InExpr) {
+      if (_referencesAlias(e.value, alias)) return true;
+      for (final v in e.values) {
+        if (_referencesAlias(v, alias)) return true;
+      }
+      return false;
+    }
+    return false;
   }
 
   /// Build `(a.c = b.c) AND ...` over [cols] using the left source from [s]
@@ -9331,6 +9464,43 @@ class _Pair {
   final Map<String, Object?> src;
   final List<Object?> row;
   _Pair(this.src, this.row);
+}
+
+class _HashJoinPlan {
+  final List<Expr> leftKeyExprs;
+  final List<Expr> rightKeyExprs;
+  final Expr? residual;
+  _HashJoinPlan(this.leftKeyExprs, this.rightKeyExprs, this.residual);
+}
+
+/// Hashable wrapper around a list of values. Two _TupleKey instances
+/// are equal iff their values compare equal element-wise.
+class _TupleKey {
+  final List<Object?> values;
+  final int _hash;
+  _TupleKey(this.values) : _hash = _hashValues(values);
+
+  static int _hashValues(List<Object?> vs) {
+    var h = 17;
+    for (final v in vs) {
+      h = (h * 31 + (v?.hashCode ?? 0)) & 0x3fffffff;
+    }
+    return h;
+  }
+
+  @override
+  int get hashCode => _hash;
+
+  @override
+  bool operator ==(Object other) {
+    if (other is! _TupleKey) return false;
+    if (other._hash != _hash) return false;
+    if (other.values.length != values.length) return false;
+    for (var i = 0; i < values.length; i++) {
+      if (values[i] != other.values[i]) return false;
+    }
+    return true;
+  }
 }
 
 class _Projection {
