@@ -1708,6 +1708,32 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     final indent = a.length >= 2 && a[1] != null ? a[1].toString() : '  ';
     return JsonEncoder.withIndent(indent).convert(v);
   },
+  // -- JSONB family (SQLite 3.45+). The reference engine returns a
+  // compact binary representation; our pure-Dart engine has no separate
+  // JSONB encoder, so jsonb(x) returns canonical text JSON. Functions
+  // that consume "JSONB" accept text JSON transparently because every
+  // JSON parser here uses jsonDecode. This keeps round-trips identical
+  // to SQLite for all values that are valid in either form.
+  'JSONB': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    try {
+      return jsonEncode(jsonDecode(a[0].toString()));
+    } catch (_) {
+      return jsonEncode(_jsonValueOf(a[0]));
+    }
+  },
+  'JSONB_EXTRACT': (a) => kScalarFunctions['JSON_EXTRACT']!(a),
+  'JSONB_ARRAY': (a) => kScalarFunctions['JSON_ARRAY']!(a),
+  'JSONB_OBJECT': (a) => kScalarFunctions['JSON_OBJECT']!(a),
+  'JSONB_SET': (a) => kScalarFunctions['JSON_SET']!(a),
+  'JSONB_INSERT': (a) => kScalarFunctions['JSON_INSERT']!(a),
+  'JSONB_REPLACE': (a) => kScalarFunctions['JSON_REPLACE']!(a),
+  'JSONB_REMOVE': (a) => kScalarFunctions['JSON_REMOVE']!(a),
+  'JSONB_PATCH': (a) => kScalarFunctions['JSON_PATCH']!(a),
+  'JSONB_QUOTE': (a) => kScalarFunctions['JSON_QUOTE']!(a),
+  'JSONB_TYPE': (a) => kScalarFunctions['JSON_TYPE']!(a),
+  'JSONB_VALID': (a) => kScalarFunctions['JSON_VALID']!(a),
+  'JSONB_ARRAY_LENGTH': (a) => kScalarFunctions['JSON_ARRAY_LENGTH']!(a),
   // ---- SQLite introspection / connection-state scalars -----------------
   // last_insert_rowid(): the ROWID of the most recent successful INSERT.
   // Returns 0 before any insert has occurred.
@@ -2268,6 +2294,8 @@ const Set<String> kAggregateFunctions = {
   'LISTAGG',
   'JSON_GROUP_ARRAY',
   'JSON_GROUP_OBJECT',
+  'JSONB_GROUP_ARRAY',
+  'JSONB_GROUP_OBJECT',
   'BIT_AND',
   'BIT_OR',
   'BIT_XOR',

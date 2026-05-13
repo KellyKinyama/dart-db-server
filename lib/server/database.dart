@@ -5985,6 +5985,7 @@ class Database {
           return best;
         }
       case 'JSON_GROUP_ARRAY':
+      case 'JSONB_GROUP_ARRAY':
         {
           final out = <Object?>[];
           for (final v in _aggValues(e, grp)) {
@@ -6004,6 +6005,7 @@ class Database {
           return jsonEncode(out);
         }
       case 'JSON_GROUP_OBJECT':
+      case 'JSONB_GROUP_OBJECT':
         {
           if (e.args.length != 2) {
             throw StateError('json_group_object requires (key, value)');
@@ -6282,11 +6284,11 @@ class Database {
           lo = boundLo(frame.start);
           hi = boundHi(frame.end);
         } else {
-          // RANGE / GROUPS: tie-aware default behaviour.
-          // For RANGE on a numeric ORDER BY, n PRECEDING/FOLLOWING look at
-          // value differences. For simplicity we treat RANGE n
-          // PRECEDING/FOLLOWING the same as ROWS when no ORDER BY tie groups
-          // matter, and use peer expansion for CURRENT ROW boundaries.
+          // RANGE / GROUPS: tie-aware behaviour.
+          //
+          // RANGE n PRECEDING/FOLLOWING uses the ORDER BY value's
+          // numeric distance from the current row (one ORDER BY key
+          // required). GROUPS n PRECEDING/FOLLOWING counts peer groups.
           int peerStart(int idx) {
             var i = idx;
             while (i > 0 && sameOrderKey(ordered[i - 1], ordered[idx])) {
@@ -6304,20 +6306,92 @@ class Database {
             return i;
           }
 
+          // RANGE numeric-distance scan. Walks outward from k stopping
+          // when |key(j) - key(k)| > off.
+          int rangeBound(num off, {required bool forward}) {
+            if (spec.orderBy.length != 1) {
+              // Fall back to ROWS-style offset when ORDER BY arity != 1.
+              return forward
+                  ? (k + off.toInt()).clamp(0, ordered.length - 1)
+                  : (k - off.toInt()).clamp(0, ordered.length - 1);
+            }
+            final ob = spec.orderBy.single;
+            final keyK = ob.expr.eval(partRows[k]);
+            if (keyK is! num) {
+              // Non-numeric ORDER BY → degenerate to peer-of-current.
+              return forward ? peerEnd(k) : peerStart(k);
+            }
+            // Forward = following (positive direction in undescended
+            // ordering). When ORDER BY is DESC the direction is flipped.
+            final dir = ob.descending ? -1 : 1;
+            final desired = forward ? keyK + dir * off : keyK - dir * off;
+            var best = k;
+            if (forward) {
+              for (var i = k; i < ordered.length; i++) {
+                final v = ob.expr.eval(partRows[i]);
+                if (v is! num) break;
+                final inWindow = ob.descending
+                    ? v >= desired - 1e-12
+                    : v <= desired + 1e-12;
+                if (inWindow) {
+                  best = i;
+                } else {
+                  break;
+                }
+              }
+            } else {
+              for (var i = k; i >= 0; i--) {
+                final v = ob.expr.eval(partRows[i]);
+                if (v is! num) break;
+                final inWindow = ob.descending
+                    ? v <= desired + 1e-12
+                    : v >= desired - 1e-12;
+                if (inWindow) {
+                  best = i;
+                } else {
+                  break;
+                }
+              }
+            }
+            return best;
+          }
+
+          // GROUPS counts peer groups in either direction.
+          int groupsBound(int off, {required bool forward}) {
+            var idx = k;
+            var moved = 0;
+            while (moved < off &&
+                (forward ? idx + 1 < ordered.length : idx - 1 >= 0)) {
+              final next = forward ? idx + 1 : idx - 1;
+              if (!sameOrderKey(ordered[idx], ordered[next])) moved++;
+              idx = next;
+            }
+            return forward ? peerEnd(idx) : peerStart(idx);
+          }
+
           int boundFor(FrameBound b, {required bool isStart}) {
             switch (b.kind) {
               case FrameBoundKind.unboundedPreceding:
                 return 0;
               case FrameBoundKind.preceding:
-                final off = (b.offset!.eval(const {}) as num).toInt();
-                final t = (k - off).clamp(0, ordered.length - 1);
-                return isStart ? peerStart(t) : peerEnd(t);
+                final off = b.offset!.eval(const {}) as num;
+                if (frame.mode == FrameMode.range) {
+                  final t = rangeBound(off, forward: false);
+                  return isStart ? peerStart(t) : peerEnd(t);
+                } else {
+                  // GROUPS
+                  return groupsBound(off.toInt(), forward: false);
+                }
               case FrameBoundKind.currentRow:
                 return isStart ? peerStart(k) : peerEnd(k);
               case FrameBoundKind.following:
-                final off = (b.offset!.eval(const {}) as num).toInt();
-                final t = (k + off).clamp(0, ordered.length - 1);
-                return isStart ? peerStart(t) : peerEnd(t);
+                final off = b.offset!.eval(const {}) as num;
+                if (frame.mode == FrameMode.range) {
+                  final t = rangeBound(off, forward: true);
+                  return isStart ? peerStart(t) : peerEnd(t);
+                } else {
+                  return groupsBound(off.toInt(), forward: true);
+                }
               case FrameBoundKind.unboundedFollowing:
                 return ordered.length - 1;
             }
@@ -6490,6 +6564,8 @@ class Database {
         case 'LISTAGG':
         case 'JSON_GROUP_ARRAY':
         case 'JSON_GROUP_OBJECT':
+        case 'JSONB_GROUP_ARRAY':
+        case 'JSONB_GROUP_OBJECT':
         case 'BIT_AND':
         case 'BIT_OR':
         case 'BIT_XOR':
@@ -8082,8 +8158,8 @@ class Database {
       if (await f.exists()) candidates.add(f);
     }
     if (candidates.isEmpty) return null;
-    candidates.sort((a, b) => b.statSync().modified.compareTo(
-        a.statSync().modified));
+    candidates
+        .sort((a, b) => b.statSync().modified.compareTo(a.statSync().modified));
     return candidates.first.readAsBytes();
   }
 
@@ -8105,8 +8181,8 @@ class Database {
       if (f.existsSync()) candidates.add(f);
     }
     if (candidates.isEmpty) return null;
-    candidates.sort((a, b) => b.statSync().modified.compareTo(
-        a.statSync().modified));
+    candidates
+        .sort((a, b) => b.statSync().modified.compareTo(a.statSync().modified));
     return candidates.first.readAsBytesSync();
   }
 
