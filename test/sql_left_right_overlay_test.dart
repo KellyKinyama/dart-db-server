@@ -9,8 +9,8 @@ void main() {
     test('basic', () async {
       final db = await Database.open();
       try {
-        final r = await db.execute(
-            "SELECT LEFT('hello', 3), RIGHT('hello', 2)");
+        final r =
+            await db.execute("SELECT LEFT('hello', 3), RIGHT('hello', 2)");
         expect(r.rows.first, ['hel', 'lo']);
       } finally {
         await db.close();
@@ -31,8 +31,7 @@ void main() {
     test('NULL input', () async {
       final db = await Database.open();
       try {
-        final r = await db
-            .execute('SELECT LEFT(NULL, 3), RIGHT(NULL, 3)');
+        final r = await db.execute('SELECT LEFT(NULL, 3), RIGHT(NULL, 3)');
         expect(r.rows.first, [null, null]);
       } finally {
         await db.close();
@@ -44,8 +43,8 @@ void main() {
     test('1-based index, 0 when not found', () async {
       final db = await Database.open();
       try {
-        final r = await db.execute(
-            "SELECT POSITION('lo', 'hello'), POSITION('zz', 'hello')");
+        final r = await db
+            .execute("SELECT POSITION('lo', 'hello'), POSITION('zz', 'hello')");
         expect(r.rows.first, [4, 0]);
       } finally {
         await db.close();
@@ -55,8 +54,7 @@ void main() {
     test('empty needle returns 1', () async {
       final db = await Database.open();
       try {
-        final r =
-            await db.execute("SELECT POSITION('', 'abc')");
+        final r = await db.execute("SELECT POSITION('', 'abc')");
         expect(r.rows.first.first, 1);
       } finally {
         await db.close();
@@ -66,8 +64,8 @@ void main() {
     test('NULL input', () async {
       final db = await Database.open();
       try {
-        final r = await db.execute(
-            "SELECT POSITION(NULL, 'abc'), POSITION('a', NULL)");
+        final r = await db
+            .execute("SELECT POSITION(NULL, 'abc'), POSITION('a', NULL)");
         expect(r.rows.first, [null, null]);
       } finally {
         await db.close();
@@ -79,8 +77,7 @@ void main() {
     test('replace using default length', () async {
       final db = await Database.open();
       try {
-        final r = await db
-            .execute("SELECT OVERLAY('abcdef', 'XY', 3)");
+        final r = await db.execute("SELECT OVERLAY('abcdef', 'XY', 3)");
         expect(r.rows.first.first, 'abXYef');
       } finally {
         await db.close();
@@ -90,8 +87,7 @@ void main() {
     test('explicit length', () async {
       final db = await Database.open();
       try {
-        final r = await db
-            .execute("SELECT OVERLAY('abcdef', 'X', 2, 3)");
+        final r = await db.execute("SELECT OVERLAY('abcdef', 'X', 2, 3)");
         expect(r.rows.first.first, 'aXef');
       } finally {
         await db.close();
@@ -101,8 +97,7 @@ void main() {
     test('insert past end', () async {
       final db = await Database.open();
       try {
-        final r = await db
-            .execute("SELECT OVERLAY('ab', 'CDE', 5)");
+        final r = await db.execute("SELECT OVERLAY('ab', 'CDE', 5)");
         expect(r.rows.first.first, 'abCDE');
       } finally {
         await db.close();
@@ -114,8 +109,7 @@ void main() {
     test('REVERSE basic', () async {
       final db = await Database.open();
       try {
-        final r =
-            await db.execute("SELECT REVERSE('hello'), REVERSE('')");
+        final r = await db.execute("SELECT REVERSE('hello'), REVERSE('')");
         expect(r.rows.first, ['olleh', '']);
       } finally {
         await db.close();
@@ -125,8 +119,8 @@ void main() {
     test('REPEAT basic', () async {
       final db = await Database.open();
       try {
-        final r = await db.execute(
-            "SELECT REPEAT('ab', 3), REPEAT('x', 0), REPEAT('y', -2)");
+        final r = await db
+            .execute("SELECT REPEAT('ab', 3), REPEAT('x', 0), REPEAT('y', -2)");
         expect(r.rows.first, ['ababab', '', '']);
       } finally {
         await db.close();
@@ -136,8 +130,8 @@ void main() {
     test('NULL input', () async {
       final db = await Database.open();
       try {
-        final r = await db
-            .execute("SELECT REVERSE(NULL), REPEAT(NULL, 3), REPEAT('x', NULL)");
+        final r = await db.execute(
+            "SELECT REVERSE(NULL), REPEAT(NULL, 3), REPEAT('x', NULL)");
         expect(r.rows.first, [null, null, null]);
       } finally {
         await db.close();

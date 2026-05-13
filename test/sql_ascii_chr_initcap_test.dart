@@ -9,8 +9,8 @@ void main() {
     test('ASCII basic and round-trip with CHR', () async {
       final db = await Database.open();
       try {
-        final r = await db.execute(
-            "SELECT ASCII('A'), ASCII('a'), CHR(65), CHR(97)");
+        final r =
+            await db.execute("SELECT ASCII('A'), ASCII('a'), CHR(65), CHR(97)");
         expect(r.rows.first, [65, 97, 'A', 'a']);
       } finally {
         await db.close();
@@ -30,8 +30,7 @@ void main() {
     test('NULL inputs', () async {
       final db = await Database.open();
       try {
-        final r =
-            await db.execute('SELECT ASCII(NULL), CHR(NULL)');
+        final r = await db.execute('SELECT ASCII(NULL), CHR(NULL)');
         expect(r.rows.first, [null, null]);
       } finally {
         await db.close();
@@ -43,8 +42,8 @@ void main() {
     test('basic', () async {
       final db = await Database.open();
       try {
-        final r = await db.execute(
-            "SELECT SPACE(0), SPACE(1), SPACE(5), SPACE(-3)");
+        final r =
+            await db.execute("SELECT SPACE(0), SPACE(1), SPACE(5), SPACE(-3)");
         expect(r.rows.first, ['', ' ', '     ', '']);
       } finally {
         await db.close();
@@ -56,9 +55,9 @@ void main() {
     test('title-cases each word', () async {
       final db = await Database.open();
       try {
-        final r = await db.execute(
-            "SELECT INITCAP('hello world'), INITCAP('FOO BAR'), "
-            "       INITCAP('mixed CASE here')");
+        final r = await db
+            .execute("SELECT INITCAP('hello world'), INITCAP('FOO BAR'), "
+                "       INITCAP('mixed CASE here')");
         expect(r.rows.first, ['Hello World', 'Foo Bar', 'Mixed Case Here']);
       } finally {
         await db.close();
@@ -68,8 +67,7 @@ void main() {
     test('handles tabs and newlines', () async {
       final db = await Database.open();
       try {
-        final r =
-            await db.execute("SELECT INITCAP('a\tb\nc')");
+        final r = await db.execute("SELECT INITCAP('a\tb\nc')");
         expect(r.rows.first.first, 'A\tB\nC');
       } finally {
         await db.close();

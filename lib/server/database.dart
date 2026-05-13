@@ -169,6 +169,14 @@ class Database {
   /// database are stored in [_tables] keyed `alias.tablename`.
   final Map<String, String> _attached = <String, String>{};
 
+  /// Per-connection counters surfaced by `last_insert_rowid()`,
+  /// `changes()` and `total_changes()`. [_lastInsertRowid] is updated
+  /// inside [_insert]; [_changesCount] / [_totalChangesCount] are
+  /// updated in [executeStmt] right after dispatch.
+  int _lastInsertRowid = 0;
+  int _changesCount = 0;
+  int _totalChangesCount = 0;
+
   /// In-memory PRAGMA state. Provides recognizable values for common
   /// PRAGMAs (read/write); unknown PRAGMAs are accepted as no-ops.
   final Map<String, Object?> _pragmas = <String, Object?>{
@@ -587,6 +595,19 @@ class Database {
         }
       }
       _executionStack.add(this);
+      final prevConnState = connStateLookup;
+      connStateLookup = (which) {
+        switch (which) {
+          case 'last_insert_rowid':
+            return _lastInsertRowid;
+          case 'changes':
+            return _changesCount;
+          case 'total_changes':
+            return _totalChangesCount;
+          default:
+            return 0;
+        }
+      };
       QueryResult result;
       try {
         // Paged-table fast path: a `CREATE TABLE … USING paged` lives
@@ -602,6 +623,7 @@ class Database {
         }
       } finally {
         _executionStack.removeLast();
+        connStateLookup = prevConnState;
         // Drain any paged commit/rollback queued by a sync _commit /
         // _rollback. Rollbacks always run before commits — and run
         // unconditionally, including on the exception path — so a
@@ -625,6 +647,13 @@ class Database {
         }
       }
       if (_isMutation(stmt)) {
+        // Track changes()/total_changes() at the SQL function layer.
+        if (stmt is InsertStmt ||
+            stmt is UpdateStmt ||
+            stmt is DeleteStmt) {
+          _changesCount = result.affected;
+          _totalChangesCount += result.affected;
+        }
         // Conservatively drop FTS5 caches for the statement's target
         // table; the next ranking call will rebuild on demand.
         final tname = _statementTable(stmt);
@@ -2891,6 +2920,7 @@ class Database {
       try {
         t.insertRow(row);
         inserted++;
+        _lastInsertRowid = _rowidOfInsertedRow(t, row);
         _fireTriggers(t.name, 'INSERT', 'AFTER', newRow: row, sourceTable: t);
         if (returningExprs.isNotEmpty) {
           final view = t.rowToMap(row);
@@ -2957,6 +2987,21 @@ class Database {
       if (v is int && v > max) max = v;
     }
     return max;
+  }
+
+  /// Pick a rowid for [row] just inserted into [t], for the purpose of
+  /// `last_insert_rowid()`. SQLite uses the value of an INTEGER PRIMARY
+  /// KEY column when present (it IS the rowid); otherwise the rowid is
+  /// the 1-based position of the row in the table.
+  int _rowidOfInsertedRow(Table t, List<Object?> row) {
+    for (var i = 0; i < t.columns.length; i++) {
+      final c = t.columns[i];
+      if (c.primaryKey && c.type == DataType.integer) {
+        final v = row[i];
+        if (v is int) return v;
+      }
+    }
+    return t.rows.length;
   }
 
   Set<int> _findUniqueConflicts(Table t, List<Object?> newRow) {

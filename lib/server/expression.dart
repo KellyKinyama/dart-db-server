@@ -1200,6 +1200,20 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
         final en = math.exp(-x);
         return (ep - en) / (ep + en);
       }),
+  'ASINH': (a) => _propagateNull(a, () {
+        final x = (a[0] as num).toDouble();
+        return math.log(x + math.sqrt(x * x + 1));
+      }),
+  'ACOSH': (a) => _propagateNull(a, () {
+        final x = (a[0] as num).toDouble();
+        if (x < 1) return null;
+        return math.log(x + math.sqrt(x * x - 1));
+      }),
+  'ATANH': (a) => _propagateNull(a, () {
+        final x = (a[0] as num).toDouble();
+        if (x <= -1 || x >= 1) return null;
+        return 0.5 * math.log((1 + x) / (1 - x));
+      }),
   'RADIANS': (a) =>
       _propagateNull(a, () => (a[0] as num).toDouble() * math.pi / 180),
   'DEGREES': (a) =>
@@ -1320,25 +1334,46 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     int upper(int cu) => (cu >= 0x61 && cu <= 0x7A) ? cu - 0x20 : cu;
     String code(int cu) {
       switch (upper(cu)) {
-        case 0x42: case 0x46: case 0x50: case 0x56: return '1';
-        case 0x43: case 0x47: case 0x4A: case 0x4B:
-        case 0x51: case 0x53: case 0x58: case 0x5A: return '2';
-        case 0x44: case 0x54: return '3';
-        case 0x4C: return '4';
-        case 0x4D: case 0x4E: return '5';
-        case 0x52: return '6';
-        default: return '';
+        case 0x42:
+        case 0x46:
+        case 0x50:
+        case 0x56:
+          return '1';
+        case 0x43:
+        case 0x47:
+        case 0x4A:
+        case 0x4B:
+        case 0x51:
+        case 0x53:
+        case 0x58:
+        case 0x5A:
+          return '2';
+        case 0x44:
+        case 0x54:
+          return '3';
+        case 0x4C:
+          return '4';
+        case 0x4D:
+        case 0x4E:
+          return '5';
+        case 0x52:
+          return '6';
+        default:
+          return '';
       }
     }
+
     bool isHW(int cu) {
       final u = upper(cu);
       return u == 0x48 || u == 0x57; // H or W
     }
+
     final out = StringBuffer(String.fromCharCode(upper(s.codeUnitAt(0))));
     var prev = code(s.codeUnitAt(0));
     for (var i = 1; i < s.length && out.length < 4; i++) {
       final cu = s.codeUnitAt(i);
-      if (isHW(cu)) continue; // H and W are transparent: skip without resetting prev.
+      if (isHW(cu))
+        continue; // H and W are transparent: skip without resetting prev.
       final c = code(cu);
       if (c.isEmpty) {
         // Vowel or other separator -- don't emit, but reset prev so the
@@ -1605,6 +1640,38 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     }
     return jsonEncode(_rfc7396Merge(base, patch));
   },
+  // Pretty-print JSON with 2-space indent (or a caller-supplied indent
+  // string). Returns NULL on invalid JSON. SQLite 3.46+.
+  'JSON_PRETTY': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    Object? v;
+    try {
+      v = jsonDecode(a[0].toString());
+    } catch (_) {
+      return null;
+    }
+    final indent = a.length >= 2 && a[1] != null ? a[1].toString() : '  ';
+    return JsonEncoder.withIndent(indent).convert(v);
+  },
+  // ---- SQLite introspection / connection-state scalars -----------------
+  // last_insert_rowid(): the ROWID of the most recent successful INSERT.
+  // Returns 0 before any insert has occurred.
+  'LAST_INSERT_ROWID': (a) => connStateLookup?.call('last_insert_rowid') ?? 0,
+  // changes(): number of rows modified by the most recently completed
+  // INSERT, UPDATE or DELETE statement.
+  'CHANGES': (a) => connStateLookup?.call('changes') ?? 0,
+  // total_changes(): total rows modified since the connection opened.
+  'TOTAL_CHANGES': (a) => connStateLookup?.call('total_changes') ?? 0,
+  // sqlite_version(): version string of the SQLite release this engine
+  // targets for feature parity.
+  'SQLITE_VERSION': (a) => kSqliteVersionString,
+  // sqlite_source_id(): in real SQLite this is a build/source hash. We
+  // return a stable identifier that names this engine.
+  'SQLITE_SOURCE_ID': (a) => 'dart-db-server (parity target $kSqliteVersionString)',
+  // sqlite_compileoption_used(opt): always 0 — no compile options.
+  'SQLITE_COMPILEOPTION_USED': (a) => 0,
+  // sqlite_compileoption_get(n): always NULL — no compile options.
+  'SQLITE_COMPILEOPTION_GET': (a) => null,
   // ---- FTS5 ranking ------------------------------------------------------
   'FTS5_TF': (a) {
     if (a.length < 2 || a[0] == null || a[1] == null) return 0;
@@ -1751,6 +1818,17 @@ Object? _jsonOp(Object l, Object r, {required bool asText}) {
 }
 
 final _rng = _Rng();
+
+/// Per-connection state hook for `last_insert_rowid()`, `changes()` and
+/// `total_changes()`. The active [Database.executeStmt] installs this so
+/// the scalar functions can read connection-scoped counters without
+/// `expression.dart` depending on `database.dart`. Returns 0 when no
+/// connection context is active.
+int Function(String which)? connStateLookup;
+
+/// Reported by `sqlite_version()`. Mirrors a recent SQLite release we
+/// aim to be feature-compatible with.
+const String kSqliteVersionString = '3.45.0';
 
 class _Rng {
   int _state = DateTime.now().microsecondsSinceEpoch & 0x7fffffff;
