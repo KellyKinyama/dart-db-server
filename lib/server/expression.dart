@@ -2257,6 +2257,9 @@ const Set<String> kAggregateFunctions = {
   'VARIANCE',
   'VAR_POP',
   'VAR_SAMP',
+  'COVAR_POP',
+  'COVAR_SAMP',
+  'CORR',
 };
 
 // ---- More JSON1 helpers ----------------------------------------------------

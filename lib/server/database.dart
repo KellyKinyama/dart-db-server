@@ -6012,6 +6012,47 @@ class Database {
           final isVar = e.name.startsWith('VAR');
           return isVar ? variance : math.sqrt(variance);
         }
+      case 'COVAR_POP':
+      case 'COVAR_SAMP':
+      case 'CORR':
+        {
+          if (e.args.length < 2) return null;
+          final xExpr = _bindExpr(e.args[0]);
+          final yExpr = _bindExpr(e.args[1]);
+          final xs = <double>[];
+          final ys = <double>[];
+          for (final r in grp) {
+            final xv = xExpr.eval(r);
+            final yv = yExpr.eval(r);
+            if (xv == null || yv == null) continue;
+            if (xv is! num || yv is! num) {
+              throw StateError('${e.name} requires numeric');
+            }
+            xs.add(xv.toDouble());
+            ys.add(yv.toDouble());
+          }
+          if (xs.isEmpty) return null;
+          final mx = xs.reduce((a, b) => a + b) / xs.length;
+          final my = ys.reduce((a, b) => a + b) / ys.length;
+          var sxy = 0.0;
+          var sxx = 0.0;
+          var syy = 0.0;
+          for (var i = 0; i < xs.length; i++) {
+            final dx = xs[i] - mx;
+            final dy = ys[i] - my;
+            sxy += dx * dy;
+            sxx += dx * dx;
+            syy += dy * dy;
+          }
+          if (e.name == 'CORR') {
+            final denom = math.sqrt(sxx * syy);
+            if (denom == 0) return null;
+            return sxy / denom;
+          }
+          final denom = e.name == 'COVAR_POP' ? xs.length : xs.length - 1;
+          if (denom <= 0) return null;
+          return sxy / denom;
+        }
     }
     throw StateError('Unknown aggregate: ${e.name}');
   }
@@ -6353,6 +6394,9 @@ class Database {
         case 'VARIANCE':
         case 'VAR_POP':
         case 'VAR_SAMP':
+        case 'COVAR_POP':
+        case 'COVAR_SAMP':
+        case 'CORR':
           {
             for (var k = 0; k < ordered.length; k++) {
               final slice = frameRows(k);
