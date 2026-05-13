@@ -266,6 +266,13 @@ class SelectStmt extends Statement {
   /// Optional `INDEXED BY` / `NOT INDEXED` hint attached to the FROM table.
   final IndexHint? indexedBy;
 
+  /// When the GROUP BY clause uses ROLLUP / CUBE / GROUPING SETS, this
+  /// holds the expanded list of grouping-key sets (one list per set).
+  /// `groupBy` then holds the union of every set's keys for binding /
+  /// validation; the executor iterates [groupingSets], runs the
+  /// aggregation per set, and unions the results.
+  final List<List<Expr>>? groupingSets;
+
   SelectStmt({
     required this.projection,
     this.fromTable,
@@ -288,6 +295,7 @@ class SelectStmt extends Statement {
     this.fromFunction,
     this.namedWindows = const {},
     this.indexedBy,
+    this.groupingSets,
   });
 }
 

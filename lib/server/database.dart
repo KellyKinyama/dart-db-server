@@ -3908,6 +3908,120 @@ class Database {
   // ---- Single SELECT (no set-op) -----------------------------------------
   QueryResult _selectInner(SelectStmt s,
       [Map<String, Object?> outer = const {}]) {
+    // GROUPING SETS / ROLLUP / CUBE: run aggregation once per set,
+    // blank out any projection that uses a grouping-key NOT in the
+    // current set, and concatenate.
+    if (s.groupingSets != null && s.groupingSets!.isNotEmpty) {
+      return _selectGroupingSets(s, outer);
+    }
+    return _selectInnerCore(s, outer);
+  }
+
+  /// Expand a SELECT with GROUPING SETS / ROLLUP / CUBE into one
+  /// per-set aggregation, blanking out projections of any grouping
+  /// key that is NOT in the current set, and concatenate the results.
+  QueryResult _selectGroupingSets(
+      SelectStmt s, Map<String, Object?> outer) {
+    final allKeys = s.groupBy;
+    String key(Expr e) {
+      // Structural string. Default Object.toString() collapses every
+      // ColumnExpr (etc.) to "Instance of '...'", which would make
+      // every key indistinguishable.
+      if (e is ColumnExpr) {
+        final t = e.table == null ? '' : '${e.table!.toLowerCase()}.';
+        return 'col:$t${e.name.toLowerCase()}';
+      }
+      if (e is LiteralExpr) return 'lit:${e.value}';
+      if (e is FunctionCallExpr) {
+        return 'fn:${e.name.toUpperCase()}(${e.args.map(key).join(",")})';
+      }
+      if (e is BinaryExpr) {
+        return 'bin:${e.op}(${key(e.left)},${key(e.right)})';
+      }
+      if (e is UnaryExpr) return 'un:${e.op}(${key(e.operand)})';
+      return e.toString();
+    }
+    final allKeyStrings = allKeys.map(key).toSet();
+    final unionRows = <List<Object?>>[];
+    List<String>? cols;
+    for (final set in s.groupingSets!) {
+      final setKeyStrings = set.map(key).toSet();
+      // Build a copy with this set's GROUP BY active and groupingSets
+      // cleared so we hit the normal aggregation path.
+      final perSet = SelectStmt(
+        projection: s.projection,
+        fromTable: s.fromTable,
+        fromSubquery: s.fromSubquery,
+        fromAlias: s.fromAlias,
+        joins: s.joins,
+        where: s.where,
+        groupBy: List<Expr>.from(set),
+        having: s.having,
+        orderBy: const [],
+        limit: null,
+        offset: null,
+        distinct: s.distinct,
+        ctes: s.ctes,
+        cteColumns: s.cteColumns,
+        ctesRecursive: s.ctesRecursive,
+        cteMaterialized: s.cteMaterialized,
+        fromFunction: s.fromFunction,
+        namedWindows: s.namedWindows,
+        indexedBy: s.indexedBy,
+        // groupingSets intentionally null
+      );
+      // Empty grouping set with no aggregates → still produce one
+      // row with all NULLs. Run normally; aggregates over the whole
+      // input will collapse to a single row.
+      final res = _selectInnerCore(perSet, outer);
+      cols ??= res.columns;
+      // Compute, for each projection column, whether its expression
+      // was a grouping-key in the union but NOT in this set; those
+      // columns get NULL'd out for every row from this set.
+      final blank = <int>[];
+      // Compute, for each projection column that is a GROUPING(expr)
+      // call, whether its argument is rolled up in the current set
+      // (i.e. NOT in setKeyStrings). If so, overwrite the column's
+      // value with 1 instead of the default 0.
+      final groupingOne = <int>[];
+      for (var i = 0; i < s.projection.length; i++) {
+        final p = s.projection[i];
+        if (p.expr == null) continue;
+        final pk = key(p.expr!);
+        if (allKeyStrings.contains(pk) && !setKeyStrings.contains(pk)) {
+          blank.add(i);
+        }
+        final pe = p.expr;
+        if (pe is FunctionCallExpr &&
+            pe.name.toUpperCase() == 'GROUPING' &&
+            pe.args.length == 1) {
+          final ak = key(pe.args.first);
+          if (allKeyStrings.contains(ak) && !setKeyStrings.contains(ak)) {
+            groupingOne.add(i);
+          }
+        }
+      }
+      for (final row in res.rows) {
+        final r = List<Object?>.from(row);
+        for (final i in blank) {
+          r[i] = null;
+        }
+        for (final i in groupingOne) {
+          r[i] = 1;
+        }
+        unionRows.add(r);
+      }
+    }
+    // Apply ORDER BY / LIMIT / OFFSET to the combined result if any.
+    var combined = QueryResult(columns: cols ?? const [], rows: unionRows);
+    if (s.orderBy.isNotEmpty || s.limit != null || s.offset != null) {
+      combined = _applyCompoundOrderLimit(combined, s);
+    }
+    return combined;
+  }
+
+  QueryResult _selectInnerCore(SelectStmt s,
+      [Map<String, Object?> outer = const {}]) {
     _planTrace = const [];
     // Index-only / covering-scan fast path. When the SELECT has the
     // shape `SELECT [DISTINCT] <indexed_col> FROM <table> [ORDER BY ... ]
@@ -6330,9 +6444,8 @@ class Database {
               for (var i = k; i < ordered.length; i++) {
                 final v = ob.expr.eval(partRows[i]);
                 if (v is! num) break;
-                final inWindow = ob.descending
-                    ? v >= desired - 1e-12
-                    : v <= desired + 1e-12;
+                final inWindow =
+                    ob.descending ? v >= desired - 1e-12 : v <= desired + 1e-12;
                 if (inWindow) {
                   best = i;
                 } else {
@@ -6343,9 +6456,8 @@ class Database {
               for (var i = k; i >= 0; i--) {
                 final v = ob.expr.eval(partRows[i]);
                 if (v is! num) break;
-                final inWindow = ob.descending
-                    ? v <= desired + 1e-12
-                    : v >= desired - 1e-12;
+                final inWindow =
+                    ob.descending ? v <= desired + 1e-12 : v >= desired - 1e-12;
                 if (inWindow) {
                   best = i;
                 } else {

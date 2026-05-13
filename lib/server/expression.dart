@@ -1166,6 +1166,10 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
   // return NULL on NULL input. Domain errors (e.g. LN(0), SQRT(-1))
   // return NULL to match SQLite.
   'PI': (a) => math.pi,
+  // GROUPING(expr) — context-sensitive. The select executor rewrites
+  // results from GROUPING SETS / ROLLUP / CUBE so this default 0
+  // applies only when the expression IS in the current grouping set.
+  'GROUPING': (a) => 0,
   'IIF': (a) {
     if (a.length < 3) return null;
     final c = a[0];

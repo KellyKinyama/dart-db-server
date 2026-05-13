@@ -15,8 +15,7 @@ void main() {
         // For k=2 the value-window [1..3] includes 1,2,2 → sum 5.
         // For k=5 the window [4..6] includes 5,6 → sum 11.
         // For k=6 the window [5..7] includes 5,6 → sum 11.
-        final r = await db.execute(
-            'SELECT k, sum(k) OVER (ORDER BY k '
+        final r = await db.execute('SELECT k, sum(k) OVER (ORDER BY k '
             'RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS s '
             'FROM t ORDER BY k');
         final got = r.rows.map((row) => [row[0], row[1]]).toList();
@@ -41,8 +40,7 @@ void main() {
         // For k=2 (peer group {2,2}): previous group is {1}, current is
         // {2,2} → frame includes 1,2,2 → sum 5. For k=3: prev group
         // {2,2}, current {3} → 2+2+3 = 7.
-        final r = await db.execute(
-            'SELECT k, sum(k) OVER (ORDER BY k '
+        final r = await db.execute('SELECT k, sum(k) OVER (ORDER BY k '
             'GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s '
             'FROM t ORDER BY k');
         final got = r.rows.map((row) => [row[0], row[1]]).toList();
@@ -62,8 +60,7 @@ void main() {
     test('jsonb(x) returns canonical JSON text', () async {
       final db = await Database.open();
       try {
-        final r =
-            await db.execute("SELECT jsonb('{\"b\":2,\"a\":1}') AS s");
+        final r = await db.execute("SELECT jsonb('{\"b\":2,\"a\":1}') AS s");
         // We don't reorder keys (text JSON path).
         expect(r.rows.first[0], '{"b":2,"a":1}');
       } finally {
@@ -97,10 +94,9 @@ void main() {
       final db = await Database.open();
       try {
         await db.execute('CREATE TABLE t(g INT, k TEXT, v INT)');
-        await db.execute(
-            "INSERT INTO t VALUES(1,'a',10),(1,'b',20),(2,'c',30)");
-        final r = await db.execute(
-            'SELECT g, jsonb_group_array(v) AS arr, '
+        await db
+            .execute("INSERT INTO t VALUES(1,'a',10),(1,'b',20),(2,'c',30)");
+        final r = await db.execute('SELECT g, jsonb_group_array(v) AS arr, '
             'jsonb_group_object(k, v) AS obj '
             'FROM t GROUP BY g ORDER BY g');
         expect(r.rows[0][0], 1);

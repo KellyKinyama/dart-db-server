@@ -1361,12 +1361,71 @@ class Parser {
     Expr? where;
     if (_matchKw('WHERE')) where = _parseExpr();
     final groupBy = <Expr>[];
+    List<List<Expr>>? groupingSets;
     Expr? having;
     if (_matchKw('GROUP')) {
       _expectKw('BY');
-      groupBy.add(_parseExpr());
-      while (_match(TokType.punct, ',')) {
+      // SQL extension: ROLLUP / CUBE / GROUPING SETS desugar into a
+      // list of grouping-key sets that the executor iterates.
+      if (_matchKw('ROLLUP')) {
+        _expect(TokType.punct, '(');
+        final keys = <Expr>[_parseExpr()];
+        while (_match(TokType.punct, ',')) {
+          keys.add(_parseExpr());
+        }
+        _expect(TokType.punct, ')');
+        groupingSets = <List<Expr>>[
+          for (var i = keys.length; i >= 0; i--) keys.sublist(0, i)
+        ];
+        groupBy.addAll(keys);
+      } else if (_matchKw('CUBE')) {
+        _expect(TokType.punct, '(');
+        final keys = <Expr>[_parseExpr()];
+        while (_match(TokType.punct, ',')) {
+          keys.add(_parseExpr());
+        }
+        _expect(TokType.punct, ')');
+        groupingSets = <List<Expr>>[];
+        for (var mask = (1 << keys.length) - 1; mask >= 0; mask--) {
+          final set = <Expr>[
+            for (var i = 0; i < keys.length; i++)
+              if ((mask >> i) & 1 == 1) keys[i]
+          ];
+          groupingSets.add(set);
+        }
+        groupBy.addAll(keys);
+      } else if (_matchKw('GROUPING')) {
+        _expectKw('SETS');
+        _expect(TokType.punct, '(');
+        groupingSets = <List<Expr>>[];
+        do {
+          if (_match(TokType.punct, '(')) {
+            final set = <Expr>[];
+            if (!_check(TokType.punct, ')')) {
+              set.add(_parseExpr());
+              while (_match(TokType.punct, ',')) {
+                set.add(_parseExpr());
+              }
+            }
+            _expect(TokType.punct, ')');
+            groupingSets.add(set);
+            // groupBy holds the union of every set's keys; we don't
+            // dedup here because a structural Expr equality is brittle
+            // and the executor only treats this list as a "known keys"
+            // membership probe via its own structural string key.
+            groupBy.addAll(set);
+          } else {
+            final k = _parseExpr();
+            groupingSets.add([k]);
+            groupBy.add(k);
+          }
+        } while (_match(TokType.punct, ','));
+        _expect(TokType.punct, ')');
+      } else {
         groupBy.add(_parseExpr());
+        while (_match(TokType.punct, ',')) {
+          groupBy.add(_parseExpr());
+        }
       }
       if (_matchKw('HAVING')) having = _parseExpr();
     }
@@ -1411,6 +1470,7 @@ class Parser {
       fromFunction: fromFunc,
       namedWindows: namedWindows,
       indexedBy: fromIndexHint,
+      groupingSets: groupingSets,
     );
   }
 

@@ -99,6 +99,10 @@ const Set<String> _keywords = {
   // --- aggregates / GROUP BY ---
   'GROUP',
   'HAVING',
+  'ROLLUP',
+  'CUBE',
+  'GROUPING',
+  'SETS',
   'COUNT',
   'SUM',
   'AVG',
