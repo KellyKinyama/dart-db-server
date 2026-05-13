@@ -6567,8 +6567,18 @@ class Database {
   // ---------------------------------------------------------------------------
   QueryResult _pragma(PragmaStmt s) {
     final name = s.name.toLowerCase();
-    // Setter form: PRAGMA name = value  /  PRAGMA name(value)
-    if (s.value != null) {
+    final target = s.value?.toString();
+    // Setter form: PRAGMA name = value  /  PRAGMA name(value) where the
+    // pragma is not an introspection one. Detect via [name] below.
+    const introspectionWithArg = <String>{
+      'table_info',
+      'table_xinfo',
+      'index_list',
+      'index_info',
+      'index_xinfo',
+      'foreign_key_list',
+    };
+    if (s.value != null && !introspectionWithArg.contains(name)) {
       _pragmas[name] = s.value;
       return QueryResult.message('PRAGMA $name = ${s.value}');
     }
@@ -6576,14 +6586,31 @@ class Database {
     switch (name) {
       case 'table_info':
       case 'table_xinfo':
-        return QueryResult(columns: const [
-          'cid',
-          'name',
-          'type',
-          'notnull',
-          'dflt_value',
-          'pk'
-        ], rows: const []);
+        {
+          final rows = <List<Object?>>[];
+          if (target != null && _tables.containsKey(target)) {
+            final t = _tables[target]!;
+            for (var i = 0; i < t.columns.length; i++) {
+              final c = t.columns[i];
+              rows.add([
+                i,
+                c.name,
+                c.type == DataType.any ? '' : c.type.name.toUpperCase(),
+                c.notNull ? 1 : 0,
+                c.defaultValue,
+                c.primaryKey ? 1 : 0,
+              ]);
+            }
+          }
+          return QueryResult(columns: const [
+            'cid',
+            'name',
+            'type',
+            'notnull',
+            'dflt_value',
+            'pk'
+          ], rows: rows);
+        }
       case 'database_list':
         return QueryResult(columns: const [
           'seq',
@@ -6595,23 +6622,69 @@ class Database {
             [e.key + 1, e.value.key, e.value.value],
         ]);
       case 'index_list':
-        return QueryResult(
-            columns: const ['seq', 'name', 'unique'], rows: const []);
+        {
+          final rows = <List<Object?>>[];
+          if (target != null && _tables.containsKey(target)) {
+            final t = _tables[target]!;
+            var seq = 0;
+            for (final entry in t.indexDefs.entries) {
+              rows.add([seq++, entry.key, entry.value.unique ? 1 : 0]);
+            }
+          }
+          return QueryResult(
+              columns: const ['seq', 'name', 'unique'], rows: rows);
+        }
       case 'index_info':
       case 'index_xinfo':
-        return QueryResult(
-            columns: const ['seqno', 'cid', 'name'], rows: const []);
+        {
+          final rows = <List<Object?>>[];
+          if (target != null) {
+            for (final t in _tables.values) {
+              final def = t.indexDefs[target];
+              if (def != null) {
+                for (var i = 0; i < def.columns.length; i++) {
+                  rows.add([i, t.columnIndex(def.columns[i]), def.columns[i]]);
+                }
+                break;
+              }
+            }
+          }
+          return QueryResult(
+              columns: const ['seqno', 'cid', 'name'], rows: rows);
+        }
       case 'foreign_key_list':
-        return QueryResult(columns: const [
-          'id',
-          'seq',
-          'table',
-          'from',
-          'to',
-          'on_update',
-          'on_delete',
-          'match'
-        ], rows: const []);
+        {
+          final rows = <List<Object?>>[];
+          if (target != null && _tables.containsKey(target)) {
+            final t = _tables[target]!;
+            var id = 0;
+            for (final fk in _foreignKeysOf(t)) {
+              for (var i = 0; i < fk.columns.length; i++) {
+                rows.add([
+                  id,
+                  i,
+                  fk.references.table,
+                  fk.columns[i],
+                  i == 0 ? fk.references.column : null,
+                  fk.references.onUpdate,
+                  fk.references.onDelete,
+                  'NONE',
+                ]);
+              }
+              id++;
+            }
+          }
+          return QueryResult(columns: const [
+            'id',
+            'seq',
+            'table',
+            'from',
+            'to',
+            'on_update',
+            'on_delete',
+            'match'
+          ], rows: rows);
+        }
       case 'integrity_check':
       case 'quick_check':
         return QueryResult(columns: const [
