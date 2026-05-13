@@ -5,6 +5,8 @@
 /// Prints rows/sec for a handful of representative workloads. Numbers
 /// are wall-clock on whatever machine you run it on; use them to spot
 /// regressions, not to claim absolute performance.
+library;
+
 import 'dart:io';
 
 import 'package:dart_db_server/dart_db_server.dart';

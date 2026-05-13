@@ -36,6 +36,24 @@ typedef AuthorizerCallback = AuthorizerResult Function(
 
 class Database {
   final Map<String, Table> _tables = <String, Table>{};
+
+  /// Cache of parsed expressions keyed by source SQL. Used to avoid
+  /// re-parsing per-row CHECK / DEFAULT / GENERATED / partial-index
+  /// expressions on every row. Bounded by the schema, not by the row
+  /// count, so it does not need eviction.
+  final Map<String, Expr> _exprCache = <String, Expr>{};
+
+  Expr _parseSelectExprCached(String sql) {
+    final cached = _exprCache[sql];
+    if (cached != null) return cached;
+    final parsed = (Parser.fromString('SELECT $sql').parseStatement()
+            as SelectStmt)
+        .projection
+        .first
+        .expr!;
+    _exprCache[sql] = parsed;
+    return parsed;
+  }
   final Map<String, SelectStmt> _views = <String, SelectStmt>{};
 
   /// Original SELECT SQL text for each view, keyed by view name.
@@ -2768,11 +2786,7 @@ class Database {
   /// Recompute GENERATED column values for all rows in [t].
   void _recomputeGenerated(Table t, ColumnDef col) {
     final idx = t.columnIndex(col.name);
-    final expr = (Parser.fromString('SELECT ${col.generatedExprSql}')
-            .parseStatement() as SelectStmt)
-        .projection
-        .first
-        .expr!;
+    final expr = _parseSelectExprCached(col.generatedExprSql!);
     final bound = _bindExpr(expr);
     for (final r in t.rows) {
       final view = t.rowToMap(r);
@@ -3362,11 +3376,7 @@ class Database {
   /// Evaluate a column's `DEFAULT (<expr>)` clause in the context of the
   /// partially-built [row]. Returns the coerced value (or null).
   Object? _evalDefaultExpr(Table t, ColumnDef c, List<Object?> row) {
-    final expr = (Parser.fromString('SELECT ${c.defaultExprSql}')
-            .parseStatement() as SelectStmt)
-        .projection
-        .first
-        .expr!;
+    final expr = _parseSelectExprCached(c.defaultExprSql!);
     final v = _bindExpr(expr).eval(t.rowToMap(row));
     return v == null ? null : coerce(v, c.type);
   }
@@ -3376,11 +3386,7 @@ class Database {
     for (var i = 0; i < t.columns.length; i++) {
       final c = t.columns[i];
       if (c.generatedExprSql == null) continue;
-      final expr = (Parser.fromString('SELECT ${c.generatedExprSql}')
-              .parseStatement() as SelectStmt)
-          .projection
-          .first
-          .expr!;
+      final expr = _parseSelectExprCached(c.generatedExprSql!);
       final view = t.rowToMap(row);
       final v = _bindExpr(expr).eval(view);
       row[i] = v == null ? null : coerce(v, c.type);
@@ -3409,10 +3415,7 @@ class Database {
     for (var i = 0; i < t.columns.length; i++) {
       final c = t.columns[i];
       if (c.checkExprSql != null) {
-        final e =
-            Parser.fromString('SELECT ${c.checkExprSql}').parseStatement();
-        // Reuse the parsed projection expr.
-        final expr = (e as SelectStmt).projection.first.expr!;
+        final expr = _parseSelectExprCached(c.checkExprSql!);
         if (!evalPredicate(_bindExpr(expr), view)) {
           throw StateError('CHECK constraint failed on column ${c.name}');
         }
@@ -3420,8 +3423,7 @@ class Database {
     }
     for (final con in t.constraints) {
       if (con is CheckConstraint) {
-        final e = Parser.fromString('SELECT ${con.sql}').parseStatement();
-        final expr = (e as SelectStmt).projection.first.expr!;
+        final expr = _parseSelectExprCached(con.sql);
         if (!evalPredicate(_bindExpr(expr), view)) {
           throw StateError('CHECK constraint failed: ${con.sql}');
         }
