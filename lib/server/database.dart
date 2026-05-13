@@ -5356,6 +5356,10 @@ class Database {
         rows = _generateSeriesRows(args);
         break;
       default:
+        if (upper.startsWith('PRAGMA_')) {
+          rows = _pragmaTableFunctionRows(upper, args);
+          break;
+        }
         throw StateError('Unknown table-valued function: ${fn.name}');
     }
     return rows
@@ -5364,6 +5368,22 @@ class Database {
               for (final e in r.entries) '$qual.${e.key}': e.value,
             })
         .toList();
+  }
+
+  /// Synthesise rows for `pragma_table_info('t')` style table-valued
+  /// PRAGMA wrappers by reusing [_pragma]'s introspection logic.
+  List<Map<String, Object?>> _pragmaTableFunctionRows(
+      String upper, List<Object?> args) {
+    final pragmaName = upper.substring('PRAGMA_'.length).toLowerCase();
+    final value = args.isNotEmpty ? args[0]?.toString() : null;
+    final result = _pragma(PragmaStmt(pragmaName, value));
+    return [
+      for (final row in result.rows)
+        <String, Object?>{
+          for (var i = 0; i < result.columns.length; i++)
+            result.columns[i]: i < row.length ? row[i] : null,
+        }
+    ];
   }
 
   /// Implementation of `generate_series(start, stop[, step])` table-valued
