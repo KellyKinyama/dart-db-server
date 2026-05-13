@@ -995,6 +995,57 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     return s.substring(idx);
   },
   'SUBSTRING': (a) => kScalarFunctions['SUBSTR']!(a),
+  // LEFT(s, n) -- first n characters.
+  'LEFT': (a) => _propagateNull(a, () {
+        final s = a[0].toString();
+        final n = (a[1] as num).toInt();
+        if (n <= 0) return '';
+        return n >= s.length ? s : s.substring(0, n);
+      }),
+  // RIGHT(s, n) -- last n characters.
+  'RIGHT': (a) => _propagateNull(a, () {
+        final s = a[0].toString();
+        final n = (a[1] as num).toInt();
+        if (n <= 0) return '';
+        return n >= s.length ? s : s.substring(s.length - n);
+      }),
+  // POSITION(needle IN haystack) is parsed as POSITION(needle, haystack)
+  // here; returns 1-based index, 0 when not found, NULL on NULL input.
+  'POSITION': (a) {
+    if (a.length < 2 || a[0] == null || a[1] == null) return null;
+    final needle = a[0].toString();
+    final hay = a[1].toString();
+    if (needle.isEmpty) return 1;
+    return hay.indexOf(needle) + 1;
+  },
+  // OVERLAY(s, replacement, start [, length]) -- replace `length`
+  // characters of `s` starting at 1-based `start` with `replacement`.
+  // When length is omitted it defaults to the length of `replacement`.
+  'OVERLAY': (a) {
+    if (a.length < 3 || a[0] == null || a[1] == null || a[2] == null) {
+      return null;
+    }
+    final s = a[0].toString();
+    final repl = a[1].toString();
+    final start = (a[2] as num).toInt();
+    final length =
+        a.length >= 4 && a[3] != null ? (a[3] as num).toInt() : repl.length;
+    final idx = (start - 1).clamp(0, s.length);
+    final endIdx = (idx + length).clamp(0, s.length);
+    return s.substring(0, idx) + repl + s.substring(endIdx);
+  },
+  // REVERSE(s) -- reverses a string by Unicode code points.
+  'REVERSE': (a) => _propagateNull(a, () {
+        final s = a[0].toString();
+        return String.fromCharCodes(s.runes.toList().reversed);
+      }),
+  // REPEAT(s, n) -- string repetition; negative or zero count returns ''.
+  'REPEAT': (a) => _propagateNull(a, () {
+        final s = a[0].toString();
+        final n = (a[1] as num).toInt();
+        if (n <= 0) return '';
+        return s * n;
+      }),
   'REPLACE': (a) => _propagateNull(
       a, () => a[0].toString().replaceAll(a[1].toString(), a[2].toString())),
   'CONCAT': (a) => a.map((v) => v ?? '').join(),
