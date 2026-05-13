@@ -2788,6 +2788,9 @@ class Database {
         return QueryResult.message('Index ${s.indexName} dropped');
       }
     }
+    if (s.ifExists) {
+      return QueryResult.message('Index ${s.indexName} did not exist');
+    }
     throw StateError('No such index: ${s.indexName}');
   }
 

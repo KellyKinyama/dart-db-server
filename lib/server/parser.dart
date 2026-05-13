@@ -190,6 +190,20 @@ class Parser {
           return DescribeStmt(_expectIdent().text);
         case 'EXPLAIN':
           _advance();
+          // SQLite syntax: `EXPLAIN [QUERY PLAN] <stmt>`. We don't yet
+          // distinguish bytecode-EXPLAIN from EXPLAIN QUERY PLAN; both
+          // route through the same plan-tree formatter.
+          {
+            final p0 = _peek();
+            final p1 = _peek(1);
+            if (p0.type == TokType.ident &&
+                p0.upper == 'QUERY' &&
+                p1.type == TokType.ident &&
+                p1.upper == 'PLAN') {
+              _advance();
+              _advance();
+            }
+          }
           return ExplainStmt(_parseStatement());
         case 'PRAGMA':
           return _parsePragma();
@@ -745,7 +759,12 @@ class Parser {
       return DropTableStmt(_expectIdent().text, ifExists: ifExists);
     }
     if (_matchKw('INDEX')) {
-      return DropIndexStmt(_expectIdent().text);
+      bool ifExists = false;
+      if (_matchKw('IF')) {
+        _expectKw('EXISTS');
+        ifExists = true;
+      }
+      return DropIndexStmt(_expectIdent().text, ifExists: ifExists);
     }
     if (_matchKw('VIEW')) {
       bool ifExists = false;

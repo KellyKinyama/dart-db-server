@@ -100,7 +100,8 @@ class CreateIndexStmt extends Statement {
 
 class DropIndexStmt extends Statement {
   final String indexName;
-  DropIndexStmt(this.indexName);
+  final bool ifExists;
+  DropIndexStmt(this.indexName, {this.ifExists = false});
 }
 
 class CreateViewStmt extends Statement {
