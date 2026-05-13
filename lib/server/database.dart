@@ -5203,6 +5203,15 @@ class Database {
   /// column references.
   List<Map<String, Object?>> _materializeRelation(String name, String? alias,
       [Map<String, Object?> outer = const {}]) {
+    // SQLite schema introspection: sqlite_master / sqlite_schema /
+    // sqlite_temp_master. We synthesise rows from the in-memory schema.
+    final lower = name.toLowerCase();
+    if (lower == 'sqlite_master' ||
+        lower == 'sqlite_schema' ||
+        lower == 'sqlite_temp_master' ||
+        lower == 'sqlite_temp_schema') {
+      return _sqliteMasterRows(name, alias, outer);
+    }
     // CTE bindings shadow tables and views.
     final cte = _lookupCte(name);
     if (cte != null) {
@@ -5239,6 +5248,66 @@ class Database {
       return out;
     }
     throw StateError('No such table or view: $name');
+  }
+
+  /// Build the schema-introspection rows for `sqlite_master` /
+  /// `sqlite_schema`. One row per base table, view, and named index;
+  /// columns: type, name, tbl_name, rootpage (always 0), sql.
+  List<Map<String, Object?>> _sqliteMasterRows(
+      String name, String? alias, Map<String, Object?> outer) {
+    final rows = <Map<String, Object?>>[];
+    void emit(String type, String objName, String tblName, String? sql) {
+      final base = <String, Object?>{
+        'type': type,
+        'name': objName,
+        'tbl_name': tblName,
+        'rootpage': 0,
+        'sql': sql,
+      };
+      final m = <String, Object?>{...outer, ...base};
+      for (final e in base.entries) {
+        m['$name.${e.key}'] = e.value;
+        if (alias != null) m['$alias.${e.key}'] = e.value;
+      }
+      rows.add(m);
+    }
+
+    final tableNames = _tables.keys.toList()..sort();
+    for (final tn in tableNames) {
+      final t = _tables[tn]!;
+      emit('table', tn, tn, _reconstructCreateTableSql(t));
+      for (final ix in t.indexDefs.keys) {
+        emit('index', ix, tn, null);
+      }
+    }
+    final viewNames = _views.keys.toList()..sort();
+    for (final vn in viewNames) {
+      final sql = _viewSql[vn];
+      emit('view', vn, vn,
+          sql == null ? null : 'CREATE VIEW $vn AS $sql');
+    }
+    return rows;
+  }
+
+  /// Best-effort CREATE TABLE SQL reconstruction used in sqlite_master.
+  String _reconstructCreateTableSql(Table t) {
+    final cols = <String>[];
+    for (final c in t.columns) {
+      final parts = <String>[c.name];
+      if (c.type != DataType.any) {
+        parts.add(c.type.name.toUpperCase());
+      }
+      if (c.primaryKey) parts.add('PRIMARY KEY');
+      if (c.autoIncrement) parts.add('AUTOINCREMENT');
+      if (c.notNull) parts.add('NOT NULL');
+      if (c.unique) parts.add('UNIQUE');
+      cols.add(parts.join(' '));
+    }
+    final tail = <String>[];
+    if (t.withoutRowid) tail.add('WITHOUT ROWID');
+    if (t.strict) tail.add('STRICT');
+    final tailStr = tail.isEmpty ? '' : ' ${tail.join(', ')}';
+    return 'CREATE TABLE ${t.name}(${cols.join(', ')})$tailStr';
   }
 
   /// Materialize a table-valued function call (e.g. `json_each(...)`) into
