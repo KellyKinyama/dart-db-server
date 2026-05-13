@@ -1372,8 +1372,10 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     var prev = code(s.codeUnitAt(0));
     for (var i = 1; i < s.length && out.length < 4; i++) {
       final cu = s.codeUnitAt(i);
-      if (isHW(cu))
-        continue; // H and W are transparent: skip without resetting prev.
+      if (isHW(cu)) {
+        // H and W are transparent: skip without resetting prev.
+        continue;
+      }
       final c = code(cu);
       if (c.isEmpty) {
         // Vowel or other separator -- don't emit, but reset prev so the
