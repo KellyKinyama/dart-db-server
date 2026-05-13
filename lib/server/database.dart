@@ -6740,9 +6740,104 @@ class Database {
           [2, 'RTRIM'],
         ]);
       case 'function_list':
+        {
+          final names = <String>{
+            ...kScalarFunctions.keys,
+            ...kAggregateFunctions,
+          }.toList()
+            ..sort();
+          return QueryResult(
+              columns: const ['name'],
+              rows: [for (final n in names) [n.toLowerCase()]]);
+        }
       case 'module_list':
+        return QueryResult(
+            columns: const ['name'],
+            rows: const [
+              ['fts5'],
+              ['rtree'],
+              ['json_each'],
+              ['json_tree'],
+              ['generate_series'],
+            ]);
       case 'pragma_list':
-        return QueryResult(columns: const ['name'], rows: const []);
+        {
+          const names = <String>[
+            'application_id',
+            'auto_vacuum',
+            'busy_timeout',
+            'cache_size',
+            'cache_spill',
+            'case_sensitive_like',
+            'cell_size_check',
+            'checkpoint_fullfsync',
+            'collation_list',
+            'compile_options',
+            'database_list',
+            'defer_foreign_keys',
+            'encoding',
+            'foreign_key_list',
+            'foreign_keys',
+            'freelist_count',
+            'fullfsync',
+            'function_list',
+            'ignore_check_constraints',
+            'index_info',
+            'index_list',
+            'index_xinfo',
+            'integrity_check',
+            'journal_mode',
+            'journal_size_limit',
+            'legacy_alter_table',
+            'legacy_file_format',
+            'locking_mode',
+            'max_page_count',
+            'mmap_size',
+            'module_list',
+            'page_count',
+            'page_size',
+            'pragma_list',
+            'query_only',
+            'quick_check',
+            'read_uncommitted',
+            'recursive_triggers',
+            'reverse_unordered_selects',
+            'schema_version',
+            'secure_delete',
+            'soft_heap_limit',
+            'synchronous',
+            'table_info',
+            'table_list',
+            'table_xinfo',
+            'temp_store',
+            'threads',
+            'trusted_schema',
+            'user_version',
+            'wal_autocheckpoint',
+            'wal_checkpoint',
+          ];
+          return QueryResult(
+              columns: const ['name'],
+              rows: [for (final n in names) [n]]);
+        }
+      case 'table_list':
+        {
+          final rows = <List<Object?>>[];
+          for (final t in _tables.values) {
+            rows.add(['main', t.name, 'table', t.columns.length, 0, 0]);
+          }
+          for (final v in _views.keys) {
+            rows.add(['main', v, 'view', 0, 0, 0]);
+          }
+          return QueryResult(columns: const [
+            'schema',
+            'name',
+            'type',
+            'ncol',
+            'wr',
+            'strict'
+          ], rows: rows);
+        }
     }
     // Recognised PRAGMA names with sensible default return values when no
     // explicit value has been set. Matches the SQLite list closely enough
