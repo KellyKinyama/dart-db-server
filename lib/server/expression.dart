@@ -2249,6 +2249,14 @@ const Set<String> kAggregateFunctions = {
   'BIT_AND',
   'BIT_OR',
   'BIT_XOR',
+  'ANY_VALUE',
+  'MEDIAN',
+  'STDDEV',
+  'STDDEV_POP',
+  'STDDEV_SAMP',
+  'VARIANCE',
+  'VAR_POP',
+  'VAR_SAMP',
 };
 
 // ---- More JSON1 helpers ----------------------------------------------------

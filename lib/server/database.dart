@@ -5960,6 +5960,58 @@ class Database {
           }
           return acc;
         }
+      case 'ANY_VALUE':
+        {
+          for (final v in _aggValues(e, grp)) {
+            if (v != null) return v;
+          }
+          return null;
+        }
+      case 'MEDIAN':
+        {
+          final nums = <double>[];
+          for (final v in _aggValues(e, grp)) {
+            if (v == null) continue;
+            if (v is! num) {
+              throw StateError('MEDIAN requires numeric');
+            }
+            nums.add(v.toDouble());
+          }
+          if (nums.isEmpty) return null;
+          nums.sort();
+          final mid = nums.length ~/ 2;
+          if (nums.length.isOdd) return nums[mid];
+          return (nums[mid - 1] + nums[mid]) / 2;
+        }
+      case 'STDDEV':
+      case 'STDDEV_SAMP':
+      case 'STDDEV_POP':
+      case 'VARIANCE':
+      case 'VAR_SAMP':
+      case 'VAR_POP':
+        {
+          final nums = <double>[];
+          for (final v in _aggValues(e, grp)) {
+            if (v == null) continue;
+            if (v is! num) {
+              throw StateError('${e.name} requires numeric');
+            }
+            nums.add(v.toDouble());
+          }
+          if (nums.isEmpty) return null;
+          final mean = nums.reduce((a, b) => a + b) / nums.length;
+          var sumSq = 0.0;
+          for (final x in nums) {
+            final d = x - mean;
+            sumSq += d * d;
+          }
+          final isPop = e.name == 'STDDEV_POP' || e.name == 'VAR_POP';
+          final denom = isPop ? nums.length : nums.length - 1;
+          if (denom <= 0) return null;
+          final variance = sumSq / denom;
+          final isVar = e.name.startsWith('VAR');
+          return isVar ? variance : math.sqrt(variance);
+        }
     }
     throw StateError('Unknown aggregate: ${e.name}');
   }
@@ -6293,6 +6345,14 @@ class Database {
         case 'BIT_AND':
         case 'BIT_OR':
         case 'BIT_XOR':
+        case 'ANY_VALUE':
+        case 'MEDIAN':
+        case 'STDDEV':
+        case 'STDDEV_POP':
+        case 'STDDEV_SAMP':
+        case 'VARIANCE':
+        case 'VAR_POP':
+        case 'VAR_SAMP':
           {
             for (var k = 0; k < ordered.length; k++) {
               final slice = frameRows(k);
