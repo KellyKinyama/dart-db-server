@@ -11,7 +11,8 @@ void main() {
         () async {
       final db = await Database.open();
       try {
-        await db.execute('CREATE TABLE files(id INTEGER PRIMARY KEY, data BLOB)');
+        await db
+            .execute('CREATE TABLE files(id INTEGER PRIMARY KEY, data BLOB)');
         // 256-byte blob: 0,1,2,...,255
         final src = Uint8List.fromList(List.generate(256, (i) => i));
         final stmt = db.prepare('INSERT INTO files VALUES (1, ?)');
@@ -82,8 +83,12 @@ void main() {
       try {
         await db.execute('CREATE TABLE bare(payload BLOB)');
         final stmt = db.prepare('INSERT INTO bare VALUES (?)');
-        await stmt.execute(positional: [Uint8List.fromList([10, 20, 30])]);
-        await stmt.execute(positional: [Uint8List.fromList([40, 50, 60, 70])]);
+        await stmt.execute(positional: [
+          Uint8List.fromList([10, 20, 30])
+        ]);
+        await stmt.execute(positional: [
+          Uint8List.fromList([40, 50, 60, 70])
+        ]);
 
         final h2 = db.openBlob(table: 'bare', column: 'payload', rowid: 2);
         expect(h2.length, 4);
@@ -100,15 +105,11 @@ void main() {
         await db.execute('CREATE TABLE m(id INTEGER PRIMARY KEY, name TEXT)');
         await db.execute("INSERT INTO m VALUES (1, 'alpha')");
 
-        expect(
-            () => db.openBlob(table: 'm', column: 'name', rowid: 1),
+        expect(() => db.openBlob(table: 'm', column: 'name', rowid: 1),
             throwsArgumentError);
-        expect(
-            () => db.openBlob(table: 'm', column: 'name', rowid: 999),
+        expect(() => db.openBlob(table: 'm', column: 'name', rowid: 999),
             throwsArgumentError);
-        expect(
-            () =>
-                db.openBlob(table: 'nope', column: 'name', rowid: 1),
+        expect(() => db.openBlob(table: 'nope', column: 'name', rowid: 1),
             throwsArgumentError);
       } finally {
         await db.close();
@@ -130,5 +131,3 @@ void main() {
     });
   });
 }
-
-

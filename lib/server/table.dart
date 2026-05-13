@@ -124,13 +124,42 @@ class Table {
   /// Build a `column-name -> value` view of [row]. Both bare and `table.col`
   /// keys are populated so qualified expressions resolve.
   Map<String, Object?> rowToMap(List<Object?> row, {String? alias}) {
+    // Cache the bare + qualified key strings; rebuilt only when the
+    // table is renamed or the column list changes (those paths set
+    // [_keysName] back to null).
+    if (_keysName != name || _keysCount != columns.length) {
+      _keysBare = [for (final c in columns) c.name];
+      _keysQualified = [for (final c in columns) '$name.${c.name}'];
+      _keysName = name;
+      _keysCount = columns.length;
+    }
     final m = <String, Object?>{};
-    for (var i = 0; i < columns.length; i++) {
-      m[columns[i].name] = row[i];
-      m['$name.${columns[i].name}'] = row[i];
-      if (alias != null) m['$alias.${columns[i].name}'] = row[i];
+    final n = columns.length;
+    for (var i = 0; i < n; i++) {
+      m[_keysBare![i]] = row[i];
+      m[_keysQualified![i]] = row[i];
+    }
+    if (alias != null) {
+      for (var i = 0; i < n; i++) {
+        m['$alias.${_keysBare![i]}'] = row[i];
+      }
     }
     return m;
+  }
+
+  // Cached key strings for [rowToMap]; nulled out by [invalidateKeyCache].
+  List<String>? _keysBare;
+  List<String>? _keysQualified;
+  String? _keysName;
+  int _keysCount = -1;
+
+  /// Drop cached row-key strings. Call after renaming the table or
+  /// mutating the column list so the next [rowToMap] rebuilds them.
+  void invalidateKeyCache() {
+    _keysBare = null;
+    _keysQualified = null;
+    _keysName = null;
+    _keysCount = -1;
   }
 
   /// Insert a single row. Values must already be coerced to the column types.

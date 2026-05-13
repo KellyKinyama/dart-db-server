@@ -2748,6 +2748,7 @@ class Database {
     renamed.forEach((k, v) {
       t.indexDefs[k] = v;
     });
+    t.invalidateKeyCache();
     return QueryResult.message(
         'Column ${s.oldName} renamed to ${s.newName} in ${s.table}');
   }
@@ -2760,6 +2761,7 @@ class Database {
     _tables.remove(s.oldName);
     t.name = s.newName;
     _tables[s.newName] = t;
+    t.invalidateKeyCache();
     return QueryResult.message('Table ${s.oldName} renamed to ${s.newName}');
   }
 
@@ -9220,8 +9222,8 @@ class Database {
             for (var ri = 0; ri < t.rows.length; ri++) {
               var match = true;
               for (var k = 0; k < c.columns.length; k++) {
-                final ti = colIdxIn([for (final col in t.columns) col.name],
-                    c.columns[k]);
+                final ti = colIdxIn(
+                    [for (final col in t.columns) col.name], c.columns[k]);
                 if (ti == null) {
                   match = false;
                   break;

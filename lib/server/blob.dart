@@ -99,8 +99,7 @@ class BlobHandle {
     final b = _backing();
     final from = offset ?? _offset;
     if (from < 0 || from + data.length > b.length) {
-      throw RangeError(
-          'write of ${data.length} bytes at offset $from exceeds '
+      throw RangeError('write of ${data.length} bytes at offset $from exceeds '
           'blob length ${b.length}; sqlite incremental blob I/O '
           'cannot grow the blob');
     }

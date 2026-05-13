@@ -72,7 +72,9 @@ class Change {
   static List<Object?> _encodeValues(List<Object?> vs) {
     return [
       for (final v in vs)
-        if (v is Uint8List) {'__blob__': base64.encode(v)} else if (v is List<int>)
+        if (v is Uint8List)
+          {'__blob__': base64.encode(v)}
+        else if (v is List<int>)
           {'__blob__': base64.encode(v)}
         else
           v

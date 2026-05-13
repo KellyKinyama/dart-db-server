@@ -72,8 +72,7 @@ void main() {
       }
     });
 
-    test('apply with default handler skips conflicts (missing rows)',
-        () async {
+    test('apply with default handler skips conflicts (missing rows)', () async {
       final src = await Database.open();
       late final Uint8List blob;
       try {
