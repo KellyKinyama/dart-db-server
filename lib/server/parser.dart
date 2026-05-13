@@ -246,6 +246,16 @@ class Parser {
   // ---- CREATE -------------------------------------------------------------
   Statement _parseCreate() {
     _expectKw('CREATE');
+    // Accept TEMP / TEMPORARY before TABLE/VIEW/TRIGGER/INDEX. We don't
+    // model temp scope; the modifier is parsed and ignored so that the
+    // CREATE statement is recognised.
+    {
+      final p = _peek();
+      if (p.type == TokType.ident &&
+          (p.upper == 'TEMP' || p.upper == 'TEMPORARY')) {
+        _advance();
+      }
+    }
     if (_matchKw('TABLE')) return _parseCreateTableTail();
     if (_matchKw('VIRTUAL')) {
       _expectKw('TABLE');
@@ -849,8 +859,20 @@ class Parser {
         mode = InsertMode.orReplace;
       } else if (_matchKw('IGNORE')) {
         mode = InsertMode.orIgnore;
+      } else if (_matchKw('ROLLBACK')) {
+        mode = InsertMode.normal;
       } else {
-        throw FormatException('Expected REPLACE or IGNORE after INSERT OR');
+        final p = _peek();
+        if (p.type == TokType.ident &&
+            (p.upper == 'ABORT' || p.upper == 'FAIL')) {
+          // SQLite conflict resolution modifier; treat the same as the
+          // default abort-on-conflict behaviour for now.
+          _advance();
+          mode = InsertMode.normal;
+        } else {
+          throw FormatException(
+              'Expected REPLACE/IGNORE/ABORT/FAIL/ROLLBACK after INSERT OR');
+        }
       }
     }
     return _parseInsertTail(mode);
