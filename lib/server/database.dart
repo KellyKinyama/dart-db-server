@@ -7861,35 +7861,6 @@ class Database {
     return QueryResult.message('ANALYZE ok');
   }
 
-  List<String> _planLines(Statement stmt) {
-    if (stmt is SelectStmt) {
-      final lines = <String>[];
-      lines.add('SCAN ${stmt.fromTable}'
-          '${stmt.fromAlias != null ? " AS ${stmt.fromAlias}" : ""}');
-      for (final j in stmt.joins) {
-        lines.add('  ${j.type} JOIN ${j.table}'
-            '${j.alias != null ? " AS ${j.alias}" : ""}'
-            '${j.on != null ? " ON ..." : ""}');
-      }
-      if (stmt.where != null) lines.add('  FILTER WHERE');
-      if (stmt.groupBy.isNotEmpty) {
-        lines.add('  GROUP BY ${stmt.groupBy.length} key(s)');
-      }
-      if (stmt.having != null) lines.add('  HAVING');
-      if (stmt.orderBy.isNotEmpty) {
-        lines.add('  ORDER BY ${stmt.orderBy.length} key(s)');
-      }
-      if (stmt.limit != null) lines.add('  LIMIT ${stmt.limit}');
-      if (stmt.offset != null) lines.add('  OFFSET ${stmt.offset}');
-      if (stmt.setOp != null) {
-        lines.add(stmt.setOp!);
-        lines.addAll(_planLines(stmt.setOpRight!).map((l) => '  $l'));
-      }
-      return lines;
-    }
-    return [stmt.runtimeType.toString()];
-  }
-
   // ---------------------------------------------------------------------------
   // Persistence
   // ---------------------------------------------------------------------------
