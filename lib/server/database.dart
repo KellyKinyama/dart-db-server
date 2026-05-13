@@ -2879,13 +2879,16 @@ class Database {
         }
       }
       if (s.columns == null) {
-        if (values.length != t.columns.length) {
+        if (values.isEmpty) {
+          // INSERT INTO t DEFAULT VALUES — leave row as defaults/NULLs.
+        } else if (values.length != t.columns.length) {
           throw StateError(
               'Expected ${t.columns.length} values, got ${values.length}');
-        }
-        for (var i = 0; i < values.length; i++) {
-          row[i] = coerceForColumn(_evalScalar(values[i]), t.columns[i],
-              strict: t.strict);
+        } else {
+          for (var i = 0; i < values.length; i++) {
+            row[i] = coerceForColumn(_evalScalar(values[i]), t.columns[i],
+                strict: t.strict);
+          }
         }
       } else {
         if (values.length != s.columns!.length) {
@@ -5775,6 +5778,45 @@ class Database {
           }
           return jsonEncode(m);
         }
+      case 'BIT_AND':
+        {
+          int? acc;
+          for (final v in _aggValues(e, grp)) {
+            if (v == null) continue;
+            if (v is! num) {
+              throw StateError('BIT_AND requires integer');
+            }
+            final iv = v.toInt();
+            acc = acc == null ? iv : (acc & iv);
+          }
+          return acc;
+        }
+      case 'BIT_OR':
+        {
+          int? acc;
+          for (final v in _aggValues(e, grp)) {
+            if (v == null) continue;
+            if (v is! num) {
+              throw StateError('BIT_OR requires integer');
+            }
+            final iv = v.toInt();
+            acc = acc == null ? iv : (acc | iv);
+          }
+          return acc;
+        }
+      case 'BIT_XOR':
+        {
+          int? acc;
+          for (final v in _aggValues(e, grp)) {
+            if (v == null) continue;
+            if (v is! num) {
+              throw StateError('BIT_XOR requires integer');
+            }
+            final iv = v.toInt();
+            acc = acc == null ? iv : (acc ^ iv);
+          }
+          return acc;
+        }
     }
     throw StateError('Unknown aggregate: ${e.name}');
   }
@@ -6104,6 +6146,9 @@ class Database {
         case 'STRING_AGG':
         case 'JSON_GROUP_ARRAY':
         case 'JSON_GROUP_OBJECT':
+        case 'BIT_AND':
+        case 'BIT_OR':
+        case 'BIT_XOR':
           {
             for (var k = 0; k < ordered.length; k++) {
               final slice = frameRows(k);

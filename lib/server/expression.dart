@@ -2155,6 +2155,9 @@ const Set<String> kAggregateFunctions = {
   'STRING_AGG',
   'JSON_GROUP_ARRAY',
   'JSON_GROUP_OBJECT',
+  'BIT_AND',
+  'BIT_OR',
+  'BIT_XOR',
 };
 
 // ---- More JSON1 helpers ----------------------------------------------------

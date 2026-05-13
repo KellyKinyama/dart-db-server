@@ -855,7 +855,12 @@ class Parser {
     }
     List<List<Expr>>? rows;
     SelectStmt? srcSelect;
-    if (_matchKw('VALUES')) {
+    if (_matchKw('DEFAULT')) {
+      // INSERT INTO t DEFAULT VALUES — single all-NULL row, the engine
+      // fills in column defaults / AUTOINCREMENT / GENERATED columns.
+      _expectKw('VALUES');
+      rows = <List<Expr>>[<Expr>[]];
+    } else if (_matchKw('VALUES')) {
       rows = <List<Expr>>[];
       do {
         _expect(TokType.punct, '(');
