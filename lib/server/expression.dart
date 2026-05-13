@@ -1104,6 +1104,26 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     return null;
   },
   'IFNULL': (a) => a[0] ?? (a.length > 1 ? a[1] : null),
+  'NVL': (a) => a[0] ?? (a.length > 1 ? a[1] : null),
+  'NVL2': (a) {
+    if (a.length < 3) return null;
+    return a[0] != null ? a[1] : a[2];
+  },
+  'DECODE': (a) {
+    // DECODE(expr, search1, result1, [search2, result2, ...] [, default])
+    if (a.isEmpty) return null;
+    final expr = a[0];
+    var i = 1;
+    while (i + 1 < a.length) {
+      final s = a[i];
+      if ((expr == null && s == null) ||
+          (expr != null && s != null && sqlEq(expr, s))) {
+        return a[i + 1];
+      }
+      i += 2;
+    }
+    return i < a.length ? a[i] : null;
+  },
   'NULLIF': (a) {
     if (a.length < 2 || a[0] == null) return a.isEmpty ? null : a[0];
     if (a[1] == null) return a[0];
@@ -1171,6 +1191,16 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
   'SIN': (a) => _propagateNull(a, () => math.sin((a[0] as num).toDouble())),
   'COS': (a) => _propagateNull(a, () => math.cos((a[0] as num).toDouble())),
   'TAN': (a) => _propagateNull(a, () => math.tan((a[0] as num).toDouble())),
+  'COT': (a) => _propagateNull(a, () {
+        final t = math.tan((a[0] as num).toDouble());
+        if (t == 0) return null;
+        return 1.0 / t;
+      }),
+  'ACOT': (a) => _propagateNull(a, () {
+        final v = (a[0] as num).toDouble();
+        if (v == 0) return math.pi / 2;
+        return math.atan(1.0 / v);
+      }),
   'ASIN': (a) => _propagateNull(a, () {
         final v = (a[0] as num).toDouble();
         if (v < -1 || v > 1) return null;
