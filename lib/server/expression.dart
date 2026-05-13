@@ -1709,6 +1709,23 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
   'CHANGES': (a) => connStateLookup?.call('changes') ?? 0,
   // total_changes(): total rows modified since the connection opened.
   'TOTAL_CHANGES': (a) => connStateLookup?.call('total_changes') ?? 0,
+  // bit_count(x): population count (number of set bits in integer x).
+  'BIT_COUNT': (a) => _propagateNull(a, () {
+        var v = (a[0] as num).toInt();
+        var c = 0;
+        while (v != 0) {
+          c += v & 1;
+          v = v >>> 1;
+        }
+        return c;
+      }),
+  // load_extension/sqlite_log: present for compatibility but no-op.
+  'LOAD_EXTENSION': (a) => null,
+  'SQLITE_LOG': (a) => null,
+  // database()/schema(): SQLite always reports 'main' for the default
+  // schema; we don't track ATTACH-time DB names through statements yet.
+  'DATABASE': (a) => 'main',
+  'SCHEMA': (a) => 'main',
   // sqlite_version(): version string of the SQLite release this engine
   // targets for feature parity.
   'SQLITE_VERSION': (a) => kSqliteVersionString,
