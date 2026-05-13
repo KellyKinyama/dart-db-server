@@ -1158,6 +1158,21 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
   // return NULL on NULL input. Domain errors (e.g. LN(0), SQRT(-1))
   // return NULL to match SQLite.
   'PI': (a) => math.pi,
+  'IIF': (a) {
+    if (a.length < 3) return null;
+    final c = a[0];
+    final truthy = c is bool
+        ? c
+        : c is num
+            ? c != 0
+            : c != null;
+    return truthy ? a[1] : a[2];
+  },
+  'CBRT': (a) => _propagateNull(a, () {
+        final v = (a[0] as num).toDouble();
+        if (v < 0) return -math.pow(-v, 1 / 3).toDouble();
+        return math.pow(v, 1 / 3).toDouble();
+      }),
   'EXP': (a) => _propagateNull(a, () => math.exp((a[0] as num).toDouble())),
   'LN': (a) => _propagateNull(a, () {
         final v = (a[0] as num).toDouble();
@@ -2183,6 +2198,7 @@ const Set<String> kAggregateFunctions = {
   'MAX',
   'GROUP_CONCAT',
   'STRING_AGG',
+  'LISTAGG',
   'JSON_GROUP_ARRAY',
   'JSON_GROUP_OBJECT',
   'BIT_AND',

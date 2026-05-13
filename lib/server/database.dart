@@ -5792,6 +5792,7 @@ class Database {
         }
       case 'GROUP_CONCAT':
       case 'STRING_AGG':
+      case 'LISTAGG':
         {
           // GROUP_CONCAT(expr [, sep]) -- defaults to ','.
           // STRING_AGG(expr, sep) -- separator is required, but we accept
@@ -6266,6 +6267,7 @@ class Database {
         case 'TOTAL':
         case 'GROUP_CONCAT':
         case 'STRING_AGG':
+        case 'LISTAGG':
         case 'JSON_GROUP_ARRAY':
         case 'JSON_GROUP_OBJECT':
         case 'BIT_AND':
