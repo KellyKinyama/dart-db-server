@@ -2693,6 +2693,7 @@ class Database {
     final n = t.rows.length;
     t.rows.clear();
     t.autoInc.clear();
+    t.invalidateUniqueCaches();
     // Rebuild indexes (now empty).
     final defs = List<IndexDef>.from(t.indexDefs.values);
     for (final d in defs) {
@@ -2732,6 +2733,8 @@ class Database {
     for (final r in t.rows) {
       r.removeAt(idx);
     }
+    t.invalidateKeyCache();
+    t.invalidateUniqueCaches();
     return QueryResult.message('Column ${s.column} dropped from ${s.table}');
   }
 
@@ -3088,6 +3091,7 @@ class Database {
   }
 
   void _rebuildIndexes(Table t) {
+    t.invalidateUniqueCaches();
     final defs = List<IndexDef>.from(t.indexDefs.values);
     for (final d in defs) {
       t.dropIndex(d.name);
@@ -5415,6 +5419,16 @@ class Database {
     }
     if (_tables.containsKey(name)) {
       final t = _tables[name]!;
+      final outerEmpty = outer.isEmpty;
+      // Fast path: no outer scope to splat into every row. The default
+      // rowToMap construction already avoids the intermediate copy.
+      if (outerEmpty) {
+        final out = <Map<String, Object?>>[];
+        for (final r in t.rows) {
+          out.add(t.rowToMap(r, alias: alias));
+        }
+        return out;
+      }
       return [
         for (final r in t.rows) {...outer, ...t.rowToMap(r, alias: alias)}
       ];
@@ -6010,8 +6024,7 @@ class Database {
         if (e.isStarArg) return grp.length;
         if (e.args.isEmpty) return grp.length;
         final boundArg = _bindExpr(e.args.first);
-        final values =
-            grp.map((r) => boundArg.eval(r)).where((v) => v != null);
+        final values = grp.map((r) => boundArg.eval(r)).where((v) => v != null);
         if (e.distinct) return values.map((v) => jsonEncode(v)).toSet().length;
         return values.length;
       case 'SUM':

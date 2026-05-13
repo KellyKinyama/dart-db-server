@@ -162,6 +162,33 @@ class Table {
     _keysCount = -1;
   }
 
+  // Per-column cache of values present in PK / UNIQUE columns. Lets
+  // [insertRow] check uniqueness in O(1) instead of scanning every
+  // existing row. Built lazily; cleared by [invalidateUniqueCaches]
+  // whenever the row store is mutated outside [insertRow]
+  // (UPDATE / DELETE / _rebuildIndexes / clone-restore).
+  final Map<int, Set<Object>> _uniqueCaches = <int, Set<Object>>{};
+
+  Set<Object>? _uniqueCacheFor(int colIdx) {
+    final c = columns[colIdx];
+    if (!(c.primaryKey || c.unique)) return null;
+    var cache = _uniqueCaches[colIdx];
+    if (cache != null) return cache;
+    cache = <Object>{};
+    for (final r in rows) {
+      final v = r[colIdx];
+      if (v != null) cache.add(v);
+    }
+    _uniqueCaches[colIdx] = cache;
+    return cache;
+  }
+
+  /// Drop the per-column unique-value caches. Call after any mutation
+  /// to [rows] that does not go through [insertRow].
+  void invalidateUniqueCaches() {
+    _uniqueCaches.clear();
+  }
+
   /// Insert a single row. Values must already be coerced to the column types.
   /// Returns the new row id (index into [rows]).
   int insertRow(List<Object?> values) {
@@ -179,16 +206,29 @@ class Table {
     for (var i = 0; i < columns.length; i++) {
       final c = columns[i];
       if ((c.unique || c.primaryKey) && values[i] != null) {
-        for (final existing in rows) {
-          if (existing[i] == values[i]) {
+        final cache = _uniqueCacheFor(i);
+        if (cache != null) {
+          if (cache.contains(values[i] as Object)) {
             throw StateError(
                 'UNIQUE constraint failed: ${c.name}=${values[i]}');
+          }
+        } else {
+          for (final existing in rows) {
+            if (existing[i] == values[i]) {
+              throw StateError(
+                  'UNIQUE constraint failed: ${c.name}=${values[i]}');
+            }
           }
         }
       }
     }
     final rowId = rows.length;
     rows.add(values);
+    // Record this row's values in the per-column unique caches we built.
+    for (final entry in _uniqueCaches.entries) {
+      final v = values[entry.key];
+      if (v != null) entry.value.add(v);
+    }
     // Update indexes — expression / partial indexes are not maintained here
     // (the executor refreshes them via rebuild), so skip them.
     for (final entry in indexDefs.entries) {
@@ -272,6 +312,8 @@ class Table {
     for (final r in rows) {
       r.add(fill);
     }
+    invalidateKeyCache();
+    invalidateUniqueCaches();
   }
 
   // --- Serialization -------------------------------------------------------
