@@ -2064,6 +2064,12 @@ DateTime? _applyModifier(DateTime dt, String mod) {
   if (m == 'start of year') {
     return DateTime.utc(dt.year, 1, 1);
   }
+  if (m == 'start of hour') {
+    return DateTime.utc(dt.year, dt.month, dt.day, dt.hour);
+  }
+  if (m == 'start of minute') {
+    return DateTime.utc(dt.year, dt.month, dt.day, dt.hour, dt.minute);
+  }
   // weekday N => move forward 0..6 days so the result lands on weekday N
   // (SQLite: 0 = Sunday .. 6 = Saturday).
   final wd = RegExp(r'^weekday\s+([0-6])$').firstMatch(m);
@@ -2164,6 +2170,45 @@ String _strftime(String fmt, DateTime d) {
         break;
       case 's':
         buf.write((d.millisecondsSinceEpoch ~/ 1000).toString());
+        break;
+      case 'w':
+        // SQLite: 0=Sunday..6=Saturday.
+        buf.write((d.weekday % 7).toString());
+        break;
+      case 'W':
+        {
+          // ISO-ish week of year, week starting Monday, range 00-53.
+          final start = DateTime.utc(d.year, 1, 1);
+          final firstMonday =
+              start.weekday == DateTime.monday ? 1 : (9 - start.weekday) % 7;
+          final doy = _dayOfYear(d);
+          final w = doy < firstMonday
+              ? 0
+              : ((doy - firstMonday) ~/ 7) + 1;
+          buf.write(w.toString().padLeft(2, '0'));
+          break;
+        }
+      case 'f':
+        {
+          final secs = d.second + d.millisecond / 1000.0 +
+              d.microsecond / 1e6;
+          buf.write(secs.toStringAsFixed(3).padLeft(6, '0'));
+          break;
+        }
+      case 'J':
+        buf.write(_toJulianDay(d).toStringAsFixed(7));
+        break;
+      case 'e':
+        buf.write(d.day.toString().padLeft(2, ' '));
+        break;
+      case 'I':
+        {
+          final h = d.hour % 12 == 0 ? 12 : d.hour % 12;
+          buf.write(h.toString().padLeft(2, '0'));
+          break;
+        }
+      case 'p':
+        buf.write(d.hour < 12 ? 'AM' : 'PM');
         break;
       case '%':
         buf.write('%');
