@@ -979,11 +979,24 @@ class Parser {
     Expr? where;
     if (_matchKw('WHERE')) where = _parseExpr();
     final ret = _parseReturning();
+    Expr? limit;
+    Expr? offset;
+    if (_matchKw('LIMIT')) {
+      limit = _parseExpr();
+      if (_matchKw('OFFSET')) {
+        offset = _parseExpr();
+      } else if (_match(TokType.punct, ',')) {
+        offset = limit;
+        limit = _parseExpr();
+      }
+    }
     return UpdateStmt(table, assignments, where,
         returning: ret,
         indexedBy: hint,
         fromTable: fromTable,
-        fromAlias: fromAlias);
+        fromAlias: fromAlias,
+        limit: limit,
+        offset: offset);
   }
 
   // ---- DELETE -------------------------------------------------------------
@@ -995,7 +1008,19 @@ class Parser {
     Expr? where;
     if (_matchKw('WHERE')) where = _parseExpr();
     final ret = _parseReturning();
-    return DeleteStmt(table, where, returning: ret, indexedBy: hint);
+    Expr? limit;
+    Expr? offset;
+    if (_matchKw('LIMIT')) {
+      limit = _parseExpr();
+      if (_matchKw('OFFSET')) {
+        offset = _parseExpr();
+      } else if (_match(TokType.punct, ',')) {
+        offset = limit;
+        limit = _parseExpr();
+      }
+    }
+    return DeleteStmt(table, where,
+        returning: ret, indexedBy: hint, limit: limit, offset: offset);
   }
 
   // ---- WITH (CTEs) --------------------------------------------------------
@@ -1074,14 +1099,22 @@ class Parser {
             returning: s.returning,
             ctes: ctes,
             cteColumns: cteColumns,
-            ctesRecursive: recursive);
+            ctesRecursive: recursive,
+            indexedBy: s.indexedBy,
+            fromTable: s.fromTable,
+            fromAlias: s.fromAlias,
+            limit: s.limit,
+            offset: s.offset);
       case 'DELETE':
         final s = _parseDelete();
         return DeleteStmt(s.table, s.where,
             returning: s.returning,
             ctes: ctes,
             cteColumns: cteColumns,
-            ctesRecursive: recursive);
+            ctesRecursive: recursive,
+            indexedBy: s.indexedBy,
+            limit: s.limit,
+            offset: s.offset);
     }
     throw FormatException('Unexpected statement after WITH: ${t.text}');
   }

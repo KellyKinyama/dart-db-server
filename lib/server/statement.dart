@@ -328,6 +328,8 @@ class UpdateStmt extends Statement {
   /// predicate.
   final String? fromTable;
   final String? fromAlias;
+  final Expr? limit;
+  final Expr? offset;
   UpdateStmt(this.table, this.assignments, this.where,
       {this.returning,
       this.ctes = const {},
@@ -335,7 +337,9 @@ class UpdateStmt extends Statement {
       this.ctesRecursive = false,
       this.indexedBy,
       this.fromTable,
-      this.fromAlias});
+      this.fromAlias,
+      this.limit,
+      this.offset});
 }
 
 class DeleteStmt extends Statement {
@@ -346,12 +350,16 @@ class DeleteStmt extends Statement {
   final Map<String, List<String>> cteColumns;
   final bool ctesRecursive;
   final IndexHint? indexedBy;
+  final Expr? limit;
+  final Expr? offset;
   DeleteStmt(this.table, this.where,
       {this.returning,
       this.ctes = const {},
       this.cteColumns = const {},
       this.ctesRecursive = false,
-      this.indexedBy});
+      this.indexedBy,
+      this.limit,
+      this.offset});
 }
 
 class BeginStmt extends Statement {}

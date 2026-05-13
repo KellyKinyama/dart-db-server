@@ -3155,7 +3155,14 @@ class Database {
       final hintedRows = _resolveHintedRowIds(t, s.where, s.indexedBy);
       final rowOrder = hintedRows ??
           List<int>.generate(t.rows.length, (i) => i, growable: false);
+      final lim = s.limit == null
+          ? -1
+          : ((_evalScalar(s.limit!, const {}) as num?)?.toInt() ?? -1);
+      var skip = s.offset == null
+          ? 0
+          : ((_evalScalar(s.offset!, const {}) as num?)?.toInt() ?? 0);
       for (final ri in rowOrder) {
+        if (lim == 0 || (lim > 0 && count >= lim)) break;
         final row = t.rows[ri];
         final view = t.rowToMap(row);
         // For UPDATE ... FROM other, look for the first `other` row that
@@ -3179,6 +3186,10 @@ class Database {
             continue;
           }
           matchedView = view;
+        }
+        if (skip > 0) {
+          skip--;
+          continue;
         }
         final old = List<Object?>.from(row);
         _fireTriggers(t.name, 'UPDATE', 'BEFORE',
@@ -3239,6 +3250,21 @@ class Database {
         }
       }
       final returnedRows = <List<Object?>>[];
+      final lim = s.limit == null
+          ? -1
+          : ((_evalScalar(s.limit!, const {}) as num?)?.toInt() ?? -1);
+      var skip = s.offset == null
+          ? 0
+          : ((_evalScalar(s.offset!, const {}) as num?)?.toInt() ?? 0);
+      bool admit() {
+        if (lim == 0) return false;
+        if (skip > 0) {
+          skip--;
+          return false;
+        }
+        if (lim > 0 && deleted.length >= lim) return false;
+        return true;
+      }
       final hintedRows = _resolveHintedRowIds(t, s.where, s.indexedBy);
       if (hintedRows != null) {
         final toDelete = <int>{};
@@ -3247,7 +3273,7 @@ class Database {
           final view = t.rowToMap(row);
           final shouldDelete =
               s.where == null || evalPredicate(_bindExpr(s.where!), view);
-          if (shouldDelete) {
+          if (shouldDelete && admit()) {
             deleted.add(row);
             toDelete.add(ri);
             if (returningExprs.isNotEmpty) {
@@ -3264,7 +3290,7 @@ class Database {
           final view = t.rowToMap(row);
           final shouldDelete =
               s.where == null || evalPredicate(_bindExpr(s.where!), view);
-          if (shouldDelete) {
+          if (shouldDelete && admit()) {
             deleted.add(row);
             if (returningExprs.isNotEmpty) {
               returnedRows
