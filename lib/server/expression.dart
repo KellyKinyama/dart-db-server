@@ -126,8 +126,27 @@ class UnaryExpr extends Expr {
         return v == null;
       case 'IS NOT NULL':
         return v != null;
+      case 'IS TRUE':
+        return _truthy(v) == true;
+      case 'IS NOT TRUE':
+        return _truthy(v) != true;
+      case 'IS FALSE':
+        return _truthy(v) == false;
+      case 'IS NOT FALSE':
+        return _truthy(v) != false;
     }
     throw StateError('Unknown unary op: $op');
+  }
+
+  /// SQL truthiness: NULL stays NULL; numeric zero is false; bool passes
+  /// through; non-zero numerics and non-empty strings are true. Used by
+  /// the IS [NOT] TRUE / FALSE predicates.
+  static bool? _truthy(Object? v) {
+    if (v == null) return null;
+    if (v is bool) return v;
+    if (v is num) return v != 0;
+    if (v is String) return v.isNotEmpty && v != '0';
+    return true;
   }
 }
 

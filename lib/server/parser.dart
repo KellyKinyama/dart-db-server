@@ -1408,6 +1408,15 @@ class Parser {
       if (_matchKw('NULL')) {
         return UnaryExpr(negated ? 'IS NOT NULL' : 'IS NULL', left);
       }
+      // IS [NOT] TRUE / FALSE -- SQL boolean predicates with three-
+      // valued truthiness: numeric 0 / empty string / NULL are not
+      // TRUE; everything else is TRUE.
+      if (_matchKw('TRUE')) {
+        return UnaryExpr(negated ? 'IS NOT TRUE' : 'IS TRUE', left);
+      }
+      if (_matchKw('FALSE')) {
+        return UnaryExpr(negated ? 'IS NOT FALSE' : 'IS FALSE', left);
+      }
       // Bare IS / IS NOT <expr> — NULL-safe (in)equality (SQLite extension).
       final right = _parseConcat();
       return BinaryExpr(negated ? 'IS NOT' : 'IS', left, right);
