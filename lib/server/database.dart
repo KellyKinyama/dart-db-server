@@ -55,6 +55,16 @@ class Database {
   /// incremental WAL writes must use the same page size.
   int _sqlitePageSize = 4096;
 
+  /// True when journal_mode = wal2: we maintain two alternating WAL
+  /// companion files (`-wal` and `-wal2`). Each commit goes to whichever
+  /// is "live"; the other holds the previous commit's overrides until
+  /// the next checkpoint, giving us a torn-write fallback.
+  bool _persistAsWal2 = false;
+
+  /// Monotonic counter for picking the live WAL slot in wal2 mode.
+  /// Even values write to `-wal2`, odd values write to `-wal`.
+  int _wal2Counter = 0;
+
   /// User-supplied authorizer callback. When non-null, every dispatched
   /// statement is run past this callback before executing; the callback
   /// can [AuthorizerResult.deny] (throws) or [AuthorizerResult.ignore]
@@ -6991,6 +7001,11 @@ class Database {
     };
     if (s.value != null && !introspectionWithArg.contains(name)) {
       _pragmas[name] = s.value;
+      // Side-effect: enable / disable wal2 dual-log persistence.
+      if (name == 'journal_mode') {
+        final v = s.value.toString().toLowerCase();
+        _persistAsWal2 = (v == 'wal2');
+      }
       return QueryResult.message('PRAGMA $name = ${s.value}');
     }
     // Special introspection PRAGMAs.
@@ -7238,23 +7253,30 @@ class Database {
           // most recent EXPLAIN so tools that toggle this pragma and
           // re-read the listing keep working.
           if (s.value != null) _pragmas[name] = s.value;
-          return QueryResult(
-              columns: const [
-                'addr',
-                'opcode',
-                'p1',
-                'p2',
-                'p3',
-                'p4',
-                'p5',
-                'comment',
-              ],
-              rows: [for (final r in _lastBytecode) List<Object?>.from(r)]);
+          return QueryResult(columns: const [
+            'addr',
+            'opcode',
+            'p1',
+            'p2',
+            'p3',
+            'p4',
+            'p5',
+            'comment',
+          ], rows: [
+            for (final r in _lastBytecode) List<Object?>.from(r)
+          ]);
         }
       case 'shrink_memory':
       case 'incremental_vacuum':
       case 'wal_checkpoint':
         {
+          if (_persistAsSqlite && path != null) {
+            // Fold any pending WAL into the main file. Fire-and-forget
+            // because PRAGMA dispatch is sync; the underlying file
+            // operations are protected by the same DbFileLock as commits.
+            // ignore: unawaited_futures
+            checkpointSqlite();
+          }
           return QueryResult(columns: const [
             'busy',
             'log',
@@ -7265,10 +7287,13 @@ class Database {
         }
       case 'wal2_checkpoint':
         {
-          // SQLite's experimental WAL2 mode keeps two WAL files. We don't
-          // implement the dual-log scheme, but accept the pragma and
-          // return a 3-column wal_checkpoint-shaped row so wrappers that
-          // poll it don't error out.
+          // WAL2 mode keeps two alternating `-wal` companions. Folding
+          // both back into the main file is exactly what checkpointSqlite
+          // already does, so route through it.
+          if (_persistAsSqlite && path != null) {
+            // ignore: unawaited_futures
+            checkpointSqlite();
+          }
           return QueryResult(columns: const [
             'busy',
             'log',
@@ -7609,8 +7634,7 @@ class Database {
   /// writes through SQL go to memory only (no propagation back to the
   /// SQLite file), matching the read-only semantics of attaching.
   void _attachSqliteFile(String alias, String path, Uint8List bytes) {
-    final walFile = File('$path-wal');
-    final walBytes = walFile.existsSync() ? walFile.readAsBytesSync() : null;
+    final walBytes = _pickFreshWalBytesSync(path);
     final fmt = walBytes != null
         ? SqliteFile.fromBytesWithWal(bytes, walBytes)
         : SqliteFile.fromBytes(bytes);
@@ -7917,6 +7941,7 @@ class Database {
     for (final p in [
       '$path.tmp',
       '${path!}-wal.tmp',
+      '${path!}-wal2.tmp',
     ]) {
       final f = File(p);
       if (await f.exists()) {
@@ -7942,6 +7967,7 @@ class Database {
     final current = _buildSqliteBytes(pageSize: _sqlitePageSize);
     final baseline = _sqliteBaselineBytes;
     final walPath = '${path!}-wal';
+    final wal2Path = '${path!}-wal2';
     final ps = _sqlitePageSize;
     final canDiff = baseline != null &&
         baseline.length % ps == 0 &&
@@ -7951,8 +7977,10 @@ class Database {
       // Full rewrite path.
       await _atomicWriteBytes(path!, current);
       _sqliteBaselineBytes = Uint8List.fromList(current);
-      final wf = File(walPath);
-      if (await wf.exists()) await wf.delete();
+      for (final p in [walPath, wal2Path]) {
+        final wf = File(p);
+        if (await wf.exists()) await wf.delete();
+      }
       return;
     }
     final pages = current.length ~/ ps;
@@ -7968,9 +7996,11 @@ class Database {
       overrides[i + 1] = Uint8List.fromList(cur);
     }
     if (overrides.isEmpty) {
-      // No-op commit; drop any stale WAL.
-      final wf = File(walPath);
-      if (await wf.exists()) await wf.delete();
+      // No-op commit; drop any stale WALs.
+      for (final p in [walPath, wal2Path]) {
+        final wf = File(p);
+        if (await wf.exists()) await wf.delete();
+      }
       return;
     }
     final ratio = overrides.length / pages;
@@ -7978,8 +8008,10 @@ class Database {
       // Too churny: rewrite the main file and reset baseline.
       await _atomicWriteBytes(path!, current);
       _sqliteBaselineBytes = Uint8List.fromList(current);
-      final wf = File(walPath);
-      if (await wf.exists()) await wf.delete();
+      for (final p in [walPath, wal2Path]) {
+        final wf = File(p);
+        if (await wf.exists()) await wf.delete();
+      }
       return;
     }
     final wal = buildWal(
@@ -7987,7 +8019,20 @@ class Database {
       pageOverrides: overrides,
       dbSizeAfterCommit: pages,
     );
-    await _atomicWriteBytes(walPath, wal);
+    if (_persistAsWal2) {
+      // Alternate write target so the previous-commit snapshot survives
+      // a torn write of the new one.
+      _wal2Counter++;
+      final liveSlot = _wal2Counter.isOdd ? 1 : 2;
+      final live = liveSlot == 1 ? walPath : wal2Path;
+      await _atomicWriteBytes(live, wal);
+      // Persist which slot is live so that a fresh open knows which
+      // companion to overlay (mtime resolution can be too coarse).
+      await _atomicWriteBytes(
+          '${path!}-wal2.meta', Uint8List.fromList(utf8.encode('$liveSlot')));
+    } else {
+      await _atomicWriteBytes(walPath, wal);
+    }
     // Baseline stays at the on-disk main image; we do NOT update it
     // here, so subsequent incremental writes keep diffing against the
     // last full snapshot.
@@ -8009,8 +8054,60 @@ class Database {
     final bytes = _buildSqliteBytes(pageSize: _sqlitePageSize);
     await _atomicWriteBytes(path!, bytes);
     _sqliteBaselineBytes = Uint8List.fromList(bytes);
-    final wf = File('${path!}-wal');
-    if (await wf.exists()) await wf.delete();
+    for (final p in ['${path!}-wal', '${path!}-wal2', '${path!}-wal2.meta']) {
+      final wf = File(p);
+      if (await wf.exists()) await wf.delete();
+    }
+    _wal2Counter = 0;
+  }
+
+  /// Pick the freshest WAL companion next to [mainPath] across both
+  /// possible slots (`-wal` and `-wal2`). Used when reading an
+  /// on-disk SQLite file that may have been written in wal2 mode.
+  /// Returns null when no WAL exists.
+  Future<Uint8List?> _pickFreshWalBytes(String mainPath) async {
+    // Prefer the explicit live-slot record written by wal2 mode.
+    final meta = File('$mainPath-wal2.meta');
+    if (await meta.exists()) {
+      try {
+        final live = int.parse(utf8.decode(await meta.readAsBytes()).trim());
+        final p = live == 1 ? '$mainPath-wal' : '$mainPath-wal2';
+        final f = File(p);
+        if (await f.exists()) return f.readAsBytes();
+      } catch (_) {/* fall through to mtime-based pick */}
+    }
+    final candidates = <File>[];
+    for (final p in ['$mainPath-wal', '$mainPath-wal2']) {
+      final f = File(p);
+      if (await f.exists()) candidates.add(f);
+    }
+    if (candidates.isEmpty) return null;
+    candidates.sort((a, b) => b.statSync().modified.compareTo(
+        a.statSync().modified));
+    return candidates.first.readAsBytes();
+  }
+
+  /// Synchronous variant for code paths that already use sync I/O
+  /// (currently only the ATTACH-as-SQLite read path).
+  Uint8List? _pickFreshWalBytesSync(String mainPath) {
+    final meta = File('$mainPath-wal2.meta');
+    if (meta.existsSync()) {
+      try {
+        final live = int.parse(utf8.decode(meta.readAsBytesSync()).trim());
+        final p = live == 1 ? '$mainPath-wal' : '$mainPath-wal2';
+        final f = File(p);
+        if (f.existsSync()) return f.readAsBytesSync();
+      } catch (_) {/* fall through */}
+    }
+    final candidates = <File>[];
+    for (final p in ['$mainPath-wal', '$mainPath-wal2']) {
+      final f = File(p);
+      if (f.existsSync()) candidates.add(f);
+    }
+    if (candidates.isEmpty) return null;
+    candidates.sort((a, b) => b.statSync().modified.compareTo(
+        a.statSync().modified));
+    return candidates.first.readAsBytesSync();
   }
 
   Future<void> _load() async {
@@ -8041,10 +8138,16 @@ class Database {
         await importSqlite(path!);
         // The reissued CREATE/INSERTs above will have produced one or
         // more incremental WAL writes against our baseline. Drop any
-        // stale WAL — the in-memory state already equals "baseline +
+        // stale WAL(s) — the in-memory state already equals "baseline +
         // its original WAL", so the baseline alone is canonical.
-        final wf = File('${path!}-wal');
-        if (await wf.exists()) await wf.delete();
+        for (final p in [
+          '${path!}-wal',
+          '${path!}-wal2',
+          '${path!}-wal2.meta',
+        ]) {
+          final wf = File(p);
+          if (await wf.exists()) await wf.delete();
+        }
         return;
       }
     }
@@ -8361,13 +8464,10 @@ class Database {
   /// Returns a human-readable summary string describing what was loaded.
   Future<String> importSqlite(String path) async {
     final bytes = await File(path).readAsBytes();
-    // If the database is in WAL mode, the companion `<path>-wal` file
-    // may hold newer page versions. Load and overlay it transparently.
-    final walFile = File('$path-wal');
-    Uint8List? walBytes;
-    if (await walFile.exists()) {
-      walBytes = await walFile.readAsBytes();
-    }
+    // If the database is in WAL (or WAL2) mode, a `<path>-wal` and/or
+    // `<path>-wal2` companion may hold newer page versions. Pick the
+    // freshest one and overlay it transparently.
+    final walBytes = await _pickFreshWalBytes(path);
     final f = walBytes != null
         ? SqliteFile.fromBytesWithWal(bytes, walBytes)
         : SqliteFile.fromBytes(bytes);

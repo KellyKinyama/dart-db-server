@@ -68,14 +68,13 @@ void main() {
       }
     });
 
-    test('uses SEARCH...USING INDEX when an equality index matches',
-        () async {
+    test('uses SEARCH...USING INDEX when an equality index matches', () async {
       final db = await Database.open();
       try {
         await db.execute('CREATE TABLE t(a INT, b INT)');
         await db.execute('CREATE INDEX ix_a ON t(a)');
-        final r = await db
-            .execute('EXPLAIN QUERY PLAN SELECT * FROM t WHERE a = 5');
+        final r =
+            await db.execute('EXPLAIN QUERY PLAN SELECT * FROM t WHERE a = 5');
         final detail = r.rows.first[3].toString();
         expect(detail, contains('SEARCH t USING INDEX ix_a'));
       } finally {
