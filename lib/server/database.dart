@@ -18,6 +18,7 @@ import 'prepared.dart';
 import 'result.dart';
 import 'rtree.dart';
 import 'schema.dart';
+import 'session.dart';
 import 'sqlite_format.dart';
 import 'statement.dart';
 import 'table.dart';
@@ -2948,6 +2949,7 @@ class Database {
         inserted++;
         _lastInsertRowid = _rowidOfInsertedRow(t, row);
         _fireTriggers(t.name, 'INSERT', 'AFTER', newRow: row, sourceTable: t);
+        _recordChange(t, 'INSERT', null, row);
         if (returningExprs.isNotEmpty) {
           final view = t.rowToMap(row);
           returnedRows.add(returningExprs.map((e) => e.eval(view)).toList());
@@ -3136,6 +3138,7 @@ class Database {
     _rebuildIndexes(t);
     _fireTriggers(t.name, 'UPDATE', 'AFTER',
         newRow: newRow, oldRow: oldRow, sourceTable: t);
+    _recordChange(t, 'UPDATE', oldRow, newRow);
   }
 
   // ---------------------------------------------------------------------------
@@ -3232,6 +3235,7 @@ class Database {
         _cascadeOnUpdate(t, old, row);
         _fireTriggers(t.name, 'UPDATE', 'AFTER',
             oldRow: old, newRow: row, sourceTable: t);
+        _recordChange(t, 'UPDATE', old, row);
         if (returningExprs.isNotEmpty) {
           final v2 = t.rowToMap(row);
           returnedRows.add(returningExprs.map((e) => e.eval(v2)).toList());
@@ -3338,6 +3342,7 @@ class Database {
       if (deleted.isNotEmpty) _rebuildIndexes(t);
       for (final row in deleted) {
         _fireTriggers(t.name, 'DELETE', 'AFTER', oldRow: row, sourceTable: t);
+        _recordChange(t, 'DELETE', row, null);
       }
       if (s.returning != null) {
         return QueryResult(
@@ -9110,6 +9115,194 @@ class Database {
     final t = _tables[name];
     if (t == null) throw StateError('No such table: $name');
     return t;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Session / changeset extension
+  // ---------------------------------------------------------------------------
+
+  /// Live recording sessions. Mutations on watched tables are appended
+  /// to each one inside [_recordChange].
+  final List<Session> _sessions = [];
+
+  /// Begin a new mutation-recording session. By default the session
+  /// records every table; call [Session.attach] to scope it.
+  Session beginSession() {
+    final s = Session();
+    _sessions.add(s);
+    return s;
+  }
+
+  /// Forget the session. Future mutations will not be recorded into
+  /// it. The session itself remains valid for inspecting captured
+  /// changes / producing a changeset.
+  void detachSession(Session s) {
+    _sessions.remove(s);
+    s.close();
+  }
+
+  List<String> _pkColumnsOf(Table t) {
+    final out = <String>[];
+    for (final c in t.columns) {
+      if (c.primaryKey) out.add(c.name);
+    }
+    if (out.isEmpty) {
+      for (final con in t.constraints) {
+        if (con is PrimaryKeyConstraint) {
+          out.addAll(con.columns);
+          break;
+        }
+      }
+    }
+    return out;
+  }
+
+  void _recordChange(
+      Table t, String op, List<Object?>? oldRow, List<Object?>? newRow) {
+    if (_sessions.isEmpty) return;
+    final cols = [for (final c in t.columns) c.name];
+    final pk = _pkColumnsOf(t);
+    final change = Change(
+      op: op,
+      table: t.name,
+      columns: cols,
+      pkColumns: pk,
+      oldValues: oldRow == null ? null : List<Object?>.from(oldRow),
+      newValues: newRow == null ? null : List<Object?>.from(newRow),
+    );
+    for (final s in _sessions) {
+      s.recordInternal(change);
+    }
+  }
+
+  /// Apply a previously-recorded changeset blob to this database.
+  /// Returns the number of changes applied (skipped/aborted changes are
+  /// not counted). Pass [onConflict] to decide what to do when a row
+  /// is missing for UPDATE/DELETE or already present for INSERT — by
+  /// default conflicts are silently skipped.
+  Future<int> applyChangeset(
+    Uint8List bytes, {
+    ChangesetConflictHandler? onConflict,
+  }) async {
+    final changes = Session.decode(bytes);
+    final handler = onConflict ?? (_, __) => ConflictResolution.skip;
+    var applied = 0;
+    return _lock.write(() async {
+      for (final c in changes) {
+        final t = _tables[c.table] ??
+            _tables[c.table.toLowerCase()] ??
+            _tables[c.table.toUpperCase()];
+        if (t == null) {
+          final res = handler(c, ConflictKind.notFound);
+          if (res == ConflictResolution.abort) return applied;
+          continue;
+        }
+        // Map recorded column order -> current column order.
+        int? colIdxIn(List<String> cols, String name) {
+          for (var i = 0; i < cols.length; i++) {
+            if (cols[i].toLowerCase() == name.toLowerCase()) return i;
+          }
+          return null;
+        }
+
+        List<Object?> projectToCurrent(List<Object?> recorded) {
+          final out = List<Object?>.filled(t.columns.length, null);
+          for (var i = 0; i < t.columns.length; i++) {
+            final src = colIdxIn(c.columns, t.columns[i].name);
+            if (src != null && src < recorded.length) out[i] = recorded[src];
+          }
+          return out;
+        }
+
+        int? findRow(List<Object?> recorded) {
+          if (c.pkColumns.isEmpty) {
+            // Fall back to whole-row equality on the recorded columns.
+            for (var ri = 0; ri < t.rows.length; ri++) {
+              var match = true;
+              for (var k = 0; k < c.columns.length; k++) {
+                final ti = colIdxIn([for (final col in t.columns) col.name],
+                    c.columns[k]);
+                if (ti == null) {
+                  match = false;
+                  break;
+                }
+                if (t.rows[ri][ti] != recorded[k]) {
+                  match = false;
+                  break;
+                }
+              }
+              if (match) return ri;
+            }
+            return null;
+          }
+          // Locate by primary-key columns.
+          final pkIdxRecorded = [
+            for (final p in c.pkColumns) colIdxIn(c.columns, p)
+          ];
+          if (pkIdxRecorded.contains(null)) return null;
+          final pkIdxTable = [for (final p in c.pkColumns) t.columnIndex(p)];
+          for (var ri = 0; ri < t.rows.length; ri++) {
+            var match = true;
+            for (var k = 0; k < c.pkColumns.length; k++) {
+              if (t.rows[ri][pkIdxTable[k]] != recorded[pkIdxRecorded[k]!]) {
+                match = false;
+                break;
+              }
+            }
+            if (match) return ri;
+          }
+          return null;
+        }
+
+        switch (c.op) {
+          case 'INSERT':
+            final candidate = projectToCurrent(c.newValues!);
+            if (findRow(c.newValues!) != null) {
+              final res = handler(c, ConflictKind.notUnique);
+              if (res == ConflictResolution.abort) return applied;
+              if (res == ConflictResolution.replace) {
+                final ri = findRow(c.newValues!)!;
+                t.rows[ri] = candidate;
+                _rebuildIndexes(t);
+                applied++;
+              }
+              continue;
+            }
+            t.insertRow(candidate);
+            _rebuildIndexes(t);
+            applied++;
+            break;
+          case 'DELETE':
+            final ri = findRow(c.oldValues!);
+            if (ri == null) {
+              final res = handler(c, ConflictKind.notFound);
+              if (res == ConflictResolution.abort) return applied;
+              continue;
+            }
+            t.rows.removeAt(ri);
+            _rebuildIndexes(t);
+            applied++;
+            break;
+          case 'UPDATE':
+            final ri = findRow(c.oldValues!);
+            if (ri == null) {
+              final res = handler(c, ConflictKind.notFound);
+              if (res == ConflictResolution.abort) return applied;
+              continue;
+            }
+            t.rows[ri] = projectToCurrent(c.newValues!);
+            _rebuildIndexes(t);
+            applied++;
+            break;
+          default:
+            // unknown op — treat as conflict
+            final res = handler(c, ConflictKind.data);
+            if (res == ConflictResolution.abort) return applied;
+        }
+      }
+      await _persist();
+      return applied;
+    });
   }
 }
 
