@@ -390,7 +390,14 @@ class CreateVirtualTableStmt extends Statement {
 
 class VacuumStmt extends Statement {
   final String? schema;
-  VacuumStmt({this.schema});
+
+  /// Destination file path for `VACUUM INTO 'file'`. When non-null,
+  /// VACUUM writes a fresh SQLite-format database image to this path
+  /// (the local engine is not modified). When null, VACUUM is a no-op
+  /// (this engine already serializes the whole database on every write).
+  final String? intoPath;
+
+  VacuumStmt({this.schema, this.intoPath});
 }
 
 class AnalyzeStmt extends Statement {

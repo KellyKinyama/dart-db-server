@@ -19,8 +19,7 @@ void main() {
       final db = await Database.open();
       try {
         await seed(db);
-        final r = await db.execute(
-            'SELECT region, dept, sum(sal) AS s FROM s '
+        final r = await db.execute('SELECT region, dept, sum(sal) AS s FROM s '
             'GROUP BY ROLLUP(region, dept) ORDER BY region, dept');
         // 4 leaf rows + 2 region subtotals + 1 grand total = 7
         expect(r.rows.length, 7);
@@ -29,8 +28,8 @@ void main() {
             r.rows.firstWhere((row) => row[0] == null && row[1] == null);
         expect(grand[2], 1000);
         // Region subtotals: dept NULL, region non-null.
-        final eastSub = r.rows.firstWhere(
-            (row) => row[0] == 'east' && row[1] == null);
+        final eastSub =
+            r.rows.firstWhere((row) => row[0] == 'east' && row[1] == null);
         expect(eastSub[2], 300);
       } finally {
         await db.close();
@@ -43,8 +42,7 @@ void main() {
       final db = await Database.open();
       try {
         await seed(db);
-        final r = await db.execute(
-            'SELECT region, dept, sum(sal) AS s FROM s '
+        final r = await db.execute('SELECT region, dept, sum(sal) AS s FROM s '
             'GROUP BY CUBE(region, dept)');
         // 4 leaves + 2 region totals + 2 dept totals + 1 grand = 9
         expect(r.rows.length, 9);
@@ -63,13 +61,12 @@ void main() {
       final db = await Database.open();
       try {
         await seed(db);
-        final r = await db.execute(
-            'SELECT region, dept, sum(sal) AS s FROM s '
+        final r = await db.execute('SELECT region, dept, sum(sal) AS s FROM s '
             'GROUP BY GROUPING SETS ((region), (dept), ())');
         // 2 region + 2 dept + 1 grand = 5
         expect(r.rows.length, 5);
-        final grand = r.rows.firstWhere(
-            (row) => row[0] == null && row[1] == null);
+        final grand =
+            r.rows.firstWhere((row) => row[0] == null && row[1] == null);
         expect(grand[2], 1000);
       } finally {
         await db.close();
@@ -82,20 +79,20 @@ void main() {
       final db = await Database.open();
       try {
         await seed(db);
-        final r = await db.execute(
-            'SELECT region, dept, GROUPING(region) AS gr, '
-            'GROUPING(dept) AS gd, sum(sal) AS s '
-            'FROM s GROUP BY ROLLUP(region, dept)');
-        final grand = r.rows.firstWhere(
-            (row) => row[0] == null && row[1] == null);
+        final r =
+            await db.execute('SELECT region, dept, GROUPING(region) AS gr, '
+                'GROUPING(dept) AS gd, sum(sal) AS s '
+                'FROM s GROUP BY ROLLUP(region, dept)');
+        final grand =
+            r.rows.firstWhere((row) => row[0] == null && row[1] == null);
         expect(grand[2], 1);
         expect(grand[3], 1);
-        final regionSub = r.rows.firstWhere(
-            (row) => row[0] == 'east' && row[1] == null);
+        final regionSub =
+            r.rows.firstWhere((row) => row[0] == 'east' && row[1] == null);
         expect(regionSub[2], 0);
         expect(regionSub[3], 1);
-        final leaf = r.rows.firstWhere(
-            (row) => row[0] == 'east' && row[1] == 'sales');
+        final leaf =
+            r.rows.firstWhere((row) => row[0] == 'east' && row[1] == 'sales');
         expect(leaf[2], 0);
         expect(leaf[3], 0);
       } finally {

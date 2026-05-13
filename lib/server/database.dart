@@ -3920,8 +3920,7 @@ class Database {
   /// Expand a SELECT with GROUPING SETS / ROLLUP / CUBE into one
   /// per-set aggregation, blanking out projections of any grouping
   /// key that is NOT in the current set, and concatenate the results.
-  QueryResult _selectGroupingSets(
-      SelectStmt s, Map<String, Object?> outer) {
+  QueryResult _selectGroupingSets(SelectStmt s, Map<String, Object?> outer) {
     final allKeys = s.groupBy;
     String key(Expr e) {
       // Structural string. Default Object.toString() collapses every
@@ -3941,6 +3940,7 @@ class Database {
       if (e is UnaryExpr) return 'un:${e.op}(${key(e.operand)})';
       return e.toString();
     }
+
     final allKeyStrings = allKeys.map(key).toSet();
     final unionRows = <List<Object?>>[];
     List<String>? cols;
@@ -7911,11 +7911,31 @@ class Database {
   }
 
   /// VACUUM: in this engine, persistence already serialises the entire
-  /// database on every mutation, so VACUUM has no internal work to do
-  /// beyond signalling that a fresh on-disk image should be written.
-  /// (Returning is enough — the dispatcher persists after mutations.)
+  /// database on every mutation, so plain `VACUUM` has no internal work
+  /// to do. `VACUUM INTO 'path'` writes a consistent SQLite-format
+  /// image of the current database to the given path (the local engine
+  /// is not modified). The destination file is overwritten if it exists.
   QueryResult _vacuum(VacuumStmt s) {
-    return QueryResult.message('VACUUM ok');
+    final dest = s.intoPath;
+    if (dest == null) return QueryResult.message('VACUUM ok');
+    final bytes = _buildSqliteBytes(pageSize: _sqlitePageSize);
+    _atomicWriteBytesSync(dest, bytes);
+    return QueryResult.message('VACUUM INTO ok');
+  }
+
+  /// Online backup: write a consistent SQLite-format snapshot of the
+  /// current database to [destPath]. Acquires the writer arm of the
+  /// engine's read/write lock briefly to take the snapshot, then writes
+  /// outside the lock so concurrent readers/writers are not blocked
+  /// for the duration of the disk I/O.
+  ///
+  /// The destination is written via `<dest>.tmp` + atomic rename, so
+  /// readers of [destPath] either see the previous file or the new
+  /// complete file, never a partial write.
+  Future<void> backup(String destPath, {int pageSize = 4096}) async {
+    final bytes = await _lock
+        .write(() async => _buildSqliteBytes(pageSize: pageSize));
+    await _atomicWriteBytes(destPath, bytes);
   }
 
   /// REINDEX: rebuild ordered index structures from the underlying rows.
@@ -8119,6 +8139,28 @@ class Database {
       }
     }
     await File(tmp).rename(dest);
+  }
+
+  /// Synchronous variant of [_atomicWriteBytes]. Used from synchronous
+  /// dispatch paths (e.g. `VACUUM INTO`) where we cannot await.
+  static void _atomicWriteBytesSync(String dest, List<int> bytes) {
+    final tmp = '$dest.tmp';
+    final raf = File(tmp).openSync(mode: FileMode.write);
+    try {
+      raf.writeFromSync(bytes);
+      raf.flushSync();
+    } finally {
+      raf.closeSync();
+    }
+    if (Platform.isWindows) {
+      final destFile = File(dest);
+      if (destFile.existsSync()) {
+        try {
+          destFile.deleteSync();
+        } catch (_) {/* best-effort */}
+      }
+    }
+    File(tmp).renameSync(dest);
   }
 
   /// Recover from a previous crash mid-[_atomicWriteBytes]: if a stale

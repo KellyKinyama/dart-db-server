@@ -213,9 +213,19 @@ class Parser {
           _advance();
           String? schema;
           if (_check(TokType.ident)) schema = _advance().text;
-          _matchKw('INTO'); // accept and ignore: "VACUUM INTO 'file'"
-          if (_peek().type == TokType.string) _advance();
-          return VacuumStmt(schema: schema);
+          String? intoPath;
+          if (_matchKw('INTO')) {
+            // "VACUUM INTO 'file'" copies a consistent SQLite-format image
+            // of the current database to the given path. The string
+            // literal is the only accepted form (matches sqlite).
+            final tok = _peek();
+            if (tok.type != TokType.string) {
+              throw FormatException(
+                  'VACUUM INTO requires a string literal path');
+            }
+            intoPath = _advance().text;
+          }
+          return VacuumStmt(schema: schema, intoPath: intoPath);
         case 'ANALYZE':
           _advance();
           String? target;
