@@ -1206,6 +1206,66 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
   'LIKELY': (a) => a.isEmpty ? null : a[0],
   'UNLIKELY': (a) => a.isEmpty ? null : a[0],
   'LIKELIHOOD': (a) => a.isEmpty ? null : a[0],
+  // SOUNDEX(s) -- classic Soundex algorithm; returns 4-char code.
+  // NULL or empty string returns '?000' (matches SQLite's odd convention).
+  'SOUNDEX': (a) {
+    if (a.isEmpty || a[0] == null) return '?000';
+    final s = a[0].toString();
+    if (s.isEmpty) return '?000';
+    int upper(int cu) => (cu >= 0x61 && cu <= 0x7A) ? cu - 0x20 : cu;
+    String code(int cu) {
+      switch (upper(cu)) {
+        case 0x42: case 0x46: case 0x50: case 0x56: return '1';
+        case 0x43: case 0x47: case 0x4A: case 0x4B:
+        case 0x51: case 0x53: case 0x58: case 0x5A: return '2';
+        case 0x44: case 0x54: return '3';
+        case 0x4C: return '4';
+        case 0x4D: case 0x4E: return '5';
+        case 0x52: return '6';
+        default: return '';
+      }
+    }
+    bool isHW(int cu) {
+      final u = upper(cu);
+      return u == 0x48 || u == 0x57; // H or W
+    }
+    final out = StringBuffer(String.fromCharCode(upper(s.codeUnitAt(0))));
+    var prev = code(s.codeUnitAt(0));
+    for (var i = 1; i < s.length && out.length < 4; i++) {
+      final cu = s.codeUnitAt(i);
+      if (isHW(cu)) continue; // H and W are transparent: skip without resetting prev.
+      final c = code(cu);
+      if (c.isEmpty) {
+        // Vowel or other separator -- don't emit, but reset prev so the
+        // next consonant can repeat its code.
+        prev = '';
+        continue;
+      }
+      if (c != prev) out.write(c);
+      prev = c;
+    }
+    while (out.length < 4) {
+      out.write('0');
+    }
+    return out.toString();
+  },
+  // BASE64(blob_or_text) -- standard Base64 encoding.
+  'BASE64': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final v = a[0]!;
+    final bytes = v is List<int> ? v : utf8.encode(v.toString());
+    return base64.encode(bytes);
+  },
+  // UNBASE64(text) -- decodes Base64 string back to BLOB; returns NULL
+  // on malformed input.
+  'UNBASE64': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    try {
+      return base64.decode(a[0].toString());
+    } catch (_) {
+      return null;
+    }
+  },
   // UNHEX(X[, ignored]) — inverse of HEX. Returns NULL on malformed input
   // (matches SQLite). Optional second arg lists characters to skip; we
   // honor the SQLite default of allowing whitespace.
