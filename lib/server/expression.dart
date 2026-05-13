@@ -3,6 +3,7 @@ library;
 
 import 'dart:convert';
 import 'dart:math' as math;
+import 'dart:typed_data';
 
 import 'fts5.dart';
 import 'schema.dart';
@@ -1350,8 +1351,8 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
   'ZEROBLOB': (a) {
     if (a.isEmpty || a[0] == null) return null;
     final n = (a[0] as num).toInt();
-    if (n < 0) return <int>[];
-    return List<int>.filled(n, 0);
+    if (n < 0) return Uint8List(0);
+    return Uint8List(n);
   },
   // RANDOMBLOB(n) -- BLOB of n random bytes.
   'RANDOMBLOB': (a) {

@@ -19,7 +19,8 @@ void main() {
       final src = await Database.open();
       try {
         await src.execute('CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT)');
-        await src.execute("INSERT INTO t VALUES (1,'alice'),(2,'bob'),(3,'carol')");
+        await src
+            .execute("INSERT INTO t VALUES (1,'alice'),(2,'bob'),(3,'carol')");
 
         final dest = _tmp('backup_basic');
         await src.backup(dest);
@@ -80,8 +81,8 @@ void main() {
       try {
         await src.execute('CREATE TABLE p(id INTEGER PRIMARY KEY, sku TEXT)');
         await src.execute('CREATE INDEX p_sku ON p(sku)');
-        await src.execute(
-            "INSERT INTO p VALUES (1,'A'),(2,'B'),(3,'C'),(4,'A')");
+        await src
+            .execute("INSERT INTO p VALUES (1,'A'),(2,'B'),(3,'C'),(4,'A')");
 
         final dest = _tmp('backup_index');
         await src.backup(dest);

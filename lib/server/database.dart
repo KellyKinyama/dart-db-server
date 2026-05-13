@@ -10,6 +10,7 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'concurrency.dart';
+import 'blob.dart';
 import 'expression.dart';
 import 'fts5.dart';
 import 'parser.dart';
@@ -7933,9 +7934,68 @@ class Database {
   /// readers of [destPath] either see the previous file or the new
   /// complete file, never a partial write.
   Future<void> backup(String destPath, {int pageSize = 4096}) async {
-    final bytes = await _lock
-        .write(() async => _buildSqliteBytes(pageSize: pageSize));
+    final bytes =
+        await _lock.write(() async => _buildSqliteBytes(pageSize: pageSize));
     await _atomicWriteBytes(destPath, bytes);
+  }
+
+  /// Open an incremental BLOB I/O handle on a row's BLOB column,
+  /// analogous to SQLite's `sqlite3_blob_open`. [rowid] resolves the
+  /// target row by INTEGER PRIMARY KEY value when the table has one,
+  /// falling back to 1-based row position. The returned handle lets
+  /// callers stream bytes in/out of the column without copying the
+  /// entire blob through user code.
+  ///
+  /// Writable handles cannot grow the blob — pre-size with
+  /// `UPDATE t SET col = zeroblob(N) WHERE ...` first if needed.
+  ///
+  /// The handle holds a direct reference to the in-memory row, so
+  /// concurrent mutations to the same row are visible (and may
+  /// invalidate offsets). Treat handles as short-lived.
+  BlobHandle openBlob({
+    required String table,
+    required String column,
+    required int rowid,
+    bool writable = false,
+  }) {
+    final t = _tables[table] ??
+        _tables[table.toLowerCase()] ??
+        _tables[table.toUpperCase()];
+    if (t == null) {
+      throw ArgumentError('No such table: $table');
+    }
+    final colIdx = t.columnIndex(column);
+    final col = t.columns[colIdx];
+    if (col.type != DataType.blob && col.type != DataType.any) {
+      throw ArgumentError(
+          'Column $table.$column is ${col.type.name}, not BLOB');
+    }
+    int? pkIdx;
+    for (var i = 0; i < t.columns.length; i++) {
+      final c = t.columns[i];
+      if (c.primaryKey && c.type == DataType.integer) {
+        pkIdx = i;
+        break;
+      }
+    }
+    List<Object?>? row;
+    if (pkIdx != null) {
+      for (final r in t.rows) {
+        final v = r[pkIdx];
+        if (v is int && v == rowid) {
+          row = r;
+          break;
+        }
+      }
+    } else {
+      final idx = rowid - 1;
+      if (idx >= 0 && idx < t.rows.length) row = t.rows[idx];
+    }
+    if (row == null) {
+      throw StateError('No row with rowid $rowid in $table');
+    }
+    return BlobHandle.internal(row, colIdx,
+        tableName: table, columnName: column, writable: writable);
   }
 
   /// REINDEX: rebuild ordered index structures from the underlying rows.
