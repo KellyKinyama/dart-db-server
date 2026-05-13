@@ -1046,6 +1046,41 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
         if (n <= 0) return '';
         return s * n;
       }),
+  // ASCII(s) -- code point of the first character. SQLite returns the
+  // codepoint of the first UTF-8 byte in the input; we mirror Dart's
+  // String.codeUnitAt(0) which is the UTF-16 code unit, equivalent for
+  // ASCII inputs.
+  'ASCII': (a) => _propagateNull(a, () {
+        final s = a[0].toString();
+        return s.isEmpty ? null : s.codeUnitAt(0);
+      }),
+  // CHR(n) -- single-character string from a Unicode codepoint.
+  'CHR': (a) => _propagateNull(a, () {
+        return String.fromCharCode((a[0] as num).toInt());
+      }),
+  // SPACE(n) -- string of n spaces.
+  'SPACE': (a) => _propagateNull(a, () {
+        final n = (a[0] as num).toInt();
+        return n <= 0 ? '' : ' ' * n;
+      }),
+  // INITCAP(s) -- title-case each whitespace-separated word.
+  'INITCAP': (a) => _propagateNull(a, () {
+        final s = a[0].toString();
+        if (s.isEmpty) return s;
+        final out = StringBuffer();
+        var nextUpper = true;
+        for (var i = 0; i < s.length; i++) {
+          final c = s[i];
+          if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+            out.write(c);
+            nextUpper = true;
+            continue;
+          }
+          out.write(nextUpper ? c.toUpperCase() : c.toLowerCase());
+          nextUpper = false;
+        }
+        return out.toString();
+      }),
   'REPLACE': (a) => _propagateNull(
       a, () => a[0].toString().replaceAll(a[1].toString(), a[2].toString())),
   'CONCAT': (a) => a.map((v) => v ?? '').join(),
