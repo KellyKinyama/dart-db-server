@@ -17,10 +17,17 @@ const int _scaleMid = 10000;
 Future<void> _bench(String name, Future<void> Function() body) async {
   // Warm-up.
   await body();
-  final sw = Stopwatch()..start();
-  await body();
-  sw.stop();
-  stdout.writeln('  ${name.padRight(48)} ${sw.elapsedMicroseconds} us');
+  // Take the best of N runs to drop GC / scheduler jitter; using min
+  // (rather than mean) keeps the number reproducible across runs.
+  const reps = 5;
+  var bestUs = 1 << 62;
+  for (var i = 0; i < reps; i++) {
+    final sw = Stopwatch()..start();
+    await body();
+    sw.stop();
+    if (sw.elapsedMicroseconds < bestUs) bestUs = sw.elapsedMicroseconds;
+  }
+  stdout.writeln('  ${name.padRight(48)} $bestUs us  (best of $reps)');
 }
 
 Future<void> main() async {
@@ -106,8 +113,8 @@ Future<void> main() async {
   await _bench('GROUP BY over $_scaleMid rows', () async {
     final db = await Database.open();
     try {
-      await db.execute(
-          'CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT, n INTEGER)');
+      await db
+          .execute('CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT, n INTEGER)');
       final stmt = db.prepare('INSERT INTO t VALUES (?, ?, ?)');
       for (var i = 0; i < _scaleMid; i++) {
         await stmt.execute(positional: [i, 'k${i % 16}', i]);

@@ -46,14 +46,15 @@ class Database {
   Expr _parseSelectExprCached(String sql) {
     final cached = _exprCache[sql];
     if (cached != null) return cached;
-    final parsed = (Parser.fromString('SELECT $sql').parseStatement()
-            as SelectStmt)
-        .projection
-        .first
-        .expr!;
+    final parsed =
+        (Parser.fromString('SELECT $sql').parseStatement() as SelectStmt)
+            .projection
+            .first
+            .expr!;
     _exprCache[sql] = parsed;
     return parsed;
   }
+
   final Map<String, SelectStmt> _views = <String, SelectStmt>{};
 
   /// Original SELECT SQL text for each view, keyed by view name.
@@ -4045,11 +4046,14 @@ class Database {
         _planScan(reordered, outer) ?? _resolveFromRows(reordered, outer);
 
     // WHERE
-    var working = s.where == null
-        ? fromRows
-        : fromRows
-            .where((r) => evalPredicate(_bindExpr(s.where!, outer), r))
-            .toList();
+    var working = fromRows;
+    if (s.where != null) {
+      // Bind once outside the row loop — _bindExpr rebuilds the entire
+      // expression tree (subqueries, casts, function args, etc.), so
+      // calling it per row turns an O(N) scan into O(N * depth(expr)).
+      final boundWhere = _bindExpr(s.where!, outer);
+      working = fromRows.where((r) => evalPredicate(boundWhere, r)).toList();
+    }
 
     // Detect aggregates anywhere in projection or HAVING.
     final hasAggregates = s.groupBy.isNotEmpty ||
@@ -5224,6 +5228,10 @@ class Database {
       }
 
       final next = <Map<String, Object?>>[];
+      // Bind ON once per join — _bindExpr rebuilds the whole tree, so
+      // calling it per (l, r) pair turned a 1k x 1k join into a million
+      // tree rebuilds.
+      final boundOn = onExpr == null ? null : _bindExpr(onExpr);
       switch (j.type) {
         case 'CROSS':
           for (final l in working) {
@@ -5237,8 +5245,7 @@ class Database {
             var matched = false;
             for (final l in working) {
               final combined = {...l, ...r};
-              if (onExpr != null &&
-                  evalPredicate(_bindExpr(onExpr), combined)) {
+              if (boundOn != null && evalPredicate(boundOn, combined)) {
                 next.add(combined);
                 matched = true;
               }
@@ -5256,8 +5263,7 @@ class Database {
             var matched = false;
             for (var ri = 0; ri < right.length; ri++) {
               final combined = {...l, ...right[ri]};
-              if (onExpr != null &&
-                  evalPredicate(_bindExpr(onExpr), combined)) {
+              if (boundOn != null && evalPredicate(boundOn, combined)) {
                 next.add(combined);
                 matched = true;
                 matchedRightIdx.add(ri);
@@ -5280,8 +5286,7 @@ class Database {
             var matched = false;
             for (final r in right) {
               final combined = {...l, ...r};
-              if (onExpr != null &&
-                  evalPredicate(_bindExpr(onExpr), combined)) {
+              if (boundOn != null && evalPredicate(boundOn, combined)) {
                 next.add(combined);
                 matched = true;
               }
@@ -5296,8 +5301,7 @@ class Database {
           for (final l in working) {
             for (final r in right) {
               final combined = {...l, ...r};
-              if (onExpr != null &&
-                  evalPredicate(_bindExpr(onExpr), combined)) {
+              if (boundOn != null && evalPredicate(boundOn, combined)) {
                 next.add(combined);
               }
             }
@@ -6005,9 +6009,9 @@ class Database {
       case 'COUNT':
         if (e.isStarArg) return grp.length;
         if (e.args.isEmpty) return grp.length;
-        final values = grp
-            .map((r) => _bindExpr(e.args.first).eval(r))
-            .where((v) => v != null);
+        final boundArg = _bindExpr(e.args.first);
+        final values =
+            grp.map((r) => boundArg.eval(r)).where((v) => v != null);
         if (e.distinct) return values.map((v) => jsonEncode(v)).toSet().length;
         return values.length;
       case 'SUM':
