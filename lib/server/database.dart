@@ -5770,6 +5770,33 @@ class Database {
         return v == true || (v is num && v != 0);
       }).toList();
     }
+    if (e.aggOrderBy != null && e.aggOrderBy!.isNotEmpty) {
+      final bound = [
+        for (final ob in e.aggOrderBy!) (_bindExpr(ob.expr), ob),
+      ];
+      grp = List<Map<String, Object?>>.from(grp)
+        ..sort((a, b) {
+          for (final pair in bound) {
+            final ex = pair.$1;
+            final ob = pair.$2;
+            final av = ex.eval(a);
+            final bv = ex.eval(b);
+            final nullsFirst = ob.nullsFirst ?? !ob.descending;
+            int cmp;
+            if (av == null && bv == null) {
+              cmp = 0;
+            } else if (av == null) {
+              cmp = nullsFirst ? -1 : 1;
+            } else if (bv == null) {
+              cmp = nullsFirst ? 1 : -1;
+            } else {
+              cmp = sqlCompare(av, bv);
+            }
+            if (cmp != 0) return ob.descending ? -cmp : cmp;
+          }
+          return 0;
+        });
+    }
     switch (e.name) {
       case 'COUNT':
         if (e.isStarArg) return grp.length;
@@ -6518,7 +6545,8 @@ class Database {
           window: boundWindow,
           filterExpr: e.filterExpr == null
               ? null
-              : _bindExpr(e.filterExpr!, outerScope));
+              : _bindExpr(e.filterExpr!, outerScope),
+          aggOrderBy: e.aggOrderBy);
     }
     return e;
   }

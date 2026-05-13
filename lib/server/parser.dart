@@ -1793,6 +1793,14 @@ class Parser {
         }
       }
     }
+    List<WindowOrderItem>? aggOrderBy;
+    if (_matchKw('ORDER')) {
+      _expectKw('BY');
+      aggOrderBy = <WindowOrderItem>[_parseWindowOrderItem()];
+      while (_match(TokType.punct, ',')) {
+        aggOrderBy.add(_parseWindowOrderItem());
+      }
+    }
     _expect(TokType.punct, ')');
     // IIF(cond, a, b) desugars to CASE WHEN cond THEN a ELSE b END so
     // that branches short-circuit, matching SQLite semantics.
@@ -1820,7 +1828,8 @@ class Parser {
         isStarArg: isStar,
         distinct: distinct,
         window: window,
-        filterExpr: filterExpr);
+        filterExpr: filterExpr,
+        aggOrderBy: aggOrderBy);
   }
 
   WindowSpec _parseWindowSpec() {

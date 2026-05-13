@@ -563,11 +563,17 @@ class FunctionCallExpr extends Expr {
   /// `FILTER (WHERE ...)` predicate; rows where the filter is false are
   /// excluded from the aggregate / window aggregate.
   final Expr? filterExpr;
+
+  /// Optional `ORDER BY ...` inside an aggregate call (SQL standard,
+  /// SQLite ≥ 3.44). Currently honored by GROUP_CONCAT / STRING_AGG /
+  /// LISTAGG / JSON_GROUP_ARRAY / JSON_GROUP_OBJECT.
+  final List<WindowOrderItem>? aggOrderBy;
   FunctionCallExpr(this.name, this.args,
       {this.isStarArg = false,
       this.distinct = false,
       this.window,
-      this.filterExpr});
+      this.filterExpr,
+      this.aggOrderBy});
 
   bool get isAggregate => kAggregateFunctions.contains(name);
   bool get isWindow => window != null;
@@ -942,6 +948,8 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
         if (v is List<int>) return v.length;
         return v.toString().length;
       }),
+  'CHAR_LENGTH': (a) => kScalarFunctions['LENGTH']!(a),
+  'CHARACTER_LENGTH': (a) => kScalarFunctions['LENGTH']!(a),
   // OCTET_LENGTH: UTF-8 byte length for text, byte length for blobs.
   'OCTET_LENGTH': (a) => _propagateNull(a, () {
         final v = a[0]!;
