@@ -83,7 +83,6 @@ const int _pageKindOverflow = 2;
 const int _slotEntrySize = 4; // u16 offset + u16 length
 const int _dataPageHeaderSize = 8;
 const int _overflowPageHeaderSize = 8;
-const int _heapHeaderSize = 16;
 const int _tombstoneLen = 0xFFFF;
 
 /// Marker prefix indicating the slot payload is an overflow pointer

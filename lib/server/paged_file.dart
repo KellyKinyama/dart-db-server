@@ -313,12 +313,6 @@ class PagedFile {
     if (v != null) _cache[pageNo] = v;
   }
 
-  Future<void> _evictIfNeeded() async {
-    while (_cache.length > cacheCapacity) {
-      await _evictOne();
-    }
-  }
-
   /// Ensure there is room for at least one more page in the cache,
   /// evicting if necessary. Used by the cache-miss paths in [read] and
   /// [allocatePage] BEFORE the new page is inserted, so the new page

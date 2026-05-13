@@ -1244,22 +1244,6 @@ class PagedTable {
     }
     return null;
   }
-
-  /// SQL-ish value equality used to decide whether a secondary-index
-  /// entry needs to be rewritten on UPDATE. Mirrors Dart's `==` for the
-  /// concrete types we store, treating two nulls as equal.
-  static bool _valuesEqual(Object? a, Object? b) {
-    if (identical(a, b)) return true;
-    if (a == null || b == null) return false;
-    if (a is List<int> && b is List<int>) {
-      if (a.length != b.length) return false;
-      for (var i = 0; i < a.length; i++) {
-        if (a[i] != b[i]) return false;
-      }
-      return true;
-    }
-    return a == b;
-  }
 }
 
 /// Runtime state for one open secondary index.

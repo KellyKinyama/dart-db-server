@@ -1141,7 +1141,7 @@ class Database {
         final v = row[colIdx];
         if (v != null) keys.add(v);
       }
-      result[pname] = (pagedCol: pgCol!, keys: keys);
+      result[pname] = (pagedCol: pgCol, keys: keys);
       return result;
     }
     return result;
@@ -1335,35 +1335,6 @@ class Database {
       throw UnsupportedError(
           '$context: only literal values are supported on paged tables.');
     }
-  }
-
-  /// Extract a single equality `<pkName> = <literal>` from [where].
-  /// Returns the literal PK value, or null when [where] is null. Throws
-  /// when the predicate is anything else.
-  Object? _pagedExtractPkEq(Expr? where, String pkName, String context) {
-    if (where == null) return null;
-    if (where is BinaryExpr && where.op == '=') {
-      ColumnExpr? col;
-      Expr? lit;
-      if (where.left is ColumnExpr) {
-        col = where.left as ColumnExpr;
-        lit = where.right;
-      } else if (where.right is ColumnExpr) {
-        col = where.right as ColumnExpr;
-        lit = where.left;
-      }
-      if (col != null && lit != null) {
-        if (col.name.toLowerCase() != pkName.toLowerCase()) {
-          throw UnsupportedError(
-              '$context: WHERE on paged tables must reference the '
-              'primary key column "$pkName".');
-        }
-        return _evalLiteral(lit, context);
-      }
-    }
-    throw UnsupportedError(
-        '$context: only `WHERE $pkName = <literal>` is supported on '
-        'paged tables.');
   }
 
   /// Parsed shape of a paged-table WHERE clause. Either [eq] is set
@@ -1659,7 +1630,7 @@ class Database {
       if (v == null) return;
       byCol
           .putIfAbsent(col.name.toLowerCase(), () => [])
-          .add((op: op, value: v!));
+          .add((op: op, value: v));
     }
 
     visit(e);
