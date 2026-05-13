@@ -190,10 +190,11 @@ class Parser {
           return DescribeStmt(_expectIdent().text);
         case 'EXPLAIN':
           _advance();
-          // SQLite syntax: `EXPLAIN [QUERY PLAN] <stmt>`. We don't yet
-          // distinguish bytecode-EXPLAIN from EXPLAIN QUERY PLAN; both
-          // route through the same plan-tree formatter.
+          // SQLite syntax: `EXPLAIN [QUERY PLAN] <stmt>`. We support
+          // both forms; QUERY PLAN routes to a tree-shaped result while
+          // bare EXPLAIN emits synthesized bytecode rows.
           {
+            var queryPlan = false;
             final p0 = _peek();
             final p1 = _peek(1);
             if (p0.type == TokType.ident &&
@@ -202,9 +203,10 @@ class Parser {
                 p1.upper == 'PLAN') {
               _advance();
               _advance();
+              queryPlan = true;
             }
+            return ExplainStmt(_parseStatement(), isQueryPlan: queryPlan);
           }
-          return ExplainStmt(_parseStatement());
         case 'PRAGMA':
           return _parsePragma();
         case 'VACUUM':

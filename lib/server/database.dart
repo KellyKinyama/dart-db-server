@@ -6806,10 +6806,171 @@ class Database {
   }
 
   QueryResult _explain(ExplainStmt s) {
+    if (s.isQueryPlan) {
+      final rows = <List<Object?>>[];
+      _explainQueryPlanInto(s.target, parentId: 0, nextId: [1], out: rows);
+      _lastBytecode = const [];
+      return QueryResult(
+        columns: const ['id', 'parent', 'notused', 'detail'],
+        rows: rows,
+      );
+    }
+    final code = _explainBytecode(s.target);
+    _lastBytecode = code;
     return QueryResult(
-      columns: const ['plan'],
-      rows: _planLines(s.target).map((l) => <Object?>[l]).toList(),
+      columns: const [
+        'addr',
+        'opcode',
+        'p1',
+        'p2',
+        'p3',
+        'p4',
+        'p5',
+        'comment',
+      ],
+      rows: [for (final op in code) op.toList()],
     );
+  }
+
+  /// Buffer of the most recently emitted EXPLAIN bytecode rows; surfaced
+  /// by `PRAGMA vdbe_listing` so tools can re-read the last plan.
+  List<List<Object?>> _lastBytecode = const [];
+
+  /// Walk a statement and emit SQLite-shaped EXPLAIN QUERY PLAN rows.
+  void _explainQueryPlanInto(
+    Statement stmt, {
+    required int parentId,
+    required List<int> nextId,
+    required List<List<Object?>> out,
+  }) {
+    if (stmt is SelectStmt) {
+      final myId = nextId[0]++;
+      final t = _tables[stmt.fromTable];
+      String detail;
+      if (t == null) {
+        detail = 'SCAN ${stmt.fromTable}';
+      } else if (stmt.where != null) {
+        // Look for an index that covers any equality column in WHERE.
+        final used = _pickIndexForWhere(t, stmt.where!);
+        detail = used == null
+            ? 'SCAN ${stmt.fromTable}'
+            : 'SEARCH ${stmt.fromTable} USING INDEX $used';
+      } else {
+        detail = 'SCAN ${stmt.fromTable}';
+      }
+      out.add([myId, parentId, 0, detail]);
+      for (final j in stmt.joins) {
+        final jId = nextId[0]++;
+        out.add([jId, myId, 0, '${j.type} JOIN ${j.table}']);
+      }
+      if (stmt.groupBy.isNotEmpty) {
+        out.add([nextId[0]++, myId, 0, 'USE TEMP B-TREE FOR GROUP BY']);
+      }
+      if (stmt.orderBy.isNotEmpty) {
+        out.add([nextId[0]++, myId, 0, 'USE TEMP B-TREE FOR ORDER BY']);
+      }
+      if (stmt.setOp != null && stmt.setOpRight != null) {
+        out.add([nextId[0]++, myId, 0, 'COMPOUND ${stmt.setOp}']);
+        _explainQueryPlanInto(stmt.setOpRight!,
+            parentId: myId, nextId: nextId, out: out);
+      }
+    } else {
+      out.add([nextId[0]++, parentId, 0, stmt.runtimeType.toString()]);
+    }
+  }
+
+  /// Best-effort: pick an index whose first column appears in an equality
+  /// against a literal in [where]. Returns the index name, or null.
+  String? _pickIndexForWhere(Table t, Expr where) {
+    final eqCols = <String>{};
+    void walk(Expr e) {
+      if (e is BinaryExpr) {
+        if (e.op == '=' || e.op.toUpperCase() == 'IS') {
+          if (e.left is ColumnExpr && e.right is LiteralExpr) {
+            eqCols.add((e.left as ColumnExpr).name.toLowerCase());
+          } else if (e.right is ColumnExpr && e.left is LiteralExpr) {
+            eqCols.add((e.right as ColumnExpr).name.toLowerCase());
+          }
+        } else if (e.op.toUpperCase() == 'AND') {
+          walk(e.left);
+          walk(e.right);
+        }
+      }
+    }
+
+    walk(where);
+    if (eqCols.isEmpty) return null;
+    for (final entry in t.indexDefs.entries) {
+      if (entry.value.columns.isNotEmpty &&
+          eqCols.contains(entry.value.columns.first.toLowerCase())) {
+        return entry.key;
+      }
+    }
+    return null;
+  }
+
+  /// Synthesize a SQLite-shaped VDBE bytecode listing for [stmt]. We
+  /// don't run a real VDBE, but this approximates the shape of the
+  /// bytecode that SQLite would emit for the same logical plan, so
+  /// tools that consume `EXPLAIN`'s 8-column format keep working.
+  List<List<Object?>> _explainBytecode(Statement stmt) {
+    final rows = <List<Object?>>[];
+    var addr = 0;
+    void emit(String opcode,
+        [int p1 = 0,
+        int p2 = 0,
+        int p3 = 0,
+        Object? p4,
+        int p5 = 0,
+        String comment = '']) {
+      rows.add([addr++, opcode, p1, p2, p3, p4, p5, comment]);
+    }
+
+    emit('Init', 0, rows.length + 1, 0, null, 0, 'Start at 1');
+    if (stmt is SelectStmt) {
+      final t = _tables[stmt.fromTable];
+      final cols = t?.columns.length ?? stmt.projection.length;
+      emit('OpenRead', 0, 2, 0, '$cols', 0, stmt.fromTable ?? '');
+      final rewindAddr = addr;
+      emit('Rewind', 0, 0, 0, null, 0, 'jump if empty');
+      final loopStart = addr;
+      for (var i = 0; i < cols; i++) {
+        emit('Column', 0, i, i + 1, null, 0,
+            t != null ? t.columns[i].name : 'col$i');
+      }
+      emit('ResultRow', 1, cols, 0, null, 0, '');
+      emit('Next', 0, loopStart, 0, null, 1, '');
+      // Patch Rewind's p2 to point past the loop (Halt address).
+      final haltAddr = addr;
+      rows[rewindAddr][3] = haltAddr;
+      emit('Halt', 0, 0, 0, null, 0, '');
+      emit('Transaction', 0, 0, 1, '0', 1, '');
+      emit('Goto', 0, 1, 0, null, 0, '');
+    } else if (stmt is InsertStmt) {
+      emit('OpenWrite', 0, 2, 0, null, 0, stmt.table);
+      emit('NewRowid', 0, 1, 0, null, 0, '');
+      emit('MakeRecord', 2, 1, 3, null, 0, '');
+      emit('Insert', 0, 3, 1, stmt.table, 0, '');
+      emit('Halt', 0, 0, 0, null, 0, '');
+    } else if (stmt is UpdateStmt) {
+      emit('OpenWrite', 0, 2, 0, null, 0, stmt.table);
+      emit('Rewind', 0, addr + 4, 0, null, 0, '');
+      emit('Column', 0, 0, 1, null, 0, '');
+      emit('MakeRecord', 1, 1, 2, null, 0, '');
+      emit('Insert', 0, 2, 0, stmt.table, 0, '');
+      emit('Next', 0, addr - 3, 0, null, 1, '');
+      emit('Halt', 0, 0, 0, null, 0, '');
+    } else if (stmt is DeleteStmt) {
+      emit('OpenWrite', 0, 2, 0, null, 0, stmt.table);
+      emit('Rewind', 0, addr + 3, 0, null, 0, '');
+      emit('Delete', 0, 0, 0, null, 0, '');
+      emit('Next', 0, addr - 2, 0, null, 1, '');
+      emit('Halt', 0, 0, 0, null, 0, '');
+    } else {
+      emit('Noop', 0, 0, 0, stmt.runtimeType.toString(), 0, '');
+      emit('Halt', 0, 0, 0, null, 0, '');
+    }
+    return rows;
   }
 
   // ---------------------------------------------------------------------------
@@ -7072,22 +7233,35 @@ class Database {
       case 'vdbe_addoptrace':
       case 'vdbe_debug':
         {
-          // Bytecode VM introspection toggles. We have no VDBE bytecode,
-          // so accept and remember the value but emit no listing.
+          // Bytecode VM introspection toggles. We don't run a real VDBE,
+          // but we surface the synthesized bytecode left behind by the
+          // most recent EXPLAIN so tools that toggle this pragma and
+          // re-read the listing keep working.
           if (s.value != null) _pragmas[name] = s.value;
           return QueryResult(
-              columns: const ['addr', 'opcode', 'p1', 'p2', 'p3', 'p4', 'p5'],
-              rows: const []);
+              columns: const [
+                'addr',
+                'opcode',
+                'p1',
+                'p2',
+                'p3',
+                'p4',
+                'p5',
+                'comment',
+              ],
+              rows: [for (final r in _lastBytecode) List<Object?>.from(r)]);
         }
       case 'shrink_memory':
       case 'incremental_vacuum':
       case 'wal_checkpoint':
         {
-          return QueryResult(
-              columns: const ['busy', 'log', 'checkpointed'],
-              rows: const [
-                [0, 0, 0]
-              ]);
+          return QueryResult(columns: const [
+            'busy',
+            'log',
+            'checkpointed'
+          ], rows: const [
+            [0, 0, 0]
+          ]);
         }
       case 'wal2_checkpoint':
         {
@@ -7095,11 +7269,13 @@ class Database {
           // implement the dual-log scheme, but accept the pragma and
           // return a 3-column wal_checkpoint-shaped row so wrappers that
           // poll it don't error out.
-          return QueryResult(
-              columns: const ['busy', 'log', 'checkpointed'],
-              rows: const [
-                [0, 0, 0]
-              ]);
+          return QueryResult(columns: const [
+            'busy',
+            'log',
+            'checkpointed'
+          ], rows: const [
+            [0, 0, 0]
+          ]);
         }
       case 'max_trigger_depth':
         {
@@ -7107,11 +7283,11 @@ class Database {
             _pragmas[name] = s.value;
             return QueryResult.message('max_trigger_depth = ${s.value}');
           }
-          return QueryResult(
-              columns: const ['max_trigger_depth'],
-              rows: [
-                [_pragmas[name] ?? 1000]
-              ]);
+          return QueryResult(columns: const [
+            'max_trigger_depth'
+          ], rows: [
+            [_pragmas[name] ?? 1000]
+          ]);
         }
     }
     // Recognised PRAGMA names with sensible default return values when no
@@ -7299,8 +7475,7 @@ class Database {
     }
     final saved = _triggerScope;
     _triggerScope = {...?saved, ...scope};
-    final maxDepth =
-        (_pragmas['max_trigger_depth'] as num?)?.toInt() ?? 1000;
+    final maxDepth = (_pragmas['max_trigger_depth'] as num?)?.toInt() ?? 1000;
     final recursive = _truthy(_pragmas['recursive_triggers'] ?? 1);
     if (_triggerDepth >= maxDepth) {
       _triggerScope = saved;

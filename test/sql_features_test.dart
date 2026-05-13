@@ -281,7 +281,8 @@ void main() {
     test('EXPLAIN returns plan rows', () async {
       await db.execute('CREATE TABLE t(n INTEGER)');
       final r = await db.execute('EXPLAIN SELECT * FROM t WHERE n > 0');
-      expect(r.columns, ['plan']);
+      expect(r.columns,
+          ['addr', 'opcode', 'p1', 'p2', 'p3', 'p4', 'p5', 'comment']);
       expect(r.rows.length, greaterThan(0));
     });
 

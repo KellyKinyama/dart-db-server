@@ -404,7 +404,12 @@ class DescribeStmt extends Statement {
 
 class ExplainStmt extends Statement {
   final Statement target;
-  ExplainStmt(this.target);
+
+  /// True for `EXPLAIN QUERY PLAN <stmt>` (returns the SQLite-shaped
+  /// `(id, parent, notused, detail)` tree). False for plain `EXPLAIN`,
+  /// which returns synthesized VDBE bytecode rows.
+  final bool isQueryPlan;
+  ExplainStmt(this.target, {this.isQueryPlan = false});
 }
 
 class CreateTriggerStmt extends Statement {

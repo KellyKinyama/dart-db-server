@@ -40,8 +40,8 @@ void main() {
     test('INSERT cannot supply value for generated column', () async {
       final db = await Database.open();
       try {
-        await db.execute(
-            'CREATE TABLE t(a INT, b INT GENERATED ALWAYS AS (a+1))');
+        await db
+            .execute('CREATE TABLE t(a INT, b INT GENERATED ALWAYS AS (a+1))');
         await db.execute('INSERT INTO t(a) VALUES(5)');
         final r = await db.execute('SELECT a, b FROM t');
         expect(r.rows.first, [5, 6]);
@@ -55,8 +55,8 @@ void main() {
     test('UPDATE cannot assign to generated column', () async {
       final db = await Database.open();
       try {
-        await db.execute(
-            'CREATE TABLE t(a INT, b INT GENERATED ALWAYS AS (a+1))');
+        await db
+            .execute('CREATE TABLE t(a INT, b INT GENERATED ALWAYS AS (a+1))');
         await db.execute('INSERT INTO t(a) VALUES(2)');
         expect(() => db.execute('UPDATE t SET b=99'), throwsA(anything));
         await db.execute('UPDATE t SET a=10');
@@ -74,11 +74,9 @@ void main() {
       try {
         await db.execute('CREATE TABLE t(n INT)');
         await db.execute('PRAGMA max_trigger_depth = 8');
-        await db.execute(
-            'CREATE TRIGGER tr AFTER INSERT ON t BEGIN '
+        await db.execute('CREATE TRIGGER tr AFTER INSERT ON t BEGIN '
             'INSERT INTO t VALUES(NEW.n + 1); END');
-        expect(() => db.execute('INSERT INTO t VALUES(1)'),
-            throwsA(anything));
+        expect(() => db.execute('INSERT INTO t VALUES(1)'), throwsA(anything));
       } finally {
         await db.close();
       }
@@ -89,8 +87,7 @@ void main() {
       try {
         await db.execute('CREATE TABLE t(n INT)');
         await db.execute('PRAGMA recursive_triggers = 0');
-        await db.execute(
-            'CREATE TRIGGER tr AFTER INSERT ON t BEGIN '
+        await db.execute('CREATE TRIGGER tr AFTER INSERT ON t BEGIN '
             'INSERT INTO t VALUES(NEW.n + 1); END');
         await db.execute('INSERT INTO t VALUES(1)');
         // Initial row + one trigger insert; no further recursion.
