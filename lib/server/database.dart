@@ -2424,9 +2424,33 @@ class Database {
     }
 
     final rows = <List<Object?>>[];
+    // Phase 1.0: ASC ORDER BY on the PK can stream-skip the
+    // buffer-and-sort iff the underlying _pagedRangeStream is itself
+    // PK-ordered. That's true when the range has a PK eq, a PK
+    // upper/lower bound, or no predicate at all (full PK scan). When
+    // the residual would route through a *secondary index*, the
+    // stream emits in index order, not PK order — keep buffering.
+    final streamIsPkOrdered = range.eq != null ||
+        range.lower != null ||
+        range.upper != null ||
+        range.residual == null ||
+        _findIndexPlan(pt, range.residual!) == null;
+    if (hasOrderBy && !descending && streamIsPkOrdered) {
+      var skipped = 0;
+      await for (final row in _pagedRangeStream(pt, range)) {
+        if (skipped < offset) {
+          skipped++;
+          continue;
+        }
+        if (!unlimited && rows.length >= limit) break;
+        rows.add(project(row));
+      }
+      return QueryResult(columns: outCols, rows: rows);
+    }
     if (hasOrderBy) {
-      // Buffer all matched rows, sort by PK, apply OFFSET/LIMIT. The
-      // PK column is always present in the streamed row maps.
+      // DESC, or ASC over a secondary-index stream: buffer + sort by
+      // PK, then slice. (LIMIT-aware reverse PK streaming would need
+      // backwards heap iteration; out of scope for Phase 1.0.)
       final buf = <Map<String, Object?>>[];
       await for (final row in _pagedRangeStream(pt, range)) {
         buf.add(row);
