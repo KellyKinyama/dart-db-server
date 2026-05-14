@@ -4430,18 +4430,29 @@ class Database {
     if (s.where == null) {
       n = t.rows.length;
     } else {
-      // Try to serve the count from an index probe. _planScan returns
-      // hydrated maps; we just want the count, but reusing it keeps
-      // the path consistent. Bail when the planner declines (the
-      // residual would still need full materialisation, which is what
-      // the generic path already does).
-      final probed = _planScan(s, outer);
-      if (probed == null) return null;
-      // The plan may include a residual; re-apply the WHERE for safety.
-      final boundWhere = _bindExpr(s.where!, outer);
-      n = 0;
-      for (final r in probed) {
-        if (evalPredicate(boundWhere, r)) n++;
+      // Phase 1.7: super-fast path for `WHERE col = literal` where
+      // `col` has a single-column non-NOCASE non-partial index. The
+      // posting list length IS the answer — no row hydration, no
+      // per-row predicate eval. NULL literal short-circuits to 0
+      // since `col = NULL` is UNKNOWN in 3VL and our index doesn't
+      // store NULLs anyway.
+      final fast = _tryCountStarFastEqProbe(t, s.where!);
+      if (fast != null) {
+        n = fast;
+      } else {
+        // Try to serve the count from an index probe. _planScan returns
+        // hydrated maps; we just want the count, but reusing it keeps
+        // the path consistent. Bail when the planner declines (the
+        // residual would still need full materialisation, which is what
+        // the generic path already does).
+        final probed = _planScan(s, outer);
+        if (probed == null) return null;
+        // The plan may include a residual; re-apply the WHERE for safety.
+        final boundWhere = _bindExpr(s.where!, outer);
+        n = 0;
+        for (final r in probed) {
+          if (evalPredicate(boundWhere, r)) n++;
+        }
       }
     }
     final alias = p.alias ?? defaultAlias;
@@ -4453,7 +4464,40 @@ class Database {
     return QueryResult(columns: [alias], rows: rows, affected: rows.length);
   }
 
-  /// Phase 1.3 / 1.6 bare aggregate fast path. Recognises a SELECT
+  /// Phase 1.7 helper: when [where] is `col = literal` (or `literal =
+  /// col`) and `col` has a single-column non-NOCASE non-partial
+  /// index, return the posting-list length directly. Returns null when
+  /// the shape doesn't match. Returns 0 for `col = NULL` since
+  /// equality with NULL is UNKNOWN.
+  int? _tryCountStarFastEqProbe(Table t, Expr where) {
+    if (where is! BinaryExpr) return null;
+    if (where.op != '=') return null;
+    ColumnExpr? col;
+    LiteralExpr? lit;
+    if (where.left is ColumnExpr && where.right is LiteralExpr) {
+      col = where.left as ColumnExpr;
+      lit = where.right as LiteralExpr;
+    } else if (where.right is ColumnExpr && where.left is LiteralExpr) {
+      col = where.right as ColumnExpr;
+      lit = where.left as LiteralExpr;
+    } else {
+      return null;
+    }
+    if (lit.value == null) return 0;
+    final idx = _findIndexForColumn(t, col.name);
+    if (idx == null) return null;
+    if (idx.columns.length != 1) return null;
+    if (idx.collations.isNotEmpty &&
+        idx.collations[0].toUpperCase() == 'NOCASE') {
+      return null;
+    }
+    if (idx.whereSql != null) return null; // partial index
+    final indexMap = t.indexes[idx.name];
+    if (indexMap == null) return null;
+    final key = idx.collate(0, lit.value);
+    if (key == null) return 0;
+    return indexMap[key]?.length ?? 0;
+  }
   /// whose every projection item is one of:
   ///
   ///   * `MIN(col)` — col has a single-column non-partial non-NOCASE
