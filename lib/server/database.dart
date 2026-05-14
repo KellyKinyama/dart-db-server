@@ -4744,10 +4744,22 @@ class Database {
       final e = p.expr;
       if (e is! FunctionCallExpr) return null;
       final name = e.name.toUpperCase();
-      if (e.distinct) return null;
+      // Phase 2.9: DISTINCT supported for COUNT/SUM/AVG/TOTAL — each
+      // index key contributes weight 1 instead of its posting length.
+      // MIN/MAX(DISTINCT) is a no-op semantically; we still bail so
+      // the generic path handles the distinct flag uniformly.
+      final dist = e.distinct;
+      if (dist &&
+          name != 'COUNT' &&
+          name != 'SUM' &&
+          name != 'AVG' &&
+          name != 'TOTAL') {
+        return null;
+      }
       if (e.window != null) return null;
       if (e.filterExpr != null) return null;
       if (name == 'COUNT' && e.isStarArg) {
+        if (dist) return null; // COUNT(DISTINCT *) is invalid SQL
         cols.add(p.alias ?? 'count(*)');
         values.add(t.rows.length);
         continue;
@@ -4756,7 +4768,8 @@ class Database {
           name != 'MAX' &&
           name != 'SUM' &&
           name != 'AVG' &&
-          name != 'TOTAL') {
+          name != 'TOTAL' &&
+          name != 'COUNT') {
         return null;
       }
       if (e.args.length != 1) return null;
@@ -4769,15 +4782,28 @@ class Database {
           idx.collations[0].toUpperCase() == 'NOCASE') {
         return null;
       }
+      if (idx.whereSql != null) return null;
       final indexMap = t.indexes[idx.name];
       if (indexMap == null) return null;
       Object? value;
-      if (name == 'SUM' || name == 'AVG' || name == 'TOTAL') {
+      if (name == 'COUNT') {
+        // COUNT(col): sum of posting lengths (NULLs absent).
+        // COUNT(DISTINCT col): indexMap.length.
+        if (dist) {
+          value = indexMap.length;
+        } else {
+          var n = 0;
+          for (final v in indexMap.values) {
+            n += v.length;
+          }
+          value = n;
+        }
+      } else if (name == 'SUM' || name == 'AVG' || name == 'TOTAL') {
         // SUM/AVG/TOTAL ignore NULLs (already excluded — index doesn't
         // store them). SUM/AVG return NULL on empty per SQL; TOTAL
         // (SQLite extension) returns 0.0. Otherwise sum
-        // `key * postingLen`. Bail on non-numeric keys so the generic
-        // path handles type coercion / errors.
+        // `key * postingLen` (or just `key` under DISTINCT). Bail on
+        // non-numeric keys so the generic path handles type coercion.
         if (indexMap.isEmpty) {
           value = name == 'TOTAL' ? 0.0 : null;
         } else {
@@ -4788,8 +4814,8 @@ class Database {
             final k = entry.key;
             if (k is! num) return null;
             if (k is double) sawDouble = true;
-            acc += k * entry.value.length;
-            cnt += entry.value.length;
+            acc += dist ? k : k * entry.value.length;
+            cnt += dist ? 1 : entry.value.length;
           }
           if (name == 'AVG') {
             // AVG always returns REAL in SQLite when there are any rows.
@@ -4806,7 +4832,8 @@ class Database {
       } else if (indexMap.isNotEmpty) {
         value = name == 'MIN' ? indexMap.firstKey() : indexMap.lastKey();
       }
-      cols.add(p.alias ?? '${name.toLowerCase()}(${arg.name})');
+      cols.add(p.alias ??
+          '${name.toLowerCase()}(${dist ? "DISTINCT " : ""}${arg.name})');
       values.add(value);
     }
     var rows = <List<Object?>>[values];
@@ -4910,7 +4937,9 @@ class Database {
         return _emitEmptyAggregate(name, p, arg.name, distinct: isDistinct);
       }
       final k = idx.collate(0, lit.value);
-      if (k == null) return _emitEmptyAggregate(name, p, arg.name, distinct: isDistinct);
+      if (k == null) {
+        return _emitEmptyAggregate(name, p, arg.name, distinct: isDistinct);
+      }
       loKey = k;
       hiKey = k;
     } else if (where is BetweenExpr &&
