@@ -4178,86 +4178,89 @@ class Database {
 
     // ORDER BY
     if (s.orderBy.isNotEmpty) {
-      // Phase 0.7: when the scan already yielded rows in the requested
-      // order (because we walked a SplayTreeMap-backed index whose
-      // leading columns match the ORDER BY), skip the sort entirely.
-      // Only safe on the non-aggregate path, which preserves the input
-      // order through projection / window evaluation.
-      final canSkip =
-          !hasAggregates && _orderBySatisfiedByIndex(s);
-      if (canSkip) {
+      // Phase 0.7/0.8: when the scan already yielded rows in (or the
+      // exact reverse of) the requested order — because we walked a
+      // SplayTreeMap-backed index whose leading columns match the
+      // ORDER BY — skip the sort. For all-DESC matches we just reverse
+      // the materialized rows. Only safe on the non-aggregate path.
+      final dir = hasAggregates ? 0 : _orderBySatisfiedByIndex(s);
+      if (dir == 1) {
         _planSortSkipped = true;
+      } else if (dir == -1) {
+        _planSortSkipped = true;
+        resultRows = resultRows.reversed.toList();
       } else {
         final paired = List.generate(
-          resultRows.length, (i) => _Pair(orderingMaps[i], resultRows[i]));
-      paired.sort((a, b) {
-        for (final ob in s.orderBy) {
-          // ORDER BY <integer literal> => 1-based projected column position.
-          if (ob.expr is LiteralExpr && (ob.expr as LiteralExpr).value is int) {
-            final pos = ((ob.expr as LiteralExpr).value as int) - 1;
-            if (pos < 0 || pos >= a.row.length) {
-              throw StateError('ORDER BY position out of range');
+            resultRows.length, (i) => _Pair(orderingMaps[i], resultRows[i]));
+        paired.sort((a, b) {
+          for (final ob in s.orderBy) {
+            // ORDER BY <integer literal> => 1-based projected column position.
+            if (ob.expr is LiteralExpr &&
+                (ob.expr as LiteralExpr).value is int) {
+              final pos = ((ob.expr as LiteralExpr).value as int) - 1;
+              if (pos < 0 || pos >= a.row.length) {
+                throw StateError('ORDER BY position out of range');
+              }
+              final av = a.row[pos];
+              final bv = b.row[pos];
+              final nullsFirst = ob.nullsFirst ?? !ob.descending;
+              if (av == null && bv == null) continue;
+              if (av == null) return nullsFirst ? -1 : 1;
+              if (bv == null) return nullsFirst ? 1 : -1;
+              final c = sqlCompare(av, bv);
+              if (c != 0) return ob.descending ? -c : c;
+              continue;
             }
-            final av = a.row[pos];
-            final bv = b.row[pos];
+            final boundExpr = _bindExpr(ob.expr);
+            Object? av;
+            Object? bv;
+            if (boundExpr is ColumnExpr) {
+              final idx = outCols.indexOf(boundExpr.name);
+              if (boundExpr.table == null && idx >= 0) {
+                av = a.row[idx];
+                bv = b.row[idx];
+              } else {
+                av = boundExpr.eval(a.src);
+                bv = boundExpr.eval(b.src);
+              }
+            } else {
+              // For composite ORDER BY expressions, build an evaluation scope
+              // that overlays projected aliases on top of the source row so
+              // `ORDER BY alias + 1` (where `alias` was introduced in the
+              // SELECT list) works the same way SQLite does.
+              Map<String, Object?> scope(_Pair p) {
+                final m = Map<String, Object?>.from(p.src);
+                for (var j = 0; j < outCols.length && j < p.row.length; j++) {
+                  m[outCols[j]] = p.row[j];
+                }
+                return m;
+              }
+
+              try {
+                av = boundExpr.eval(scope(a));
+                bv = boundExpr.eval(scope(b));
+              } catch (_) {
+                // Fall back to projected column lookup if expression refers
+                // only to a projected alias.
+                if (ob.expr is ColumnExpr) {
+                  final idx = outCols.indexOf((ob.expr as ColumnExpr).name);
+                  if (idx >= 0) {
+                    av = a.row[idx];
+                    bv = b.row[idx];
+                  }
+                }
+              }
+            }
             final nullsFirst = ob.nullsFirst ?? !ob.descending;
             if (av == null && bv == null) continue;
             if (av == null) return nullsFirst ? -1 : 1;
             if (bv == null) return nullsFirst ? 1 : -1;
             final c = sqlCompare(av, bv);
             if (c != 0) return ob.descending ? -c : c;
-            continue;
           }
-          final boundExpr = _bindExpr(ob.expr);
-          Object? av;
-          Object? bv;
-          if (boundExpr is ColumnExpr) {
-            final idx = outCols.indexOf(boundExpr.name);
-            if (boundExpr.table == null && idx >= 0) {
-              av = a.row[idx];
-              bv = b.row[idx];
-            } else {
-              av = boundExpr.eval(a.src);
-              bv = boundExpr.eval(b.src);
-            }
-          } else {
-            // For composite ORDER BY expressions, build an evaluation scope
-            // that overlays projected aliases on top of the source row so
-            // `ORDER BY alias + 1` (where `alias` was introduced in the
-            // SELECT list) works the same way SQLite does.
-            Map<String, Object?> scope(_Pair p) {
-              final m = Map<String, Object?>.from(p.src);
-              for (var j = 0; j < outCols.length && j < p.row.length; j++) {
-                m[outCols[j]] = p.row[j];
-              }
-              return m;
-            }
-
-            try {
-              av = boundExpr.eval(scope(a));
-              bv = boundExpr.eval(scope(b));
-            } catch (_) {
-              // Fall back to projected column lookup if expression refers
-              // only to a projected alias.
-              if (ob.expr is ColumnExpr) {
-                final idx = outCols.indexOf((ob.expr as ColumnExpr).name);
-                if (idx >= 0) {
-                  av = a.row[idx];
-                  bv = b.row[idx];
-                }
-              }
-            }
-          }
-          final nullsFirst = ob.nullsFirst ?? !ob.descending;
-          if (av == null && bv == null) continue;
-          if (av == null) return nullsFirst ? -1 : 1;
-          if (bv == null) return nullsFirst ? 1 : -1;
-          final c = sqlCompare(av, bv);
-          if (c != 0) return ob.descending ? -c : c;
-        }
-        return 0;
-      });
-      resultRows = paired.map((p) => p.row).toList();
+          return 0;
+        });
+        resultRows = paired.map((p) => p.row).toList();
       }
     }
 
@@ -5429,8 +5432,7 @@ class Database {
       final pLen = plan.prefixKey!.length;
       _planScanOrderedAsc = List<String>.unmodifiable(cols);
       _planScanEqualityCols = {
-        for (var i = 0; i < pLen && i < cols.length; i++)
-          cols[i].toLowerCase()
+        for (var i = 0; i < pLen && i < cols.length; i++) cols[i].toLowerCase()
       };
       return;
     }
@@ -5439,41 +5441,60 @@ class Database {
     _planScanEqualityCols = const {};
   }
 
-  /// Returns true when [s.orderBy] is satisfied by the ordering that
+  /// Returns how [s.orderBy] is satisfied by the ordering that
   /// [_planScan] already produced (see [_planScanOrderedAsc]).
   ///
   /// Rules:
-  ///   * Every ORDER BY item must be a bare column reference, ASC, with
+  ///   * Every ORDER BY item must be a bare column reference with
   ///     default NULLS placement (which matches SplayTreeMap's natural
   ///     null-first ordering).
+  ///   * Either every non-equality item is ASC, or every non-equality
+  ///     item is DESC. Mixed direction is not satisfiable by a single
+  ///     forward / reverse walk.
   ///   * Equality-bound columns from the plan may appear in any
-  ///     position without consuming the ordered prefix.
+  ///     position / direction without consuming the ordered prefix.
   ///   * Otherwise, the remaining ORDER BY items must match the
   ///     remaining non-equality columns of [_planScanOrderedAsc] in
   ///     order.
-  bool _orderBySatisfiedByIndex(SelectStmt s) {
-    if (_planScanOrderedAsc.isEmpty) return false;
-    if (s.distinct) return false;
-    if (s.orderBy.isEmpty) return false;
+  ///
+  /// Returns `0` when not satisfied, `1` for ascending (no reversal
+  /// needed), `-1` for descending (caller should reverse the rows).
+  int _orderBySatisfiedByIndex(SelectStmt s) {
+    if (_planScanOrderedAsc.isEmpty) return 0;
+    if (s.distinct) return 0;
+    if (s.orderBy.isEmpty) return 0;
     final ordered = _planScanOrderedAsc;
     final eq = _planScanEqualityCols;
     var j = 0;
+    int? direction; // null = undecided, 1 = asc, -1 = desc
     for (final ob in s.orderBy) {
-      if (ob.descending) return false;
-      // SplayTreeMap orders nulls first; allow only that (or default).
-      if (ob.nullsFirst == false) return false;
+      // SplayTreeMap orders nulls first; allow only that (or default
+      // for ASC). For DESC, default is NULLS LAST — which after
+      // reversing an ascending nulls-first walk becomes nulls-last, so
+      // that's also fine.
+      if (ob.nullsFirst != null) {
+        final defaultNullsFirst = !ob.descending;
+        if (ob.nullsFirst != defaultNullsFirst) return 0;
+      }
       final e = ob.expr;
-      if (e is! ColumnExpr) return false;
+      if (e is! ColumnExpr) return 0;
       final name = e.name.toLowerCase();
       if (eq.contains(name)) continue;
+      // Direction must be consistent across non-equality items.
+      final dir = ob.descending ? -1 : 1;
+      if (direction == null) {
+        direction = dir;
+      } else if (direction != dir) {
+        return 0;
+      }
       while (j < ordered.length && eq.contains(ordered[j].toLowerCase())) {
         j++;
       }
-      if (j >= ordered.length) return false;
-      if (ordered[j].toLowerCase() != name) return false;
+      if (j >= ordered.length) return 0;
+      if (ordered[j].toLowerCase() != name) return 0;
       j++;
     }
-    return true;
+    return direction ?? 1;
   }
 
   List<Map<String, Object?>> _resolveFromRows(SelectStmt s,
