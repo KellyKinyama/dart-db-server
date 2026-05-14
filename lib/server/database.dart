@@ -4480,6 +4480,23 @@ class Database {
   /// summing posting-list lengths over the range of keys, walking the
   /// SplayTreeMap in sorted order.
   int? _tryCountStarFastEqProbe(Table t, Expr where) {
+    // ---- col IS NULL / col IS NOT NULL ----
+    if (where is UnaryExpr &&
+        where.operand is ColumnExpr &&
+        (where.op == 'IS NULL' || where.op == 'IS NOT NULL')) {
+      final col = where.operand as ColumnExpr;
+      final ix = _resolveSingleColIndex(t, col.name);
+      if (ix == null) return null;
+      final (_, indexMap) = ix;
+      // Indexes don't store NULL keys, so `not-null` is `sum(posting)`
+      // and `is-null` is `t.rows.length - that`.
+      var nonNull = 0;
+      for (final v in indexMap.values) {
+        nonNull += v.length;
+      }
+      if (where.op == 'IS NOT NULL') return nonNull;
+      return t.rows.length - nonNull;
+    }
     // ---- col IN (lit, lit, ...) ----
     if (where is InExpr && !where.negated) {
       final value = where.value;
@@ -4622,13 +4639,33 @@ class Database {
     if (lit.value == null) return null;
     switch (op) {
       case '>':
-        return (col: col.name, value: lit.value!, isLower: true, inclusive: false);
+        return (
+          col: col.name,
+          value: lit.value!,
+          isLower: true,
+          inclusive: false
+        );
       case '>=':
-        return (col: col.name, value: lit.value!, isLower: true, inclusive: true);
+        return (
+          col: col.name,
+          value: lit.value!,
+          isLower: true,
+          inclusive: true
+        );
       case '<':
-        return (col: col.name, value: lit.value!, isLower: false, inclusive: false);
+        return (
+          col: col.name,
+          value: lit.value!,
+          isLower: false,
+          inclusive: false
+        );
       case '<=':
-        return (col: col.name, value: lit.value!, isLower: false, inclusive: true);
+        return (
+          col: col.name,
+          value: lit.value!,
+          isLower: false,
+          inclusive: true
+        );
     }
     return null;
   }
@@ -4636,8 +4673,8 @@ class Database {
   /// Sum posting-list lengths for every key in [m] within
   /// `[loK, hiK]` (or open variants). Walks the SplayTreeMap in
   /// sorted order; O(matching keys + matching rows).
-  int _countRange(SplayTreeMap<Object, List<int>> m, Object loK,
-      bool loInc, Object hiK, bool hiInc) {
+  int _countRange(SplayTreeMap<Object, List<int>> m, Object loK, bool loInc,
+      Object hiK, bool hiInc) {
     var n = 0;
     for (final entry in m.entries) {
       final cLo = sqlCompare(entry.key, loK);
