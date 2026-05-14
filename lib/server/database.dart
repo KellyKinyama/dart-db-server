@@ -4173,6 +4173,12 @@ class Database {
     final gbc = _tryGroupByCountFast(s);
     if (gbc != null) return gbc;
 
+    // Phase 3.8: `SELECT DISTINCT col1, col2[, ...] FROM t
+    // [ORDER BY col1[, col2[, ...]]] [LIMIT/OFFSET]` covered by a
+    // composite index whose leading columns match the projection.
+    final dcm = _tryDistinctCompositeFast(s);
+    if (dcm != null) return dcm;
+
     final reordered = _reorderInnerJoins(s);
     final fromRows =
         _planScan(reordered, outer) ?? _resolveFromRows(reordered, outer);
@@ -5616,6 +5622,132 @@ class Database {
     return null;
   }
 
+  /// Phase 3.8: `SELECT DISTINCT c1, c2[, ...] FROM t
+  /// [ORDER BY c1[, c2[, ...]]] [LIMIT/OFFSET]` answered from a
+  /// composite index whose leading columns match the projection in
+  /// order. Each composite-index key already represents a distinct
+  /// (c1,...,ck) tuple, but multiple keys can share the leading
+  /// prefix when the projection is shorter than the index — we walk
+  /// in sorted order and dedupe adjacent prefix tuples.
+  QueryResult? _tryDistinctCompositeFast(SelectStmt s) {
+    if (!s.distinct) return null;
+    if (s.fromTable == null) return null;
+    if (s.joins.isNotEmpty) return null;
+    if (s.fromSubquery != null || s.fromFunction != null) return null;
+    if (s.where != null) return null;
+    if (s.groupBy.isNotEmpty || s.having != null) return null;
+    if (s.setOp != null) return null;
+    if (s.projection.length < 2) return null;
+    final colNames = <String>[];
+    for (final p in s.projection) {
+      if (p.isStar) return null;
+      final e = p.expr;
+      if (e is! ColumnExpr) return null;
+      colNames.add(e.name);
+    }
+    final t = _tables[s.fromTable!];
+    if (t == null) return null;
+    // Find a composite index whose leading columns match colNames in
+    // order (case-insensitive). Length k <= index.columns.length.
+    IndexDef? matched;
+    for (final d in t.indexDefs.values) {
+      if (d.exprSql != null) continue;
+      if (d.whereSql != null) continue;
+      if (d.columns.length < colNames.length) continue;
+      var ok = true;
+      for (var i = 0; i < colNames.length; i++) {
+        if (d.columns[i].toLowerCase() != colNames[i].toLowerCase()) {
+          ok = false;
+          break;
+        }
+        if (i < d.collations.length &&
+            d.collations[i].toUpperCase() == 'NOCASE') {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) {
+        matched = d;
+        break;
+      }
+    }
+    if (matched == null) return null;
+    final indexMap = t.indexes[matched.name];
+    if (indexMap == null) return null;
+
+    // Bail when the table contains rows whose leading col is NULL —
+    // the index has no NULL keys, but DISTINCT must include a NULL
+    // tuple if any row carries one.
+    var indexed = 0;
+    for (final v in indexMap.values) {
+      indexed += v.length;
+    }
+    if (indexed != t.rows.length) return null;
+
+    // ORDER BY: only ORDER BY <prefix-of-colNames> [ASC|DESC, all
+    // matching direction] is satisfied by the index walk.
+    var descending = false;
+    if (s.orderBy.isNotEmpty) {
+      if (s.orderBy.length > colNames.length) return null;
+      final firstDesc = s.orderBy.first.descending;
+      for (var i = 0; i < s.orderBy.length; i++) {
+        final ob = s.orderBy[i];
+        if (ob.expr is! ColumnExpr) return null;
+        if ((ob.expr as ColumnExpr).name.toLowerCase() !=
+            colNames[i].toLowerCase()) {
+          return null;
+        }
+        if (ob.descending != firstDesc) return null;
+      }
+      descending = firstDesc;
+    }
+
+    final k = colNames.length;
+    final isComposite = matched.columns.length > 1;
+    final out = <List<Object?>>[];
+    List<Object?>? prev;
+    bool sameTuple(List<Object?> a, List<Object?> b) {
+      for (var i = 0; i < k; i++) {
+        final av = a[i];
+        final bv = b[i];
+        if (av == null && bv == null) continue;
+        if (av == null || bv == null) return false;
+        if (sqlCompare(av, bv) != 0) return false;
+      }
+      return true;
+    }
+
+    Iterable<Object> keysIter =
+        descending ? indexMap.keys.toList().reversed : indexMap.keys;
+    for (final raw in keysIter) {
+      final tuple = <Object?>[];
+      if (isComposite) {
+        final parts = (raw as CompositeIndexKey).parts;
+        for (var i = 0; i < k; i++) {
+          tuple.add(parts[i]);
+        }
+      } else {
+        tuple.add(raw);
+      }
+      if (prev != null && sameTuple(prev, tuple)) continue;
+      out.add(tuple);
+      prev = tuple;
+    }
+
+    var rows = out;
+    final start = (s.offset ?? 0).clamp(0, rows.length);
+    var end = rows.length;
+    if (s.limit != null) end = (start + s.limit!).clamp(0, rows.length);
+    rows = rows.sublist(start, end);
+
+    final cols = <String>[
+      for (var i = 0; i < s.projection.length; i++)
+        s.projection[i].alias ?? colNames[i],
+    ];
+    if (s.orderBy.isNotEmpty) _planSortSkipped = true;
+    return QueryResult(columns: cols, rows: rows, affected: rows.length);
+  }
+
   /// Empty-input aggregate result for the `_tryAggregateWithWhereFast`
   /// path. Mirrors SQLite: COUNT/TOTAL are 0/0.0, everything else NULL.
   QueryResult _emitEmptyAggregate(String name, SelectItem p, String argName,
@@ -5666,6 +5798,12 @@ class Database {
     if (t == null) return null;
     final idx = _findIndexForColumn(t, colExpr.name);
     if (idx == null) return null;
+    // Covering scan only works for single-column indexes — composite
+    // keys would emit CompositeIndexKey instances as the projected
+    // value. Composite-leading DISTINCT is served by
+    // _tryDistinctCompositeFast (multi-projection) and GROUP BY /
+    // aggregate fast paths, so just bail here.
+    if (idx.columns.length != 1) return null;
     final indexMap = t.indexes[idx.name];
     if (indexMap == null) return null;
 
