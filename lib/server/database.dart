@@ -529,7 +529,10 @@ class Database {
       final tableName = name.substring(0, name.length - '.meta.json'.length);
       final base = '$dir/$tableName';
       try {
-        final pt = await PagedTable.open(base);
+        final ps = _pragmaPageSize();
+        final cc = _pragmaCacheCapacity(ps);
+        final pt =
+            await PagedTable.open(base, pageSize: ps, cacheCapacity: cc);
         pt.tableName = tableName;
         _pagedTables[tableName] = pt;
         // Re-register every secondary index this table owns so
@@ -922,8 +925,7 @@ class Database {
   /// PagedTable API and return the result. Returns null when the
   /// caller should fall through to the regular synchronous dispatch.
   Future<QueryResult?> _maybeRunPagedStmt(Statement stmt) async {
-    if (stmt is CreateTableStmt &&
-        (stmt.usingPaged || _shouldAutoPage(stmt))) {
+    if (stmt is CreateTableStmt && (stmt.usingPaged || _shouldAutoPage(stmt))) {
       _assertNoPagedDdlInTx('CREATE TABLE … USING paged');
       return _createPagedTable(stmt);
     }
@@ -1324,10 +1326,14 @@ class Database {
     ];
     final dir = Directory(_pagedDir!);
     if (!await dir.exists()) await dir.create(recursive: true);
+    final ps = _pragmaPageSize();
+    final cc = _pragmaCacheCapacity(ps);
     final pt = await PagedTable.create(
       '${_pagedDir!}/${s.name}',
       columns: cols,
       primaryKey: pkName,
+      pageSize: ps,
+      cacheCapacity: cc,
     );
     pt.tableName = s.name;
     _pagedTables[s.name] = pt;
@@ -1396,8 +1402,10 @@ class Database {
         } catch (_) {}
       }
     }
-    final fresh =
-        await PagedTable.create(base, columns: cols, primaryKey: pkName);
+    final ps = _pragmaPageSize();
+    final cc = _pragmaCacheCapacity(ps);
+    final fresh = await PagedTable.create(base,
+        columns: cols, primaryKey: pkName, pageSize: ps, cacheCapacity: cc);
     fresh.tableName = s.name;
     _pagedTables[s.name] = fresh;
     return QueryResult.message('paged table ${s.name} truncated');
@@ -9312,6 +9320,35 @@ class Database {
   /// Internal: predicate form of [_pagedTable]. Use at sites that only
   /// need to know whether [name] resolves to a paged table.
   bool _isPaged(String? name) => _pagedTable(name) != null;
+
+  /// Phase 0.3: resolve the current `PRAGMA page_size` to a value
+  /// valid for [PagedTable] / [PagedFile]. SQLite accepts power-of-two
+  /// page sizes in [512, 65536]; we follow the same rule and silently
+  /// fall back to 4096 for anything else (matches SQLite's behaviour
+  /// of ignoring invalid page_size values).
+  int _pragmaPageSize() {
+    final raw = _pragmas['page_size'];
+    final n = raw is num ? raw.toInt() : int.tryParse('$raw') ?? 4096;
+    if (n < 512 || n > 65536) return 4096;
+    // Power-of-two check.
+    if ((n & (n - 1)) != 0) return 4096;
+    return n;
+  }
+
+  /// Phase 0.3: resolve the current `PRAGMA cache_size` to the number
+  /// of pages we want the paged-table LRU to hold. SQLite convention:
+  /// negative values are sized in KiB (so cache_size = -2000 means
+  /// 2 MiB regardless of page_size); positive values are page counts.
+  /// Zero means "engine default" — we use 64 pages.
+  int _pragmaCacheCapacity(int pageSize) {
+    final raw = _pragmas['cache_size'];
+    final n = raw is num ? raw.toInt() : int.tryParse('$raw') ?? -2000;
+    if (n == 0) return 64;
+    if (n > 0) return n.clamp(2, 1 << 20);
+    final kib = -n;
+    final pages = (kib * 1024) ~/ pageSize;
+    return pages.clamp(2, 1 << 20);
+  }
 
   /// Phase 0.2: decide whether a bare `CREATE TABLE` (no explicit
   /// `USING paged`) should be auto-routed to the paged backend based

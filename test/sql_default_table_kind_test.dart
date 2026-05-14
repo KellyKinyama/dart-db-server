@@ -84,8 +84,8 @@ void main() {
       expect(db.lookupBackend('comp')!.kind, TableBackendKind.memory);
 
       // STRICT -> not paged-eligible.
-      await db.execute(
-          'CREATE TABLE s (id INTEGER PRIMARY KEY, x TEXT) STRICT');
+      await db
+          .execute('CREATE TABLE s (id INTEGER PRIMARY KEY, x TEXT) STRICT');
       expect(db.lookupBackend('s')!.kind, TableBackendKind.memory);
     } finally {
       await db.close();

@@ -201,7 +201,10 @@ class PagedTable implements TableBackend {
   }
 
   /// Open an existing paged table from `<basePath>.meta.json`. Throws
-  /// if the metadata file does not exist.
+  /// if the metadata file does not exist. When the metadata records a
+  /// `pageSize`, it overrides the [pageSize] argument (the on-disk
+  /// page size is authoritative — changing it after the table exists
+  /// would corrupt every page boundary).
   static Future<PagedTable> open(
     String basePath, {
     int pageSize = 4096,
@@ -211,8 +214,9 @@ class PagedTable implements TableBackend {
     if (meta == null) {
       throw StateError('PagedTable: no metadata at $basePath.meta.json');
     }
+    final effectivePageSize = meta.pageSize ?? pageSize;
     return _openWith(basePath, meta.columns, meta.pkIndex, meta.indexes,
-        pageSize: pageSize, cacheCapacity: cacheCapacity);
+        pageSize: effectivePageSize, cacheCapacity: cacheCapacity);
   }
 
   /// Create a brand-new paged table. Refuses to overwrite an existing
@@ -236,7 +240,7 @@ class PagedTable implements TableBackend {
     }
     // Write schema first so a crash before any heap/index writes leaves
     // a recoverable empty table.
-    await _writeMeta(basePath, columns, pkIdx, const []);
+    await _writeMeta(basePath, columns, pkIdx, const [], pageSize: pageSize);
     return _openWith(basePath, columns, pkIdx, const [],
         pageSize: pageSize, cacheCapacity: cacheCapacity);
   }
@@ -252,8 +256,9 @@ class PagedTable implements TableBackend {
   }) async {
     final meta = await _readMeta(basePath);
     if (meta != null) {
+      final effectivePageSize = meta.pageSize ?? pageSize;
       return _openWith(basePath, meta.columns, meta.pkIndex, meta.indexes,
-          pageSize: pageSize, cacheCapacity: cacheCapacity);
+          pageSize: effectivePageSize, cacheCapacity: cacheCapacity);
     }
     return create(basePath,
         columns: columns,
@@ -328,6 +333,11 @@ class PagedTable implements TableBackend {
 
   /// Number of rows currently in the table.
   int get length => _index.length;
+
+  /// Bytes per page used by this table's heap + index files. Set at
+  /// [create] time, persisted in `meta.json`, and authoritative on
+  /// reopen (the on-disk value overrides any caller-supplied default).
+  int get pageSize => _heapFile.pageSize;
 
   /// Insert a row. The map's keys must be a subset of the column names;
   /// missing columns are stored as NULL. Throws if a row with the same
@@ -737,7 +747,8 @@ class PagedTable implements TableBackend {
     // Persist the schema change *after* the backfilled index is on disk;
     // a crash before this point leaves an orphan file the next open will
     // ignore (since meta.json doesn't list it).
-    await _writeMeta(basePath, columns, primaryKeyIndex, _indexDescriptors());
+    await _writeMeta(basePath, columns, primaryKeyIndex, _indexDescriptors(),
+        pageSize: _heapFile.pageSize);
   }
 
   /// Drop secondary index [name]. Removes the on-disk files and
@@ -749,7 +760,8 @@ class PagedTable implements TableBackend {
     await si.file.close();
     // Persist schema first so a crash mid-delete still removes the
     // index from the next opener's view.
-    await _writeMeta(basePath, columns, primaryKeyIndex, _indexDescriptors());
+    await _writeMeta(basePath, columns, primaryKeyIndex, _indexDescriptors(),
+        pageSize: _heapFile.pageSize);
     for (final ext in const ['', '.journal']) {
       final f = File('$basePath.idx_$name$ext');
       if (await f.exists()) {
@@ -897,6 +909,7 @@ class PagedTable implements TableBackend {
       ({
         List<PagedColumn> columns,
         int pkIndex,
+        int? pageSize,
         List<({String name, List<String> columns, bool unique})> indexes,
       })?> _readMeta(String basePath) async {
     final f = File('$basePath.meta.json');
@@ -907,6 +920,8 @@ class PagedTable implements TableBackend {
         .map(PagedColumn.fromJson)
         .toList();
     final pkIdx = (j['pkIndex'] as num).toInt();
+    final psRaw = j['pageSize'];
+    final pageSize = psRaw is num ? psRaw.toInt() : null;
     final rawIdx = j['indexes'];
     final indexes = <({String name, List<String> columns, bool unique})>[];
     if (rawIdx is List) {
@@ -933,18 +948,20 @@ class PagedTable implements TableBackend {
         }
       }
     }
-    return (columns: cols, pkIndex: pkIdx, indexes: indexes);
+    return (columns: cols, pkIndex: pkIdx, pageSize: pageSize, indexes: indexes);
   }
 
   static Future<void> _writeMeta(
       String basePath,
       List<PagedColumn> columns,
       int pkIndex,
-      List<({String name, List<String> columns, bool unique})> indexes) async {
+      List<({String name, List<String> columns, bool unique})> indexes,
+      {int? pageSize}) async {
     final j = jsonEncode({
       'version': 1,
       'columns': [for (final c in columns) c.toJson()],
       'pkIndex': pkIndex,
+      if (pageSize != null) 'pageSize': pageSize,
       'indexes': [
         for (final ent in indexes)
           {

@@ -857,6 +857,19 @@ class Parser {
       _advance();
       return t.text;
     }
+    // Allow signed numeric literals (e.g. `PRAGMA cache_size = -2000`).
+    // SQLite accepts negative cache_size as a KiB hint; positive values
+    // are page counts.
+    if (t.type == TokType.op && (t.text == '-' || t.text == '+')) {
+      final sign = t.text;
+      _advance();
+      final inner = _parsePrimary();
+      if (inner is LiteralExpr) {
+        final v = inner.value;
+        if (v is num) return sign == '-' ? -v : v;
+      }
+      throw FormatException('Expected numeric literal after $sign in PRAGMA');
+    }
     final e = _parsePrimary();
     if (e is LiteralExpr) return e.value;
     throw FormatException('Expected literal in PRAGMA value');
