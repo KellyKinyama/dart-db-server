@@ -4,6 +4,7 @@
 library;
 
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
@@ -4473,21 +4474,19 @@ class Database {
   /// Phase 1.8 extends this to `col IN (lit1, lit2, ...)` (and the
   /// negated `NOT IN` is *not* handled — it would require complementing
   /// the whole row count and dealing with NULLs).
+  ///
+  /// Phase 1.9 also handles `col BETWEEN lo AND hi` and the explicit
+  /// `col >= lo AND col <= hi` (and < / > variants) AND-chains by
+  /// summing posting-list lengths over the range of keys, walking the
+  /// SplayTreeMap in sorted order.
   int? _tryCountStarFastEqProbe(Table t, Expr where) {
     // ---- col IN (lit, lit, ...) ----
     if (where is InExpr && !where.negated) {
       final value = where.value;
       if (value is! ColumnExpr) return null;
-      final idx = _findIndexForColumn(t, value.name);
-      if (idx == null) return null;
-      if (idx.columns.length != 1) return null;
-      if (idx.collations.isNotEmpty &&
-          idx.collations[0].toUpperCase() == 'NOCASE') {
-        return null;
-      }
-      if (idx.whereSql != null) return null;
-      final indexMap = t.indexes[idx.name];
-      if (indexMap == null) return null;
+      final ix = _resolveSingleColIndex(t, value.name);
+      if (ix == null) return null;
+      final (idx, indexMap) = ix;
       // Every list element must be a literal.
       final seenKeys = <Object>{};
       var n = 0;
@@ -4502,6 +4501,52 @@ class Database {
         n += indexMap[k]?.length ?? 0;
       }
       return n;
+    }
+    // ---- col BETWEEN lo AND hi (non-negated) ----
+    if (where is BetweenExpr && !where.negated) {
+      final value = where.value;
+      if (value is! ColumnExpr) return null;
+      if (where.low is! LiteralExpr || where.high is! LiteralExpr) return null;
+      final loRaw = (where.low as LiteralExpr).value;
+      final hiRaw = (where.high as LiteralExpr).value;
+      if (loRaw == null || hiRaw == null) return 0;
+      final ix = _resolveSingleColIndex(t, value.name);
+      if (ix == null) return null;
+      final (idx, indexMap) = ix;
+      final loK = idx.collate(0, loRaw);
+      final hiK = idx.collate(0, hiRaw);
+      if (loK == null || hiK == null) return 0;
+      return _countRange(indexMap, loK, true, hiK, true);
+    }
+    // ---- col >= a AND col <= b (and the < / > flavours) ----
+    if (where is BinaryExpr &&
+        where.op == 'AND' &&
+        where.left is BinaryExpr &&
+        where.right is BinaryExpr) {
+      final lo = _extractRangeBound(where.left as BinaryExpr);
+      final hi = _extractRangeBound(where.right as BinaryExpr);
+      if (lo != null && hi != null && lo.col == hi.col) {
+        // One side must be a lower bound (>, >=) and the other an
+        // upper bound (<, <=); otherwise this is not a range.
+        ({Object value, bool inclusive})? loB;
+        ({Object value, bool inclusive})? hiB;
+        if (lo.isLower && !hi.isLower) {
+          loB = (value: lo.value, inclusive: lo.inclusive);
+          hiB = (value: hi.value, inclusive: hi.inclusive);
+        } else if (!lo.isLower && hi.isLower) {
+          loB = (value: hi.value, inclusive: hi.inclusive);
+          hiB = (value: lo.value, inclusive: lo.inclusive);
+        } else {
+          return null;
+        }
+        final ix = _resolveSingleColIndex(t, lo.col);
+        if (ix == null) return null;
+        final (idx, indexMap) = ix;
+        final loK = idx.collate(0, loB.value);
+        final hiK = idx.collate(0, hiB.value);
+        if (loK == null || hiK == null) return 0;
+        return _countRange(indexMap, loK, loB.inclusive, hiK, hiB.inclusive);
+      }
     }
     // ---- col = literal ----
     if (where is! BinaryExpr) return null;
@@ -4518,19 +4563,90 @@ class Database {
       return null;
     }
     if (lit.value == null) return 0;
-    final idx = _findIndexForColumn(t, col.name);
+    final ix = _resolveSingleColIndex(t, col.name);
+    if (ix == null) return null;
+    final (idx, indexMap) = ix;
+    final key = idx.collate(0, lit.value);
+    if (key == null) return 0;
+    return indexMap[key]?.length ?? 0;
+  }
+
+  /// Resolves [colName] to a single-column non-NOCASE non-partial
+  /// index on [t]. Returns the (def, treeMap) pair or null when no
+  /// such index exists.
+  (IndexDef, SplayTreeMap<Object, List<int>>)? _resolveSingleColIndex(
+      Table t, String colName) {
+    final idx = _findIndexForColumn(t, colName);
     if (idx == null) return null;
     if (idx.columns.length != 1) return null;
     if (idx.collations.isNotEmpty &&
         idx.collations[0].toUpperCase() == 'NOCASE') {
       return null;
     }
-    if (idx.whereSql != null) return null; // partial index
-    final indexMap = t.indexes[idx.name];
-    if (indexMap == null) return null;
-    final key = idx.collate(0, lit.value);
-    if (key == null) return 0;
-    return indexMap[key]?.length ?? 0;
+    if (idx.whereSql != null) return null;
+    final m = t.indexes[idx.name];
+    if (m == null) return null;
+    return (idx, m);
+  }
+
+  /// Phase 1.9 helper: parse `col OP literal` (or commuted) where OP
+  /// is one of `<`, `<=`, `>`, `>=`. Returns the column name, the
+  /// literal value, whether it's a lower bound (> / >=), and whether
+  /// the bound is inclusive. Returns null on any other shape or NULL
+  /// literal.
+  ({String col, Object value, bool isLower, bool inclusive})?
+      _extractRangeBound(BinaryExpr e) {
+    var op = e.op;
+    ColumnExpr? col;
+    LiteralExpr? lit;
+    if (e.left is ColumnExpr && e.right is LiteralExpr) {
+      col = e.left as ColumnExpr;
+      lit = e.right as LiteralExpr;
+    } else if (e.right is ColumnExpr && e.left is LiteralExpr) {
+      col = e.right as ColumnExpr;
+      lit = e.left as LiteralExpr;
+      // Commute the operator: literal OP col  <->  col OP' literal.
+      switch (op) {
+        case '<':
+          op = '>';
+        case '<=':
+          op = '>=';
+        case '>':
+          op = '<';
+        case '>=':
+          op = '<=';
+      }
+    } else {
+      return null;
+    }
+    if (lit.value == null) return null;
+    switch (op) {
+      case '>':
+        return (col: col.name, value: lit.value!, isLower: true, inclusive: false);
+      case '>=':
+        return (col: col.name, value: lit.value!, isLower: true, inclusive: true);
+      case '<':
+        return (col: col.name, value: lit.value!, isLower: false, inclusive: false);
+      case '<=':
+        return (col: col.name, value: lit.value!, isLower: false, inclusive: true);
+    }
+    return null;
+  }
+
+  /// Sum posting-list lengths for every key in [m] within
+  /// `[loK, hiK]` (or open variants). Walks the SplayTreeMap in
+  /// sorted order; O(matching keys + matching rows).
+  int _countRange(SplayTreeMap<Object, List<int>> m, Object loK,
+      bool loInc, Object hiK, bool hiInc) {
+    var n = 0;
+    for (final entry in m.entries) {
+      final cLo = sqlCompare(entry.key, loK);
+      if (cLo < 0 || (cLo == 0 && !loInc)) continue;
+      final cHi = sqlCompare(entry.key, hiK);
+      if (cHi > 0 || (cHi == 0 && !hiInc)) break;
+      n += entry.value.length;
+    }
+    return n;
   }
 
   /// whose every projection item is one of:
