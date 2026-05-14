@@ -4723,7 +4723,9 @@ class Database {
         values.add(t.rows.length);
         continue;
       }
-      if (name != 'MIN' && name != 'MAX' && name != 'SUM') return null;
+      if (name != 'MIN' && name != 'MAX' && name != 'SUM' && name != 'AVG') {
+        return null;
+      }
       if (e.args.length != 1) return null;
       final arg = e.args.first;
       if (arg is! ColumnExpr) return null;
@@ -4737,8 +4739,8 @@ class Database {
       final indexMap = t.indexes[idx.name];
       if (indexMap == null) return null;
       Object? value;
-      if (name == 'SUM') {
-        // SUM ignores NULLs (already excluded — index doesn't store
+      if (name == 'SUM' || name == 'AVG') {
+        // SUM/AVG ignore NULLs (already excluded — index doesn't store
         // them). Empty index is NULL per SQL. Otherwise sum
         // `key * postingLen`. Bail on non-numeric keys so the generic
         // path handles type coercion / errors.
@@ -4746,16 +4748,23 @@ class Database {
           value = null;
         } else {
           num acc = 0;
+          var cnt = 0;
           var sawDouble = false;
           for (final entry in indexMap.entries) {
             final k = entry.key;
             if (k is! num) return null;
             if (k is double) sawDouble = true;
             acc += k * entry.value.length;
+            cnt += entry.value.length;
           }
-          // If every key was an int and the running total stayed int,
-          // emit int; otherwise emit double to match SQLite behaviour.
-          value = (sawDouble || acc is! int) ? acc.toDouble() : acc;
+          if (name == 'AVG') {
+            // AVG always returns REAL in SQLite when there are any rows.
+            value = acc / cnt;
+          } else {
+            // If every key was an int and the running total stayed int,
+            // emit int; otherwise emit double to match SQLite behaviour.
+            value = (sawDouble || acc is! int) ? acc.toDouble() : acc;
+          }
         }
       } else if (indexMap.isNotEmpty) {
         value = name == 'MIN' ? indexMap.firstKey() : indexMap.lastKey();
