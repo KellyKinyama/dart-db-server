@@ -4375,10 +4375,40 @@ class Database {
     final e = p.expr;
     if (e is! FunctionCallExpr) return null;
     if (e.name.toUpperCase() != 'COUNT') return null;
-    if (!e.isStarArg) return null;
     if (e.distinct) return null;
     if (e.window != null) return null;
     if (e.filterExpr != null) return null;
+    // Phase 1.5: COUNT(col) is equivalent to COUNT(*) when `col` is
+    // known to be non-NULL — i.e. declared NOT NULL or the PRIMARY
+    // KEY of the table. We rewrite by simply continuing through the
+    // COUNT(*) path; the bare-arg case still must be a single
+    // ColumnExpr referencing such a column.
+    var starShape = e.isStarArg;
+    String defaultAlias = 'count(*)';
+    if (!starShape) {
+      if (e.args.length != 1) return null;
+      final arg = e.args.first;
+      if (arg is! ColumnExpr) return null;
+      defaultAlias = 'count(${arg.name})';
+      // Resolve column on either backend and require NOT NULL / PK.
+      final tname = s.fromTable!;
+      final pTbl = _pagedTable(tname);
+      if (pTbl != null) {
+        // PagedColumn carries no notNull flag; only the PK is known
+        // non-NULL.
+        final pkName = pTbl.primaryKey.name.toLowerCase();
+        if (arg.name.toLowerCase() != pkName) return null;
+      } else {
+        final tt = _tables[tname];
+        if (tt == null) return null;
+        final ci = tt.columns.indexWhere(
+            (c) => c.name.toLowerCase() == arg.name.toLowerCase());
+        if (ci < 0) return null;
+        final col = tt.columns[ci];
+        if (!(col.notNull || col.primaryKey)) return null;
+      }
+      starShape = true; // proceed as COUNT(*)
+    }
     // Phase 1.4: paged tables expose O(1) `length`, so the no-WHERE
     // branch can serve them too. Anything with a WHERE still needs the
     // in-memory `_planScan` path below, which doesn't know paged
@@ -4386,7 +4416,7 @@ class Database {
     final pt = _pagedTable(s.fromTable);
     if (pt != null) {
       if (s.where != null) return null;
-      final alias = p.alias ?? 'count(*)';
+      final alias = p.alias ?? defaultAlias;
       var rows = <List<Object?>>[
         [pt.length],
       ];
@@ -4414,7 +4444,7 @@ class Database {
         if (evalPredicate(boundWhere, r)) n++;
       }
     }
-    final alias = p.alias ?? 'count(*)';
+    final alias = p.alias ?? defaultAlias;
     var rows = <List<Object?>>[
       [n],
     ];
