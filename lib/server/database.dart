@@ -4723,7 +4723,7 @@ class Database {
         values.add(t.rows.length);
         continue;
       }
-      if (name != 'MIN' && name != 'MAX') return null;
+      if (name != 'MIN' && name != 'MAX' && name != 'SUM') return null;
       if (e.args.length != 1) return null;
       final arg = e.args.first;
       if (arg is! ColumnExpr) return null;
@@ -4737,7 +4737,27 @@ class Database {
       final indexMap = t.indexes[idx.name];
       if (indexMap == null) return null;
       Object? value;
-      if (indexMap.isNotEmpty) {
+      if (name == 'SUM') {
+        // SUM ignores NULLs (already excluded — index doesn't store
+        // them). Empty index is NULL per SQL. Otherwise sum
+        // `key * postingLen`. Bail on non-numeric keys so the generic
+        // path handles type coercion / errors.
+        if (indexMap.isEmpty) {
+          value = null;
+        } else {
+          num acc = 0;
+          var sawDouble = false;
+          for (final entry in indexMap.entries) {
+            final k = entry.key;
+            if (k is! num) return null;
+            if (k is double) sawDouble = true;
+            acc += k * entry.value.length;
+          }
+          // If every key was an int and the running total stayed int,
+          // emit int; otherwise emit double to match SQLite behaviour.
+          value = (sawDouble || acc is! int) ? acc.toDouble() : acc;
+        }
+      } else if (indexMap.isNotEmpty) {
         value = name == 'MIN' ? indexMap.firstKey() : indexMap.lastKey();
       }
       cols.add(p.alias ?? '${name.toLowerCase()}(${arg.name})');
