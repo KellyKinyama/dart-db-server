@@ -4401,8 +4401,8 @@ class Database {
       } else {
         final tt = _tables[tname];
         if (tt == null) return null;
-        final ci = tt.columns.indexWhere(
-            (c) => c.name.toLowerCase() == arg.name.toLowerCase());
+        final ci = tt.columns
+            .indexWhere((c) => c.name.toLowerCase() == arg.name.toLowerCase());
         if (ci < 0) return null;
         final col = tt.columns[ci];
         if (!(col.notNull || col.primaryKey)) return null;
@@ -4453,16 +4453,18 @@ class Database {
     return QueryResult(columns: [alias], rows: rows, affected: rows.length);
   }
 
-  /// Phase 1.3 bare MIN(col) / MAX(col) fast path. Recognises:
+  /// Phase 1.3 / 1.6 bare aggregate fast path. Recognises a SELECT
+  /// whose every projection item is one of:
   ///
-  ///   `SELECT MIN(col) [AS alias] FROM <in-memory-table>`
-  ///   `SELECT MAX(col) [AS alias] FROM <in-memory-table>`
+  ///   * `MIN(col)` — col has a single-column non-partial non-NOCASE
+  ///     index; result is `indexMap.firstKey()` (or NULL when empty).
+  ///   * `MAX(col)` — same, with `lastKey()`.
+  ///   * `COUNT(*)` — `t.rows.length`.
   ///
   /// with no WHERE / GROUP BY / HAVING / ORDER BY / DISTINCT / window /
-  /// FILTER / LIMIT-elimination, and where `col` has a single-column,
-  /// non-partial, non-expression, non-NOCASE index. SQL MIN/MAX ignore
-  /// NULLs, and our index doesn't store NULL keys, so the first / last
-  /// SplayTreeMap entry IS the answer. Returns null on any mismatch.
+  /// FILTER. SQL MIN/MAX ignore NULLs and our index doesn't store
+  /// NULL keys, so the first / last entry IS the answer. Returns null
+  /// on any mismatch.
   QueryResult? _tryMinMaxFast(SelectStmt s) {
     if (s.fromTable == null) return null;
     if (s.joins.isNotEmpty) return null;
@@ -4472,42 +4474,47 @@ class Database {
     if (s.orderBy.isNotEmpty) return null;
     if (s.setOp != null) return null;
     if (s.distinct) return null;
-    if (s.projection.length != 1) return null;
-    final p = s.projection.first;
-    final e = p.expr;
-    if (e is! FunctionCallExpr) return null;
-    final name = e.name.toUpperCase();
-    if (name != 'MIN' && name != 'MAX') return null;
-    if (e.distinct) return null;
-    if (e.window != null) return null;
-    if (e.filterExpr != null) return null;
-    if (e.args.length != 1) return null;
-    final arg = e.args.first;
-    if (arg is! ColumnExpr) return null;
+    if (s.projection.isEmpty) return null;
     final t = _tables[s.fromTable!];
     if (t == null) return null;
-    final idx = _findIndexForColumn(t, arg.name);
-    if (idx == null) return null;
-    if (idx.columns.length != 1) return null;
-    if (idx.collations.isNotEmpty &&
-        idx.collations[0].toUpperCase() == 'NOCASE') {
-      // NOCASE indexes store lower-cased keys; the original case is
-      // lost, so we can't return it from the index.
-      return null;
+    final cols = <String>[];
+    final values = <Object?>[];
+    for (final p in s.projection) {
+      final e = p.expr;
+      if (e is! FunctionCallExpr) return null;
+      final name = e.name.toUpperCase();
+      if (e.distinct) return null;
+      if (e.window != null) return null;
+      if (e.filterExpr != null) return null;
+      if (name == 'COUNT' && e.isStarArg) {
+        cols.add(p.alias ?? 'count(*)');
+        values.add(t.rows.length);
+        continue;
+      }
+      if (name != 'MIN' && name != 'MAX') return null;
+      if (e.args.length != 1) return null;
+      final arg = e.args.first;
+      if (arg is! ColumnExpr) return null;
+      final idx = _findIndexForColumn(t, arg.name);
+      if (idx == null) return null;
+      if (idx.columns.length != 1) return null;
+      if (idx.collations.isNotEmpty &&
+          idx.collations[0].toUpperCase() == 'NOCASE') {
+        return null;
+      }
+      final indexMap = t.indexes[idx.name];
+      if (indexMap == null) return null;
+      Object? value;
+      if (indexMap.isNotEmpty) {
+        value = name == 'MIN' ? indexMap.firstKey() : indexMap.lastKey();
+      }
+      cols.add(p.alias ?? '${name.toLowerCase()}(${arg.name})');
+      values.add(value);
     }
-    final indexMap = t.indexes[idx.name];
-    if (indexMap == null) return null;
-    Object? value;
-    if (indexMap.isNotEmpty) {
-      value = name == 'MIN' ? indexMap.firstKey() : indexMap.lastKey();
-    }
-    final alias = p.alias ?? '${name.toLowerCase()}(${arg.name})';
-    var rows = <List<Object?>>[
-      [value],
-    ];
+    var rows = <List<Object?>>[values];
     if (s.limit != null && s.limit! <= 0) rows = const <List<Object?>>[];
     if ((s.offset ?? 0) >= 1) rows = const <List<Object?>>[];
-    return QueryResult(columns: [alias], rows: rows, affected: rows.length);
+    return QueryResult(columns: cols, rows: rows, affected: rows.length);
   }
 
   /// Index-only / covering-scan fast path.
