@@ -4379,6 +4379,21 @@ class Database {
     if (e.distinct) return null;
     if (e.window != null) return null;
     if (e.filterExpr != null) return null;
+    // Phase 1.4: paged tables expose O(1) `length`, so the no-WHERE
+    // branch can serve them too. Anything with a WHERE still needs the
+    // in-memory `_planScan` path below, which doesn't know paged
+    // backends.
+    final pt = _pagedTable(s.fromTable);
+    if (pt != null) {
+      if (s.where != null) return null;
+      final alias = p.alias ?? 'count(*)';
+      var rows = <List<Object?>>[
+        [pt.length],
+      ];
+      if (s.limit != null && s.limit! <= 0) rows = const <List<Object?>>[];
+      if ((s.offset ?? 0) >= 1) rows = const <List<Object?>>[];
+      return QueryResult(columns: [alias], rows: rows, affected: rows.length);
+    }
     final t = _tables[s.fromTable!];
     if (t == null) return null;
     int n;
