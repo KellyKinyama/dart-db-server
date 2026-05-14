@@ -437,6 +437,25 @@ class Database {
   List<String> _planTrace = const [];
   List<String> get lastPlanTrace => List.unmodifiable(_planTrace);
 
+  /// Columns (in order) along which [_planScan]'s most recent output is
+  /// already sorted ascending. Set when the chosen plan is a prefix /
+  /// prefixRange / single-column range / single-key equality scan. Used
+  /// by [_selectInnerCore] to skip the ORDER BY sort when ORDER BY is
+  /// satisfied by the scan's natural order.
+  List<String> _planScanOrderedAsc = const [];
+
+  /// Subset of [_planScanOrderedAsc] that is equality-bound. ORDER BY on
+  /// these columns is a no-op (all surviving rows share the same value)
+  /// and is allowed in any direction / position when checking whether
+  /// ORDER BY is satisfied.
+  Set<String> _planScanEqualityCols = const {};
+
+  /// Whether the executor skipped the ORDER BY sort for the most recent
+  /// SELECT because [_planScan] already produced rows in the requested
+  /// order. Exposed for tests via [lastPlanSortSkipped].
+  bool _planSortSkipped = false;
+  bool get lastPlanSortSkipped => _planSortSkipped;
+
   /// Last per-CTE materialization decision the dispatcher saw. Entries
   /// are `name` -> `true` for `MATERIALIZED`, `false` for
   /// `NOT MATERIALIZED`, or absent when no hint was given (default).
@@ -4086,6 +4105,9 @@ class Database {
   QueryResult _selectInnerCore(SelectStmt s,
       [Map<String, Object?> outer = const {}]) {
     _planTrace = const [];
+    _planScanOrderedAsc = const [];
+    _planScanEqualityCols = const {};
+    _planSortSkipped = false;
     // Index-only / covering-scan fast path. When the SELECT has the
     // shape `SELECT [DISTINCT] <indexed_col> FROM <table> [ORDER BY ... ]
     // [LIMIT ...]`, we can answer entirely from the index without
@@ -4156,7 +4178,17 @@ class Database {
 
     // ORDER BY
     if (s.orderBy.isNotEmpty) {
-      final paired = List.generate(
+      // Phase 0.7: when the scan already yielded rows in the requested
+      // order (because we walked a SplayTreeMap-backed index whose
+      // leading columns match the ORDER BY), skip the sort entirely.
+      // Only safe on the non-aggregate path, which preserves the input
+      // order through projection / window evaluation.
+      final canSkip =
+          !hasAggregates && _orderBySatisfiedByIndex(s);
+      if (canSkip) {
+        _planSortSkipped = true;
+      } else {
+        final paired = List.generate(
           resultRows.length, (i) => _Pair(orderingMaps[i], resultRows[i]));
       paired.sort((a, b) {
         for (final ob in s.orderBy) {
@@ -4226,6 +4258,7 @@ class Database {
         return 0;
       });
       resultRows = paired.map((p) => p.row).toList();
+      }
     }
 
     // DISTINCT
@@ -4660,6 +4693,7 @@ class Database {
         });
         final best = usable.first;
         _planTrace = [best.describe()];
+        _recordPlanOrder(t, best);
         final rowIds = _executeIndexPlan(t, best);
         return [
           for (final ri in rowIds)
@@ -4685,6 +4719,7 @@ class Database {
       if (best.estHits >= (t.rows.length * 0.8).ceil()) return null;
 
       _planTrace = [best.describe()];
+      _recordPlanOrder(t, best);
       final rowIds = _executeIndexPlan(t, best);
       return [
         for (final ri in rowIds)
@@ -4865,8 +4900,7 @@ class Database {
     // first one we see per column.
     final eqByCol = <String, Object>{};
     // Map column-name (lowercase) -> list of range bounds we observed.
-    final rangesByCol =
-        <String, List<({String op, Object value})>>{};
+    final rangesByCol = <String, List<({String op, Object value})>>{};
     for (final c in conjuncts) {
       if (c is! BinaryExpr) continue;
       final op = c.op;
@@ -5364,6 +5398,82 @@ class Database {
       out.addAll(entry.value);
     }
     return out;
+  }
+
+  /// Records the ordering that [_executeIndexPlan] will produce for
+  /// [plan]. See [_planScanOrderedAsc] / [_planScanEqualityCols] for the
+  /// contract. Called by [_planScan] right before [_executeIndexPlan]
+  /// runs, so [_selectInnerCore] can later decide whether the requested
+  /// ORDER BY is already satisfied.
+  void _recordPlanOrder(Table t, _IndexPlan plan) {
+    final def = t.indexDefs[plan.index];
+    if (def == null || def.exprSql != null) {
+      _planScanOrderedAsc = const [];
+      _planScanEqualityCols = const {};
+      return;
+    }
+    final cols = def.columns;
+    if (plan.equalityKeys != null) {
+      if (plan.equalityKeys!.length != 1) {
+        // IN-list with multiple keys: posting lists are concatenated in
+        // IN-list order, so no global ordering survives.
+        _planScanOrderedAsc = const [];
+        _planScanEqualityCols = const {};
+        return;
+      }
+      _planScanOrderedAsc = List<String>.unmodifiable(cols);
+      _planScanEqualityCols = {for (final c in cols) c.toLowerCase()};
+      return;
+    }
+    if (plan.prefixKey != null) {
+      final pLen = plan.prefixKey!.length;
+      _planScanOrderedAsc = List<String>.unmodifiable(cols);
+      _planScanEqualityCols = {
+        for (var i = 0; i < pLen && i < cols.length; i++)
+          cols[i].toLowerCase()
+      };
+      return;
+    }
+    // Single-column range: only the first indexed column is ordered.
+    _planScanOrderedAsc = [cols.first];
+    _planScanEqualityCols = const {};
+  }
+
+  /// Returns true when [s.orderBy] is satisfied by the ordering that
+  /// [_planScan] already produced (see [_planScanOrderedAsc]).
+  ///
+  /// Rules:
+  ///   * Every ORDER BY item must be a bare column reference, ASC, with
+  ///     default NULLS placement (which matches SplayTreeMap's natural
+  ///     null-first ordering).
+  ///   * Equality-bound columns from the plan may appear in any
+  ///     position without consuming the ordered prefix.
+  ///   * Otherwise, the remaining ORDER BY items must match the
+  ///     remaining non-equality columns of [_planScanOrderedAsc] in
+  ///     order.
+  bool _orderBySatisfiedByIndex(SelectStmt s) {
+    if (_planScanOrderedAsc.isEmpty) return false;
+    if (s.distinct) return false;
+    if (s.orderBy.isEmpty) return false;
+    final ordered = _planScanOrderedAsc;
+    final eq = _planScanEqualityCols;
+    var j = 0;
+    for (final ob in s.orderBy) {
+      if (ob.descending) return false;
+      // SplayTreeMap orders nulls first; allow only that (or default).
+      if (ob.nullsFirst == false) return false;
+      final e = ob.expr;
+      if (e is! ColumnExpr) return false;
+      final name = e.name.toLowerCase();
+      if (eq.contains(name)) continue;
+      while (j < ordered.length && eq.contains(ordered[j].toLowerCase())) {
+        j++;
+      }
+      if (j >= ordered.length) return false;
+      if (ordered[j].toLowerCase() != name) return false;
+      j++;
+    }
+    return true;
   }
 
   List<Map<String, Object?>> _resolveFromRows(SelectStmt s,
