@@ -4381,9 +4381,33 @@ class Database {
     final e = p.expr;
     if (e is! FunctionCallExpr) return null;
     if (e.name.toUpperCase() != 'COUNT') return null;
-    if (e.distinct) return null;
     if (e.window != null) return null;
     if (e.filterExpr != null) return null;
+    // Phase 2.7: COUNT(DISTINCT col) is `indexMap.length` when col has
+    // a single-column non-NOCASE non-partial index — keys ARE the
+    // distinct values, NULLs are absent (which matches SQL semantics:
+    // COUNT(DISTINCT) ignores NULLs). Only the bare `FROM t` shape
+    // with no WHERE is handled here; a WHERE would need to project a
+    // distinct subset which is more involved.
+    if (e.distinct) {
+      if (s.where != null) return null;
+      if (e.isStarArg) return null;
+      if (e.args.length != 1) return null;
+      final arg = e.args.first;
+      if (arg is! ColumnExpr) return null;
+      final t = _tables[s.fromTable!];
+      if (t == null) return null;
+      final ix = _resolveSingleColIndex(t, arg.name);
+      if (ix == null) return null;
+      final (_, indexMap) = ix;
+      final alias = p.alias ?? 'count(DISTINCT ${arg.name})';
+      var rows = <List<Object?>>[
+        [indexMap.length],
+      ];
+      if (s.limit != null && s.limit! <= 0) rows = const <List<Object?>>[];
+      if ((s.offset ?? 0) >= 1) rows = const <List<Object?>>[];
+      return QueryResult(columns: [alias], rows: rows, affected: rows.length);
+    }
     // Phase 1.5: COUNT(col) is equivalent to COUNT(*) when `col` is
     // known to be non-NULL — i.e. declared NOT NULL or the PRIMARY
     // KEY of the table. We rewrite by simply continuing through the
@@ -5115,10 +5139,8 @@ class Database {
           w.op == '=' &&
           ((w.left is ColumnExpr && w.right is LiteralExpr) ||
               (w.right is ColumnExpr && w.left is LiteralExpr))) {
-        final c =
-            (w.left is ColumnExpr ? w.left : w.right) as ColumnExpr;
-        final lit =
-            (w.left is LiteralExpr ? w.left : w.right) as LiteralExpr;
+        final c = (w.left is ColumnExpr ? w.left : w.right) as ColumnExpr;
+        final lit = (w.left is LiteralExpr ? w.left : w.right) as LiteralExpr;
         if (c.name.toLowerCase() != colNameLower) return null;
         if (lit.value == null) {
           emptyResult = true;
@@ -5220,8 +5242,7 @@ class Database {
       Iterable<MapEntry<Object, List<int>>> entries;
       if (inKeys != null) {
         // Walk the explicit IN-list. Sort keys to keep ASC order.
-        final sorted = inKeys.toList()
-          ..sort((a, b) => sqlCompare(a, b));
+        final sorted = inKeys.toList()..sort((a, b) => sqlCompare(a, b));
         entries = [
           for (final k in sorted)
             if (indexMap[k] != null) MapEntry(k, indexMap[k]!),
