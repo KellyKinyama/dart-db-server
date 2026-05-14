@@ -4167,6 +4167,12 @@ class Database {
     final agw = _tryAggregateWithWhereFast(s);
     if (agw != null) return agw;
 
+    // Phase 3.1: `SELECT col, COUNT(*) FROM t GROUP BY col` on a
+    // single-column non-NOCASE non-partial index — one row per index
+    // key with `posting.length`, in ascending key order.
+    final gbc = _tryGroupByCountFast(s);
+    if (gbc != null) return gbc;
+
     final reordered = _reorderInnerJoins(s);
     final fromRows =
         _planScan(reordered, outer) ?? _resolveFromRows(reordered, outer);
@@ -5114,6 +5120,115 @@ class Database {
     if (s.limit != null && s.limit! <= 0) rows = const <List<Object?>>[];
     if ((s.offset ?? 0) >= 1) rows = const <List<Object?>>[];
     return QueryResult(columns: [col], rows: rows, affected: rows.length);
+  }
+
+  /// Phase 3.1: `SELECT col [, COUNT(*)] FROM t GROUP BY col` on a
+  /// single-column non-NOCASE non-partial index. The index already
+  /// groups rows by key, so we emit one output row per index entry
+  /// with `posting.length` for COUNT(*). ASC ORDER BY on the same
+  /// column is satisfied by the SplayTreeMap walk; DESC by reversing.
+  /// HAVING / WHERE / DISTINCT / set-ops / joins / multi-col GROUP
+  /// disqualify. NULLs are absent from the index, matching the SQL
+  /// rule that NULL doesn't compare equal to anything (SQLite groups
+  /// NULLs together, but no NULL-keyed rows are present, so we'd
+  /// silently drop a NULL-group; bail when the table has any NULL in
+  /// the grouped col).
+  QueryResult? _tryGroupByCountFast(SelectStmt s) {
+    if (s.fromTable == null) return null;
+    if (s.joins.isNotEmpty) return null;
+    if (s.fromSubquery != null || s.fromFunction != null) return null;
+    if (s.where != null) return null;
+    if (s.having != null) return null;
+    if (s.setOp != null) return null;
+    if (s.distinct) return null;
+    if (s.groupBy.length != 1) return null;
+    final ge = s.groupBy.first;
+    if (ge is! ColumnExpr) return null;
+    final t = _tables[s.fromTable!];
+    if (t == null) return null;
+    final ix = _resolveSingleColIndex(t, ge.name);
+    if (ix == null) return null;
+    final (_, indexMap) = ix;
+
+    // Bail if the table has any NULL in the grouped column — SQLite
+    // would emit a NULL-group, but the index has no NULL key.
+    var indexed = 0;
+    for (final v in indexMap.values) {
+      indexed += v.length;
+    }
+    if (indexed != t.rows.length) return null;
+
+    // Validate projections: each must be either the group col, a
+    // bare COUNT(*), or COUNT(<group-col>) (equivalent here since the
+    // group col is non-null in the present rows).
+    final geNameLower = ge.name.toLowerCase();
+    for (final p in s.projection) {
+      final e = p.expr;
+      if (e is ColumnExpr) {
+        if (e.name.toLowerCase() != geNameLower) return null;
+        continue;
+      }
+      if (e is FunctionCallExpr) {
+        if (e.name.toUpperCase() != 'COUNT') return null;
+        if (e.distinct) return null;
+        if (e.window != null || e.filterExpr != null) return null;
+        if (e.isStarArg) continue;
+        if (e.args.length != 1) return null;
+        final a = e.args.first;
+        if (a is! ColumnExpr) return null;
+        if (a.name.toLowerCase() != geNameLower) return null;
+        continue;
+      }
+      return null;
+    }
+
+    // ORDER BY: only ORDER BY <group-col> [ASC|DESC] is satisfied by
+    // the index walk; anything else would need a sort.
+    var descending = false;
+    if (s.orderBy.isNotEmpty) {
+      if (s.orderBy.length != 1) return null;
+      final ob = s.orderBy.first;
+      if (ob.expr is! ColumnExpr) return null;
+      if ((ob.expr as ColumnExpr).name.toLowerCase() != geNameLower) {
+        return null;
+      }
+      descending = ob.descending;
+    }
+
+    // Materialise.
+    final cols = <String>[
+      for (final p in s.projection)
+        p.alias ??
+            (p.expr is ColumnExpr
+                ? (p.expr as ColumnExpr).name
+                : (() {
+                    final e = p.expr as FunctionCallExpr;
+                    if (e.isStarArg) return 'count(*)';
+                    return 'count(${(e.args.first as ColumnExpr).name})';
+                  })()),
+    ];
+    var entries = indexMap.entries.toList();
+    if (descending) entries = entries.reversed.toList();
+    final out = <List<Object?>>[];
+    for (final entry in entries) {
+      final row = <Object?>[];
+      for (final p in s.projection) {
+        final e = p.expr;
+        if (e is ColumnExpr) {
+          row.add(entry.key);
+        } else {
+          row.add(entry.value.length);
+        }
+      }
+      out.add(row);
+    }
+    var rows = out;
+    final start = (s.offset ?? 0).clamp(0, rows.length);
+    var end = rows.length;
+    if (s.limit != null) end = (start + s.limit!).clamp(0, rows.length);
+    rows = rows.sublist(start, end);
+    if (s.orderBy.isNotEmpty) _planSortSkipped = true;
+    return QueryResult(columns: cols, rows: rows, affected: rows.length);
   }
 
   /// Empty-input aggregate result for the `_tryAggregateWithWhereFast`
