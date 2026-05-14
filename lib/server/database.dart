@@ -4641,6 +4641,29 @@ class Database {
     return (idx, m);
   }
 
+  /// Like [_resolveSingleColIndex] but also accepts a composite index
+  /// whose LEADING column is [colName]. Returns the def, the
+  /// SplayTreeMap (keyed by `CompositeIndexKey` for composite cases),
+  /// and a flag indicating composite. Used by GROUP BY / DISTINCT
+  /// fast paths that bucket adjacent entries by `parts[0]`.
+  (IndexDef, SplayTreeMap<Object, List<int>>, bool)? _resolveLeadingColIndex(
+      Table t, String colName) {
+    final single = _resolveSingleColIndex(t, colName);
+    if (single != null) return (single.$1, single.$2, false);
+    final idx = _findIndexForColumn(t, colName);
+    if (idx == null) return null;
+    if (idx.columns.length < 2) return null;
+    if (idx.columns.first.toLowerCase() != colName.toLowerCase()) return null;
+    if (idx.collations.isNotEmpty &&
+        idx.collations[0].toUpperCase() == 'NOCASE') {
+      return null;
+    }
+    if (idx.whereSql != null) return null;
+    final m = t.indexes[idx.name];
+    if (m == null) return null;
+    return (idx, m, true);
+  }
+
   /// Phase 1.9 helper: parse `col OP literal` (or commuted) where OP
   /// is one of `<`, `<=`, `>`, `>=`. Returns the column name, the
   /// literal value, whether it's a lower bound (> / >=), and whether
@@ -5143,9 +5166,13 @@ class Database {
     if (ge is! ColumnExpr) return null;
     final t = _tables[s.fromTable!];
     if (t == null) return null;
-    final ix = _resolveSingleColIndex(t, ge.name);
+    final ix = _resolveLeadingColIndex(t, ge.name);
     if (ix == null) return null;
-    final (idx, indexMap) = ix;
+    final (idx, indexMap, isComposite) = ix;
+    // Composite-leading branch can't use the bounds machinery (the
+    // SplayTreeMap is keyed by CompositeIndexKey, not the leading
+    // scalar). Bail when a WHERE/HAVING is present.
+    if (isComposite && (s.where != null || s.having != null)) return null;
 
     // When there is no WHERE we have to bail if the table has any NULL
     // in the grouped column — SQLite would emit a NULL-group, but the
@@ -5362,7 +5389,24 @@ class Database {
     ];
     var entries = <MapEntry<Object, List<int>>>[];
     if (!whereEmpty) {
-      if (inKeys != null) {
+      if (isComposite) {
+        // Walk composite keys in sorted order, bucketing adjacent
+        // entries that share parts[0]. Posting lists are concatenated.
+        Object? curLead;
+        List<int>? curList;
+        for (final entry in indexMap.entries) {
+          final lead = (entry.key as CompositeIndexKey).parts[0];
+          if (lead == null) continue;
+          if (curLead == null || sqlCompare(lead, curLead) != 0) {
+            if (curLead != null) entries.add(MapEntry(curLead, curList!));
+            curLead = lead;
+            curList = List<int>.from(entry.value);
+          } else {
+            curList!.addAll(entry.value);
+          }
+        }
+        if (curLead != null) entries.add(MapEntry(curLead, curList!));
+      } else if (inKeys != null) {
         for (final k in inKeys) {
           final posting = indexMap[k];
           if (posting != null) entries.add(MapEntry(k, posting));
