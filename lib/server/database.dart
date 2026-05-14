@@ -4701,7 +4701,9 @@ class Database {
     final t = _tables[s.fromTable!];
     if (t == null) return null;
 
-    final conjuncts = _splitAndConjuncts(s.where!);
+    final conjuncts = [
+      for (final c in _splitAndConjuncts(s.where!)) _orChainToIn(c),
+    ];
 
     // Honor `NOT INDEXED`: skip the index planner entirely.
     final hint = s.indexedBy;
@@ -4809,7 +4811,9 @@ class Database {
       throw FormatException(
           'no query solution for INDEXED BY ${hint.indexName} on ${t.name}');
     }
-    final conjuncts = _splitAndConjuncts(where);
+    final conjuncts = [
+      for (final c in _splitAndConjuncts(where)) _orChainToIn(c),
+    ];
     final prevConjuncts = _currentScanConjuncts;
     _currentScanConjuncts = conjuncts;
     try {
@@ -4940,6 +4944,47 @@ class Database {
 
     visit(e);
     return out;
+  }
+
+  /// Phase 1.1: planner-only rewrite of `col = a OR col = b OR ...`
+  /// (every disjunct an equality on the same column with a constant
+  /// RHS) into a single [InExpr]. The original WHERE is still
+  /// re-evaluated as a residual, so this is purely a planning hint —
+  /// it lets [_classifyConjunct]'s existing IN-list path produce one
+  /// indexed plan instead of giving up at the first OR.
+  ///
+  /// Returns [c] unchanged when the OR chain does not match the
+  /// strict shape (mixed columns, non-equality, non-constant RHS, or
+  /// any disjunct that is itself a non-equality expression).
+  Expr _orChainToIn(Expr c) {
+    if (c is! BinaryExpr || c.op != 'OR') return c;
+    final disjuncts = <Expr>[];
+    void split(Expr e) {
+      if (e is BinaryExpr && e.op == 'OR') {
+        split(e.left);
+        split(e.right);
+      } else {
+        disjuncts.add(e);
+      }
+    }
+
+    split(c);
+    String? column;
+    final keys = <Expr>[];
+    for (final d in disjuncts) {
+      if (d is! BinaryExpr || d.op != '=') return c;
+      final (col, _, _) = _columnLiteralPair(d);
+      if (col == null) return c;
+      // Pull out the literal-side expression (preserve the AST node so
+      // _bindExpr can still walk it cleanly).
+      final litSide = (d.left is ColumnExpr) ? d.right : d.left;
+      if (!_isConstExpr(litSide)) return c;
+      column ??= col;
+      if (col.toLowerCase() != column.toLowerCase()) return c;
+      keys.add(litSide);
+    }
+    if (column == null || keys.isEmpty) return c;
+    return InExpr(ColumnExpr(column), keys);
   }
 
   /// Build composite-key plans for multi-column indexes. Walks every
