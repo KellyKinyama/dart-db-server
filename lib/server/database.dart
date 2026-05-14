@@ -1740,6 +1740,12 @@ class Database {
 
     scanNulls(e);
 
+    // Collect every viable plan, then rank below. (Previously we returned
+    // the first matching index in registration order — that gave the
+    // wrong answer whenever a less-selective index happened to be
+    // declared first.)
+    final candidates = <_PagedIndexPlan>[];
+
     // For each index in registration order, try to build the strongest
     // plan it supports.
     for (final name in pt.secondaryIndexNames) {
@@ -1828,7 +1834,7 @@ class Database {
 
       final isEquality =
           rangeColIdx < 0 && equalPrefix.length == idxCols.length;
-      return _PagedIndexPlan(
+      candidates.add(_PagedIndexPlan(
         indexName: name,
         isEquality: isEquality,
         equalPrefix: equalPrefix,
@@ -1836,9 +1842,30 @@ class Database {
         lowerInclusive: loInc,
         upper: hi,
         upperInclusive: hiInc,
-      );
+      ));
     }
-    return null;
+    if (candidates.isEmpty) return null;
+    // Rank candidates by selectivity proxy:
+    //   1. Prefer plans whose equality prefix covers more columns
+    //      (longer prefix = tighter probe).
+    //   2. Prefer full-equality (`isEquality`) plans over hybrid
+    //      equality+range plans of the same prefix length.
+    //   3. Prefer plans that drive a UNIQUE index — at most one row.
+    //   4. Tie-break on registration order (stable for reproducibility).
+    candidates.sort((a, b) {
+      // Longer equality prefix wins (descending).
+      final ap = a.equalPrefix.length;
+      final bp = b.equalPrefix.length;
+      if (ap != bp) return bp - ap;
+      // Pure equality wins over equality+range.
+      if (a.isEquality != b.isEquality) return a.isEquality ? -1 : 1;
+      // UNIQUE wins as a final selectivity hint.
+      final au = pt.isIndexUnique(a.indexName);
+      final bu = pt.isIndexUnique(b.indexName);
+      if (au != bu) return au ? -1 : 1;
+      return 0;
+    });
+    return candidates.first;
   }
 
   Future<QueryResult> _pagedInsert(InsertStmt s, PagedTable pt) async {
