@@ -5136,7 +5136,6 @@ class Database {
     if (s.fromTable == null) return null;
     if (s.joins.isNotEmpty) return null;
     if (s.fromSubquery != null || s.fromFunction != null) return null;
-    if (s.where != null) return null;
     if (s.having != null) return null;
     if (s.setOp != null) return null;
     if (s.distinct) return null;
@@ -5147,15 +5146,19 @@ class Database {
     if (t == null) return null;
     final ix = _resolveSingleColIndex(t, ge.name);
     if (ix == null) return null;
-    final (_, indexMap) = ix;
+    final (idx, indexMap) = ix;
 
-    // Bail if the table has any NULL in the grouped column — SQLite
-    // would emit a NULL-group, but the index has no NULL key.
-    var indexed = 0;
-    for (final v in indexMap.values) {
-      indexed += v.length;
+    // When there is no WHERE we have to bail if the table has any NULL
+    // in the grouped column — SQLite would emit a NULL-group, but the
+    // index has no NULL key. With a WHERE that excludes NULLs (every
+    // shape we recognise except `IS NULL` does), this check is moot.
+    if (s.where == null) {
+      var indexed = 0;
+      for (final v in indexMap.values) {
+        indexed += v.length;
+      }
+      if (indexed != t.rows.length) return null;
     }
-    if (indexed != t.rows.length) return null;
 
     // Validate projections: each must be either the group col, or
     // an aggregate (COUNT/MIN/MAX/SUM/AVG/TOTAL) whose only argument
@@ -5209,6 +5212,115 @@ class Database {
       descending = ob.descending;
     }
 
+    // Resolve WHERE into an index-key restriction. Same vocabulary as
+    // `_tryAggregateWithWhereFast` and `_tryCoveringScan`:
+    //   col IS NULL              → empty (index has no NULL keys)
+    //   col IS NOT NULL          → walkAll (no extra restriction)
+    //   col = lit                → loKey == hiKey
+    //   col BETWEEN lo AND hi    → inclusive range
+    //   AND-chain of two range comparisons on col
+    //   col IN (lit, lit, ...)
+    Object? loKey;
+    Object? hiKey;
+    var loInc = true;
+    var hiInc = true;
+    List<Object>? inKeys;
+    var whereEmpty = false; // shortcut: WHERE proves no rows match
+    if (s.where != null) {
+      final where = s.where!;
+      if (where is UnaryExpr &&
+          where.operand is ColumnExpr &&
+          (where.op == 'IS NULL' || where.op == 'IS NOT NULL')) {
+        final col = where.operand as ColumnExpr;
+        if (col.name.toLowerCase() != geNameLower) return null;
+        if (where.op == 'IS NULL') {
+          whereEmpty = true;
+        }
+        // IS NOT NULL → no restriction; index already excludes NULLs.
+      } else if (where is BinaryExpr &&
+          where.op == '=' &&
+          ((where.left is ColumnExpr && where.right is LiteralExpr) ||
+              (where.right is ColumnExpr && where.left is LiteralExpr))) {
+        final col = (where.left is ColumnExpr ? where.left : where.right)
+            as ColumnExpr;
+        final lit = (where.left is LiteralExpr ? where.left : where.right)
+            as LiteralExpr;
+        if (col.name.toLowerCase() != geNameLower) return null;
+        if (lit.value == null) {
+          whereEmpty = true;
+        } else {
+          final k = idx.collate(0, lit.value);
+          if (k == null) {
+            whereEmpty = true;
+          } else {
+            loKey = k;
+            hiKey = k;
+          }
+        }
+      } else if (where is BetweenExpr &&
+          !where.negated &&
+          where.value is ColumnExpr &&
+          where.low is LiteralExpr &&
+          where.high is LiteralExpr) {
+        final col = where.value as ColumnExpr;
+        if (col.name.toLowerCase() != geNameLower) return null;
+        final loRaw = (where.low as LiteralExpr).value;
+        final hiRaw = (where.high as LiteralExpr).value;
+        if (loRaw == null || hiRaw == null) {
+          whereEmpty = true;
+        } else {
+          loKey = idx.collate(0, loRaw);
+          hiKey = idx.collate(0, hiRaw);
+          if (loKey == null || hiKey == null) whereEmpty = true;
+        }
+      } else if (where is BinaryExpr &&
+          where.op == 'AND' &&
+          where.left is BinaryExpr &&
+          where.right is BinaryExpr) {
+        final lo = _extractRangeBound(where.left as BinaryExpr);
+        final hi = _extractRangeBound(where.right as BinaryExpr);
+        if (lo == null || hi == null) return null;
+        if (lo.col != hi.col) return null;
+        if (lo.col.toLowerCase() != geNameLower) return null;
+        ({Object value, bool inclusive})? loB;
+        ({Object value, bool inclusive})? hiB;
+        if (lo.isLower && !hi.isLower) {
+          loB = (value: lo.value, inclusive: lo.inclusive);
+          hiB = (value: hi.value, inclusive: hi.inclusive);
+        } else if (!lo.isLower && hi.isLower) {
+          loB = (value: hi.value, inclusive: hi.inclusive);
+          hiB = (value: lo.value, inclusive: lo.inclusive);
+        } else {
+          return null;
+        }
+        loKey = idx.collate(0, loB.value);
+        hiKey = idx.collate(0, hiB.value);
+        if (loKey == null || hiKey == null) {
+          whereEmpty = true;
+        } else {
+          loInc = loB.inclusive;
+          hiInc = hiB.inclusive;
+        }
+      } else if (where is InExpr &&
+          !where.negated &&
+          where.value is ColumnExpr) {
+        final col = where.value as ColumnExpr;
+        if (col.name.toLowerCase() != geNameLower) return null;
+        final keys = <Object>{};
+        for (final ev in where.values) {
+          if (ev is! LiteralExpr) return null;
+          final raw = ev.value;
+          if (raw == null) continue;
+          final k = idx.collate(0, raw);
+          if (k == null) continue;
+          keys.add(k);
+        }
+        inKeys = keys.toList();
+      } else {
+        return null;
+      }
+    }
+
     // Materialise.
     final cols = <String>[
       for (final p in s.projection)
@@ -5223,7 +5335,27 @@ class Database {
                     return '$n($aname)';
                   })()),
     ];
-    var entries = indexMap.entries.toList();
+    var entries = <MapEntry<Object, List<int>>>[];
+    if (!whereEmpty) {
+      if (inKeys != null) {
+        for (final k in inKeys) {
+          final posting = indexMap[k];
+          if (posting != null) entries.add(MapEntry(k, posting));
+        }
+        entries.sort((a, b) => sqlCompare(a.key, b.key));
+      } else if (loKey == null && hiKey == null) {
+        entries = indexMap.entries.toList();
+      } else {
+        for (final entry in indexMap.entries) {
+          final k = entry.key;
+          final cLo = sqlCompare(k, loKey!);
+          if (cLo < 0 || (cLo == 0 && !loInc)) continue;
+          final cHi = sqlCompare(k, hiKey!);
+          if (cHi > 0 || (cHi == 0 && !hiInc)) break;
+          entries.add(entry);
+        }
+      }
+    }
     if (descending) entries = entries.reversed.toList();
     final out = <List<Object?>>[];
     for (final entry in entries) {
