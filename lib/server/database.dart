@@ -4154,6 +4154,13 @@ class Database {
     final cnt = _tryCountStarFast(s, outer);
     if (cnt != null) return cnt;
 
+    // Phase 1.3: bare MIN(col) / MAX(col) fast path on in-memory tables
+    // backed by a single-column non-partial, non-NOCASE index. Reads
+    // the first / last non-null entry of the SplayTreeMap directly
+    // instead of scanning every row.
+    final mm = _tryMinMaxFast(s);
+    if (mm != null) return mm;
+
     final reordered = _reorderInnerJoins(s);
     final fromRows =
         _planScan(reordered, outer) ?? _resolveFromRows(reordered, outer);
@@ -4395,6 +4402,63 @@ class Database {
     final alias = p.alias ?? 'count(*)';
     var rows = <List<Object?>>[
       [n],
+    ];
+    if (s.limit != null && s.limit! <= 0) rows = const <List<Object?>>[];
+    if ((s.offset ?? 0) >= 1) rows = const <List<Object?>>[];
+    return QueryResult(columns: [alias], rows: rows, affected: rows.length);
+  }
+
+  /// Phase 1.3 bare MIN(col) / MAX(col) fast path. Recognises:
+  ///
+  ///   `SELECT MIN(col) [AS alias] FROM <in-memory-table>`
+  ///   `SELECT MAX(col) [AS alias] FROM <in-memory-table>`
+  ///
+  /// with no WHERE / GROUP BY / HAVING / ORDER BY / DISTINCT / window /
+  /// FILTER / LIMIT-elimination, and where `col` has a single-column,
+  /// non-partial, non-expression, non-NOCASE index. SQL MIN/MAX ignore
+  /// NULLs, and our index doesn't store NULL keys, so the first / last
+  /// SplayTreeMap entry IS the answer. Returns null on any mismatch.
+  QueryResult? _tryMinMaxFast(SelectStmt s) {
+    if (s.fromTable == null) return null;
+    if (s.joins.isNotEmpty) return null;
+    if (s.fromSubquery != null || s.fromFunction != null) return null;
+    if (s.where != null) return null;
+    if (s.groupBy.isNotEmpty || s.having != null) return null;
+    if (s.orderBy.isNotEmpty) return null;
+    if (s.setOp != null) return null;
+    if (s.distinct) return null;
+    if (s.projection.length != 1) return null;
+    final p = s.projection.first;
+    final e = p.expr;
+    if (e is! FunctionCallExpr) return null;
+    final name = e.name.toUpperCase();
+    if (name != 'MIN' && name != 'MAX') return null;
+    if (e.distinct) return null;
+    if (e.window != null) return null;
+    if (e.filterExpr != null) return null;
+    if (e.args.length != 1) return null;
+    final arg = e.args.first;
+    if (arg is! ColumnExpr) return null;
+    final t = _tables[s.fromTable!];
+    if (t == null) return null;
+    final idx = _findIndexForColumn(t, arg.name);
+    if (idx == null) return null;
+    if (idx.columns.length != 1) return null;
+    if (idx.collations.isNotEmpty &&
+        idx.collations[0].toUpperCase() == 'NOCASE') {
+      // NOCASE indexes store lower-cased keys; the original case is
+      // lost, so we can't return it from the index.
+      return null;
+    }
+    final indexMap = t.indexes[idx.name];
+    if (indexMap == null) return null;
+    Object? value;
+    if (indexMap.isNotEmpty) {
+      value = name == 'MIN' ? indexMap.firstKey() : indexMap.lastKey();
+    }
+    final alias = p.alias ?? '${name.toLowerCase()}(${arg.name})';
+    var rows = <List<Object?>>[
+      [value],
     ];
     if (s.limit != null && s.limit! <= 0) rows = const <List<Object?>>[];
     if ((s.offset ?? 0) >= 1) rows = const <List<Object?>>[];
