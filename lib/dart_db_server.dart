@@ -23,4 +23,5 @@ export 'server/schema.dart';
 export 'server/server.dart';
 export 'server/sqlite_format.dart';
 export 'server/statement.dart';
+export 'server/table_backend.dart' show TableBackend, TableBackendKind;
 export 'server/table.dart' show Table, IndexDef;

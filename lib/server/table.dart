@@ -5,6 +5,7 @@ library;
 import 'dart:collection';
 
 import 'schema.dart';
+import 'table_backend.dart';
 
 /// Definition of an index attached to a table.
 class IndexDef {
@@ -53,13 +54,23 @@ class IndexDef {
   }
 }
 
-class Table {
+class Table implements TableBackend {
   String name;
   final List<ColumnDef> columns;
   final List<TableConstraint> constraints;
   final List<List<Object?>> rows;
   final Map<String, IndexDef> indexDefs; // index name -> def
   final Map<String, SplayTreeMap<Object, List<int>>> indexes;
+
+  // --- TableBackend (Phase 0 unification scaffold) ------------------------
+  @override
+  String get tableName => name;
+
+  @override
+  List<String> get columnNames => [for (final c in columns) c.name];
+
+  @override
+  TableBackendKind get kind => TableBackendKind.memory;
 
   /// AUTOINCREMENT counters keyed by column name. Reset by TRUNCATE.
   final Map<String, int> autoInc;

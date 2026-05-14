@@ -58,6 +58,7 @@ import 'dart:typed_data';
 import 'paged_btree.dart';
 import 'paged_file.dart';
 import 'paged_heap.dart';
+import 'table_backend.dart';
 
 /// Column types supported by a [PagedTable].
 enum PagedColumnType { intType, realType, textType, blobType, boolType }
@@ -76,7 +77,7 @@ class PagedColumn {
 }
 
 /// Self-contained out-of-core typed table.
-class PagedTable {
+class PagedTable implements TableBackend {
   /// Common base path; the table owns `<base>.heap`, `<base>.idx`, and
   /// `<base>.meta.json`.
   final String basePath;
@@ -87,6 +88,33 @@ class PagedTable {
   final int primaryKeyIndex;
 
   PagedColumn get primaryKey => columns[primaryKeyIndex];
+
+  /// User-visible table name as known to the SQL layer. Set by
+  /// [Database] when the table is registered. Falls back to the final
+  /// path component of [basePath] when used standalone (the lower-level
+  /// PagedTable API doesn't otherwise know the SQL name).
+  String? _tableName;
+
+  // --- TableBackend (Phase 0 unification scaffold) ------------------------
+  @override
+  String get tableName {
+    final n = _tableName;
+    if (n != null) return n;
+    // Strip directory + any extension from basePath.
+    final sep = basePath.lastIndexOf(RegExp(r'[\\/]'));
+    final base = sep < 0 ? basePath : basePath.substring(sep + 1);
+    final dot = base.indexOf('.');
+    return dot < 0 ? base : base.substring(0, dot);
+  }
+
+  /// Set by [Database] when this table is registered under a SQL name.
+  set tableName(String value) => _tableName = value;
+
+  @override
+  List<String> get columnNames => [for (final c in columns) c.name];
+
+  @override
+  TableBackendKind get kind => TableBackendKind.paged;
 
   final PagedFile _heapFile;
   final PagedFile _idxFile;

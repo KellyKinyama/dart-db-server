@@ -23,6 +23,7 @@ import 'sqlite_format.dart';
 import 'statement.dart';
 import 'table.dart';
 import 'paged_table.dart';
+import 'table_backend.dart';
 
 /// Outcome of an [AuthorizerCallback] invocation. Mirrors the
 /// SQLITE_OK / SQLITE_DENY / SQLITE_IGNORE constants of the C API.
@@ -520,6 +521,7 @@ class Database {
       final base = '$dir/$tableName';
       try {
         final pt = await PagedTable.open(base);
+        pt.tableName = tableName;
         _pagedTables[tableName] = pt;
         // Re-register every secondary index this table owns so
         // `DROP INDEX <name>` can route to the right paged table.
@@ -1317,6 +1319,7 @@ class Database {
       columns: cols,
       primaryKey: pkName,
     );
+    pt.tableName = s.name;
     _pagedTables[s.name] = pt;
     return QueryResult.message('paged table ${s.name} created');
   }
@@ -1385,6 +1388,7 @@ class Database {
     }
     final fresh =
         await PagedTable.create(base, columns: cols, primaryKey: pkName);
+    fresh.tableName = s.name;
     _pagedTables[s.name] = fresh;
     return QueryResult.message('paged table ${s.name} truncated');
   }
@@ -9264,6 +9268,25 @@ class Database {
   Iterable<String> get tableNames => _tables.keys;
   Iterable<String> get viewNames => _views.keys;
   Table? table(String name) => _tables[name];
+
+  /// Phase-0 unification scaffold: look up a table by name across both
+  /// the in-memory and paged backends and return the shared
+  /// [TableBackend] view of it. Returns null when no table by that
+  /// name exists in either registry. Prefer this over poking at
+  /// [_tables] / [_pagedTables] directly when you only need metadata
+  /// (existence / column names / which backend it lives on).
+  TableBackend? lookupBackend(String name) {
+    final t = _tables[name];
+    if (t != null) return t;
+    return _pagedTables[name];
+  }
+
+  /// Every backend known to this database — both in-memory and paged.
+  /// Order is unspecified.
+  Iterable<TableBackend> get backends sync* {
+    yield* _tables.values;
+    yield* _pagedTables.values;
+  }
 
   Table _requireTable(String name) {
     final t = _tables[name];
