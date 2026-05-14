@@ -223,6 +223,15 @@ class Database {
     'user_version': 0,
     'synchronous': 'normal',
     'encoding': 'UTF-8',
+    // Phase 0.2: opt-in default backend for new CREATE TABLE statements
+    // on path-backed databases. Accepted values: 'memory' (default) and
+    // 'paged'. When set to 'paged' and the table shape is compatible
+    // (single-column PK, no STRICT / WITHOUT ROWID, _pagedDir != null),
+    // bare `CREATE TABLE` routes to the paged backend just as if the
+    // user had written `... USING paged`. Incompatible shapes fall
+    // through to the in-memory backend silently so existing schemas
+    // keep working.
+    'default_table_kind': 'memory',
   };
 
   /// Optional per-table query-planner statistics, populated by `ANALYZE`.
@@ -913,7 +922,8 @@ class Database {
   /// PagedTable API and return the result. Returns null when the
   /// caller should fall through to the regular synchronous dispatch.
   Future<QueryResult?> _maybeRunPagedStmt(Statement stmt) async {
-    if (stmt is CreateTableStmt && stmt.usingPaged) {
+    if (stmt is CreateTableStmt &&
+        (stmt.usingPaged || _shouldAutoPage(stmt))) {
       _assertNoPagedDdlInTx('CREATE TABLE … USING paged');
       return _createPagedTable(stmt);
     }
@@ -9302,6 +9312,36 @@ class Database {
   /// Internal: predicate form of [_pagedTable]. Use at sites that only
   /// need to know whether [name] resolves to a paged table.
   bool _isPaged(String? name) => _pagedTable(name) != null;
+
+  /// Phase 0.2: decide whether a bare `CREATE TABLE` (no explicit
+  /// `USING paged`) should be auto-routed to the paged backend based
+  /// on the `default_table_kind` PRAGMA. Returns true only when paged
+  /// is currently selected AND the table shape is compatible with
+  /// [_createPagedTable]; otherwise falls back to the in-memory path.
+  ///
+  /// Compatibility predicates (mirror [_createPagedTable] checks):
+  ///   * _pagedDir != null (database is path-backed)
+  ///   * not STRICT and not WITHOUT ROWID
+  ///   * exactly one column flagged PRIMARY KEY, or a single-column
+  ///     table-level PRIMARY KEY constraint
+  bool _shouldAutoPage(CreateTableStmt s) {
+    if (s.usingPaged) return false; // already handled explicitly
+    final kind = _pragmas['default_table_kind']?.toString().toLowerCase();
+    if (kind != 'paged') return false;
+    if (_pagedDir == null) return false;
+    if (s.strict || s.withoutRowid) return false;
+    var pkCount = 0;
+    for (final c in s.columns) {
+      if (c.primaryKey) pkCount++;
+    }
+    for (final tc in s.constraints) {
+      if (tc is PrimaryKeyConstraint) {
+        if (tc.columns.length != 1) return false;
+        pkCount += 1;
+      }
+    }
+    return pkCount == 1;
+  }
 
   Table _requireTable(String name) {
     final t = _tables[name];
