@@ -456,6 +456,12 @@ class Database {
   bool _planSortSkipped = false;
   bool get lastPlanSortSkipped => _planSortSkipped;
 
+  /// Whether the executor pushed LIMIT/OFFSET down to truncate `working`
+  /// before projection / window evaluation, because ORDER BY was
+  /// satisfied by the index. Exposed via [lastPlanLimitPushed].
+  bool _planLimitPushed = false;
+  bool get lastPlanLimitPushed => _planLimitPushed;
+
   /// Last per-CTE materialization decision the dispatcher saw. Entries
   /// are `name` -> `true` for `MATERIALIZED`, `false` for
   /// `NOT MATERIALIZED`, or absent when no hint was given (default).
@@ -4108,6 +4114,7 @@ class Database {
     _planScanOrderedAsc = const [];
     _planScanEqualityCols = const {};
     _planSortSkipped = false;
+    _planLimitPushed = false;
     // Index-only / covering-scan fast path. When the SELECT has the
     // shape `SELECT [DISTINCT] <indexed_col> FROM <table> [ORDER BY ... ]
     // [LIMIT ...]`, we can answer entirely from the index without
@@ -4133,6 +4140,29 @@ class Database {
     final hasAggregates = s.groupBy.isNotEmpty ||
         _containsAggregate(s.having) ||
         s.projection.any((p) => p.expr != null && _containsAggregate(p.expr));
+
+    // Phase 0.9: LIMIT/OFFSET pushdown. When ORDER BY is satisfied by
+    // the index walk (so rows are already in their final order) AND the
+    // query has LIMIT, truncate `working` before the projection / window
+    // pass so we don't evaluate expressions on rows that LIMIT would
+    // discard. Skip when there are window functions (they need every
+    // row in the partition) or DISTINCT (dedup may pull from later
+    // rows). Aggregates already collapse the row set, so they're out.
+    final orderDir = (!hasAggregates && s.orderBy.isNotEmpty)
+        ? _orderBySatisfiedByIndex(s)
+        : 0;
+    if (orderDir != 0 &&
+        s.limit != null &&
+        !s.distinct &&
+        !_projectionHasWindow(s)) {
+      final keep = (s.offset ?? 0) + s.limit!;
+      if (keep >= 0 && keep < working.length) {
+        working = orderDir == 1
+            ? working.sublist(0, keep)
+            : working.sublist(working.length - keep);
+        _planLimitPushed = true;
+      }
+    }
 
     List<List<Object?>> resultRows;
     List<String> outCols;
@@ -4183,7 +4213,7 @@ class Database {
       // SplayTreeMap-backed index whose leading columns match the
       // ORDER BY — skip the sort. For all-DESC matches we just reverse
       // the materialized rows. Only safe on the non-aggregate path.
-      final dir = hasAggregates ? 0 : _orderBySatisfiedByIndex(s);
+      final dir = orderDir;
       if (dir == 1) {
         _planSortSkipped = true;
       } else if (dir == -1) {
@@ -5439,6 +5469,18 @@ class Database {
     // Single-column range: only the first indexed column is ordered.
     _planScanOrderedAsc = [cols.first];
     _planScanEqualityCols = const {};
+  }
+
+  /// Returns true when any top-level projected expression of [s] is a
+  /// window function. Used by Phase 0.9 LIMIT pushdown to disable
+  /// itself, since window evaluation requires every row in the
+  /// partition.
+  bool _projectionHasWindow(SelectStmt s) {
+    for (final p in s.projection) {
+      final e = p.expr;
+      if (e is FunctionCallExpr && e.isWindow) return true;
+    }
+    return false;
   }
 
   /// Returns how [s.orderBy] is satisfied by the ordering that
