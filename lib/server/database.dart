@@ -5061,7 +5061,6 @@ class Database {
     if (s.fromTable == null) return null;
     if (s.joins.isNotEmpty) return null;
     if (s.fromSubquery != null || s.fromFunction != null) return null;
-    if (s.where != null) return null;
     if (s.groupBy.isNotEmpty || s.having != null) return null;
     if (s.setOp != null) return null;
     if (s.projection.length != 1) return null;
@@ -5075,6 +5074,128 @@ class Database {
     if (idx == null) return null;
     final indexMap = t.indexes[idx.name];
     if (indexMap == null) return null;
+
+    // Phase 2.6: optional WHERE restricted to the indexed column.
+    // Recognised shapes mirror `_tryAggregateWithWhereFast`:
+    //   * col = lit
+    //   * col BETWEEN lo AND hi
+    //   * col >= a AND col <= b (and < / > flavours)
+    //   * col IN (lit, ...)
+    //   * col IS NULL / IS NOT NULL
+    // Returns null on any other WHERE shape so the generic scan keeps
+    // semantics. NOCASE and partial indexes already disqualify earlier.
+    if (idx.collations.isNotEmpty &&
+        idx.collations[0].toUpperCase() == 'NOCASE') {
+      return null;
+    }
+    if (idx.whereSql != null) return null;
+
+    final colNameLower = colExpr.name.toLowerCase();
+    Object? loKey;
+    Object? hiKey;
+    var loInc = true;
+    var hiInc = true;
+    List<Object>? inKeys;
+    var emptyResult = false; // WHERE matches nothing
+    var hasWhere = false;
+    if (s.where != null) {
+      hasWhere = true;
+      final w = s.where!;
+      if (w is UnaryExpr &&
+          w.operand is ColumnExpr &&
+          (w.op == 'IS NULL' || w.op == 'IS NOT NULL')) {
+        final c = w.operand as ColumnExpr;
+        if (c.name.toLowerCase() != colNameLower) return null;
+        if (w.op == 'IS NULL') {
+          // Index has no NULL keys → no rows.
+          emptyResult = true;
+        }
+        // IS NOT NULL → fall through with no bounds (walk all).
+      } else if (w is BinaryExpr &&
+          w.op == '=' &&
+          ((w.left is ColumnExpr && w.right is LiteralExpr) ||
+              (w.right is ColumnExpr && w.left is LiteralExpr))) {
+        final c =
+            (w.left is ColumnExpr ? w.left : w.right) as ColumnExpr;
+        final lit =
+            (w.left is LiteralExpr ? w.left : w.right) as LiteralExpr;
+        if (c.name.toLowerCase() != colNameLower) return null;
+        if (lit.value == null) {
+          emptyResult = true;
+        } else {
+          final k = idx.collate(0, lit.value);
+          if (k == null) {
+            emptyResult = true;
+          } else {
+            loKey = k;
+            hiKey = k;
+          }
+        }
+      } else if (w is BetweenExpr &&
+          !w.negated &&
+          w.value is ColumnExpr &&
+          w.low is LiteralExpr &&
+          w.high is LiteralExpr) {
+        final c = w.value as ColumnExpr;
+        if (c.name.toLowerCase() != colNameLower) return null;
+        final loRaw = (w.low as LiteralExpr).value;
+        final hiRaw = (w.high as LiteralExpr).value;
+        if (loRaw == null || hiRaw == null) {
+          emptyResult = true;
+        } else {
+          loKey = idx.collate(0, loRaw);
+          hiKey = idx.collate(0, hiRaw);
+          if (loKey == null || hiKey == null) emptyResult = true;
+        }
+      } else if (w is BinaryExpr &&
+          w.op == 'AND' &&
+          w.left is BinaryExpr &&
+          w.right is BinaryExpr) {
+        final lo = _extractRangeBound(w.left as BinaryExpr);
+        final hi = _extractRangeBound(w.right as BinaryExpr);
+        if (lo == null || hi == null) return null;
+        if (lo.col != hi.col) return null;
+        if (lo.col.toLowerCase() != colNameLower) return null;
+        ({Object value, bool inclusive})? loB;
+        ({Object value, bool inclusive})? hiB;
+        if (lo.isLower && !hi.isLower) {
+          loB = (value: lo.value, inclusive: lo.inclusive);
+          hiB = (value: hi.value, inclusive: hi.inclusive);
+        } else if (!lo.isLower && hi.isLower) {
+          loB = (value: hi.value, inclusive: hi.inclusive);
+          hiB = (value: lo.value, inclusive: lo.inclusive);
+        } else {
+          return null;
+        }
+        loKey = idx.collate(0, loB.value);
+        hiKey = idx.collate(0, hiB.value);
+        if (loKey == null || hiKey == null) {
+          emptyResult = true;
+        } else {
+          loInc = loB.inclusive;
+          hiInc = hiB.inclusive;
+        }
+      } else if (w is InExpr && !w.negated && w.value is ColumnExpr) {
+        final c = w.value as ColumnExpr;
+        if (c.name.toLowerCase() != colNameLower) return null;
+        final keys = <Object>{};
+        for (final ev in w.values) {
+          if (ev is! LiteralExpr) return null;
+          final raw = ev.value;
+          if (raw == null) continue;
+          final k = idx.collate(0, raw);
+          if (k == null) continue;
+          keys.add(k);
+        }
+        if (keys.isEmpty) {
+          emptyResult = true;
+        } else {
+          inKeys = keys.toList();
+        }
+      } else {
+        return null;
+      }
+    }
 
     // Honour ORDER BY only if it's on the same column. Anything else
     // requires re-sorting, which defeats the optimisation.
@@ -5091,17 +5212,44 @@ class Database {
     }
 
     // Iterate the index in sorted (asc) order and emit one row per
-    // posting (or one per distinct key when DISTINCT).
+    // posting (or one per distinct key when DISTINCT). Phase 2.6:
+    // when a WHERE was recognised, restrict to the matching subset.
     final outName = p.alias ?? colExpr.name;
     final out = <List<Object?>>[];
-    Iterable<MapEntry<Object, List<int>>> entries = indexMap.entries;
-    if (descending) entries = entries.toList().reversed;
-    for (final e in entries) {
-      if (s.distinct) {
-        out.add([e.key]);
+    if (!emptyResult) {
+      Iterable<MapEntry<Object, List<int>>> entries;
+      if (inKeys != null) {
+        // Walk the explicit IN-list. Sort keys to keep ASC order.
+        final sorted = inKeys.toList()
+          ..sort((a, b) => sqlCompare(a, b));
+        entries = [
+          for (final k in sorted)
+            if (indexMap[k] != null) MapEntry(k, indexMap[k]!),
+        ];
+      } else if (loKey != null && hiKey != null) {
+        // Inclusive/exclusive range walk.
+        final captLo = loKey;
+        final captHi = hiKey;
+        final captLoInc = loInc;
+        final captHiInc = hiInc;
+        entries = indexMap.entries.where((e) {
+          final cLo = sqlCompare(e.key, captLo);
+          if (cLo < 0 || (cLo == 0 && !captLoInc)) return false;
+          final cHi = sqlCompare(e.key, captHi);
+          if (cHi > 0 || (cHi == 0 && !captHiInc)) return false;
+          return true;
+        });
       } else {
-        for (var i = 0; i < e.value.length; i++) {
+        entries = indexMap.entries;
+      }
+      if (descending) entries = entries.toList().reversed;
+      for (final e in entries) {
+        if (s.distinct) {
           out.add([e.key]);
+        } else {
+          for (var i = 0; i < e.value.length; i++) {
+            out.add([e.key]);
+          }
         }
       }
     }
@@ -5114,9 +5262,11 @@ class Database {
     rows = rows.sublist(start, end);
 
     coveringScansUsed++;
+    if (s.orderBy.isNotEmpty) _planSortSkipped = true;
     _planTrace = [
       'COVERING SCAN ${t.name} USING INDEX ${idx.name} '
-          '(${colExpr.name}${descending ? " DESC" : ""})',
+          '(${colExpr.name}${descending ? " DESC" : ""}'
+          '${hasWhere ? " +WHERE" : ""})',
     ];
     return QueryResult(columns: [outName], rows: rows, affected: rows.length);
   }
