@@ -4851,8 +4851,7 @@ class Database {
       } else if (indexMap.isNotEmpty) {
         // MIN/MAX. Single-column → key IS the value. Composite →
         // CompositeIndexKey.parts[0] is the leading-column value.
-        final raw =
-            name == 'MIN' ? indexMap.firstKey() : indexMap.lastKey();
+        final raw = name == 'MIN' ? indexMap.firstKey() : indexMap.lastKey();
         if (isComposite) {
           // For MAX over a composite key we want the LARGEST leading
           // value. lastKey() gives the lexicographically-largest full
@@ -5158,9 +5157,11 @@ class Database {
     }
     if (indexed != t.rows.length) return null;
 
-    // Validate projections: each must be either the group col, a
-    // bare COUNT(*), or COUNT(<group-col>) (equivalent here since the
-    // group col is non-null in the present rows).
+    // Validate projections: each must be either the group col, or
+    // an aggregate (COUNT/MIN/MAX/SUM/AVG/TOTAL) whose only argument
+    // is the group col itself (or COUNT(*)). Within each group the
+    // grouped col is by definition constant, so MIN=MAX=key,
+    // SUM=key*cnt, AVG=key, TOTAL=key*cnt (REAL), COUNT(*)=cnt.
     final geNameLower = ge.name.toLowerCase();
     for (final p in s.projection) {
       final e = p.expr;
@@ -5169,14 +5170,27 @@ class Database {
         continue;
       }
       if (e is FunctionCallExpr) {
-        if (e.name.toUpperCase() != 'COUNT') return null;
+        final n = e.name.toUpperCase();
+        if (n != 'COUNT' &&
+            n != 'MIN' &&
+            n != 'MAX' &&
+            n != 'SUM' &&
+            n != 'AVG' &&
+            n != 'TOTAL') {
+          return null;
+        }
         if (e.distinct) return null;
         if (e.window != null || e.filterExpr != null) return null;
-        if (e.isStarArg) continue;
+        if (e.isStarArg) {
+          if (n != 'COUNT') return null;
+          continue;
+        }
         if (e.args.length != 1) return null;
         final a = e.args.first;
         if (a is! ColumnExpr) return null;
         if (a.name.toLowerCase() != geNameLower) return null;
+        // For SUM/AVG/TOTAL we also need the key to be numeric — bail
+        // here on the first key check below if not.
         continue;
       }
       return null;
@@ -5204,20 +5218,52 @@ class Database {
                 : (() {
                     final e = p.expr as FunctionCallExpr;
                     if (e.isStarArg) return 'count(*)';
-                    return 'count(${(e.args.first as ColumnExpr).name})';
+                    final n = e.name.toLowerCase();
+                    final aname = (e.args.first as ColumnExpr).name;
+                    return '$n($aname)';
                   })()),
     ];
     var entries = indexMap.entries.toList();
     if (descending) entries = entries.reversed.toList();
     final out = <List<Object?>>[];
     for (final entry in entries) {
+      final key = entry.key;
+      final cnt = entry.value.length;
       final row = <Object?>[];
       for (final p in s.projection) {
         final e = p.expr;
         if (e is ColumnExpr) {
-          row.add(entry.key);
+          row.add(key);
+          continue;
+        }
+        final fc = e as FunctionCallExpr;
+        final n = fc.name.toUpperCase();
+        if (n == 'COUNT') {
+          row.add(cnt);
+          continue;
+        }
+        if (n == 'MIN' || n == 'MAX' || n == 'AVG') {
+          // Within a group the col is constant; AVG of a constant is
+          // the constant itself. SQLite returns AVG as the value's
+          // numeric type when integer division is exact, but to match
+          // generic-path behaviour exactly we promote to double when
+          // the arg is numeric.
+          if (n == 'AVG') {
+            if (key is! num) return null;
+            row.add(key.toDouble());
+          } else {
+            row.add(key);
+          }
+          continue;
+        }
+        // SUM / TOTAL: key * cnt; numeric keys only.
+        if (key is! num) return null;
+        final acc = key * cnt;
+        if (n == 'TOTAL') {
+          row.add(acc.toDouble());
         } else {
-          row.add(entry.value.length);
+          // SUM: int when key is int and product fits int.
+          row.add(key is double ? acc.toDouble() : acc);
         }
       }
       out.add(row);
