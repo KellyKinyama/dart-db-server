@@ -4850,15 +4850,26 @@ class Database {
     var loInc = true;
     var hiInc = true;
     List<Object>? inKeys; // null unless IN-list shape
+    var walkAll = false; // true for `WHERE col IS NOT NULL`
 
-    if (where is BinaryExpr &&
+    if (where is UnaryExpr &&
+        where.operand is ColumnExpr &&
+        (where.op == 'IS NULL' || where.op == 'IS NOT NULL')) {
+      final col = where.operand as ColumnExpr;
+      if (col.name.toLowerCase() != colNameLower) return null;
+      // Index never stores NULL keys, so `IS NULL` matches nothing.
+      if (where.op == 'IS NULL') {
+        return _emitEmptyAggregate(name, p, arg.name);
+      }
+      walkAll = true;
+    } else if (where is BinaryExpr &&
         where.op == '=' &&
         ((where.left is ColumnExpr && where.right is LiteralExpr) ||
             (where.right is ColumnExpr && where.left is LiteralExpr))) {
-      final col = (where.left is ColumnExpr ? where.left : where.right)
-          as ColumnExpr;
-      final lit = (where.left is LiteralExpr ? where.left : where.right)
-          as LiteralExpr;
+      final col =
+          (where.left is ColumnExpr ? where.left : where.right) as ColumnExpr;
+      final lit =
+          (where.left is LiteralExpr ? where.left : where.right) as LiteralExpr;
       if (col.name.toLowerCase() != colNameLower) return null;
       if (lit.value == null) {
         // `col = NULL` is never true; aggregate over empty input.
@@ -4912,9 +4923,7 @@ class Database {
       }
       loInc = loB.inclusive;
       hiInc = hiB.inclusive;
-    } else if (where is InExpr &&
-        !where.negated &&
-        where.value is ColumnExpr) {
+    } else if (where is InExpr && !where.negated && where.value is ColumnExpr) {
       final col = where.value as ColumnExpr;
       if (col.name.toLowerCase() != colNameLower) return null;
       final keys = <Object>{};
@@ -4951,6 +4960,19 @@ class Database {
         cnt += posting.length;
         if (minKey == null || sqlCompare(k, minKey) < 0) minKey = k;
         if (maxKey == null || sqlCompare(k, maxKey) > 0) maxKey = k;
+      }
+    } else if (walkAll) {
+      for (final entry in indexMap.entries) {
+        final k = entry.key;
+        final posting = entry.value;
+        if (needsNumeric) {
+          if (k is! num) return null;
+          if (k is double) sawDouble = true;
+          sumAcc += k * posting.length;
+        }
+        cnt += posting.length;
+        minKey ??= k;
+        maxKey = k;
       }
     } else {
       for (final entry in indexMap.entries) {
@@ -5004,8 +5026,7 @@ class Database {
 
   /// Empty-input aggregate result for the `_tryAggregateWithWhereFast`
   /// path. Mirrors SQLite: COUNT/TOTAL are 0/0.0, everything else NULL.
-  QueryResult _emitEmptyAggregate(
-      String name, SelectItem p, String argName) {
+  QueryResult _emitEmptyAggregate(String name, SelectItem p, String argName) {
     Object? value;
     switch (name) {
       case 'COUNT':
@@ -5016,7 +5037,9 @@ class Database {
         value = null;
     }
     final col = p.alias ?? '${name.toLowerCase()}($argName)';
-    return QueryResult(columns: [col], rows: [
+    return QueryResult(columns: [
+      col
+    ], rows: [
       [value]
     ], affected: 1);
   }
