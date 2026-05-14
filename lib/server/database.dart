@@ -4855,19 +4855,35 @@ class Database {
   /// scans [conjuncts] for `col = literal` predicates that constrain a
   /// contiguous leading prefix of the index. When the entire index is
   /// equality-bound, emits a full composite probe; when only a leading
-  /// prefix is bound, emits a [_IndexPlan.prefix] scan.
+  /// prefix is bound, emits a [_IndexPlan.prefix] scan. When the prefix
+  /// is short by exactly one column AND that one column has range
+  /// predicates (`<`/`<=`/`>`/`>=`), emits a tighter
+  /// [_IndexPlan.prefixRange] plan that combines both.
   List<_IndexPlan> _classifyMultiColumnPlans(Table t, List<Expr> conjuncts) {
     final out = <_IndexPlan>[];
     // Map column-name (lowercase) -> equality literal value, taking the
     // first one we see per column.
     final eqByCol = <String, Object>{};
+    // Map column-name (lowercase) -> list of range bounds we observed.
+    final rangesByCol =
+        <String, List<({String op, Object value})>>{};
     for (final c in conjuncts) {
-      if (c is! BinaryExpr || c.op != '=') continue;
-      final (col, key, _) = _columnLiteralPair(c);
-      if (col == null || key == null) continue;
-      eqByCol.putIfAbsent(col.toLowerCase(), () => key);
+      if (c is! BinaryExpr) continue;
+      final op = c.op;
+      if (op == '=') {
+        final (col, key, _) = _columnLiteralPair(c);
+        if (col == null || key == null) continue;
+        eqByCol.putIfAbsent(col.toLowerCase(), () => key);
+      } else if (op == '<' || op == '<=' || op == '>' || op == '>=') {
+        final (col, key, flipped) = _columnLiteralPair(c);
+        if (col == null || key == null) continue;
+        final effective = flipped ? _flipComparison(op) : op;
+        rangesByCol
+            .putIfAbsent(col.toLowerCase(), () => [])
+            .add((op: effective, value: key));
+      }
     }
-    if (eqByCol.isEmpty) return out;
+    if (eqByCol.isEmpty && rangesByCol.isEmpty) return out;
 
     for (final def in t.indexDefs.values) {
       if (def.exprSql != null) continue;
@@ -4888,13 +4904,71 @@ class Database {
       final divisor = math.pow(2, parts.length - 1).toInt();
       final est = (perCol / divisor).ceil().clamp(1, t.rows.length);
       if (parts.length == def.columns.length) {
-        // Full key probe \u2014 single composite key into the SplayTreeMap.
+        // Full key probe — single composite key into the SplayTreeMap.
         out.add(_IndexPlan.equality(
           table: t.name,
           index: def.name,
           column: def.columns.join(','),
           equalityKey: CompositeIndexKey(parts),
           estHits: est,
+        ));
+        continue;
+      }
+      // Prefix is short by 1+ columns. If we have range predicates on
+      // the *next* indexed column, emit a tighter hybrid plan.
+      final nextCol = def.columns[parts.length].toLowerCase();
+      final ranges = rangesByCol[nextCol];
+      Object? lo;
+      bool loInc = true;
+      Object? hi;
+      bool hiInc = false;
+      if (ranges != null) {
+        for (final p in ranges) {
+          switch (p.op) {
+            case '>=':
+              if (lo == null || _compareLiteral(p.value, lo) > 0) {
+                lo = p.value;
+                loInc = true;
+              }
+              break;
+            case '>':
+              if (lo == null ||
+                  _compareLiteral(p.value, lo) > 0 ||
+                  (_compareLiteral(p.value, lo) == 0 && loInc)) {
+                lo = p.value;
+                loInc = false;
+              }
+              break;
+            case '<=':
+              if (hi == null || _compareLiteral(p.value, hi) < 0) {
+                hi = p.value;
+                hiInc = true;
+              }
+              break;
+            case '<':
+              if (hi == null ||
+                  _compareLiteral(p.value, hi) < 0 ||
+                  (_compareLiteral(p.value, hi) == 0 && hiInc)) {
+                hi = p.value;
+                hiInc = false;
+              }
+              break;
+          }
+        }
+      }
+      if (lo != null || hi != null) {
+        // Range halves the prefix estimate as a coarse selectivity hint.
+        final rangedEst = (est / 2).ceil().clamp(1, t.rows.length);
+        out.add(_IndexPlan.prefixRange(
+          table: t.name,
+          index: def.name,
+          column: def.columns.take(parts.length + 1).join(','),
+          prefixKey: parts,
+          lo: lo,
+          hi: hi,
+          loInclusive: loInc,
+          hiInclusive: hiInc,
+          estHits: rangedEst,
         ));
       } else {
         out.add(_IndexPlan.prefix(
@@ -5218,12 +5292,22 @@ class Database {
     Object? coll0(Object? v) => def == null ? v : def.collate(0, v);
     // Prefix scan over a composite-key (multi-column) index: collect
     // every entry whose key shares the requested leading components.
+    // When the plan also carries lo/hi, the next column (at index
+    // `prefix.length`) is range-bounded too.
     if (plan.prefixKey != null) {
       final prefixRaw = plan.prefixKey!;
       final prefix = <Object?>[
         for (var i = 0; i < prefixRaw.length; i++)
           def == null ? prefixRaw[i] : def.collate(i, prefixRaw[i])
       ];
+      final hasRange = plan.lo != null || plan.hi != null;
+      final rangeColPos = prefix.length;
+      final loC = plan.lo == null
+          ? null
+          : (def == null ? plan.lo : def.collate(rangeColPos, plan.lo));
+      final hiC = plan.hi == null
+          ? null
+          : (def == null ? plan.hi : def.collate(rangeColPos, plan.hi));
       final out = <int>[];
       for (final entry in idx.entries) {
         final k = entry.key;
@@ -5236,7 +5320,20 @@ class Database {
             break;
           }
         }
-        if (match) out.addAll(entry.value);
+        if (!match) continue;
+        if (hasRange) {
+          if (k.parts.length <= rangeColPos) continue;
+          final v = k.parts[rangeColPos];
+          if (loC != null) {
+            final c = CompositeIndexKey.compareValues(v, loC);
+            if (plan.loInclusive ? c < 0 : c <= 0) continue;
+          }
+          if (hiC != null) {
+            final c = CompositeIndexKey.compareValues(v, hiC);
+            if (plan.hiInclusive ? c > 0 : c >= 0) continue;
+          }
+        }
+        out.addAll(entry.value);
       }
       return out;
     }
@@ -9748,6 +9845,9 @@ class _PendingOn {
 /// used both for `col = lit` and `col IN (lit, lit, ...)`).
 /// `prefixKey != null` => prefix scan over a composite-key (multi-column)
 /// index when only the leading K of N columns are equality-constrained.
+/// When `prefixKey` is set, `lo`/`hi` (if non-null) describe a range
+/// constraint on the *next* indexed column — the equality prefix scopes
+/// the scan, then the range trims it further.
 /// Otherwise (`lo`, `hi`, `loInclusive`, `hiInclusive`) define an open or
 /// closed range. Either bound may be null for half-open ranges.
 class _IndexPlan {
@@ -9813,8 +9913,29 @@ class _IndexPlan {
         loInclusive = false,
         hiInclusive = false;
 
+  /// Hybrid plan: equality prefix over the leading K of N indexed
+  /// columns, then a range constraint on column K+1.
+  _IndexPlan.prefixRange({
+    required this.table,
+    required this.index,
+    required this.column,
+    required this.prefixKey,
+    required this.lo,
+    required this.hi,
+    required this.loInclusive,
+    required this.hiInclusive,
+    required this.estHits,
+  }) : equalityKeys = null;
+
   String describe() {
     if (prefixKey != null) {
+      if (lo != null || hi != null) {
+        final loS = lo == null ? '' : '${loInclusive ? ">=" : ">"} $lo';
+        final hiS = hi == null ? '' : '${hiInclusive ? "<=" : "<"} $hi';
+        final cond = [loS, hiS].where((s) => s.isNotEmpty).join(' AND ');
+        return 'SEARCH $table USING INDEX $index '
+            '($column PREFIX ${prefixKey!.length}=? RANGE $cond) ~$estHits';
+      }
       return 'SEARCH $table USING INDEX $index '
           '($column PREFIX ${prefixKey!.length}=?) ~$estHits';
     }
