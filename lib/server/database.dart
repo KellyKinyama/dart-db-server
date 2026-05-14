@@ -5136,7 +5136,6 @@ class Database {
     if (s.fromTable == null) return null;
     if (s.joins.isNotEmpty) return null;
     if (s.fromSubquery != null || s.fromFunction != null) return null;
-    if (s.having != null) return null;
     if (s.setOp != null) return null;
     if (s.distinct) return null;
     if (s.groupBy.length != 1) return null;
@@ -5241,8 +5240,8 @@ class Database {
           where.op == '=' &&
           ((where.left is ColumnExpr && where.right is LiteralExpr) ||
               (where.right is ColumnExpr && where.left is LiteralExpr))) {
-        final col = (where.left is ColumnExpr ? where.left : where.right)
-            as ColumnExpr;
+        final col =
+            (where.left is ColumnExpr ? where.left : where.right) as ColumnExpr;
         final lit = (where.left is LiteralExpr ? where.left : where.right)
             as LiteralExpr;
         if (col.name.toLowerCase() != geNameLower) return null;
@@ -5321,6 +5320,19 @@ class Database {
       }
     }
 
+    // HAVING: build a predicate over (key, cnt). Recognised shapes:
+    //   <term> [op] <lit>            with op in {=, !=, <>, <, <=, >, >=}
+    //   <term> BETWEEN <lit> AND <lit>
+    //   <term> IN (<lit>, ...)
+    //   <a> AND <b>                  (recursively)
+    // where <term> is either the group col (→ key) or COUNT(*) (→ cnt).
+    bool Function(Object key, int cnt)? havingPred;
+    if (s.having != null) {
+      final pred = _buildGroupByHavingPred(s.having!, geNameLower);
+      if (pred == null) return null;
+      havingPred = pred;
+    }
+
     // Materialise.
     final cols = <String>[
       for (final p in s.projection)
@@ -5361,6 +5373,7 @@ class Database {
     for (final entry in entries) {
       final key = entry.key;
       final cnt = entry.value.length;
+      if (havingPred != null && !havingPred(key, cnt)) continue;
       final row = <Object?>[];
       for (final p in s.projection) {
         final e = p.expr;
@@ -5407,6 +5420,123 @@ class Database {
     rows = rows.sublist(start, end);
     if (s.orderBy.isNotEmpty) _planSortSkipped = true;
     return QueryResult(columns: cols, rows: rows, affected: rows.length);
+  }
+
+  /// Build a `(key, cnt) -> bool` predicate for the GROUP BY fast-path
+  /// HAVING clause. Returns `null` if any sub-shape is unsupported, in
+  /// which case the caller bails to the generic group-by path.
+  bool Function(Object key, int cnt)? _buildGroupByHavingPred(
+      Expr h, String geNameLower) {
+    // <term> resolves to either `key` or `cnt`. null → unsupported.
+    Object? Function(Object key, int cnt)? termOf(Expr e) {
+      if (e is ColumnExpr) {
+        if (e.name.toLowerCase() != geNameLower) return null;
+        return (k, _) => k;
+      }
+      if (e is FunctionCallExpr &&
+          e.name.toUpperCase() == 'COUNT' &&
+          e.isStarArg &&
+          !e.distinct &&
+          e.window == null &&
+          e.filterExpr == null) {
+        return (_, c) => c;
+      }
+      return null;
+    }
+
+    if (h is BinaryExpr && h.op == 'AND') {
+      final l = _buildGroupByHavingPred(h.left, geNameLower);
+      final r = _buildGroupByHavingPred(h.right, geNameLower);
+      if (l == null || r == null) return null;
+      return (k, c) => l(k, c) && r(k, c);
+    }
+    if (h is BinaryExpr) {
+      const cmpOps = {'=', '!=', '<>', '<', '<=', '>', '>='};
+      if (!cmpOps.contains(h.op)) return null;
+      final isLeftLit = h.left is LiteralExpr;
+      final isRightLit = h.right is LiteralExpr;
+      if (isLeftLit == isRightLit) return null;
+      final term =
+          termOf(isLeftLit ? h.right : h.left);
+      if (term == null) return null;
+      final lit =
+          (isLeftLit ? h.left : h.right) as LiteralExpr;
+      final litVal = lit.value;
+      if (litVal == null) return (_, __) => false;
+      // If lit is on the LEFT we have to flip op direction.
+      var op = h.op;
+      if (isLeftLit) {
+        switch (op) {
+          case '<':
+            op = '>';
+          case '<=':
+            op = '>=';
+          case '>':
+            op = '<';
+          case '>=':
+            op = '<=';
+        }
+      }
+      return (k, c) {
+        final v = term(k, c);
+        if (v == null) return false;
+        final cmp = sqlCompare(v, litVal);
+        switch (op) {
+          case '=':
+            return cmp == 0;
+          case '!=':
+          case '<>':
+            return cmp != 0;
+          case '<':
+            return cmp < 0;
+          case '<=':
+            return cmp <= 0;
+          case '>':
+            return cmp > 0;
+          case '>=':
+            return cmp >= 0;
+        }
+        return false;
+      };
+    }
+    if (h is BetweenExpr && h.low is LiteralExpr && h.high is LiteralExpr) {
+      final term = termOf(h.value);
+      if (term == null) return null;
+      final lo = (h.low as LiteralExpr).value;
+      final hi = (h.high as LiteralExpr).value;
+      if (lo == null || hi == null) return (_, __) => h.negated;
+      return (k, c) {
+        final v = term(k, c);
+        if (v == null) return false;
+        final inRange =
+            sqlCompare(v, lo) >= 0 && sqlCompare(v, hi) <= 0;
+        return h.negated ? !inRange : inRange;
+      };
+    }
+    if (h is InExpr) {
+      final term = termOf(h.value);
+      if (term == null) return null;
+      final lits = <Object>[];
+      for (final ev in h.values) {
+        if (ev is! LiteralExpr) return null;
+        final raw = ev.value;
+        if (raw == null) continue;
+        lits.add(raw);
+      }
+      return (k, c) {
+        final v = term(k, c);
+        if (v == null) return false;
+        var hit = false;
+        for (final l in lits) {
+          if (sqlCompare(v, l) == 0) {
+            hit = true;
+            break;
+          }
+        }
+        return h.negated ? !hit : hit;
+      };
+    }
+    return null;
   }
 
   /// Empty-input aggregate result for the `_tryAggregateWithWhereFast`
