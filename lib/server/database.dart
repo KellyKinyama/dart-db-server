@@ -4723,7 +4723,11 @@ class Database {
         values.add(t.rows.length);
         continue;
       }
-      if (name != 'MIN' && name != 'MAX' && name != 'SUM' && name != 'AVG') {
+      if (name != 'MIN' &&
+          name != 'MAX' &&
+          name != 'SUM' &&
+          name != 'AVG' &&
+          name != 'TOTAL') {
         return null;
       }
       if (e.args.length != 1) return null;
@@ -4739,13 +4743,14 @@ class Database {
       final indexMap = t.indexes[idx.name];
       if (indexMap == null) return null;
       Object? value;
-      if (name == 'SUM' || name == 'AVG') {
-        // SUM/AVG ignore NULLs (already excluded — index doesn't store
-        // them). Empty index is NULL per SQL. Otherwise sum
+      if (name == 'SUM' || name == 'AVG' || name == 'TOTAL') {
+        // SUM/AVG/TOTAL ignore NULLs (already excluded — index doesn't
+        // store them). SUM/AVG return NULL on empty per SQL; TOTAL
+        // (SQLite extension) returns 0.0. Otherwise sum
         // `key * postingLen`. Bail on non-numeric keys so the generic
         // path handles type coercion / errors.
         if (indexMap.isEmpty) {
-          value = null;
+          value = name == 'TOTAL' ? 0.0 : null;
         } else {
           num acc = 0;
           var cnt = 0;
@@ -4760,6 +4765,9 @@ class Database {
           if (name == 'AVG') {
             // AVG always returns REAL in SQLite when there are any rows.
             value = acc / cnt;
+          } else if (name == 'TOTAL') {
+            // TOTAL always returns REAL.
+            value = acc.toDouble();
           } else {
             // If every key was an int and the running total stayed int,
             // emit int; otherwise emit double to match SQLite behaviour.
