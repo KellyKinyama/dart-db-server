@@ -4162,6 +4162,11 @@ class Database {
     final mm = _tryMinMaxFast(s);
     if (mm != null) return mm;
 
+    // Phase 2.4: bare aggregate with WHERE on the same indexed column.
+    // Walks only the matching subrange of the index — no row hydration.
+    final agw = _tryAggregateWithWhereFast(s);
+    if (agw != null) return agw;
+
     final reordered = _reorderInnerJoins(s);
     final fromRows =
         _planScan(reordered, outer) ?? _resolveFromRows(reordered, outer);
@@ -4784,6 +4789,236 @@ class Database {
     if (s.limit != null && s.limit! <= 0) rows = const <List<Object?>>[];
     if ((s.offset ?? 0) >= 1) rows = const <List<Object?>>[];
     return QueryResult(columns: cols, rows: rows, affected: rows.length);
+  }
+
+  /// Phase 2.4: bare aggregate (`MIN`/`MAX`/`SUM`/`AVG`/`TOTAL`/
+  /// `COUNT(col)`) over a single-column non-NOCASE non-partial index
+  /// with a WHERE predicate restricted to the SAME column. Recognised
+  /// WHERE shapes (all literal-bounded) match those in
+  /// `_tryCountStarFastEqProbe`:
+  ///
+  ///   * `col = lit`
+  ///   * `col BETWEEN lo AND hi`
+  ///   * `col >= a AND col <= b` (and the < / > flavours)
+  ///   * `col IN (lit, lit, ...)` (non-negated, literal elements)
+  ///
+  /// Single projection only — multi-projection composition is handled
+  /// by `_tryMinMaxFast` (which has no WHERE) and by the generic
+  /// aggregate path otherwise. Returns null on any mismatch so the
+  /// generic path keeps semantics.
+  QueryResult? _tryAggregateWithWhereFast(SelectStmt s) {
+    if (s.fromTable == null) return null;
+    if (s.joins.isNotEmpty) return null;
+    if (s.fromSubquery != null || s.fromFunction != null) return null;
+    if (s.where == null) return null;
+    if (s.groupBy.isNotEmpty || s.having != null) return null;
+    if (s.orderBy.isNotEmpty) return null;
+    if (s.setOp != null) return null;
+    if (s.distinct) return null;
+    if (s.projection.length != 1) return null;
+    final p = s.projection.first;
+    final e = p.expr;
+    if (e is! FunctionCallExpr) return null;
+    final name = e.name.toUpperCase();
+    if (e.distinct) return null;
+    if (e.window != null) return null;
+    if (e.filterExpr != null) return null;
+    if (e.isStarArg) return null;
+    if (name != 'MIN' &&
+        name != 'MAX' &&
+        name != 'SUM' &&
+        name != 'AVG' &&
+        name != 'TOTAL' &&
+        name != 'COUNT') {
+      return null;
+    }
+    if (e.args.length != 1) return null;
+    final arg = e.args.first;
+    if (arg is! ColumnExpr) return null;
+    final t = _tables[s.fromTable!];
+    if (t == null) return null;
+    final ix = _resolveSingleColIndex(t, arg.name);
+    if (ix == null) return null;
+    final (idx, indexMap) = ix;
+
+    // Resolve the WHERE into an inclusive/exclusive [lo, hi] range
+    // over `indexMap` keys, OR an explicit set of keys for IN.
+    final colNameLower = arg.name.toLowerCase();
+    final where = s.where!;
+    Object? loKey;
+    Object? hiKey;
+    var loInc = true;
+    var hiInc = true;
+    List<Object>? inKeys; // null unless IN-list shape
+
+    if (where is BinaryExpr &&
+        where.op == '=' &&
+        ((where.left is ColumnExpr && where.right is LiteralExpr) ||
+            (where.right is ColumnExpr && where.left is LiteralExpr))) {
+      final col = (where.left is ColumnExpr ? where.left : where.right)
+          as ColumnExpr;
+      final lit = (where.left is LiteralExpr ? where.left : where.right)
+          as LiteralExpr;
+      if (col.name.toLowerCase() != colNameLower) return null;
+      if (lit.value == null) {
+        // `col = NULL` is never true; aggregate over empty input.
+        return _emitEmptyAggregate(name, p, arg.name);
+      }
+      final k = idx.collate(0, lit.value);
+      if (k == null) return _emitEmptyAggregate(name, p, arg.name);
+      loKey = k;
+      hiKey = k;
+    } else if (where is BetweenExpr &&
+        !where.negated &&
+        where.value is ColumnExpr &&
+        where.low is LiteralExpr &&
+        where.high is LiteralExpr) {
+      final col = where.value as ColumnExpr;
+      if (col.name.toLowerCase() != colNameLower) return null;
+      final loRaw = (where.low as LiteralExpr).value;
+      final hiRaw = (where.high as LiteralExpr).value;
+      if (loRaw == null || hiRaw == null) {
+        return _emitEmptyAggregate(name, p, arg.name);
+      }
+      loKey = idx.collate(0, loRaw);
+      hiKey = idx.collate(0, hiRaw);
+      if (loKey == null || hiKey == null) {
+        return _emitEmptyAggregate(name, p, arg.name);
+      }
+    } else if (where is BinaryExpr &&
+        where.op == 'AND' &&
+        where.left is BinaryExpr &&
+        where.right is BinaryExpr) {
+      final lo = _extractRangeBound(where.left as BinaryExpr);
+      final hi = _extractRangeBound(where.right as BinaryExpr);
+      if (lo == null || hi == null) return null;
+      if (lo.col != hi.col) return null;
+      if (lo.col.toLowerCase() != colNameLower) return null;
+      ({Object value, bool inclusive})? loB;
+      ({Object value, bool inclusive})? hiB;
+      if (lo.isLower && !hi.isLower) {
+        loB = (value: lo.value, inclusive: lo.inclusive);
+        hiB = (value: hi.value, inclusive: hi.inclusive);
+      } else if (!lo.isLower && hi.isLower) {
+        loB = (value: hi.value, inclusive: hi.inclusive);
+        hiB = (value: lo.value, inclusive: lo.inclusive);
+      } else {
+        return null;
+      }
+      loKey = idx.collate(0, loB.value);
+      hiKey = idx.collate(0, hiB.value);
+      if (loKey == null || hiKey == null) {
+        return _emitEmptyAggregate(name, p, arg.name);
+      }
+      loInc = loB.inclusive;
+      hiInc = hiB.inclusive;
+    } else if (where is InExpr &&
+        !where.negated &&
+        where.value is ColumnExpr) {
+      final col = where.value as ColumnExpr;
+      if (col.name.toLowerCase() != colNameLower) return null;
+      final keys = <Object>{};
+      for (final ev in where.values) {
+        if (ev is! LiteralExpr) return null;
+        final raw = ev.value;
+        if (raw == null) continue;
+        final k = idx.collate(0, raw);
+        if (k == null) continue;
+        keys.add(k);
+      }
+      inKeys = keys.toList();
+    } else {
+      return null;
+    }
+
+    // Walk the matching index entries.
+    num sumAcc = 0;
+    var cnt = 0;
+    Object? minKey;
+    Object? maxKey;
+    var sawDouble = false;
+    var needsNumeric = name == 'SUM' || name == 'AVG' || name == 'TOTAL';
+
+    if (inKeys != null) {
+      for (final k in inKeys) {
+        final posting = indexMap[k];
+        if (posting == null) continue;
+        if (needsNumeric) {
+          if (k is! num) return null;
+          if (k is double) sawDouble = true;
+          sumAcc += k * posting.length;
+        }
+        cnt += posting.length;
+        if (minKey == null || sqlCompare(k, minKey) < 0) minKey = k;
+        if (maxKey == null || sqlCompare(k, maxKey) > 0) maxKey = k;
+      }
+    } else {
+      for (final entry in indexMap.entries) {
+        final k = entry.key;
+        final cLo = sqlCompare(k, loKey!);
+        if (cLo < 0 || (cLo == 0 && !loInc)) continue;
+        final cHi = sqlCompare(k, hiKey!);
+        if (cHi > 0 || (cHi == 0 && !hiInc)) break;
+        final posting = entry.value;
+        if (needsNumeric) {
+          if (k is! num) return null;
+          if (k is double) sawDouble = true;
+          sumAcc += k * posting.length;
+        }
+        cnt += posting.length;
+        minKey ??= k; // first matching key in sorted order
+        maxKey = k; // last matching key seen so far
+      }
+    }
+
+    Object? value;
+    switch (name) {
+      case 'COUNT':
+        // COUNT(col): index doesn't store NULLs, so any matching
+        // posting entry contributes its length.
+        value = cnt;
+      case 'MIN':
+        value = minKey;
+      case 'MAX':
+        value = maxKey;
+      case 'SUM':
+        if (cnt == 0) {
+          value = null;
+        } else {
+          value = (sawDouble || sumAcc is! int) ? sumAcc.toDouble() : sumAcc;
+        }
+      case 'AVG':
+        value = cnt == 0 ? null : sumAcc / cnt;
+      case 'TOTAL':
+        value = cnt == 0 ? 0.0 : sumAcc.toDouble();
+    }
+
+    final col = p.alias ?? '${name.toLowerCase()}(${arg.name})';
+    var rows = <List<Object?>>[
+      [value]
+    ];
+    if (s.limit != null && s.limit! <= 0) rows = const <List<Object?>>[];
+    if ((s.offset ?? 0) >= 1) rows = const <List<Object?>>[];
+    return QueryResult(columns: [col], rows: rows, affected: rows.length);
+  }
+
+  /// Empty-input aggregate result for the `_tryAggregateWithWhereFast`
+  /// path. Mirrors SQLite: COUNT/TOTAL are 0/0.0, everything else NULL.
+  QueryResult _emitEmptyAggregate(
+      String name, SelectItem p, String argName) {
+    Object? value;
+    switch (name) {
+      case 'COUNT':
+        value = 0;
+      case 'TOTAL':
+        value = 0.0;
+      default:
+        value = null;
+    }
+    final col = p.alias ?? '${name.toLowerCase()}($argName)';
+    return QueryResult(columns: [col], rows: [
+      [value]
+    ], affected: 1);
   }
 
   /// Index-only / covering-scan fast path.
