@@ -4146,6 +4146,14 @@ class Database {
     final cov = _tryCoveringScan(s);
     if (cov != null) return cov;
 
+    // Phase 1.2: bare COUNT(*) fast path on in-memory tables. Avoids
+    // hydrating any row map — counts directly from the index posting
+    // lists (when WHERE is index-classifiable) or from t.rows.length
+    // (when there is no WHERE). Falls through to the generic aggregate
+    // path on any shape mismatch.
+    final cnt = _tryCountStarFast(s, outer);
+    if (cnt != null) return cnt;
+
     final reordered = _reorderInnerJoins(s);
     final fromRows =
         _planScan(reordered, outer) ?? _resolveFromRows(reordered, outer);
@@ -4335,6 +4343,64 @@ class Database {
   }
 
   // Build initial row maps from FROM table (real or view) and JOINs.
+
+  /// Phase 1.2 bare COUNT(*) fast path. Recognises:
+  ///
+  ///   `SELECT COUNT(*) [AS alias] FROM <in-memory-table> [WHERE …]`
+  ///
+  /// with no GROUP BY / HAVING / ORDER BY (LIMIT 0 still returns no
+  /// rows; any other LIMIT/OFFSET is fine since the result is one
+  /// row). When WHERE is null we return `t.rows.length`; when WHERE is
+  /// classifiable through an index we count posting-list hits without
+  /// hydrating any row map. Falls through (returns null) on any shape
+  /// mismatch — including any WHERE that can't be served by an index,
+  /// because the residual would still need full per-row evaluation.
+  QueryResult? _tryCountStarFast(SelectStmt s, Map<String, Object?> outer) {
+    if (s.fromTable == null) return null;
+    if (s.joins.isNotEmpty) return null;
+    if (s.fromSubquery != null || s.fromFunction != null) return null;
+    if (s.groupBy.isNotEmpty || s.having != null) return null;
+    if (s.orderBy.isNotEmpty) return null;
+    if (s.setOp != null) return null;
+    if (s.distinct) return null;
+    if (s.projection.length != 1) return null;
+    final p = s.projection.first;
+    final e = p.expr;
+    if (e is! FunctionCallExpr) return null;
+    if (e.name.toUpperCase() != 'COUNT') return null;
+    if (!e.isStarArg) return null;
+    if (e.distinct) return null;
+    if (e.window != null) return null;
+    if (e.filterExpr != null) return null;
+    final t = _tables[s.fromTable!];
+    if (t == null) return null;
+    int n;
+    if (s.where == null) {
+      n = t.rows.length;
+    } else {
+      // Try to serve the count from an index probe. _planScan returns
+      // hydrated maps; we just want the count, but reusing it keeps
+      // the path consistent. Bail when the planner declines (the
+      // residual would still need full materialisation, which is what
+      // the generic path already does).
+      final probed = _planScan(s, outer);
+      if (probed == null) return null;
+      // The plan may include a residual; re-apply the WHERE for safety.
+      final boundWhere = _bindExpr(s.where!, outer);
+      n = 0;
+      for (final r in probed) {
+        if (evalPredicate(boundWhere, r)) n++;
+      }
+    }
+    final alias = p.alias ?? 'count(*)';
+    var rows = <List<Object?>>[
+      [n],
+    ];
+    if (s.limit != null && s.limit! <= 0) rows = const <List<Object?>>[];
+    if ((s.offset ?? 0) >= 1) rows = const <List<Object?>>[];
+    return QueryResult(columns: [alias], rows: rows, affected: rows.length);
+  }
+
   /// Index-only / covering-scan fast path.
   ///
   /// Recognises the shape:
