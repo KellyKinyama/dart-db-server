@@ -919,7 +919,7 @@ class Database {
     }
     // CREATE INDEX may target a paged table; we look up by table name.
     if (stmt is CreateIndexStmt) {
-      final pt = _pagedTables[stmt.table];
+      final pt = _pagedTable(stmt.table);
       if (pt != null) {
         _assertNoPagedDdlInTx('CREATE INDEX on paged table ${stmt.table}');
         return _pagedCreateIndex(stmt, pt);
@@ -930,7 +930,7 @@ class Database {
     if (stmt is DropIndexStmt) {
       final ownerTable = _pagedIndexOwners[stmt.indexName];
       if (ownerTable != null) {
-        final pt = _pagedTables[ownerTable];
+        final pt = _pagedTable(ownerTable);
         if (pt != null) {
           _assertNoPagedDdlInTx('DROP INDEX on paged table $ownerTable');
           return _pagedDropIndex(stmt, pt);
@@ -940,7 +940,7 @@ class Database {
     }
     final tname = _statementTable(stmt);
     if (tname == null) return null;
-    final pt = _pagedTables[tname];
+    final pt = _pagedTable(tname);
     if (pt == null) {
       // The FROM table is in-memory — but a SELECT can still join
       // *to* a paged table. Detect that and run the join through
@@ -949,7 +949,7 @@ class Database {
       if (stmt is SelectStmt && stmt.joins.isNotEmpty) {
         final pagedJoined = <String>[
           for (final j in stmt.joins)
-            if (j.table != null && _pagedTables.containsKey(j.table)) j.table!,
+            if (j.table != null && _isPaged(j.table)) j.table!,
         ];
         if (pagedJoined.isNotEmpty) {
           return _pagedJoinSelect(stmt, [tname, ...pagedJoined]);
@@ -1098,13 +1098,13 @@ class Database {
       // Decide pre-filter eligibility for each paged participant.
       final filters = _pagedJoinFilters(s, pagedNames);
       for (final name in pagedNames) {
-        if (!_pagedTables.containsKey(name)) continue;
+        if (!_isPaged(name)) continue;
         if (_tables.containsKey(name)) {
           throw StateError(
               'paged join: name collision with in-memory table $name '
               '(should not happen — names are unique across maps)');
         }
-        final pt = _pagedTables[name]!;
+        final pt = _pagedTable(name)!;
         final colDefs = <ColumnDef>[
           for (var i = 0; i < pt.columns.length; i++)
             ColumnDef(
@@ -1149,7 +1149,7 @@ class Database {
     }
     if (pagedNames.length != 1) return result;
     final pname = pagedNames.single;
-    final pt = _pagedTables[pname];
+    final pt = _pagedTable(pname);
     if (pt == null) return result;
     final pagedCols = {for (final c in pt.columns) c.name.toLowerCase()};
 
@@ -1271,7 +1271,7 @@ class Database {
     }
     if (_tables.containsKey(s.name) ||
         _views.containsKey(s.name) ||
-        _pagedTables.containsKey(s.name)) {
+        _isPaged(s.name)) {
       if (s.ifNotExists) return QueryResult.message('table exists');
       throw StateError('Object ${s.name} already exists');
     }
@@ -9287,6 +9287,21 @@ class Database {
     yield* _tables.values;
     yield* _pagedTables.values;
   }
+
+  /// Internal: route a paged-table lookup through [lookupBackend] so
+  /// every read site funnels through the same predicate. Returns the
+  /// concrete [PagedTable] (callers still need its async API), or
+  /// null when [name] is null, unknown, or refers to an in-memory
+  /// table.
+  PagedTable? _pagedTable(String? name) {
+    if (name == null) return null;
+    final b = lookupBackend(name);
+    return b is PagedTable ? b : null;
+  }
+
+  /// Internal: predicate form of [_pagedTable]. Use at sites that only
+  /// need to know whether [name] resolves to a paged table.
+  bool _isPaged(String? name) => _pagedTable(name) != null;
 
   Table _requireTable(String name) {
     final t = _tables[name];
