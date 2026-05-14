@@ -4777,7 +4777,20 @@ class Database {
       if (arg is! ColumnExpr) return null;
       final idx = _findIndexForColumn(t, arg.name);
       if (idx == null) return null;
-      if (idx.columns.length != 1) return null;
+      // Phase 3.0: composite indexes are only usable for MIN/MAX of the
+      // LEADING column — first/last sort entry's leading component is
+      // the answer (NULL keys are excluded so any inserted full key
+      // proves a non-null leading value exists). Other aggregates would
+      // need to dedupe / sum across the trailing components, which the
+      // current SplayTreeMap entries don't expose without a row scan.
+      final isComposite = idx.columns.length > 1;
+      if (isComposite) {
+        if (dist) return null;
+        if (name != 'MIN' && name != 'MAX') return null;
+        if (idx.columns.first.toLowerCase() != arg.name.toLowerCase()) {
+          return null;
+        }
+      }
       if (idx.collations.isNotEmpty &&
           idx.collations[0].toUpperCase() == 'NOCASE') {
         return null;
@@ -4830,7 +4843,19 @@ class Database {
           }
         }
       } else if (indexMap.isNotEmpty) {
-        value = name == 'MIN' ? indexMap.firstKey() : indexMap.lastKey();
+        // MIN/MAX. Single-column → key IS the value. Composite →
+        // CompositeIndexKey.parts[0] is the leading-column value.
+        final raw =
+            name == 'MIN' ? indexMap.firstKey() : indexMap.lastKey();
+        if (isComposite) {
+          // For MAX over a composite key we want the LARGEST leading
+          // value. lastKey() gives the lexicographically-largest full
+          // key, whose parts[0] IS the largest leading value. firstKey
+          // analogously yields the smallest. Both are correct.
+          value = (raw as CompositeIndexKey).parts[0];
+        } else {
+          value = raw;
+        }
       }
       cols.add(p.alias ??
           '${name.toLowerCase()}(${dist ? "DISTINCT " : ""}${arg.name})');
