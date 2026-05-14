@@ -4844,7 +4844,17 @@ class Database {
     final e = p.expr;
     if (e is! FunctionCallExpr) return null;
     final name = e.name.toUpperCase();
-    if (e.distinct) return null;
+    // Phase 2.8: DISTINCT is supported for COUNT/SUM/AVG/TOTAL only —
+    // weight each matching key as 1 instead of its posting-list length.
+    // MIN/MAX are unaffected by DISTINCT (and we'd need to bail anyway).
+    final isDistinct = e.distinct;
+    if (isDistinct &&
+        name != 'COUNT' &&
+        name != 'SUM' &&
+        name != 'AVG' &&
+        name != 'TOTAL') {
+      return null;
+    }
     if (e.window != null) return null;
     if (e.filterExpr != null) return null;
     if (e.isStarArg) return null;
@@ -4883,7 +4893,7 @@ class Database {
       if (col.name.toLowerCase() != colNameLower) return null;
       // Index never stores NULL keys, so `IS NULL` matches nothing.
       if (where.op == 'IS NULL') {
-        return _emitEmptyAggregate(name, p, arg.name);
+        return _emitEmptyAggregate(name, p, arg.name, distinct: isDistinct);
       }
       walkAll = true;
     } else if (where is BinaryExpr &&
@@ -4897,10 +4907,10 @@ class Database {
       if (col.name.toLowerCase() != colNameLower) return null;
       if (lit.value == null) {
         // `col = NULL` is never true; aggregate over empty input.
-        return _emitEmptyAggregate(name, p, arg.name);
+        return _emitEmptyAggregate(name, p, arg.name, distinct: isDistinct);
       }
       final k = idx.collate(0, lit.value);
-      if (k == null) return _emitEmptyAggregate(name, p, arg.name);
+      if (k == null) return _emitEmptyAggregate(name, p, arg.name, distinct: isDistinct);
       loKey = k;
       hiKey = k;
     } else if (where is BetweenExpr &&
@@ -4913,12 +4923,12 @@ class Database {
       final loRaw = (where.low as LiteralExpr).value;
       final hiRaw = (where.high as LiteralExpr).value;
       if (loRaw == null || hiRaw == null) {
-        return _emitEmptyAggregate(name, p, arg.name);
+        return _emitEmptyAggregate(name, p, arg.name, distinct: isDistinct);
       }
       loKey = idx.collate(0, loRaw);
       hiKey = idx.collate(0, hiRaw);
       if (loKey == null || hiKey == null) {
-        return _emitEmptyAggregate(name, p, arg.name);
+        return _emitEmptyAggregate(name, p, arg.name, distinct: isDistinct);
       }
     } else if (where is BinaryExpr &&
         where.op == 'AND' &&
@@ -4943,7 +4953,7 @@ class Database {
       loKey = idx.collate(0, loB.value);
       hiKey = idx.collate(0, hiB.value);
       if (loKey == null || hiKey == null) {
-        return _emitEmptyAggregate(name, p, arg.name);
+        return _emitEmptyAggregate(name, p, arg.name, distinct: isDistinct);
       }
       loInc = loB.inclusive;
       hiInc = hiB.inclusive;
@@ -4976,12 +4986,13 @@ class Database {
       for (final k in inKeys) {
         final posting = indexMap[k];
         if (posting == null) continue;
+        final weight = isDistinct ? 1 : posting.length;
         if (needsNumeric) {
           if (k is! num) return null;
           if (k is double) sawDouble = true;
-          sumAcc += k * posting.length;
+          sumAcc += isDistinct ? k : k * posting.length;
         }
-        cnt += posting.length;
+        cnt += weight;
         if (minKey == null || sqlCompare(k, minKey) < 0) minKey = k;
         if (maxKey == null || sqlCompare(k, maxKey) > 0) maxKey = k;
       }
@@ -4989,12 +5000,13 @@ class Database {
       for (final entry in indexMap.entries) {
         final k = entry.key;
         final posting = entry.value;
+        final weight = isDistinct ? 1 : posting.length;
         if (needsNumeric) {
           if (k is! num) return null;
           if (k is double) sawDouble = true;
-          sumAcc += k * posting.length;
+          sumAcc += isDistinct ? k : k * posting.length;
         }
-        cnt += posting.length;
+        cnt += weight;
         minKey ??= k;
         maxKey = k;
       }
@@ -5006,12 +5018,13 @@ class Database {
         final cHi = sqlCompare(k, hiKey!);
         if (cHi > 0 || (cHi == 0 && !hiInc)) break;
         final posting = entry.value;
+        final weight = isDistinct ? 1 : posting.length;
         if (needsNumeric) {
           if (k is! num) return null;
           if (k is double) sawDouble = true;
-          sumAcc += k * posting.length;
+          sumAcc += isDistinct ? k : k * posting.length;
         }
-        cnt += posting.length;
+        cnt += weight;
         minKey ??= k; // first matching key in sorted order
         maxKey = k; // last matching key seen so far
       }
@@ -5039,7 +5052,8 @@ class Database {
         value = cnt == 0 ? 0.0 : sumAcc.toDouble();
     }
 
-    final col = p.alias ?? '${name.toLowerCase()}(${arg.name})';
+    final col = p.alias ??
+        '${name.toLowerCase()}(${isDistinct ? "DISTINCT " : ""}${arg.name})';
     var rows = <List<Object?>>[
       [value]
     ];
@@ -5050,7 +5064,8 @@ class Database {
 
   /// Empty-input aggregate result for the `_tryAggregateWithWhereFast`
   /// path. Mirrors SQLite: COUNT/TOTAL are 0/0.0, everything else NULL.
-  QueryResult _emitEmptyAggregate(String name, SelectItem p, String argName) {
+  QueryResult _emitEmptyAggregate(String name, SelectItem p, String argName,
+      {bool distinct = false}) {
     Object? value;
     switch (name) {
       case 'COUNT':
@@ -5060,7 +5075,8 @@ class Database {
       default:
         value = null;
     }
-    final col = p.alias ?? '${name.toLowerCase()}($argName)';
+    final col = p.alias ??
+        '${name.toLowerCase()}(${distinct ? "DISTINCT " : ""}$argName)';
     return QueryResult(columns: [
       col
     ], rows: [
