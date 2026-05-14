@@ -4469,7 +4469,41 @@ class Database {
   /// index, return the posting-list length directly. Returns null when
   /// the shape doesn't match. Returns 0 for `col = NULL` since
   /// equality with NULL is UNKNOWN.
+  ///
+  /// Phase 1.8 extends this to `col IN (lit1, lit2, ...)` (and the
+  /// negated `NOT IN` is *not* handled — it would require complementing
+  /// the whole row count and dealing with NULLs).
   int? _tryCountStarFastEqProbe(Table t, Expr where) {
+    // ---- col IN (lit, lit, ...) ----
+    if (where is InExpr && !where.negated) {
+      final value = where.value;
+      if (value is! ColumnExpr) return null;
+      final idx = _findIndexForColumn(t, value.name);
+      if (idx == null) return null;
+      if (idx.columns.length != 1) return null;
+      if (idx.collations.isNotEmpty &&
+          idx.collations[0].toUpperCase() == 'NOCASE') {
+        return null;
+      }
+      if (idx.whereSql != null) return null;
+      final indexMap = t.indexes[idx.name];
+      if (indexMap == null) return null;
+      // Every list element must be a literal.
+      final seenKeys = <Object>{};
+      var n = 0;
+      for (final e in where.values) {
+        if (e is! LiteralExpr) return null;
+        final raw = e.value;
+        if (raw == null) continue; // NULL literal contributes nothing
+        final k = idx.collate(0, raw);
+        if (k == null) continue;
+        // De-duplicate so `IN (1, 1, 1)` doesn't triple-count.
+        if (!seenKeys.add(k)) continue;
+        n += indexMap[k]?.length ?? 0;
+      }
+      return n;
+    }
+    // ---- col = literal ----
     if (where is! BinaryExpr) return null;
     if (where.op != '=') return null;
     ColumnExpr? col;
@@ -4498,6 +4532,7 @@ class Database {
     if (key == null) return 0;
     return indexMap[key]?.length ?? 0;
   }
+
   /// whose every projection item is one of:
   ///
   ///   * `MIN(col)` — col has a single-column non-partial non-NOCASE
