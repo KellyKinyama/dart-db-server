@@ -948,7 +948,12 @@ class PagedTable implements TableBackend {
         }
       }
     }
-    return (columns: cols, pkIndex: pkIdx, pageSize: pageSize, indexes: indexes);
+    return (
+      columns: cols,
+      pkIndex: pkIdx,
+      pageSize: pageSize,
+      indexes: indexes
+    );
   }
 
   static Future<void> _writeMeta(

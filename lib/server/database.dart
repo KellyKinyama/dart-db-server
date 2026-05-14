@@ -531,8 +531,7 @@ class Database {
       try {
         final ps = _pragmaPageSize();
         final cc = _pragmaCacheCapacity(ps);
-        final pt =
-            await PagedTable.open(base, pageSize: ps, cacheCapacity: cc);
+        final pt = await PagedTable.open(base, pageSize: ps, cacheCapacity: cc);
         pt.tableName = tableName;
         _pagedTables[tableName] = pt;
         // Re-register every secondary index this table owns so
@@ -4477,10 +4476,35 @@ class Database {
   }
 
   int _tableRowCountEstimate(String tableName) {
+    // Prefer ANALYZE-derived stats when present — they win over the live
+    // row count so a recently-analyzed snapshot drives join order even
+    // while concurrent inserts perturb the live size. (Matches SQLite,
+    // which only consults sqlite_stat1 at prepare time.) Paged tables
+    // have no live `rows.length` so stats are the only signal.
+    final stats = _stats[tableName];
+    if (stats != null) return stats.rowCount;
     final t = _tables[tableName];
     if (t != null) return t.rows.length;
+    final pt = _pagedTable(tableName);
+    if (pt != null) return pt.length;
     // Unknown (CTE / view alias not in _tables): assume 100.
     return 100;
+  }
+
+  /// Test/diagnostics hook: the row count the planner currently sees for
+  /// [tableName]. Reflects whichever signal `_tableRowCountEstimate`
+  /// picks — ANALYZE stats first, then live row count, then 100.
+  int plannerRowCountEstimate(String tableName) =>
+      _tableRowCountEstimate(tableName);
+
+  /// Test/diagnostics hook: the average rows-per-key the planner would
+  /// charge an equality probe on `tableName.column`, mirroring the
+  /// internal `_estimateEqualityHits` heuristic. Paged tables aren't
+  /// supported (their stats path doesn't go through `_estimateEqualityHits`).
+  int? plannerEqualityHitsEstimate(String tableName, String column) {
+    final t = _tables[tableName];
+    if (t == null) return null;
+    return _estimateEqualityHits(t, column);
   }
 
   /// Lower-cased keys a relation contributes to a row map: bare column
