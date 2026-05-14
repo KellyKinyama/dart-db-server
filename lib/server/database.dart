@@ -5198,16 +5198,29 @@ class Database {
       return null;
     }
 
-    // ORDER BY: only ORDER BY <group-col> [ASC|DESC] is satisfied by
-    // the index walk; anything else would need a sort.
+    // ORDER BY: ORDER BY <group-col> is satisfied by the index walk;
+    // ORDER BY MIN(col) / MAX(col) / AVG(col) is equivalent (each
+    // equals the key within a group) and is satisfied the same way.
     var descending = false;
     if (s.orderBy.isNotEmpty) {
       if (s.orderBy.length != 1) return null;
       final ob = s.orderBy.first;
-      if (ob.expr is! ColumnExpr) return null;
-      if ((ob.expr as ColumnExpr).name.toLowerCase() != geNameLower) {
-        return null;
+      final oe = ob.expr;
+      var matches = false;
+      if (oe is ColumnExpr && oe.name.toLowerCase() == geNameLower) {
+        matches = true;
+      } else if (oe is FunctionCallExpr &&
+          !oe.distinct &&
+          oe.window == null &&
+          oe.filterExpr == null &&
+          !oe.isStarArg &&
+          oe.args.length == 1 &&
+          oe.args.first is ColumnExpr &&
+          (oe.args.first as ColumnExpr).name.toLowerCase() == geNameLower) {
+        final n = oe.name.toUpperCase();
+        if (n == 'MIN' || n == 'MAX' || n == 'AVG') matches = true;
       }
+      if (!matches) return null;
       descending = ob.descending;
     }
 
