@@ -5434,12 +5434,35 @@ class Database {
         return (k, _) => k;
       }
       if (e is FunctionCallExpr &&
-          e.name.toUpperCase() == 'COUNT' &&
-          e.isStarArg &&
           !e.distinct &&
           e.window == null &&
           e.filterExpr == null) {
-        return (_, c) => c;
+        final n = e.name.toUpperCase();
+        if (n == 'COUNT' && e.isStarArg) {
+          return (_, c) => c;
+        }
+        if (e.isStarArg) return null;
+        if (e.args.length != 1) return null;
+        final a = e.args.first;
+        if (a is! ColumnExpr) return null;
+        if (a.name.toLowerCase() != geNameLower) return null;
+        switch (n) {
+          case 'COUNT':
+            return (_, c) => c;
+          case 'MIN':
+          case 'MAX':
+            return (k, _) => k;
+          case 'AVG':
+            return (k, _) => k is num ? k.toDouble() : null;
+          case 'SUM':
+            return (k, c) {
+              if (k is! num) return null;
+              final acc = k * c;
+              return k is double ? acc.toDouble() : acc;
+            };
+          case 'TOTAL':
+            return (k, c) => k is num ? (k * c).toDouble() : null;
+        }
       }
       return null;
     }
@@ -5456,11 +5479,9 @@ class Database {
       final isLeftLit = h.left is LiteralExpr;
       final isRightLit = h.right is LiteralExpr;
       if (isLeftLit == isRightLit) return null;
-      final term =
-          termOf(isLeftLit ? h.right : h.left);
+      final term = termOf(isLeftLit ? h.right : h.left);
       if (term == null) return null;
-      final lit =
-          (isLeftLit ? h.left : h.right) as LiteralExpr;
+      final lit = (isLeftLit ? h.left : h.right) as LiteralExpr;
       final litVal = lit.value;
       if (litVal == null) return (_, __) => false;
       // If lit is on the LEFT we have to flip op direction.
@@ -5508,8 +5529,7 @@ class Database {
       return (k, c) {
         final v = term(k, c);
         if (v == null) return false;
-        final inRange =
-            sqlCompare(v, lo) >= 0 && sqlCompare(v, hi) <= 0;
+        final inRange = sqlCompare(v, lo) >= 0 && sqlCompare(v, hi) <= 0;
         return h.negated ? !inRange : inRange;
       };
     }
