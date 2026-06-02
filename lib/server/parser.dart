@@ -182,9 +182,12 @@ class Parser {
           _matchKw('SAVEPOINT');
           return ReleaseSavepointStmt(_expectName());
         case 'SHOW':
+          return _parseShow();
+        case 'USE':
           _advance();
-          _expectKw('TABLES');
-          return ShowTablesStmt();
+          return UseDatabaseStmt(_expectName());
+        case 'SET':
+          return _parseSetSession();
         case 'DESCRIBE':
           _advance();
           return DescribeStmt(_expectIdent().text);
@@ -253,6 +256,118 @@ class Parser {
       }
     }
     throw FormatException('Unsupported statement starting with "${t.text}"');
+  }
+
+  // ---- SHOW / USE / SET (MySQL connection-management surface) ----------
+  Statement _parseShow() {
+    _expectKw('SHOW');
+    // Optional SESSION/GLOBAL scope is ignored.
+    final scope = _peek();
+    if (scope.type == TokType.ident &&
+        (scope.upper == 'SESSION' || scope.upper == 'GLOBAL')) {
+      _advance();
+    }
+    if (_matchKw('TABLES')) {
+      // Eat optional MySQL trailing clauses like `FROM db` / `LIKE 'pat'`.
+      if (_matchKw('FROM') || _matchKw('IN')) _expectName();
+      if (_matchKw('LIKE')) _parsePrimary();
+      return ShowTablesStmt();
+    }
+    if (_matchKw('DATABASES') || _matchKw('SCHEMAS')) {
+      if (_matchKw('LIKE')) _parsePrimary();
+      return ShowDatabasesStmt();
+    }
+    if (_matchKw('COLUMNS')) {
+      if (!_matchKw('FROM')) _expectKw('IN');
+      final name = _expectName();
+      // Optional `FROM db`.
+      if (_matchKw('FROM') || _matchKw('IN')) _expectName();
+      return ShowColumnsStmt(name);
+    }
+    if (_matchKw('CREATE')) {
+      _expectKw('TABLE');
+      return ShowCreateTableStmt(_expectName());
+    }
+    if (_matchKw('VARIABLES')) {
+      String? like;
+      if (_matchKw('LIKE')) {
+        final t = _expect(TokType.string);
+        like = t.text;
+      }
+      return ShowVariablesStmt(likePattern: like);
+    }
+    if (_matchKw('STATUS')) {
+      String? like;
+      if (_matchKw('LIKE')) {
+        final t = _expect(TokType.string);
+        like = t.text;
+      }
+      return ShowStatusStmt(likePattern: like);
+    }
+    final got = _peek();
+    throw FormatException('Unsupported SHOW form at "${got.text}"');
+  }
+
+  /// Parse a top-level `SET ...` and return a [SetSessionStmt] that the
+  /// executor treats as a no-op. We do not interpret the assignment(s)
+  /// because the engine has no MySQL system-variable backing store.
+  Statement _parseSetSession() {
+    final start = _peek().offset;
+    _expectKw('SET');
+    // Consume tokens until end of statement / semicolon to stay in sync.
+    while (!_isAtEnd() && !(_check(TokType.punct, ';'))) {
+      _advance();
+    }
+    final end = _peek().offset;
+    return SetSessionStmt(_sliceSource(start, end));
+  }
+
+  /// Look up a MySQL `@@var` system variable; unknown names return null
+  /// (which becomes SQL NULL).
+  Object? _mysqlSystemVar(String name) {
+    final n = name.toLowerCase().replaceFirst(RegExp(r'^(global|session)\.'), '');
+    switch (n) {
+      case 'version':
+      case 'version_comment':
+        return '8.0.0-dart_db_server';
+      case 'version_compile_machine':
+        return 'x86_64';
+      case 'version_compile_os':
+        return 'dart';
+      case 'character_set_client':
+      case 'character_set_connection':
+      case 'character_set_results':
+      case 'character_set_server':
+      case 'character_set_database':
+        return 'utf8mb4';
+      case 'collation_connection':
+      case 'collation_server':
+      case 'collation_database':
+        return 'utf8mb4_0900_ai_ci';
+      case 'sql_mode':
+        return '';
+      case 'autocommit':
+      case 'auto_increment_increment':
+        return 1;
+      case 'tx_isolation':
+      case 'transaction_isolation':
+        return 'REPEATABLE-READ';
+      case 'time_zone':
+      case 'system_time_zone':
+        return 'UTC';
+      case 'lower_case_table_names':
+        return 0;
+      case 'max_allowed_packet':
+        return 67108864;
+      case 'wait_timeout':
+      case 'interactive_timeout':
+        return 28800;
+      case 'init_connect':
+        return '';
+      case 'license':
+        return 'GPL';
+    }
+    return null;
   }
 
   // ---- CREATE -------------------------------------------------------------
@@ -1892,6 +2007,13 @@ class Parser {
       return e;
     }
     if (t.type == TokType.ident) {
+      // MySQL system variable: @@var / @@session.var / @@global.var.
+      // Resolve to a literal here so callers don't need a runtime
+      // variable store; unknown variables surface as NULL.
+      if (t.text.startsWith('@@')) {
+        _advance();
+        return LiteralExpr(_mysqlSystemVar(t.text.substring(2)));
+      }
       _advance();
       if (_check(TokType.punct, '(')) {
         return _parseFunctionCall(t.text);

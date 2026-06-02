@@ -207,6 +207,13 @@ const Set<String> _keywords = {
   'STRICT',
   'MATCH',
   'COLLATE',
+  'USE',
+  'DATABASES',
+  'SCHEMAS',
+  'COLUMNS',
+  'VARIABLES',
+  'STATUS',
+  'NAMES',
 };
 
 class Lexer {
@@ -471,6 +478,19 @@ class Lexer {
       return Token(TokType.param, '?${src.substring(ds, _pos)}', start);
     }
     if (c == ':' || c == '@' || c == '\$') {
+      // MySQL system variable: @@name or @@global.name / @@session.name.
+      if (c == '@' && _peek(1) == '@') {
+        final s = _pos;
+        _pos += 2;
+        while (_pos < src.length &&
+            (_isIdentCont(src[_pos]) || src[_pos] == '.')) {
+          _pos++;
+        }
+        if (_pos == s + 2) {
+          throw FormatException('Empty system-variable name at $s');
+        }
+        return Token(TokType.ident, src.substring(s, _pos), s);
+      }
       // Named parameter: leading sigil + identifier characters.
       _pos++;
       final ns = _pos;

@@ -841,6 +841,21 @@ class Database {
       result = _showTables();
     } else if (stmt is DescribeStmt) {
       result = _describe(stmt);
+    } else if (stmt is ShowDatabasesStmt) {
+      result = _showDatabases();
+    } else if (stmt is ShowColumnsStmt) {
+      result = _describe(DescribeStmt(stmt.table));
+    } else if (stmt is ShowCreateTableStmt) {
+      result = _showCreateTable(stmt.table);
+    } else if (stmt is ShowVariablesStmt) {
+      result = _showVariables(stmt.likePattern);
+    } else if (stmt is ShowStatusStmt) {
+      result = QueryResult(
+          columns: const ['Variable_name', 'Value'], rows: const []);
+    } else if (stmt is UseDatabaseStmt) {
+      result = QueryResult.message('Database changed');
+    } else if (stmt is SetSessionStmt) {
+      result = QueryResult.message('OK');
     } else if (stmt is ExplainStmt) {
       result = _explain(stmt);
     } else if (stmt is PragmaStmt) {
@@ -9127,6 +9142,78 @@ class Database {
         ],
         affected: _tables.length + _views.length,
       );
+
+  QueryResult _showDatabases() {
+    final names = <String>['main'];
+    return QueryResult(
+        columns: const ['Database'],
+        rows: names.map((n) => <Object?>[n]).toList(),
+        affected: names.length);
+  }
+
+  QueryResult _showCreateTable(String name) {
+    final t = _requireTable(name);
+    final colDefs = t.columns.map((c) {
+      final parts = <String>['`${c.name}`', dataTypeName(c.type)];
+      if (c.primaryKey) {
+        parts.add('PRIMARY KEY');
+        if (c.autoIncrement) parts.add('AUTOINCREMENT');
+      }
+      if (c.notNull) parts.add('NOT NULL');
+      if (c.unique && !c.primaryKey) parts.add('UNIQUE');
+      if (c.defaultValue != null) {
+        final v = c.defaultValue;
+        final lit = v is num ? v.toString() : "'$v'";
+        parts.add('DEFAULT $lit');
+      }
+      return '  ${parts.join(' ')}';
+    }).join(',\n');
+    final ddl = 'CREATE TABLE `${t.name}` (\n$colDefs\n)';
+    return QueryResult(
+        columns: const ['Table', 'Create Table'],
+        rows: [<Object?>[t.name, ddl]],
+        affected: 1);
+  }
+
+  QueryResult _showVariables(String? likePattern) {
+    // Hand-picked subset of MySQL system variables the `mysql` CLI and
+    // common drivers probe at connect time.
+    const all = <List<String>>[
+      ['version', '8.0.0-dart_db_server'],
+      ['version_comment', 'dart-db-server'],
+      ['protocol_version', '10'],
+      ['character_set_client', 'utf8mb4'],
+      ['character_set_connection', 'utf8mb4'],
+      ['character_set_results', 'utf8mb4'],
+      ['character_set_server', 'utf8mb4'],
+      ['character_set_database', 'utf8mb4'],
+      ['collation_connection', 'utf8mb4_0900_ai_ci'],
+      ['collation_server', 'utf8mb4_0900_ai_ci'],
+      ['collation_database', 'utf8mb4_0900_ai_ci'],
+      ['sql_mode', ''],
+      ['autocommit', 'ON'],
+      ['tx_isolation', 'REPEATABLE-READ'],
+      ['transaction_isolation', 'REPEATABLE-READ'],
+      ['time_zone', 'UTC'],
+      ['system_time_zone', 'UTC'],
+      ['lower_case_table_names', '0'],
+      ['max_allowed_packet', '67108864'],
+      ['wait_timeout', '28800'],
+      ['interactive_timeout', '28800'],
+      ['license', 'GPL'],
+    ];
+    Iterable<List<String>> rows = all;
+    if (likePattern != null) {
+      final re = RegExp(
+          '^${RegExp.escape(likePattern).replaceAll('%', '.*').replaceAll('_', '.')}\$',
+          caseSensitive: false);
+      rows = all.where((r) => re.hasMatch(r[0]));
+    }
+    return QueryResult(
+        columns: const ['Variable_name', 'Value'],
+        rows: rows.map((r) => <Object?>[r[0], r[1]]).toList(),
+        affected: rows.length);
+  }
 
   QueryResult _describe(DescribeStmt s) {
     if (_views.containsKey(s.table)) {

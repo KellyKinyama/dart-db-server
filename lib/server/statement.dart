@@ -379,6 +379,48 @@ class RollbackStmt extends Statement {}
 
 class ShowTablesStmt extends Statement {}
 
+/// `SHOW DATABASES` / `SHOW SCHEMAS` — returns one row per known database.
+class ShowDatabasesStmt extends Statement {}
+
+/// `SHOW COLUMNS FROM <table>` — MySQL alias for DESCRIBE.
+class ShowColumnsStmt extends Statement {
+  final String table;
+  ShowColumnsStmt(this.table);
+}
+
+/// `SHOW CREATE TABLE <table>` — emits a best-effort reconstruction.
+class ShowCreateTableStmt extends Statement {
+  final String table;
+  ShowCreateTableStmt(this.table);
+}
+
+/// `SHOW [SESSION|GLOBAL] VARIABLES [LIKE 'pat']`.
+class ShowVariablesStmt extends Statement {
+  final String? likePattern;
+  ShowVariablesStmt({this.likePattern});
+}
+
+/// `SHOW [SESSION|GLOBAL] STATUS [LIKE 'pat']`.
+class ShowStatusStmt extends Statement {
+  final String? likePattern;
+  ShowStatusStmt({this.likePattern});
+}
+
+/// MySQL `USE <db>` — accepted and acknowledged (we don't model multiple
+/// databases at the SQL surface).
+class UseDatabaseStmt extends Statement {
+  final String name;
+  UseDatabaseStmt(this.name);
+}
+
+/// MySQL `SET ...` — connection-state assignment. The wire layer needs
+/// these to succeed for clients like the `mysql` CLI; the engine does
+/// not actually apply them. Holds the raw source for diagnostics.
+class SetSessionStmt extends Statement {
+  final String raw;
+  SetSessionStmt(this.raw);
+}
+
 class CreateVirtualTableStmt extends Statement {
   final String name;
   final String module; // e.g. fts5, rtree
