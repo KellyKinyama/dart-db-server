@@ -96,6 +96,7 @@ class MySqlServer {
   final InternetAddress address;
   final int port;
   final String? password;
+
   /// Optional TLS context; if non-null the server advertises CLIENT_SSL
   /// in the handshake and accepts an SSLRequest packet to upgrade the
   /// connection to TLS before reading the real HandshakeResponse.
@@ -155,6 +156,9 @@ class _Conn {
   int _seq = 0;
   StreamSubscription<Uint8List>? _sub;
   bool _tlsActive = false;
+  int _clientCaps = 0;
+
+  bool get _deprecateEof => (_clientCaps & _Cap.deprecateEof) != 0;
 
   /// Active prepared statements keyed by statement id (1-based).
   final Map<int, _Prepared> _prepared = <int, _Prepared>{};
@@ -241,7 +245,8 @@ class _Conn {
   bool _looksLikeSslRequest(Uint8List payload) {
     if (server.tlsContext == null) return false;
     if (payload.length != 32) return false;
-    final caps = payload[0] |
+    final caps =
+        payload[0] |
         (payload[1] << 8) |
         (payload[2] << 16) |
         (payload[3] << 24);
@@ -288,7 +293,8 @@ class _Conn {
     b.u32(threadId);
     b.bytes(_scramble.sublist(0, 8));
     b.u8(0); // filler
-    final caps = _Cap.longPassword |
+    final caps =
+        _Cap.longPassword |
         _Cap.foundRows |
         _Cap.longFlag |
         _Cap.connectWithDb |
@@ -314,6 +320,7 @@ class _Conn {
   Future<void> _handleHandshakeResponse(Uint8List payload) async {
     final p = _PacketReader(payload);
     final clientCaps = p.u32();
+    _clientCaps = clientCaps;
     p.u32(); // max packet
     p.u8(); // charset
     p.skip(23);
@@ -463,7 +470,8 @@ class _Conn {
         return;
       case _Cmd.stmtClose:
         if (payload.length >= 5) {
-          final id = payload[1] |
+          final id =
+              payload[1] |
               (payload[2] << 8) |
               (payload[3] << 16) |
               (payload[4] << 24);
@@ -530,6 +538,7 @@ class _Conn {
       for (var i = 0; i < numParams; i++) {
         _writePacket(_columnDef('?', _FieldType.varString));
       }
+      if (!_deprecateEof) _sendEofOrOk();
     }
   }
 
@@ -577,8 +586,8 @@ class _Conn {
             : _FieldType.varString;
         final unsigned =
             prep.paramUnsigned != null && i < prep.paramUnsigned!.length
-                ? prep.paramUnsigned![i]
-                : false;
+            ? prep.paramUnsigned![i]
+            : false;
         positional.add(_readBinaryValue(r, type, unsigned: unsigned));
       }
     }
@@ -677,7 +686,18 @@ class _Conn {
         final len = r.lenencInt();
         final bytes = r.bytes(len);
         if (type == _FieldType.blob) return Uint8List.fromList(bytes);
-        return utf8.decode(bytes, allowMalformed: true);
+        final s = utf8.decode(bytes, allowMalformed: true);
+        // Drivers like `mysql_client` send every parameter as VAR_STRING,
+        // including numeric values. Coerce purely-numeric strings so the
+        // engine's WHERE/INSERT type comparisons behave as the driver
+        // intends (e.g. `WHERE id = ?` against an INTEGER column).
+        if (type == _FieldType.varString || type == _FieldType.string_) {
+          final i = int.tryParse(s);
+          if (i != null) return i;
+          final d = double.tryParse(s);
+          if (d != null) return d;
+        }
+        return s;
     }
   }
 
@@ -688,6 +708,7 @@ class _Conn {
     for (var i = 0; i < r.columns.length; i++) {
       _writePacket(_columnDef(r.columns[i], types[i]));
     }
+    if (!_deprecateEof) _sendEofOrOk();
     for (final row in r.rows) {
       _writePacket(_buildBinaryRow(row, types));
     }
@@ -728,8 +749,9 @@ class _Conn {
         return;
       case _FieldType.double_:
         final bytes = Uint8List(8);
-        ByteData.sublistView(bytes)
-            .setFloat64(0, (v as num).toDouble(), Endian.little);
+        ByteData.sublistView(
+          bytes,
+        ).setFloat64(0, (v as num).toDouble(), Endian.little);
         b.bytes(bytes);
         return;
       case _FieldType.blob:
@@ -744,8 +766,6 @@ class _Conn {
     }
   }
 
-
-
   void _sendResultSet(QueryResult r) {
     // 1) column count
     final cc = _PacketBuilder()..lenencInt(r.columns.length);
@@ -755,7 +775,8 @@ class _Conn {
       final type = _inferType(r, name);
       _writePacket(_columnDef(name, type));
     }
-    // (EOF after columns is omitted under CLIENT_DEPRECATE_EOF.)
+    // 2b) classic intermediate EOF when the client lacks DEPRECATE_EOF.
+    if (!_deprecateEof) _sendEofOrOk();
     // 3) rows (text protocol)
     for (final row in r.rows) {
       final b = _PacketBuilder();
@@ -814,13 +835,18 @@ class _Conn {
 
   void _sendEofOrOk() {
     // Under CLIENT_DEPRECATE_EOF, terminator is an OK packet with the 0xFE
-    // header (length < 9). Older clients see this as a classic EOF.
+    // header (length < 9). Older clients want a classic 5-byte EOF.
     final b = _PacketBuilder();
     b.u8(0xfe);
-    b.lenencInt(0); // affected
-    b.lenencInt(0); // insert id
-    b.u16(_statusAutocommit);
-    b.u16(0); // warnings
+    if (_deprecateEof) {
+      b.lenencInt(0); // affected
+      b.lenencInt(0); // insert id
+      b.u16(_statusAutocommit);
+      b.u16(0); // warnings
+    } else {
+      b.u16(0); // warnings
+      b.u16(_statusAutocommit);
+    }
     _writePacket(b.build());
   }
 

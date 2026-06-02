@@ -19,3 +19,4 @@ dev_dependencies:
   # Requires the sqlite3 native shared library to be available at test
   # time; tests skip themselves if it isn't. Not used by production code.
   sqlite3: ^2.4.0
+  mysql_client: ^0.0.27
