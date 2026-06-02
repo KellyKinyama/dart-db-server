@@ -234,6 +234,11 @@ class Lexer {
         out.add(_readString(c));
         continue;
       }
+      // MySQL-style backtick-quoted identifier.
+      if (c == '`') {
+        out.add(_readBacktickIdent());
+        continue;
+      }
       // X'...' BLOB literal (hex). Must be a standalone X immediately
       // followed by a single-quoted run of hex digits.
       if ((c == 'X' || c == 'x') && _peek(1) == "'") {
@@ -327,6 +332,28 @@ class Lexer {
       _pos++;
     }
     throw FormatException('Unterminated string at $start');
+  }
+
+  Token _readBacktickIdent() {
+    final start = _pos;
+    _pos++; // opening backtick
+    final buf = StringBuffer();
+    while (_pos < src.length) {
+      final c = src[_pos];
+      if (c == '`') {
+        // Doubled backtick is an escape for a literal backtick.
+        if (_peek(1) == '`') {
+          buf.write('`');
+          _pos += 2;
+          continue;
+        }
+        _pos++;
+        return Token(TokType.ident, buf.toString(), start);
+      }
+      buf.write(c);
+      _pos++;
+    }
+    throw FormatException('Unterminated backtick identifier at $start');
   }
 
   Token _readBlobLiteral() {

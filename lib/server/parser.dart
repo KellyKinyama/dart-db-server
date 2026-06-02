@@ -368,6 +368,12 @@ class Parser {
               'CREATE TABLE $name USING $mod: only "paged" is supported');
         }
         usingPaged = true;
+      } else if (_isMysqlTableOptionStart()) {
+        _skipMysqlTableOption();
+        // MySQL allows space- or comma-separated options; eat an optional
+        // comma but do not require it.
+        _match(TokType.punct, ',');
+        continue;
       } else {
         break;
       }
@@ -390,6 +396,71 @@ class Parser {
         strict: strict,
         withoutRowid: withoutRowid,
         usingPaged: usingPaged);
+  }
+
+  /// MySQL trailing CREATE TABLE options like
+  /// `ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+  ///  AUTO_INCREMENT=100 ROW_FORMAT=DYNAMIC COMMENT='hi'`.
+  /// Parsed for compatibility and dropped on the floor.
+  static const _kMysqlTableOptionKws = <String>{
+    'ENGINE',
+    'CHARSET',
+    'COLLATE',
+    'AUTO_INCREMENT',
+    'COMMENT',
+    'DEFAULT',
+    'CHARACTER',
+    'ROW_FORMAT',
+    'MIN_ROWS',
+    'MAX_ROWS',
+    'AVG_ROW_LENGTH',
+    'PACK_KEYS',
+    'CHECKSUM',
+    'DELAY_KEY_WRITE',
+    'KEY_BLOCK_SIZE',
+    'STATS_AUTO_RECALC',
+    'STATS_PERSISTENT',
+    'STATS_SAMPLE_PAGES',
+    'TABLESPACE',
+    'COMPRESSION',
+    'ENCRYPTION',
+  };
+
+  bool _isMysqlTableOptionStart() {
+    final t = _peek();
+    if (t.type == TokType.keyword) {
+      return _kMysqlTableOptionKws.contains(t.upper);
+    }
+    if (t.type == TokType.ident) {
+      return _kMysqlTableOptionKws.contains(t.upper);
+    }
+    return false;
+  }
+
+  void _skipMysqlTableOption() {
+    // Accept any sequence of: NAME [DEFAULT? NAME]* [=] (NAME|string|number).
+    // Eat tokens until we hit a comma at table-option depth, the end of
+    // the statement, or another known trailing keyword.
+    _advance();
+    if (_matchKw('DEFAULT')) {
+      // `DEFAULT CHARSET=...` / `DEFAULT CHARACTER SET=...`
+    }
+    // Optional secondary word: e.g. `CHARACTER SET`.
+    if (_check(TokType.ident) || _check(TokType.keyword)) {
+      final p = _peek();
+      if (p.upper == 'SET' || p.upper == 'CHARSET') {
+        _advance();
+      }
+    }
+    _match(TokType.op, '=');
+    // Value: string, number, or ident/keyword.
+    final v = _peek();
+    if (v.type == TokType.string ||
+        v.type == TokType.number ||
+        v.type == TokType.ident ||
+        v.type == TokType.keyword) {
+      _advance();
+    }
   }
 
   bool _isTableLevelConstraintStart() {
@@ -1232,6 +1303,10 @@ class Parser {
     int? offset;
     if (_matchKw('LIMIT')) {
       limit = int.parse(_expect(TokType.number).text);
+      if (_match(TokType.punct, ',')) {
+        offset = limit;
+        limit = int.parse(_expect(TokType.number).text);
+      }
     }
     if (_matchKw('OFFSET')) {
       offset = int.parse(_expect(TokType.number).text);
@@ -1473,6 +1548,12 @@ class Parser {
     int? offset;
     if (_matchKw('LIMIT')) {
       limit = int.parse(_expect(TokType.number).text);
+      // MySQL form: `LIMIT offset, count` swaps the meaning of the
+      // first integer.
+      if (_match(TokType.punct, ',')) {
+        offset = limit;
+        limit = int.parse(_expect(TokType.number).text);
+      }
     }
     if (_matchKw('OFFSET')) {
       offset = int.parse(_expect(TokType.number).text);
