@@ -7,6 +7,7 @@ export 'server/database.dart';
 export 'server/blob.dart';
 export 'server/session.dart';
 export 'server/expression.dart' show Expr;
+export 'server/mysql_wire.dart' show MySqlServer;
 export 'server/fts5.dart'
     show
         tokenizeFts,
