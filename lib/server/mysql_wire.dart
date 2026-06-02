@@ -42,6 +42,7 @@ class _Cap {
   static const multiStatements = 0x00010000;
   static const multiResults = 0x00020000;
   static const psMultiResults = 0x00040000;
+  static const ssl = 0x00000800;
   static const pluginAuth = 0x00080000;
   static const pluginAuthLenEncClientData = 0x00200000;
   static const deprecateEof = 0x01000000;
@@ -95,6 +96,10 @@ class MySqlServer {
   final InternetAddress address;
   final int port;
   final String? password;
+  /// Optional TLS context; if non-null the server advertises CLIENT_SSL
+  /// in the handshake and accepts an SSLRequest packet to upgrade the
+  /// connection to TLS before reading the real HandshakeResponse.
+  final SecurityContext? tlsContext;
   ServerSocket? _socket;
   final Set<_Conn> _conns = <_Conn>{};
   int _nextThreadId = 1;
@@ -105,6 +110,7 @@ class MySqlServer {
     InternetAddress? address,
     this.port = 3306,
     this.password,
+    this.tlsContext,
   }) : address = address ?? InternetAddress.loopbackIPv4;
 
   Future<void> start() async {
@@ -141,13 +147,14 @@ enum _Phase { handshake, command }
 
 class _Conn {
   final MySqlServer server;
-  final Socket socket;
+  Socket socket;
   final int threadId;
   final BytesBuilder _in = BytesBuilder(copy: false);
   late final Uint8List _scramble;
   _Phase _phase = _Phase.handshake;
   int _seq = 0;
-  StreamSubscription<List<int>>? _sub;
+  StreamSubscription<Uint8List>? _sub;
+  bool _tlsActive = false;
 
   /// Active prepared statements keyed by statement id (1-based).
   final Map<int, _Prepared> _prepared = <int, _Prepared>{};
@@ -207,6 +214,12 @@ class _Conn {
     try {
       switch (_phase) {
         case _Phase.handshake:
+          if (!_tlsActive && _looksLikeSslRequest(pkt.payload)) {
+            await _upgradeToTls();
+            // Stay in handshake phase; the real HandshakeResponse arrives
+            // on the TLS-wrapped socket as the next packet.
+            break;
+          }
           await _handleHandshakeResponse(pkt.payload);
           _phase = _Phase.command;
           break;
@@ -222,6 +235,48 @@ class _Conn {
     }
   }
 
+  /// An SSLRequest packet is a HandshakeResponse41 truncated after the
+  /// 23-byte reserved field: 4 caps + 4 max_packet + 1 charset + 23 = 32
+  /// bytes, with the CLIENT_SSL capability bit set.
+  bool _looksLikeSslRequest(Uint8List payload) {
+    if (server.tlsContext == null) return false;
+    if (payload.length != 32) return false;
+    final caps = payload[0] |
+        (payload[1] << 8) |
+        (payload[2] << 16) |
+        (payload[3] << 24);
+    return (caps & _Cap.ssl) != 0;
+  }
+
+  Future<void> _upgradeToTls() async {
+    final ctx = server.tlsContext!;
+    final oldSub = _sub;
+    // Pause (do not cancel) the existing listener: cancelling can close
+    // the underlying socket before SecureSocket.secureServer detaches it.
+    oldSub?.pause();
+    final buffered = _in.toBytes();
+    _in.clear();
+    final oldSocket = socket;
+    final secure = await SecureSocket.secureServer(
+      oldSocket,
+      ctx,
+      bufferedData: buffered.isEmpty ? null : buffered,
+    );
+    await oldSub?.cancel();
+    socket = secure;
+    _tlsActive = true;
+    _sub = secure.listen(
+      _onData,
+      onError: (Object e, StackTrace st) {
+        server._log('conn $threadId tls error: $e');
+      },
+      onDone: () {
+        server._conns.remove(this);
+      },
+      cancelOnError: false,
+    );
+  }
+
   // -------------------------------------------------------------------------
   // Handshake
   // -------------------------------------------------------------------------
@@ -233,8 +288,7 @@ class _Conn {
     b.u32(threadId);
     b.bytes(_scramble.sublist(0, 8));
     b.u8(0); // filler
-    const caps =
-        _Cap.longPassword |
+    final caps = _Cap.longPassword |
         _Cap.foundRows |
         _Cap.longFlag |
         _Cap.connectWithDb |
@@ -242,7 +296,8 @@ class _Conn {
         _Cap.transactions |
         _Cap.secureConnection |
         _Cap.pluginAuth |
-        _Cap.deprecateEof;
+        _Cap.deprecateEof |
+        (server.tlsContext != null ? _Cap.ssl : 0);
     b.u16(caps & 0xffff);
     b.u8(_utf8mb4Collation);
     b.u16(_statusAutocommit);
