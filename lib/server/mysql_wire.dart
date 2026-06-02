@@ -287,22 +287,60 @@ class _Conn {
       'plugin=$pluginName',
     );
 
-    if (pluginName != 'mysql_native_password') {
+    if (pluginName == 'mysql_native_password') {
+      if (!_checkNativePassword(authResp)) {
+        _sendErr(1045, '28000', "Access denied for user '$username'");
+        await close();
+        return;
+      }
+      _sendOk();
+    } else if (pluginName == 'caching_sha2_password') {
+      if (!_checkCachingSha2Password(authResp)) {
+        _sendErr(1045, '28000', "Access denied for user '$username'");
+        await close();
+        return;
+      }
+      // Fast-auth success: AuthMoreData(0x01) + 0x03 byte, then OK.
+      _sendAuthMoreData(Uint8List.fromList([0x03]));
+      _sendOk();
+    } else {
       _sendErr(
         2059,
         'HY000',
-        'Authentication plugin "$pluginName" not supported (use mysql_native_password)',
+        'Authentication plugin "$pluginName" not supported '
+            '(use mysql_native_password or caching_sha2_password)',
       );
       await close();
       return;
     }
+  }
 
-    if (!_checkNativePassword(authResp)) {
-      _sendErr(1045, '28000', "Access denied for user '$username'");
-      await close();
-      return;
+  bool _checkCachingSha2Password(Uint8List clientResp) {
+    final pwd = server.password;
+    if (pwd == null || pwd.isEmpty) {
+      // Empty password: client sends a zero-length scramble response.
+      return clientResp.isEmpty;
     }
-    _sendOk();
+    if (clientResp.length != 32) return false;
+    // SHA256(password) XOR SHA256( SHA256(SHA256(password)) || scramble )
+    final pwdBytes = utf8.encode(pwd);
+    final h1 = sha256.convert(pwdBytes).bytes;
+    final h2 = sha256.convert(h1).bytes;
+    final mixInput = Uint8List(h2.length + 20)
+      ..setRange(0, h2.length, h2)
+      ..setRange(h2.length, h2.length + 20, _scramble.sublist(0, 20));
+    final mix = sha256.convert(mixInput).bytes;
+    for (var i = 0; i < 32; i++) {
+      if ((h1[i] ^ mix[i]) != clientResp[i]) return false;
+    }
+    return true;
+  }
+
+  void _sendAuthMoreData(Uint8List data) {
+    final b = _PacketBuilder();
+    b.u8(0x01);
+    b.bytes(data);
+    _writePacket(b.build());
   }
 
   bool _checkNativePassword(Uint8List clientResp) {
