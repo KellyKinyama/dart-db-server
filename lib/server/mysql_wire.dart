@@ -80,6 +80,7 @@ class _FieldType {
 }
 
 const int _statusAutocommit = 0x0002;
+const int _statusMoreResultsExists = 0x0008;
 const int _utf8mb4Collation = 255;
 const String _serverVersion = '8.0.0-dart_db_server';
 
@@ -159,6 +160,12 @@ class _Conn {
   int _clientCaps = 0;
 
   bool get _deprecateEof => (_clientCaps & _Cap.deprecateEof) != 0;
+
+  /// Did the client negotiate CLIENT_MULTI_STATEMENTS? When set, a single
+  /// COM_QUERY may contain multiple `;`-separated statements and the
+  /// server returns one result set per statement, each carrying the
+  /// SERVER_MORE_RESULTS_EXISTS status flag except the last.
+  bool get _multiStatements => (_clientCaps & _Cap.multiStatements) != 0;
 
   /// Active prepared statements keyed by statement id (1-based).
   final Map<int, _Prepared> _prepared = <int, _Prepared>{};
@@ -302,6 +309,9 @@ class _Conn {
         _Cap.transactions |
         _Cap.secureConnection |
         _Cap.pluginAuth |
+        _Cap.multiStatements |
+        _Cap.multiResults |
+        _Cap.psMultiResults |
         _Cap.deprecateEof |
         (server.tlsContext != null ? _Cap.ssl : 0);
     b.u16(caps & 0xffff);
@@ -492,17 +502,26 @@ class _Conn {
   Future<void> _executeQuery(String sql) async {
     List<QueryResult> results;
     try {
-      results = await server.db.executeScript(sql);
+      results = _multiStatements
+          ? await server.db.executeScript(sql)
+          : <QueryResult>[await server.db.execute(sql)];
     } catch (e) {
       _sendErr(1064, '42000', e.toString());
       return;
     }
-    final last = results.isEmpty ? QueryResult.empty : results.last;
-    if (last.columns.isEmpty) {
-      _sendOk(affected: last.affected, info: last.message);
+    if (results.isEmpty) {
+      _sendOk();
       return;
     }
-    _sendResultSet(last);
+    for (var i = 0; i < results.length; i++) {
+      final r = results[i];
+      final more = i < results.length - 1;
+      if (r.columns.isEmpty) {
+        _sendOk(affected: r.affected, info: r.message, moreResults: more);
+      } else {
+        _sendResultSet(r, moreResults: more);
+      }
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -701,18 +720,18 @@ class _Conn {
     }
   }
 
-  void _sendBinaryResultSet(QueryResult r) {
+  void _sendBinaryResultSet(QueryResult r, {bool moreResults = false}) {
     final cc = _PacketBuilder()..lenencInt(r.columns.length);
     _writePacket(cc.build());
     final types = <int>[for (final c in r.columns) _inferType(r, c)];
     for (var i = 0; i < r.columns.length; i++) {
       _writePacket(_columnDef(r.columns[i], types[i]));
     }
-    if (!_deprecateEof) _sendEofOrOk();
+    if (!_deprecateEof) _sendEofOrOk(moreResults: moreResults);
     for (final row in r.rows) {
       _writePacket(_buildBinaryRow(row, types));
     }
-    _sendEofOrOk();
+    _sendEofOrOk(moreResults: moreResults);
   }
 
   Uint8List _buildBinaryRow(List<Object?> row, List<int> types) {
@@ -766,7 +785,7 @@ class _Conn {
     }
   }
 
-  void _sendResultSet(QueryResult r) {
+  void _sendResultSet(QueryResult r, {bool moreResults = false}) {
     // 1) column count
     final cc = _PacketBuilder()..lenencInt(r.columns.length);
     _writePacket(cc.build());
@@ -776,7 +795,7 @@ class _Conn {
       _writePacket(_columnDef(name, type));
     }
     // 2b) classic intermediate EOF when the client lacks DEPRECATE_EOF.
-    if (!_deprecateEof) _sendEofOrOk();
+    if (!_deprecateEof) _sendEofOrOk(moreResults: moreResults);
     // 3) rows (text protocol)
     for (final row in r.rows) {
       final b = _PacketBuilder();
@@ -791,7 +810,7 @@ class _Conn {
       _writePacket(b.build());
     }
     // 4) terminator (OK with EOF header under DEPRECATE_EOF)
-    _sendEofOrOk();
+    _sendEofOrOk(moreResults: moreResults);
   }
 
   int _inferType(QueryResult r, String col) {
@@ -820,12 +839,19 @@ class _Conn {
   // Packet senders
   // -------------------------------------------------------------------------
 
-  void _sendOk({int affected = 0, int lastInsertId = 0, String? info}) {
+  void _sendOk({
+    int affected = 0,
+    int lastInsertId = 0,
+    String? info,
+    bool moreResults = false,
+  }) {
+    final status =
+        _statusAutocommit | (moreResults ? _statusMoreResultsExists : 0);
     final b = _PacketBuilder();
     b.u8(0x00);
     b.lenencInt(affected);
     b.lenencInt(lastInsertId);
-    b.u16(_statusAutocommit);
+    b.u16(status);
     b.u16(0); // warnings
     if (info != null && info.isNotEmpty) {
       b.bytes(Uint8List.fromList(utf8.encode(info)));
@@ -833,19 +859,21 @@ class _Conn {
     _writePacket(b.build());
   }
 
-  void _sendEofOrOk() {
+  void _sendEofOrOk({bool moreResults = false}) {
     // Under CLIENT_DEPRECATE_EOF, terminator is an OK packet with the 0xFE
     // header (length < 9). Older clients want a classic 5-byte EOF.
+    final status =
+        _statusAutocommit | (moreResults ? _statusMoreResultsExists : 0);
     final b = _PacketBuilder();
     b.u8(0xfe);
     if (_deprecateEof) {
       b.lenencInt(0); // affected
       b.lenencInt(0); // insert id
-      b.u16(_statusAutocommit);
+      b.u16(status);
       b.u16(0); // warnings
     } else {
       b.u16(0); // warnings
-      b.u16(_statusAutocommit);
+      b.u16(status);
     }
     _writePacket(b.build());
   }

@@ -71,5 +71,27 @@ void main() {
       final back = await conn.execute('SELECT name FROM t WHERE id = 5');
       expect(back.rows.first.colAt(0), 'eve');
     });
+
+    test('multi-statement COM_QUERY returns one result per statement',
+        () async {
+      // `mysql_client`'s state machine only walks the linked list when
+      // result sets carry column data, so this exercise sticks to SELECTs.
+      final first = await conn.execute(
+        "SELECT id FROM t WHERE id = 1;"
+        "SELECT name FROM t WHERE id = 2;"
+        "SELECT id, name FROM t WHERE id IN (1, 2) ORDER BY id",
+      );
+      final all = first.toList();
+      expect(all.length, 3);
+      expect(all[0].rows.map((r) => r.colAt(0)).toList(), ['1']);
+      expect(all[1].rows.map((r) => r.colAt(0)).toList(), ['bob']);
+      expect(
+        all[2].rows.map((r) => [r.colAt(0), r.colAt(1)]).toList(),
+        [
+          ['1', 'alice'],
+          ['2', 'bob'],
+        ],
+      );
+    });
   });
 }
