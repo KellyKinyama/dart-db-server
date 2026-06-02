@@ -33,7 +33,8 @@ class Parser {
     _match(TokType.punct, ';');
     if (!_isAtEnd()) {
       throw FormatException(
-          'Unexpected token after statement: ${_peek().text}');
+        'Unexpected token after statement: ${_peek().text}',
+      );
     }
     return stmt;
   }
@@ -87,7 +88,8 @@ class Parser {
     final t = _peek();
     if (t.type == TokType.ident) return _advance();
     throw FormatException(
-        'Expected identifier but got "${t.text}" at offset ${t.offset}');
+      'Expected identifier but got "${t.text}" at offset ${t.offset}',
+    );
   }
 
   /// Accept an identifier OR a keyword (used where keywords like `name`
@@ -97,7 +99,8 @@ class Parser {
     if (t.type == TokType.ident) return _advance().text;
     if (t.type == TokType.keyword) return _advance().text;
     throw FormatException(
-        'Expected name but got "${t.text}" at offset ${t.offset}');
+      'Expected name but got "${t.text}" at offset ${t.offset}',
+    );
   }
 
   /// Parse a (possibly schema-qualified) table name like `users` or
@@ -224,7 +227,8 @@ class Parser {
             final tok = _peek();
             if (tok.type != TokType.string) {
               throw FormatException(
-                  'VACUUM INTO requires a string literal path');
+                'VACUUM INTO requires a string literal path',
+              );
             }
             intoPath = _advance().text;
           }
@@ -245,7 +249,8 @@ class Parser {
           final pathTok = _advance();
           if (pathTok.type != TokType.string) {
             throw FormatException(
-                'ATTACH DATABASE expects a string path at ${pathTok.offset}');
+              'ATTACH DATABASE expects a string path at ${pathTok.offset}',
+            );
           }
           _expectKw('AS');
           return AttachDatabaseStmt(pathTok.text, _expectName());
@@ -325,7 +330,10 @@ class Parser {
   /// Look up a MySQL `@@var` system variable; unknown names return null
   /// (which becomes SQL NULL).
   Object? _mysqlSystemVar(String name) {
-    final n = name.toLowerCase().replaceFirst(RegExp(r'^(global|session)\.'), '');
+    final n = name.toLowerCase().replaceFirst(
+      RegExp(r'^(global|session)\.'),
+      '',
+    );
     switch (n) {
       case 'version':
       case 'version_comment':
@@ -393,7 +401,8 @@ class Parser {
     if (_matchKw('VIEW')) return _parseCreateViewTail();
     if (_matchKw('TRIGGER')) return _parseCreateTriggerTail();
     throw FormatException(
-        'Expected TABLE, INDEX, VIEW or TRIGGER after CREATE');
+      'Expected TABLE, INDEX, VIEW or TRIGGER after CREATE',
+    );
   }
 
   CreateVirtualTableStmt _parseCreateVirtualTableTail() {
@@ -480,7 +489,8 @@ class Parser {
         final mod = _expectIdent().text;
         if (mod.toLowerCase() != 'paged') {
           throw FormatException(
-              'CREATE TABLE $name USING $mod: only "paged" is supported');
+            'CREATE TABLE $name USING $mod: only "paged" is supported',
+          );
         }
         usingPaged = true;
       } else if (_isMysqlTableOptionStart()) {
@@ -499,18 +509,22 @@ class Parser {
         final raw = rawTypes[i].toLowerCase();
         if (!kStrictAllowedTypeNames.contains(raw)) {
           throw FormatException(
-              'STRICT table $name: column ${cols[i].name} has unsupported '
-              'type "${rawTypes[i]}". STRICT only allows '
-              'INT, INTEGER, REAL, TEXT, BLOB, ANY.');
+            'STRICT table $name: column ${cols[i].name} has unsupported '
+            'type "${rawTypes[i]}". STRICT only allows '
+            'INT, INTEGER, REAL, TEXT, BLOB, ANY.',
+          );
         }
       }
     }
-    return CreateTableStmt(name, cols,
-        constraints: constraints,
-        ifNotExists: ifNotExists,
-        strict: strict,
-        withoutRowid: withoutRowid,
-        usingPaged: usingPaged);
+    return CreateTableStmt(
+      name,
+      cols,
+      constraints: constraints,
+      ifNotExists: ifNotExists,
+      strict: strict,
+      withoutRowid: withoutRowid,
+      usingPaged: usingPaged,
+    );
   }
 
   /// MySQL trailing CREATE TABLE options like
@@ -653,8 +667,12 @@ class Parser {
         throw FormatException('Expected DELETE or UPDATE after ON');
       }
     }
-    return ForeignKeyRef(tbl,
-        column: col, onDelete: onDelete, onUpdate: onUpdate);
+    return ForeignKeyRef(
+      tbl,
+      column: col,
+      onDelete: onDelete,
+      onUpdate: onUpdate,
+    );
   }
 
   String _parseRefAction() {
@@ -808,17 +826,20 @@ class Parser {
       }
       break;
     }
-    return ColumnDef(name, type,
-        primaryKey: primaryKey,
-        notNull: notNull,
-        unique: unique,
-        autoIncrement: autoInc,
-        defaultValue: defaultValue,
-        defaultExprSql: defaultExprSql,
-        checkExprSql: checkSql,
-        references: references,
-        generatedExprSql: generatedSql,
-        generatedStored: generatedStored);
+    return ColumnDef(
+      name,
+      type,
+      primaryKey: primaryKey,
+      notNull: notNull,
+      unique: unique,
+      autoIncrement: autoInc,
+      defaultValue: defaultValue,
+      defaultExprSql: defaultExprSql,
+      checkExprSql: checkSql,
+      references: references,
+      generatedExprSql: generatedSql,
+      generatedStored: generatedStored,
+    );
   }
 
   CreateIndexStmt _parseCreateIndexTail({bool unique = false}) {
@@ -875,12 +896,16 @@ class Parser {
       final end = _peek().offset;
       whereSql = _sliceSource(start, end);
     }
-    return CreateIndexStmt(indexName, table, col,
-        unique: unique,
-        whereSql: whereSql,
-        exprSql: exprSql,
-        columns: extraCols == null ? null : [col, ...extraCols],
-        collations: collations);
+    return CreateIndexStmt(
+      indexName,
+      table,
+      col,
+      unique: unique,
+      whereSql: whereSql,
+      exprSql: exprSql,
+      columns: extraCols == null ? null : [col, ...extraCols],
+      collations: collations,
+    );
   }
 
   CreateViewStmt _parseCreateViewTail() {
@@ -896,8 +921,12 @@ class Parser {
     final sel = _parseSelect();
     final selEnd = _peek().offset;
     final selSql = _sliceSource(selStart, selEnd).trim();
-    return CreateViewStmt(name, sel,
-        ifNotExists: ifNotExists, selectSql: selSql);
+    return CreateViewStmt(
+      name,
+      sel,
+      ifNotExists: ifNotExists,
+      selectSql: selSql,
+    );
   }
 
   CreateTriggerStmt _parseCreateTriggerTail() {
@@ -951,8 +980,15 @@ class Parser {
       _match(TokType.punct, ';');
     }
     _expectKw('END');
-    return CreateTriggerStmt(name, timing, event, table, when, body,
-        ifNotExists: ifNotExists);
+    return CreateTriggerStmt(
+      name,
+      timing,
+      event,
+      table,
+      when,
+      body,
+      ifNotExists: ifNotExists,
+    );
   }
 
   // ---- DROP ---------------------------------------------------------------
@@ -1082,7 +1118,8 @@ class Parser {
           mode = InsertMode.normal;
         } else {
           throw FormatException(
-              'Expected REPLACE/IGNORE/ABORT/FAIL/ROLLBACK after INSERT OR');
+            'Expected REPLACE/IGNORE/ABORT/FAIL/ROLLBACK after INSERT OR',
+          );
         }
       }
     }
@@ -1130,14 +1167,37 @@ class Parser {
     }
     final onConflict = _parseOnConflictClause();
     final ret = _parseReturning();
-    return InsertStmt(table, cols, rows,
-        mode: mode, select: srcSelect, returning: ret, onConflict: onConflict);
+    return InsertStmt(
+      table,
+      cols,
+      rows,
+      mode: mode,
+      select: srcSelect,
+      returning: ret,
+      onConflict: onConflict,
+    );
   }
 
   /// Parse an optional `ON CONFLICT [(col, ...)] DO {NOTHING|UPDATE SET ...}`
-  /// clause. Returns null if `ON CONFLICT` is not present.
+  /// clause, or the MySQL equivalent `ON DUPLICATE KEY UPDATE col = expr,...`.
+  /// Returns null if neither form is present.
   OnConflictClause? _parseOnConflictClause() {
     if (!_matchKw('ON')) return null;
+    // MySQL: ON DUPLICATE KEY UPDATE col = expr [, ...]
+    if (_matchKw('DUPLICATE')) {
+      _expectKw('KEY');
+      _expectKw('UPDATE');
+      final assigns = <String, Expr>{};
+      do {
+        final col = _expectName();
+        _expect(TokType.op, '=');
+        assigns[col] = _rewriteValuesRefs(_parseExpr());
+      } while (_match(TokType.punct, ','));
+      return OnConflictClause(
+        targetColumns: const <String>[],
+        assignments: assigns,
+      );
+    }
     _expectKw('CONFLICT');
     final cols = <String>[];
     if (_match(TokType.punct, '(')) {
@@ -1162,7 +1222,43 @@ class Parser {
     Expr? where;
     if (_matchKw('WHERE')) where = _parseExpr();
     return OnConflictClause(
-        targetColumns: cols, assignments: assigns, where: where);
+      targetColumns: cols,
+      assignments: assigns,
+      where: where,
+    );
+  }
+
+  /// Translate MySQL `VALUES(col)` references inside `ON DUPLICATE KEY UPDATE`
+  /// expressions into `excluded.col` column references, which the executor
+  /// already understands as "the row that would have been inserted".
+  Expr _rewriteValuesRefs(Expr e) {
+    if (e is FunctionCallExpr &&
+        e.name.toUpperCase() == 'VALUES' &&
+        e.args.length == 1 &&
+        e.args.first is ColumnExpr) {
+      final c = e.args.first as ColumnExpr;
+      return ColumnExpr(c.name, table: 'excluded');
+    }
+    if (e is BinaryExpr) {
+      return BinaryExpr(
+          e.op, _rewriteValuesRefs(e.left), _rewriteValuesRefs(e.right));
+    }
+    if (e is UnaryExpr) {
+      return UnaryExpr(e.op, _rewriteValuesRefs(e.operand));
+    }
+    if (e is FunctionCallExpr) {
+      return FunctionCallExpr(
+        e.name,
+        e.args.map(_rewriteValuesRefs).toList(),
+        isStarArg: e.isStarArg,
+        distinct: e.distinct,
+        window: e.window,
+        filterExpr:
+            e.filterExpr == null ? null : _rewriteValuesRefs(e.filterExpr!),
+        aggOrderBy: e.aggOrderBy,
+      );
+    }
+    return e;
   }
 
   // ---- UPDATE -------------------------------------------------------------
@@ -1201,13 +1297,17 @@ class Parser {
         limit = _parseExpr();
       }
     }
-    return UpdateStmt(table, assignments, where,
-        returning: ret,
-        indexedBy: hint,
-        fromTable: fromTable,
-        fromAlias: fromAlias,
-        limit: limit,
-        offset: offset);
+    return UpdateStmt(
+      table,
+      assignments,
+      where,
+      returning: ret,
+      indexedBy: hint,
+      fromTable: fromTable,
+      fromAlias: fromAlias,
+      limit: limit,
+      offset: offset,
+    );
   }
 
   // ---- DELETE -------------------------------------------------------------
@@ -1230,8 +1330,14 @@ class Parser {
         limit = _parseExpr();
       }
     }
-    return DeleteStmt(table, where,
-        returning: ret, indexedBy: hint, limit: limit, offset: offset);
+    return DeleteStmt(
+      table,
+      where,
+      returning: ret,
+      indexedBy: hint,
+      limit: limit,
+      offset: offset,
+    );
   }
 
   // ---- WITH (CTEs) --------------------------------------------------------
@@ -1297,35 +1403,46 @@ class Parser {
         );
       case 'INSERT':
         final s = _parseInsert();
-        return InsertStmt(s.table, s.columns, s.rows,
-            mode: s.mode,
-            select: s.select,
-            returning: s.returning,
-            ctes: ctes,
-            cteColumns: cteColumns,
-            ctesRecursive: recursive);
+        return InsertStmt(
+          s.table,
+          s.columns,
+          s.rows,
+          mode: s.mode,
+          select: s.select,
+          returning: s.returning,
+          ctes: ctes,
+          cteColumns: cteColumns,
+          ctesRecursive: recursive,
+        );
       case 'UPDATE':
         final s = _parseUpdate();
-        return UpdateStmt(s.table, s.assignments, s.where,
-            returning: s.returning,
-            ctes: ctes,
-            cteColumns: cteColumns,
-            ctesRecursive: recursive,
-            indexedBy: s.indexedBy,
-            fromTable: s.fromTable,
-            fromAlias: s.fromAlias,
-            limit: s.limit,
-            offset: s.offset);
+        return UpdateStmt(
+          s.table,
+          s.assignments,
+          s.where,
+          returning: s.returning,
+          ctes: ctes,
+          cteColumns: cteColumns,
+          ctesRecursive: recursive,
+          indexedBy: s.indexedBy,
+          fromTable: s.fromTable,
+          fromAlias: s.fromAlias,
+          limit: s.limit,
+          offset: s.offset,
+        );
       case 'DELETE':
         final s = _parseDelete();
-        return DeleteStmt(s.table, s.where,
-            returning: s.returning,
-            ctes: ctes,
-            cteColumns: cteColumns,
-            ctesRecursive: recursive,
-            indexedBy: s.indexedBy,
-            limit: s.limit,
-            offset: s.offset);
+        return DeleteStmt(
+          s.table,
+          s.where,
+          returning: s.returning,
+          ctes: ctes,
+          cteColumns: cteColumns,
+          ctesRecursive: recursive,
+          indexedBy: s.indexedBy,
+          limit: s.limit,
+          offset: s.offset,
+        );
     }
     throw FormatException('Unexpected statement after WITH: ${t.text}');
   }
@@ -1402,7 +1519,8 @@ class Parser {
       _expect(TokType.punct, ')');
       if (r.length != first.length) {
         throw FormatException(
-            'VALUES rows must all have the same number of columns');
+          'VALUES rows must all have the same number of columns',
+        );
       }
       rows.add(r);
     }
@@ -1429,8 +1547,9 @@ class Parser {
     SelectStmt makeArm(List<Expr> vals, {bool nameCols = false}) {
       final proj = <SelectItem>[];
       for (var i = 0; i < vals.length; i++) {
-        proj.add(SelectItem.expr(vals[i],
-            alias: nameCols ? 'column${i + 1}' : null));
+        proj.add(
+          SelectItem.expr(vals[i], alias: nameCols ? 'column${i + 1}' : null),
+        );
       }
       return SelectStmt(projection: proj, orderBy: const []);
     }
@@ -1564,11 +1683,18 @@ class Parser {
             on = _parseExpr();
           }
         }
-        joins.add(JoinClause(joinType, tbl, alias, on,
+        joins.add(
+          JoinClause(
+            joinType,
+            tbl,
+            alias,
+            on,
             subquery: sub,
             using: usingCols,
             natural: natural,
-            indexedBy: joinHint));
+            indexedBy: joinHint,
+          ),
+        );
       }
     }
     Expr? where;
@@ -1588,7 +1714,7 @@ class Parser {
         }
         _expect(TokType.punct, ')');
         groupingSets = <List<Expr>>[
-          for (var i = keys.length; i >= 0; i--) keys.sublist(0, i)
+          for (var i = keys.length; i >= 0; i--) keys.sublist(0, i),
         ];
         groupBy.addAll(keys);
       } else if (_matchKw('CUBE')) {
@@ -1602,7 +1728,7 @@ class Parser {
         for (var mask = (1 << keys.length) - 1; mask >= 0; mask--) {
           final set = <Expr>[
             for (var i = 0; i < keys.length; i++)
-              if ((mask >> i) & 1 == 1) keys[i]
+              if ((mask >> i) & 1 == 1) keys[i],
           ];
           groupingSets.add(set);
         }
@@ -1775,7 +1901,10 @@ class Parser {
         _expectKw('FROM');
         final right = _parseConcat();
         return BinaryExpr(
-            negated ? 'IS NOT DISTINCT FROM' : 'IS DISTINCT FROM', left, right);
+          negated ? 'IS NOT DISTINCT FROM' : 'IS DISTINCT FROM',
+          left,
+          right,
+        );
       }
       // IS [NOT] NULL.
       if (_matchKw('NULL')) {
@@ -2112,12 +2241,15 @@ class Parser {
         window = WindowSpec(baseName: n.text);
       }
     }
-    return FunctionCallExpr(upper, args,
-        isStarArg: isStar,
-        distinct: distinct,
-        window: window,
-        filterExpr: filterExpr,
-        aggOrderBy: aggOrderBy);
+    return FunctionCallExpr(
+      upper,
+      args,
+      isStarArg: isStar,
+      distinct: distinct,
+      window: window,
+      filterExpr: filterExpr,
+      aggOrderBy: aggOrderBy,
+    );
   }
 
   WindowSpec _parseWindowSpec() {

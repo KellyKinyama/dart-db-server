@@ -214,6 +214,7 @@ const Set<String> _keywords = {
   'VARIABLES',
   'STATUS',
   'NAMES',
+  'DUPLICATE',
 };
 
 class Lexer {
@@ -289,8 +290,8 @@ class Lexer {
 
   void _skipBlockComment() {
     _pos += 2;
-    while (
-        _pos + 1 < src.length && !(src[_pos] == '*' && src[_pos + 1] == '/')) {
+    while (_pos + 1 < src.length &&
+        !(src[_pos] == '*' && src[_pos + 1] == '/')) {
       _pos++;
     }
     if (_pos + 1 < src.length) _pos += 2;
@@ -369,7 +370,8 @@ class Lexer {
     final buf = StringBuffer();
     while (_pos < src.length && src[_pos] != "'") {
       final c = src[_pos];
-      final ok = (c.codeUnitAt(0) >= 48 && c.codeUnitAt(0) <= 57) ||
+      final ok =
+          (c.codeUnitAt(0) >= 48 && c.codeUnitAt(0) <= 57) ||
           (c.codeUnitAt(0) >= 65 && c.codeUnitAt(0) <= 70) ||
           (c.codeUnitAt(0) >= 97 && c.codeUnitAt(0) <= 102);
       if (!ok) {
@@ -499,7 +501,8 @@ class Lexer {
       }
       if (ns == _pos) {
         throw FormatException(
-            'Empty named-parameter at $start (expected $c<name>)');
+          'Empty named-parameter at $start (expected $c<name>)',
+        );
       }
       return Token(TokType.param, '$c${src.substring(ns, _pos)}', start);
     }
