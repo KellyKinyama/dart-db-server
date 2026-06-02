@@ -1835,6 +1835,150 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     if (idx == null) return 0;
     return idx.bm25Text(a[0].toString(), a[1].toString(), k1: k1, b: b);
   },
+  // --- MySQL datetime aliases ----------------------------------------
+  'NOW': (a) => _fmtDateTime(DateTime.now().toUtc(), full: true),
+  'SYSDATE': (a) => _fmtDateTime(DateTime.now().toUtc(), full: true),
+  'CURDATE': (a) => _fmtDate(DateTime.now().toUtc()),
+  'CURRENT_DATE': (a) => _fmtDate(DateTime.now().toUtc()),
+  'CURTIME': (a) => _fmtTime(DateTime.now().toUtc()),
+  'CURRENT_TIME': (a) => _fmtTime(DateTime.now().toUtc()),
+  'UTC_TIMESTAMP': (a) => _fmtDateTime(DateTime.now().toUtc(), full: true),
+  'UTC_DATE': (a) => _fmtDate(DateTime.now().toUtc()),
+  'UTC_TIME': (a) => _fmtTime(DateTime.now().toUtc()),
+  'UNIX_TIMESTAMP': (a) {
+    final dt = a.isEmpty ? DateTime.now().toUtc() : _resolveDateTime(a);
+    if (dt == null) return null;
+    return dt.millisecondsSinceEpoch ~/ 1000;
+  },
+  'FROM_UNIXTIME': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final secs = (a[0] as num).toInt();
+    final dt = DateTime.fromMillisecondsSinceEpoch(secs * 1000, isUtc: true);
+    if (a.length > 1 && a[1] != null) {
+      return _strftime(_mysqlFmtToStrftime(a[1].toString()), dt);
+    }
+    return _fmtDateTime(dt, full: true);
+  },
+  'YEAR': (a) {
+    final dt = _resolveDateTime(a);
+    return dt?.year;
+  },
+  'MONTH': (a) {
+    final dt = _resolveDateTime(a);
+    return dt?.month;
+  },
+  'DAY': (a) {
+    final dt = _resolveDateTime(a);
+    return dt?.day;
+  },
+  'DAYOFMONTH': (a) {
+    final dt = _resolveDateTime(a);
+    return dt?.day;
+  },
+  'HOUR': (a) {
+    final dt = _resolveDateTime(a);
+    return dt?.hour;
+  },
+  'MINUTE': (a) {
+    final dt = _resolveDateTime(a);
+    return dt?.minute;
+  },
+  'SECOND': (a) {
+    final dt = _resolveDateTime(a);
+    return dt?.second;
+  },
+  'MICROSECOND': (a) {
+    final dt = _resolveDateTime(a);
+    return dt == null ? null : dt.millisecond * 1000 + dt.microsecond;
+  },
+  'DAYOFWEEK': (a) {
+    // MySQL: 1=Sunday..7=Saturday.
+    final dt = _resolveDateTime(a);
+    if (dt == null) return null;
+    return (dt.weekday % 7) + 1;
+  },
+  'WEEKDAY': (a) {
+    // MySQL: 0=Monday..6=Sunday.
+    final dt = _resolveDateTime(a);
+    if (dt == null) return null;
+    return dt.weekday - 1;
+  },
+  'DAYOFYEAR': (a) {
+    final dt = _resolveDateTime(a);
+    return dt == null ? null : _dayOfYear(dt);
+  },
+  'DAYNAME': (a) {
+    final dt = _resolveDateTime(a);
+    if (dt == null) return null;
+    const names = [
+      'Monday',
+      'Tuesday',
+      'Wednesday',
+      'Thursday',
+      'Friday',
+      'Saturday',
+      'Sunday'
+    ];
+    return names[dt.weekday - 1];
+  },
+  'MONTHNAME': (a) {
+    final dt = _resolveDateTime(a);
+    if (dt == null) return null;
+    const names = [
+      'January',
+      'February',
+      'March',
+      'April',
+      'May',
+      'June',
+      'July',
+      'August',
+      'September',
+      'October',
+      'November',
+      'December'
+    ];
+    return names[dt.month - 1];
+  },
+  'LAST_DAY': (a) {
+    final dt = _resolveDateTime(a);
+    if (dt == null) return null;
+    final nextMonth = dt.month == 12
+        ? DateTime.utc(dt.year + 1, 1, 1)
+        : DateTime.utc(dt.year, dt.month + 1, 1);
+    final last = nextMonth.subtract(const Duration(days: 1));
+    return _fmtDate(last);
+  },
+  'DATEDIFF': (a) {
+    if (a.length < 2) return null;
+    final da = _resolveDateTime([a[0]]);
+    final db = _resolveDateTime([a[1]]);
+    if (da == null || db == null) return null;
+    final aMid = DateTime.utc(da.year, da.month, da.day);
+    final bMid = DateTime.utc(db.year, db.month, db.day);
+    return aMid.difference(bMid).inDays;
+  },
+  'DATE_FORMAT': (a) {
+    if (a.length < 2 || a[0] == null || a[1] == null) return null;
+    final dt = _resolveDateTime([a[0]]);
+    if (dt == null) return null;
+    return _mysqlDateFormat(a[1].toString(), dt);
+  },
+  'TIME_FORMAT': (a) {
+    if (a.length < 2 || a[0] == null || a[1] == null) return null;
+    final dt = _resolveDateTime([a[0]]);
+    if (dt == null) return null;
+    return _mysqlDateFormat(a[1].toString(), dt);
+  },
+  'STR_TO_DATE': (a) {
+    if (a.length < 2 || a[0] == null) return null;
+    // We do not implement a full MySQL parser; defer to ISO parsing of
+    // the input string and ignore the format. Good enough for typical
+    // 'YYYY-MM-DD' / 'YYYY-MM-DD HH:MM:SS' inputs.
+    return _resolveDateTime([a[0]]) == null
+        ? null
+        : _fmtDateTime(_resolveDateTime([a[0]])!, full: true);
+  },
 };
 
 /// Hook installed by the engine: given a table and column name, return
@@ -2274,9 +2418,204 @@ String _strftime(String fmt, DateTime d) {
   return buf.toString();
 }
 
+/// Render [d] using MySQL's DATE_FORMAT specifiers. Implements the
+/// commonly used subset; unrecognised `%X` sequences are passed through
+/// unchanged so callers can spot omissions.
+String _mysqlDateFormat(String fmt, DateTime d) {
+  const monthNames = [
+    'January',
+    'February',
+    'March',
+    'April',
+    'May',
+    'June',
+    'July',
+    'August',
+    'September',
+    'October',
+    'November',
+    'December'
+  ];
+  const monthAbbr = [
+    'Jan',
+    'Feb',
+    'Mar',
+    'Apr',
+    'May',
+    'Jun',
+    'Jul',
+    'Aug',
+    'Sep',
+    'Oct',
+    'Nov',
+    'Dec'
+  ];
+  const dayNames = [
+    'Monday',
+    'Tuesday',
+    'Wednesday',
+    'Thursday',
+    'Friday',
+    'Saturday',
+    'Sunday'
+  ];
+  const dayAbbr = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  String two(int v) => v.toString().padLeft(2, '0');
+  String three(int v) => v.toString().padLeft(3, '0');
+  final buf = StringBuffer();
+  for (var i = 0; i < fmt.length; i++) {
+    final ch = fmt[i];
+    if (ch != '%' || i + 1 >= fmt.length) {
+      buf.write(ch);
+      continue;
+    }
+    final code = fmt[++i];
+    switch (code) {
+      case 'Y':
+        buf.write(d.year.toString().padLeft(4, '0'));
+        break;
+      case 'y':
+        buf.write((d.year % 100).toString().padLeft(2, '0'));
+        break;
+      case 'm':
+        buf.write(two(d.month));
+        break;
+      case 'c':
+        buf.write(d.month.toString());
+        break;
+      case 'M':
+        buf.write(monthNames[d.month - 1]);
+        break;
+      case 'b':
+        buf.write(monthAbbr[d.month - 1]);
+        break;
+      case 'd':
+        buf.write(two(d.day));
+        break;
+      case 'e':
+        buf.write(d.day.toString());
+        break;
+      case 'H':
+      case 'k':
+        buf.write(two(d.hour));
+        break;
+      case 'h':
+      case 'I':
+      case 'l':
+        {
+          final h = d.hour % 12 == 0 ? 12 : d.hour % 12;
+          buf.write(two(h));
+          break;
+        }
+      case 'i':
+        buf.write(two(d.minute));
+        break;
+      case 'S':
+      case 's':
+        buf.write(two(d.second));
+        break;
+      case 'f':
+        buf.write(((d.millisecond * 1000) + d.microsecond)
+            .toString()
+            .padLeft(6, '0'));
+        break;
+      case 'p':
+        buf.write(d.hour < 12 ? 'AM' : 'PM');
+        break;
+      case 'T':
+        buf.write('${two(d.hour)}:${two(d.minute)}:${two(d.second)}');
+        break;
+      case 'r':
+        {
+          final h = d.hour % 12 == 0 ? 12 : d.hour % 12;
+          buf.write(
+              '${two(h)}:${two(d.minute)}:${two(d.second)} ${d.hour < 12 ? 'AM' : 'PM'}');
+          break;
+        }
+      case 'W':
+        buf.write(dayNames[d.weekday - 1]);
+        break;
+      case 'a':
+        buf.write(dayAbbr[d.weekday - 1]);
+        break;
+      case 'w':
+        // MySQL: 0=Sunday..6=Saturday.
+        buf.write((d.weekday % 7).toString());
+        break;
+      case 'j':
+        buf.write(three(_dayOfYear(d)));
+        break;
+      case '%':
+        buf.write('%');
+        break;
+      default:
+        buf.write('%');
+        buf.write(code);
+    }
+  }
+  return buf.toString();
+}
+
 int _dayOfYear(DateTime d) {
   final start = DateTime.utc(d.year, 1, 1);
   return d.toUtc().difference(start).inDays + 1;
+}
+
+/// Translate MySQL DATE_FORMAT specifiers to the strftime subset that
+/// [_strftime] understands. Used by [FROM_UNIXTIME] when a format is
+/// supplied; DATE_FORMAT itself uses [_mysqlDateFormat] directly.
+String _mysqlFmtToStrftime(String mysqlFmt) {
+  final buf = StringBuffer();
+  for (var i = 0; i < mysqlFmt.length; i++) {
+    final ch = mysqlFmt[i];
+    if (ch != '%' || i + 1 >= mysqlFmt.length) {
+      buf.write(ch);
+      continue;
+    }
+    final code = mysqlFmt[++i];
+    switch (code) {
+      case 'Y':
+      case 'm':
+      case 'd':
+      case 'H':
+      case 'S':
+      case 'p':
+      case 'j':
+      case 'W':
+      case 'w':
+      case '%':
+        buf.write('%');
+        buf.write(code);
+        break;
+      case 's':
+        buf.write('%S');
+        break;
+      case 'i':
+        buf.write('%M');
+        break;
+      case 'h':
+      case 'I':
+      case 'l':
+        buf.write('%I');
+        break;
+      case 'T':
+        buf.write('%H:%M:%S');
+        break;
+      case 'r':
+        buf.write('%I:%M:%S %p');
+        break;
+      case 'k':
+        buf.write('%H');
+        break;
+      case 'f':
+        buf.write('%f');
+        break;
+      default:
+        buf.write('%');
+        buf.write(code);
+    }
+  }
+  return buf.toString();
 }
 
 double _pow10(int n) {

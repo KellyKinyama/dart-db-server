@@ -96,6 +96,17 @@ const Set<String> kStrictAllowedTypeNames = {
 DataType parseDataType(String s) {
   final low = s.toLowerCase();
   if (low.isEmpty) return DataType.blob;
+  // MySQL datetime types are stored as ISO-8601 TEXT (YEAR as INTEGER).
+  // Listed before the "contains int" rule so DATETIME / TIMESTAMP do
+  // not accidentally hit INTEGER via the substring 'int' in 'int'erval-
+  // free names. (They don't contain 'int' today, but be defensive.)
+  if (low == 'date' ||
+      low == 'datetime' ||
+      low == 'timestamp' ||
+      low == 'time') {
+    return DataType.text;
+  }
+  if (low == 'year') return DataType.integer;
   // 1. Contains "INT" -> INTEGER (catches INT, INTEGER, BIGINT, SMALLINT…)
   if (low.contains('int')) return DataType.integer;
   // 2. Contains TEXT/CHAR/CLOB -> TEXT.
