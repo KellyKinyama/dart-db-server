@@ -417,7 +417,7 @@ class Lexer {
     final text = src.substring(start, _pos);
     final upper = text.toUpperCase();
     if (_keywords.contains(upper)) {
-      return Token(TokType.keyword, upper, start);
+      return Token(TokType.keyword, text, start);
     }
     return Token(TokType.ident, text, start);
   }

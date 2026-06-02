@@ -23,6 +23,7 @@ import 'dart:typed_data';
 import 'package:crypto/crypto.dart';
 
 import 'database.dart';
+import 'prepared.dart';
 import 'result.dart';
 import 'schema.dart' show storageToJsonValue;
 
@@ -61,11 +62,20 @@ class _Cmd {
 
 class _FieldType {
   static const tiny = 0x01;
-  static const longlong = 0x08;
+  static const short_ = 0x02;
+  static const long_ = 0x03;
+  static const float_ = 0x04;
   static const double_ = 0x05;
   static const null_ = 0x06;
+  static const timestamp = 0x07;
+  static const longlong = 0x08;
+  static const date = 0x0a;
+  static const time = 0x0b;
+  static const datetime = 0x0c;
+  static const newDecimal = 0xf6;
   static const blob = 0xfc;
   static const varString = 0xfd;
+  static const string_ = 0xfe;
 }
 
 const int _statusAutocommit = 0x0002;
@@ -138,6 +148,10 @@ class _Conn {
   _Phase _phase = _Phase.handshake;
   int _seq = 0;
   StreamSubscription<List<int>>? _sub;
+
+  /// Active prepared statements keyed by statement id (1-based).
+  final Map<int, _Prepared> _prepared = <int, _Prepared>{};
+  int _nextStmtId = 1;
 
   _Conn(this.server, this.socket, this.threadId);
 
@@ -348,14 +362,25 @@ class _Conn {
         await _executeQuery(sql);
         return;
       case _Cmd.stmtPrepare:
+        final sql = utf8.decode(payload.sublist(1));
+        await _handleStmtPrepare(sql);
+        return;
       case _Cmd.stmtExecute:
+        await _handleStmtExecute(payload);
+        return;
       case _Cmd.stmtClose:
+        if (payload.length >= 5) {
+          final id = payload[1] |
+              (payload[2] << 8) |
+              (payload[3] << 16) |
+              (payload[4] << 24);
+          _prepared.remove(id);
+        }
+        // COM_STMT_CLOSE has no reply.
+        return;
       case _Cmd.stmtReset:
-        _sendErr(
-          1295,
-          'HY000',
-          'Prepared statements not yet supported by dart-db-server mysql wire',
-        );
+        // We have no long-data buffers to flush; just OK.
+        _sendOk();
         return;
       default:
         _sendErr(1047, 'HY000', 'Unknown command 0x${cmd.toRadixString(16)}');
@@ -378,6 +403,255 @@ class _Conn {
     }
     _sendResultSet(last);
   }
+
+  // -------------------------------------------------------------------------
+  // Prepared statements (COM_STMT_PREPARE / EXECUTE / CLOSE / RESET)
+  // -------------------------------------------------------------------------
+
+  Future<void> _handleStmtPrepare(String sql) async {
+    PreparedStatement ps;
+    try {
+      ps = server.db.prepare(sql);
+    } catch (e) {
+      _sendErr(1064, '42000', e.toString());
+      return;
+    }
+    final id = _nextStmtId++;
+    final numParams = ps.positionalCount;
+    _prepared[id] = _Prepared(id: id, ps: ps, numParams: numParams);
+
+    // Prepare-OK: we report 0 columns up-front and let the EXECUTE response
+    // carry the actual result-set metadata. Standard drivers tolerate this.
+    final b = _PacketBuilder();
+    b.u8(0x00); // status
+    b.u32(id);
+    b.u16(0); // num_columns
+    b.u16(numParams);
+    b.u8(0); // reserved
+    b.u16(0); // warning_count
+    _writePacket(b.build());
+
+    // Per-parameter column defs (all reported as VAR_STRING), terminated
+    // by an EOF unless DEPRECATE_EOF is set (we always negotiate it).
+    if (numParams > 0) {
+      for (var i = 0; i < numParams; i++) {
+        _writePacket(_columnDef('?', _FieldType.varString));
+      }
+    }
+  }
+
+  Future<void> _handleStmtExecute(Uint8List payload) async {
+    final r = _PacketReader(payload);
+    r.u8(); // command byte
+    final id = r.u32();
+    final prep = _prepared[id];
+    if (prep == null) {
+      _sendErr(1243, 'HY000', 'Unknown prepared statement handler');
+      return;
+    }
+    r.u8(); // flags (cursor type) — ignored
+    r.u32(); // iteration_count — always 1
+
+    final n = prep.numParams;
+    final positional = <Object?>[];
+    if (n > 0) {
+      // NULL bitmap, offset = 0 for execute.
+      final bitmapBytes = (n + 7) ~/ 8;
+      final nullBitmap = r.bytes(bitmapBytes);
+      final newBound = r.u8();
+      if (newBound == 1) {
+        // Param types are sent (2 bytes each).
+        final types = <int>[];
+        final unsigned = <bool>[];
+        for (var i = 0; i < n; i++) {
+          final t = r.u8();
+          final flag = r.u8();
+          types.add(t);
+          unsigned.add((flag & 0x80) != 0);
+        }
+        prep.paramTypes = types;
+        prep.paramUnsigned = unsigned;
+      }
+      // Read values for non-null params.
+      for (var i = 0; i < n; i++) {
+        final isNull = (nullBitmap[i ~/ 8] & (1 << (i % 8))) != 0;
+        if (isNull) {
+          positional.add(null);
+          continue;
+        }
+        final type = prep.paramTypes != null && i < prep.paramTypes!.length
+            ? prep.paramTypes![i]
+            : _FieldType.varString;
+        final unsigned =
+            prep.paramUnsigned != null && i < prep.paramUnsigned!.length
+                ? prep.paramUnsigned![i]
+                : false;
+        positional.add(_readBinaryValue(r, type, unsigned: unsigned));
+      }
+    }
+
+    QueryResult result;
+    try {
+      // Bind positionals 1..n: PreparedStatement.execute uses 1-based.
+      // The list is passed positionally; index 0 corresponds to `?1`.
+      result = await prep.ps.execute(positional: positional);
+    } catch (e) {
+      _sendErr(1064, '42000', e.toString());
+      return;
+    }
+
+    if (result.columns.isEmpty) {
+      _sendOk(affected: result.affected, info: result.message);
+      return;
+    }
+    _sendBinaryResultSet(result);
+  }
+
+  /// Decode a single MySQL binary-protocol parameter value at the
+  /// current position of [r].
+  Object? _readBinaryValue(_PacketReader r, int type, {bool unsigned = false}) {
+    switch (type) {
+      case _FieldType.tiny:
+        final v = r.u8();
+        return unsigned ? v : (v & 0x80 != 0 ? v - 0x100 : v);
+      case _FieldType.short_:
+        final v = r.u16();
+        return unsigned ? v : (v & 0x8000 != 0 ? v - 0x10000 : v);
+      case _FieldType.long_:
+        final v = r.u32();
+        return unsigned ? v : (v & 0x80000000 != 0 ? v - 0x100000000 : v);
+      case _FieldType.longlong:
+        var v = 0;
+        for (var i = 0; i < 8; i++) {
+          v |= r.u8() << (8 * i);
+        }
+        return v;
+      case _FieldType.float_:
+        final bytes = r.bytes(4);
+        return ByteData.sublistView(bytes).getFloat32(0, Endian.little);
+      case _FieldType.double_:
+        final bytes = r.bytes(8);
+        return ByteData.sublistView(bytes).getFloat64(0, Endian.little);
+      case _FieldType.null_:
+        return null;
+      case _FieldType.date:
+      case _FieldType.datetime:
+      case _FieldType.timestamp:
+        {
+          final len = r.u8();
+          if (len == 0) return null;
+          final y = r.u16();
+          final mo = r.u8();
+          final d = r.u8();
+          var h = 0, mi = 0, s = 0, us = 0;
+          if (len >= 7) {
+            h = r.u8();
+            mi = r.u8();
+            s = r.u8();
+          }
+          if (len >= 11) {
+            us = r.u32();
+          }
+          String two(int v) => v.toString().padLeft(2, '0');
+          final date = '${y.toString().padLeft(4, '0')}-${two(mo)}-${two(d)}';
+          if (type == _FieldType.date) return date;
+          final time = '${two(h)}:${two(mi)}:${two(s)}';
+          if (us == 0) return '$date $time';
+          return '$date $time.${us.toString().padLeft(6, '0')}';
+        }
+      case _FieldType.time:
+        {
+          final len = r.u8();
+          if (len == 0) return '00:00:00';
+          final isNeg = r.u8();
+          r.u32(); // days
+          final h = r.u8();
+          final mi = r.u8();
+          final s = r.u8();
+          var us = 0;
+          if (len >= 12) us = r.u32();
+          String two(int v) => v.toString().padLeft(2, '0');
+          final sign = isNeg == 1 ? '-' : '';
+          if (us == 0) return '$sign${two(h)}:${two(mi)}:${two(s)}';
+          return '$sign${two(h)}:${two(mi)}:${two(s)}.${us.toString().padLeft(6, '0')}';
+        }
+      case _FieldType.varString:
+      case _FieldType.string_:
+      case _FieldType.blob:
+      case _FieldType.newDecimal:
+      default:
+        // Length-encoded string (varchar/blob/decimal/...).
+        final len = r.lenencInt();
+        final bytes = r.bytes(len);
+        if (type == _FieldType.blob) return Uint8List.fromList(bytes);
+        return utf8.decode(bytes, allowMalformed: true);
+    }
+  }
+
+  void _sendBinaryResultSet(QueryResult r) {
+    final cc = _PacketBuilder()..lenencInt(r.columns.length);
+    _writePacket(cc.build());
+    final types = <int>[for (final c in r.columns) _inferType(r, c)];
+    for (var i = 0; i < r.columns.length; i++) {
+      _writePacket(_columnDef(r.columns[i], types[i]));
+    }
+    for (final row in r.rows) {
+      _writePacket(_buildBinaryRow(row, types));
+    }
+    _sendEofOrOk();
+  }
+
+  Uint8List _buildBinaryRow(List<Object?> row, List<int> types) {
+    final b = _PacketBuilder();
+    b.u8(0x00); // binary row packet header
+    final n = row.length;
+    final bitmapBytes = (n + 9) ~/ 8;
+    final nullBitmap = Uint8List(bitmapBytes);
+    for (var i = 0; i < n; i++) {
+      if (row[i] == null) {
+        final bitIdx = i + 2;
+        nullBitmap[bitIdx ~/ 8] |= 1 << (bitIdx % 8);
+      }
+    }
+    b.bytes(nullBitmap);
+    for (var i = 0; i < n; i++) {
+      final v = row[i];
+      if (v == null) continue;
+      _writeBinaryValue(b, v, types[i]);
+    }
+    return b.build();
+  }
+
+  void _writeBinaryValue(_PacketBuilder b, Object v, int type) {
+    switch (type) {
+      case _FieldType.tiny:
+        b.u8(v is bool ? (v ? 1 : 0) : (v as num).toInt() & 0xff);
+        return;
+      case _FieldType.longlong:
+        final n = (v as num).toInt();
+        for (var i = 0; i < 8; i++) {
+          b.u8((n >> (8 * i)) & 0xff);
+        }
+        return;
+      case _FieldType.double_:
+        final bytes = Uint8List(8);
+        ByteData.sublistView(bytes)
+            .setFloat64(0, (v as num).toDouble(), Endian.little);
+        b.bytes(bytes);
+        return;
+      case _FieldType.blob:
+        final bytes = v is List<int> ? v : utf8.encode(v.toString());
+        b.lenencInt(bytes.length);
+        b.bytes(bytes);
+        return;
+      case _FieldType.varString:
+      default:
+        b.lenencStr(_renderText(v));
+        return;
+    }
+  }
+
+
 
   void _sendResultSet(QueryResult r) {
     // 1) column count
@@ -517,6 +791,15 @@ class _Conn {
 // ---------------------------------------------------------------------------
 // Packet builder / reader
 // ---------------------------------------------------------------------------
+
+class _Prepared {
+  final int id;
+  final PreparedStatement ps;
+  final int numParams;
+  List<int>? paramTypes;
+  List<bool>? paramUnsigned;
+  _Prepared({required this.id, required this.ps, required this.numParams});
+}
 
 class _PacketBuilder {
   final BytesBuilder _b = BytesBuilder(copy: false);
