@@ -34,9 +34,9 @@ void main() {
   test('GROUP BY v WHERE v BETWEEN 2 AND 4', () async {
     final db = await seed();
     try {
-      final r = await db.execute(
-          'SELECT v, COUNT(*), SUM(v) FROM t WHERE v BETWEEN 2 AND 4 '
-          'GROUP BY v ORDER BY v');
+      final r = await db
+          .execute('SELECT v, COUNT(*), SUM(v) FROM t WHERE v BETWEEN 2 AND 4 '
+              'GROUP BY v ORDER BY v');
       expect(r.rows, [
         [2, 2, 4],
         [3, 3, 9],
@@ -50,9 +50,9 @@ void main() {
   test('GROUP BY v WHERE v >= 3 AND v < 5 (range AND)', () async {
     final db = await seed();
     try {
-      final r = await db.execute(
-          'SELECT v, COUNT(*) FROM t WHERE v >= 3 AND v < 5 '
-          'GROUP BY v ORDER BY v');
+      final r =
+          await db.execute('SELECT v, COUNT(*) FROM t WHERE v >= 3 AND v < 5 '
+              'GROUP BY v ORDER BY v');
       expect(r.rows, [
         [3, 3],
         [4, 1],
@@ -65,9 +65,9 @@ void main() {
   test('GROUP BY v WHERE v IN (1, 3, 5)', () async {
     final db = await seed();
     try {
-      final r = await db.execute(
-          'SELECT v, COUNT(*) FROM t WHERE v IN (1, 3, 5) '
-          'GROUP BY v ORDER BY v');
+      final r =
+          await db.execute('SELECT v, COUNT(*) FROM t WHERE v IN (1, 3, 5) '
+              'GROUP BY v ORDER BY v');
       expect(r.rows, [
         [1, 1],
         [3, 3],
@@ -81,9 +81,9 @@ void main() {
   test('GROUP BY v WHERE v IS NOT NULL behaves like no WHERE', () async {
     final db = await seed();
     try {
-      final r = await db.execute(
-          'SELECT v, COUNT(*) FROM t WHERE v IS NOT NULL '
-          'GROUP BY v ORDER BY v');
+      final r =
+          await db.execute('SELECT v, COUNT(*) FROM t WHERE v IS NOT NULL '
+              'GROUP BY v ORDER BY v');
       expect(r.rows, [
         [1, 1],
         [2, 2],
@@ -99,15 +99,16 @@ void main() {
   test('GROUP BY v WHERE v IS NULL → empty result', () async {
     final db = await seed();
     try {
-      final r = await db.execute(
-          'SELECT v, COUNT(*) FROM t WHERE v IS NULL GROUP BY v');
+      final r = await db
+          .execute('SELECT v, COUNT(*) FROM t WHERE v IS NULL GROUP BY v');
       expect(r.rows, isEmpty);
     } finally {
       await db.close();
     }
   });
 
-  test('GROUP BY v with WHERE excluding NULLs works even when table '
+  test(
+      'GROUP BY v with WHERE excluding NULLs works even when table '
       'has NULL rows', () async {
     final db = await Database.open();
     try {
@@ -134,9 +135,9 @@ void main() {
   test('GROUP BY v WHERE v BETWEEN 2 AND 4 ORDER BY v DESC', () async {
     final db = await seed();
     try {
-      final r = await db.execute(
-          'SELECT v, COUNT(*) FROM t WHERE v BETWEEN 2 AND 4 '
-          'GROUP BY v ORDER BY v DESC');
+      final r =
+          await db.execute('SELECT v, COUNT(*) FROM t WHERE v BETWEEN 2 AND 4 '
+              'GROUP BY v ORDER BY v DESC');
       expect(r.rows, [
         [4, 1],
         [3, 3],

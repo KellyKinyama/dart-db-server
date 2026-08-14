@@ -1241,7 +1241,10 @@ class Parser {
     }
     if (e is BinaryExpr) {
       return BinaryExpr(
-          e.op, _rewriteValuesRefs(e.left), _rewriteValuesRefs(e.right));
+        e.op,
+        _rewriteValuesRefs(e.left),
+        _rewriteValuesRefs(e.right),
+      );
     }
     if (e is UnaryExpr) {
       return UnaryExpr(e.op, _rewriteValuesRefs(e.operand));
@@ -1253,8 +1256,9 @@ class Parser {
         isStarArg: e.isStarArg,
         distinct: e.distinct,
         window: e.window,
-        filterExpr:
-            e.filterExpr == null ? null : _rewriteValuesRefs(e.filterExpr!),
+        filterExpr: e.filterExpr == null
+            ? null
+            : _rewriteValuesRefs(e.filterExpr!),
         aggOrderBy: e.aggOrderBy,
       );
     }

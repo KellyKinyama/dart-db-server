@@ -1,0 +1,17 @@
+﻿00:00 +0: loading test/mysql_client_driver_test.dart
+00:00 +0: mysql_client driver compatibility plain COM_QUERY SELECT returns the expected rows
+[mysql] listening on 127.0.0.1:60987 (mysql wire)
+[mysql] conn 1 login user=root db= plugin=mysql_native_password
+00:00 +1: mysql_client driver compatibility COM_QUERY INSERT reports affectedRows
+[mysql] listening on 127.0.0.1:60989 (mysql wire)
+[mysql] conn 1 login user=root db= plugin=mysql_native_password
+00:00 +2: mysql_client driver compatibility prepared statement with positional param returns the matching row
+[mysql] listening on 127.0.0.1:60991 (mysql wire)
+[mysql] conn 1 login user=root db= plugin=mysql_native_password
+00:00 +3: mysql_client driver compatibility prepared INSERT with two params adds a row
+[mysql] listening on 127.0.0.1:60993 (mysql wire)
+[mysql] conn 1 login user=root db= plugin=mysql_native_password
+00:00 +4: mysql_client driver compatibility multi-statement COM_QUERY returns one result per statement
+[mysql] listening on 127.0.0.1:60995 (mysql wire)
+[mysql] conn 1 login user=root db= plugin=mysql_native_password
+00:00 +5: All tests passed!

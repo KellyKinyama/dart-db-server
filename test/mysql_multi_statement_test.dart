@@ -48,91 +48,95 @@ void main() {
       await server.stop();
     });
 
-    test('SELECT; INSERT; SELECT chains 3 results with proper status flags',
-        () async {
-      w.send(
-        _comQuery(
-          "SELECT id FROM t WHERE id = 1;"
-          "INSERT INTO t VALUES (10, 'jay');"
-          "SELECT name FROM t WHERE id = 10",
-        ),
-        seq: 0,
-      );
+    test(
+      'SELECT; INSERT; SELECT chains 3 results with proper status flags',
+      () async {
+        w.send(
+          _comQuery(
+            "SELECT id FROM t WHERE id = 1;"
+            "INSERT INTO t VALUES (10, 'jay');"
+            "SELECT name FROM t WHERE id = 10",
+          ),
+          seq: 0,
+        );
 
-      // --- First result: SELECT (one row).
-      final cc1 = await r.next();
-      expect(cc1.payload[0], 1, reason: 'column count = 1');
-      await r.next(); // col def
-      await r.next(); // intermediate EOF (DEPRECATE_EOF not negotiated)
-      await r.next(); // row
-      final eof1 = await r.next();
-      expect(eof1.payload[0], 0xfe);
-      // Classic EOF layout: 0xfe, u16 warnings, u16 status.
-      final status1 = eof1.payload[3] | (eof1.payload[4] << 8);
-      expect(
-        status1 & _statusMoreResultsExists,
-        isNot(0),
-        reason: 'first SELECT carries MORE_RESULTS',
-      );
+        // --- First result: SELECT (one row).
+        final cc1 = await r.next();
+        expect(cc1.payload[0], 1, reason: 'column count = 1');
+        await r.next(); // col def
+        await r.next(); // intermediate EOF (DEPRECATE_EOF not negotiated)
+        await r.next(); // row
+        final eof1 = await r.next();
+        expect(eof1.payload[0], 0xfe);
+        // Classic EOF layout: 0xfe, u16 warnings, u16 status.
+        final status1 = eof1.payload[3] | (eof1.payload[4] << 8);
+        expect(
+          status1 & _statusMoreResultsExists,
+          isNot(0),
+          reason: 'first SELECT carries MORE_RESULTS',
+        );
 
-      // --- Second result: INSERT (OK packet) with MORE_RESULTS set.
-      final ok2 = await r.next();
-      expect(ok2.payload[0], 0x00, reason: 'OK packet after INSERT');
-      // OK layout: 0x00, lenenc affected, lenenc insertId, u16 status, ...
-      final pr = _PR(ok2.payload);
-      pr.u8(); // 0x00
-      pr.lenencInt(); // affected
-      pr.lenencInt(); // insert id
-      final status2 = pr.u8() | (pr.u8() << 8);
-      expect(
-        status2 & _statusMoreResultsExists,
-        isNot(0),
-        reason: 'INSERT OK in the middle carries MORE_RESULTS',
-      );
+        // --- Second result: INSERT (OK packet) with MORE_RESULTS set.
+        final ok2 = await r.next();
+        expect(ok2.payload[0], 0x00, reason: 'OK packet after INSERT');
+        // OK layout: 0x00, lenenc affected, lenenc insertId, u16 status, ...
+        final pr = _PR(ok2.payload);
+        pr.u8(); // 0x00
+        pr.lenencInt(); // affected
+        pr.lenencInt(); // insert id
+        final status2 = pr.u8() | (pr.u8() << 8);
+        expect(
+          status2 & _statusMoreResultsExists,
+          isNot(0),
+          reason: 'INSERT OK in the middle carries MORE_RESULTS',
+        );
 
-      // --- Third (last) result: SELECT (one row), no more results.
-      final cc3 = await r.next();
-      expect(cc3.payload[0], 1);
-      await r.next(); // col def
-      await r.next(); // intermediate EOF
-      await r.next(); // row
-      final eof3 = await r.next();
-      expect(eof3.payload[0], 0xfe);
-      final status3 = eof3.payload[3] | (eof3.payload[4] << 8);
-      expect(
-        status3 & _statusMoreResultsExists,
-        0,
-        reason: 'final result clears MORE_RESULTS',
-      );
-    });
+        // --- Third (last) result: SELECT (one row), no more results.
+        final cc3 = await r.next();
+        expect(cc3.payload[0], 1);
+        await r.next(); // col def
+        await r.next(); // intermediate EOF
+        await r.next(); // row
+        final eof3 = await r.next();
+        expect(eof3.payload[0], 0xfe);
+        final status3 = eof3.payload[3] | (eof3.payload[4] << 8);
+        expect(
+          status3 & _statusMoreResultsExists,
+          0,
+          reason: 'final result clears MORE_RESULTS',
+        );
+      },
+    );
 
-    test('without CLIENT_MULTI_STATEMENTS, only the first stmt is executed',
-        () async {
-      // Reconnect without the cap.
-      await sock.close();
-      sock = await Socket.connect(
-        InternetAddress.loopbackIPv4,
-        server.boundPort,
-      );
-      r = _Reader(sock);
-      w = _Writer(sock);
-      await r.next();
-      w.send(_handshakeResponse(multi: false), seq: 1);
-      expect((await r.next()).payload[0], 0x00);
+    test(
+      'without CLIENT_MULTI_STATEMENTS, only the first stmt is executed',
+      () async {
+        // Reconnect without the cap.
+        await sock.close();
+        sock = await Socket.connect(
+          InternetAddress.loopbackIPv4,
+          server.boundPort,
+        );
+        r = _Reader(sock);
+        w = _Writer(sock);
+        await r.next();
+        w.send(_handshakeResponse(multi: false), seq: 1);
+        expect((await r.next()).payload[0], 0x00);
 
-      // Server should parse only the first statement and either error
-      // or ignore the rest. With our parser, the trailing `;` is
-      // permitted but extra tokens after it cause an ERR.
-      w.send(
-        _comQuery("SELECT id FROM t WHERE id = 1; SELECT id FROM t"),
-        seq: 0,
-      );
-      final resp = await r.next();
-      // Either a successful first result OR an ERR is acceptable —
-      // we just need to guarantee the multi-result behaviour does
-      // NOT kick in for clients that did not negotiate it.
-      expect([0x01, 0xff].contains(resp.payload[0]), isTrue);
-    });
+        // Server should parse only the first statement and either error
+        // or ignore the rest. With our parser, the trailing `;` is
+        // permitted but extra tokens after it cause an ERR.
+        w.send(
+          _comQuery("SELECT id FROM t WHERE id = 1; SELECT id FROM t"),
+          seq: 0,
+        );
+        final resp = await r.next();
+        // Either a successful first result OR an ERR is acceptable —
+        // we just need to guarantee the multi-result behaviour does
+        // NOT kick in for clients that did not negotiate it.
+        expect([0x01, 0xff].contains(resp.payload[0]), isTrue);
+      },
+    );
   });
 }
 
@@ -195,7 +199,8 @@ class _Reader {
     var bytes = _buf.toBytes();
     var consumed = 0;
     while (bytes.length - consumed >= 4) {
-      final len = bytes[consumed] |
+      final len =
+          bytes[consumed] |
           (bytes[consumed + 1] << 8) |
           (bytes[consumed + 2] << 16);
       final seq = bytes[consumed + 3];

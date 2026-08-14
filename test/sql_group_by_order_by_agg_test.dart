@@ -21,8 +21,8 @@ void main() {
   test('ORDER BY MIN(v) ASC matches ORDER BY v', () async {
     final db = await seed();
     try {
-      final r = await db.execute(
-          'SELECT v, COUNT(*) FROM t GROUP BY v ORDER BY MIN(v)');
+      final r = await db
+          .execute('SELECT v, COUNT(*) FROM t GROUP BY v ORDER BY MIN(v)');
       expect(r.rows, [
         [1, 1],
         [2, 2],
@@ -38,8 +38,8 @@ void main() {
   test('ORDER BY MAX(v) DESC matches ORDER BY v DESC', () async {
     final db = await seed();
     try {
-      final r = await db.execute(
-          'SELECT v, COUNT(*) FROM t GROUP BY v ORDER BY MAX(v) DESC');
+      final r = await db
+          .execute('SELECT v, COUNT(*) FROM t GROUP BY v ORDER BY MAX(v) DESC');
       expect(r.rows, [
         [5, 2],
         [4, 1],

@@ -59,8 +59,7 @@ void main() {
       for (final k in [1, 2, 2, 3]) {
         await db.execute('INSERT INTO t VALUES (${id++}, $k)');
       }
-      final r =
-          await db.execute('SELECT COUNT(*) FROM t WHERE k IN (2, 2, 2)');
+      final r = await db.execute('SELECT COUNT(*) FROM t WHERE k IN (2, 2, 2)');
       expect(r.rows, [
         [2],
       ]);
@@ -77,8 +76,8 @@ void main() {
       for (var i = 1; i <= 5; i++) {
         await db.execute('INSERT INTO t VALUES ($i, $i)');
       }
-      final r = await db
-          .execute('SELECT COUNT(*) FROM t WHERE k IN (98, 99, 100)');
+      final r =
+          await db.execute('SELECT COUNT(*) FROM t WHERE k IN (98, 99, 100)');
       expect(r.rows, [
         [0],
       ]);

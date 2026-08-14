@@ -38,50 +38,53 @@ void main() {
       expect(caps & 0x0800, isNot(0), reason: 'CLIENT_SSL bit set');
     });
 
-    test('SSLRequest upgrades the connection and a query round-trips',
-        () async {
-      final r = _Reader(sock);
-      final w = _Writer(sock);
+    test(
+      'SSLRequest upgrades the connection and a query round-trips',
+      () async {
+        final r = _Reader(sock);
+        final w = _Writer(sock);
 
-      final hs = await r.next();
-      final caps = _parseServerCaps(hs.payload);
-      expect(caps & 0x0800, isNot(0));
+        final hs = await r.next();
+        final caps = _parseServerCaps(hs.payload);
+        expect(caps & 0x0800, isNot(0));
 
-      // Send a 32-byte SSLRequest with CLIENT_SSL bit set, seq=1.
-      const clientCaps = 0x00000200 | // PROTOCOL_41
-          0x00000800 | // SSL
-          0x00008000 | // SECURE_CONNECTION
-          0x00080000 | // PLUGIN_AUTH
-          0x01000000; // DEPRECATE_EOF
-      w.send(_sslRequest(clientCaps), seq: 1);
+        // Send a 32-byte SSLRequest with CLIENT_SSL bit set, seq=1.
+        const clientCaps =
+            0x00000200 | // PROTOCOL_41
+            0x00000800 | // SSL
+            0x00008000 | // SECURE_CONNECTION
+            0x00080000 | // PLUGIN_AUTH
+            0x01000000; // DEPRECATE_EOF
+        w.send(_sslRequest(clientCaps), seq: 1);
 
-      // Pause (do not cancel) the existing subscription so the underlying
-      // socket stays alive while SecureSocket.secure detaches its raw end.
-      r.pause();
-      final secure = await SecureSocket.secure(
-        sock,
-        host: 'localhost',
-        onBadCertificate: (_) => true,
-      );
-      sock = secure;
-      final rr = _Reader(secure);
-      final ww = _Writer(secure);
+        // Pause (do not cancel) the existing subscription so the underlying
+        // socket stays alive while SecureSocket.secure detaches its raw end.
+        r.pause();
+        final secure = await SecureSocket.secure(
+          sock,
+          host: 'localhost',
+          onBadCertificate: (_) => true,
+        );
+        sock = secure;
+        final rr = _Reader(secure);
+        final ww = _Writer(secure);
 
-      // Send the real handshake response over TLS, seq=2.
-      ww.send(_handshakeResponse(clientCaps), seq: 2);
-      final ok = await rr.next();
-      expect(ok.payload[0], 0x00, reason: 'OK after TLS handshake');
+        // Send the real handshake response over TLS, seq=2.
+        ww.send(_handshakeResponse(clientCaps), seq: 2);
+        final ok = await rr.next();
+        expect(ok.payload[0], 0x00, reason: 'OK after TLS handshake');
 
-      // Run a simple query.
-      ww.send(_query('SELECT 1'), seq: 0);
-      final cc = await rr.next();
-      expect(cc.payload[0], 1);
-      await rr.next(); // column def
-      final row = await rr.next();
-      expect(row.payload[0], 1); // lenenc len=1
-      expect(utf8.decode(row.payload.sublist(1, 2)), '1');
-      await rr.next(); // EOF/OK terminator
-    });
+        // Run a simple query.
+        ww.send(_query('SELECT 1'), seq: 0);
+        final cc = await rr.next();
+        expect(cc.payload[0], 1);
+        await rr.next(); // column def
+        final row = await rr.next();
+        expect(row.payload[0], 1); // lenenc len=1
+        expect(utf8.decode(row.payload.sublist(1, 2)), '1');
+        await rr.next(); // EOF/OK terminator
+      },
+    );
   });
 }
 

@@ -22,7 +22,8 @@ void main() {
   test('SUM(v) WHERE v BETWEEN lo AND hi (range walk)', () async {
     final db = await seed();
     try {
-      final r = await db.execute('SELECT SUM(v) FROM t WHERE v BETWEEN 3 AND 7');
+      final r =
+          await db.execute('SELECT SUM(v) FROM t WHERE v BETWEEN 3 AND 7');
       expect(r.rows.first.first, 25); // 3+4+5+6+7
       expect(r.columns, ['sum(v)']);
     } finally {
@@ -33,8 +34,8 @@ void main() {
   test('AVG(v) WHERE v >= a AND v <= b', () async {
     final db = await seed();
     try {
-      final r = await db
-          .execute('SELECT AVG(v) FROM t WHERE v >= 4 AND v <= 8');
+      final r =
+          await db.execute('SELECT AVG(v) FROM t WHERE v >= 4 AND v <= 8');
       expect((r.rows.first.first as num).toDouble(), closeTo(6.0, 1e-9));
     } finally {
       await db.close();
@@ -55,11 +56,11 @@ void main() {
   test('SUM/AVG WHERE no matches → NULL', () async {
     final db = await seed();
     try {
-      final r1 = await db
-          .execute('SELECT SUM(v) FROM t WHERE v BETWEEN 100 AND 200');
+      final r1 =
+          await db.execute('SELECT SUM(v) FROM t WHERE v BETWEEN 100 AND 200');
       expect(r1.rows.first.first, isNull);
-      final r2 = await db
-          .execute('SELECT AVG(v) FROM t WHERE v BETWEEN 100 AND 200');
+      final r2 =
+          await db.execute('SELECT AVG(v) FROM t WHERE v BETWEEN 100 AND 200');
       expect(r2.rows.first.first, isNull);
     } finally {
       await db.close();
@@ -69,11 +70,11 @@ void main() {
   test('MIN/MAX WHERE BETWEEN restrict to subrange', () async {
     final db = await seed();
     try {
-      final r1 = await db
-          .execute('SELECT MIN(v) FROM t WHERE v BETWEEN 4 AND 8');
+      final r1 =
+          await db.execute('SELECT MIN(v) FROM t WHERE v BETWEEN 4 AND 8');
       expect(r1.rows.first.first, 4);
-      final r2 = await db
-          .execute('SELECT MAX(v) FROM t WHERE v BETWEEN 4 AND 8');
+      final r2 =
+          await db.execute('SELECT MAX(v) FROM t WHERE v BETWEEN 4 AND 8');
       expect(r2.rows.first.first, 8);
     } finally {
       await db.close();
@@ -119,8 +120,7 @@ void main() {
     }
   });
 
-  test('Open range: v < hi only — bails (no upper-only support)',
-      () async {
+  test('Open range: v < hi only — bails (no upper-only support)', () async {
     // Single-sided ranges aren't recognized; falls through to generic
     // path which still returns the right answer.
     final db = await seed();
@@ -142,17 +142,16 @@ void main() {
     }
   });
 
-  test('Aggregate on non-indexed col falls through (correctness)',
-      () async {
+  test('Aggregate on non-indexed col falls through (correctness)', () async {
     final db = await Database.open();
     try {
-      await db.execute(
-          'CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)');
+      await db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)');
       // No index on v.
       for (var i = 1; i <= 5; i++) {
         await db.execute('INSERT INTO t VALUES ($i, $i)');
       }
-      final r = await db.execute('SELECT SUM(v) FROM t WHERE v BETWEEN 2 AND 4');
+      final r =
+          await db.execute('SELECT SUM(v) FROM t WHERE v BETWEEN 2 AND 4');
       expect(r.rows.first.first, 9);
     } finally {
       await db.close();

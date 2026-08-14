@@ -20,12 +20,15 @@ class CreateTableStmt extends Statement {
   /// Database._executePagedStmt).
   final bool usingPaged;
 
-  CreateTableStmt(this.name, this.columns,
-      {this.constraints = const [],
-      this.ifNotExists = false,
-      this.strict = false,
-      this.withoutRowid = false,
-      this.usingPaged = false});
+  CreateTableStmt(
+    this.name,
+    this.columns, {
+    this.constraints = const [],
+    this.ifNotExists = false,
+    this.strict = false,
+    this.withoutRowid = false,
+    this.usingPaged = false,
+  });
 }
 
 class DropTableStmt extends Statement {
@@ -87,15 +90,19 @@ class CreateIndexStmt extends Statement {
   /// Per-column collation names ('BINARY' default; 'NOCASE' supported).
   final List<String> collations;
 
-  CreateIndexStmt(this.indexName, this.table, this.column,
-      {this.unique = false,
-      this.whereSql,
-      this.exprSql,
-      List<String>? columns,
-      List<String>? collations})
-      : columns = columns ?? [column],
-        collations = collations ??
-            List<String>.filled((columns ?? [column]).length, 'BINARY');
+  CreateIndexStmt(
+    this.indexName,
+    this.table,
+    this.column, {
+    this.unique = false,
+    this.whereSql,
+    this.exprSql,
+    List<String>? columns,
+    List<String>? collations,
+  }) : columns = columns ?? [column],
+       collations =
+           collations ??
+           List<String>.filled((columns ?? [column]).length, 'BINARY');
 }
 
 class DropIndexStmt extends Statement {
@@ -113,8 +120,12 @@ class CreateViewStmt extends Statement {
   /// preserved so views can be persisted and re-parsed verbatim across
   /// open/close cycles. Empty for views created programmatically.
   final String selectSql;
-  CreateViewStmt(this.name, this.select,
-      {this.ifNotExists = false, this.selectSql = ''});
+  CreateViewStmt(
+    this.name,
+    this.select, {
+    this.ifNotExists = false,
+    this.selectSql = '',
+  });
 }
 
 class DropViewStmt extends Statement {
@@ -169,14 +180,18 @@ class InsertStmt extends Statement {
 
   /// Optional UPSERT clause.
   final OnConflictClause? onConflict;
-  InsertStmt(this.table, this.columns, this.rows,
-      {this.mode = InsertMode.normal,
-      this.select,
-      this.returning,
-      this.ctes = const {},
-      this.cteColumns = const {},
-      this.ctesRecursive = false,
-      this.onConflict});
+  InsertStmt(
+    this.table,
+    this.columns,
+    this.rows, {
+    this.mode = InsertMode.normal,
+    this.select,
+    this.returning,
+    this.ctes = const {},
+    this.cteColumns = const {},
+    this.ctesRecursive = false,
+    this.onConflict,
+  });
 }
 
 /// Optional `INDEXED BY name` / `NOT INDEXED` hint attached to a table
@@ -186,12 +201,8 @@ class InsertStmt extends Statement {
 class IndexHint {
   final String? indexName;
   final bool notIndexed;
-  const IndexHint.byName(String name)
-      : indexName = name,
-        notIndexed = false;
-  const IndexHint.notIndexed()
-      : indexName = null,
-        notIndexed = true;
+  const IndexHint.byName(String name) : indexName = name, notIndexed = false;
+  const IndexHint.notIndexed() : indexName = null, notIndexed = true;
 }
 
 class JoinClause {
@@ -213,8 +224,16 @@ class JoinClause {
   /// Optional `INDEXED BY` / `NOT INDEXED` hint on this joined relation.
   final IndexHint? indexedBy;
 
-  JoinClause(this.type, this.table, this.alias, this.on,
-      {this.subquery, this.using, this.natural = false, this.indexedBy});
+  JoinClause(
+    this.type,
+    this.table,
+    this.alias,
+    this.on, {
+    this.subquery,
+    this.using,
+    this.natural = false,
+    this.indexedBy,
+  });
 }
 
 class SelectStmt extends Statement {
@@ -304,20 +323,17 @@ class SelectItem {
   final String? starTable; // for `t.*`
   final Expr? expr;
   final String? alias;
-  SelectItem.star({this.starTable})
-      : isStar = true,
-        expr = null,
-        alias = null;
+  SelectItem.star({this.starTable}) : isStar = true, expr = null, alias = null;
   SelectItem.expr(Expr this.expr, {this.alias})
-      : isStar = false,
-        starTable = null;
+    : isStar = false,
+      starTable = null;
 }
 
 class OrderByItem {
   final Expr expr;
   final bool descending;
   final bool?
-      nullsFirst; // null => default (NULLS FIRST for ASC, LAST for DESC)
+  nullsFirst; // null => default (NULLS FIRST for ASC, LAST for DESC)
   OrderByItem(this.expr, {this.descending = false, this.nullsFirst});
 }
 
@@ -339,16 +355,20 @@ class UpdateStmt extends Statement {
   final String? fromAlias;
   final Expr? limit;
   final Expr? offset;
-  UpdateStmt(this.table, this.assignments, this.where,
-      {this.returning,
-      this.ctes = const {},
-      this.cteColumns = const {},
-      this.ctesRecursive = false,
-      this.indexedBy,
-      this.fromTable,
-      this.fromAlias,
-      this.limit,
-      this.offset});
+  UpdateStmt(
+    this.table,
+    this.assignments,
+    this.where, {
+    this.returning,
+    this.ctes = const {},
+    this.cteColumns = const {},
+    this.ctesRecursive = false,
+    this.indexedBy,
+    this.fromTable,
+    this.fromAlias,
+    this.limit,
+    this.offset,
+  });
 }
 
 class DeleteStmt extends Statement {
@@ -361,14 +381,17 @@ class DeleteStmt extends Statement {
   final IndexHint? indexedBy;
   final Expr? limit;
   final Expr? offset;
-  DeleteStmt(this.table, this.where,
-      {this.returning,
-      this.ctes = const {},
-      this.cteColumns = const {},
-      this.ctesRecursive = false,
-      this.indexedBy,
-      this.limit,
-      this.offset});
+  DeleteStmt(
+    this.table,
+    this.where, {
+    this.returning,
+    this.ctes = const {},
+    this.cteColumns = const {},
+    this.ctesRecursive = false,
+    this.indexedBy,
+    this.limit,
+    this.offset,
+  });
 }
 
 class BeginStmt extends Statement {}
@@ -426,8 +449,12 @@ class CreateVirtualTableStmt extends Statement {
   final String module; // e.g. fts5, rtree
   final List<String> args; // module-specific arguments (column names etc.)
   final bool ifNotExists;
-  CreateVirtualTableStmt(this.name, this.module, this.args,
-      {this.ifNotExists = false});
+  CreateVirtualTableStmt(
+    this.name,
+    this.module,
+    this.args, {
+    this.ifNotExists = false,
+  });
 }
 
 class VacuumStmt extends Statement {
@@ -482,8 +509,14 @@ class CreateTriggerStmt extends Statement {
   final List<Statement> body;
   final bool ifNotExists;
   CreateTriggerStmt(
-      this.name, this.timing, this.event, this.table, this.when, this.body,
-      {this.ifNotExists = false});
+    this.name,
+    this.timing,
+    this.event,
+    this.table,
+    this.when,
+    this.body, {
+    this.ifNotExists = false,
+  });
 }
 
 class DropTriggerStmt extends Statement {
@@ -538,7 +571,8 @@ class SubquerySelectExpr extends Expr {
   @override
   Object? eval(Map<String, Object?> row) {
     throw StateError(
-        'SubquerySelectExpr must be evaluated by the database executor.');
+      'SubquerySelectExpr must be evaluated by the database executor.',
+    );
   }
 }
 
@@ -550,7 +584,8 @@ class SubqueryInExpr extends Expr {
   @override
   Object? eval(Map<String, Object?> row) {
     throw StateError(
-        'SubqueryInExpr must be evaluated by the database executor.');
+      'SubqueryInExpr must be evaluated by the database executor.',
+    );
   }
 }
 
@@ -561,6 +596,7 @@ class SubqueryExistsExpr extends Expr {
   @override
   Object? eval(Map<String, Object?> row) {
     throw StateError(
-        'SubqueryExistsExpr must be evaluated by the database executor.');
+      'SubqueryExistsExpr must be evaluated by the database executor.',
+    );
   }
 }

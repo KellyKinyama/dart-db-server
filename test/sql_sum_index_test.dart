@@ -53,8 +53,7 @@ void main() {
       await db.execute('CREATE INDEX i_v ON t(v)');
       var id = 1;
       for (final v in [1, null, 2, null, 3]) {
-        await db.execute(
-            'INSERT INTO t VALUES (${id++}, ${v ?? 'NULL'})');
+        await db.execute('INSERT INTO t VALUES (${id++}, ${v ?? 'NULL'})');
       }
       final r = await db.execute('SELECT SUM(v) FROM t');
       expect(r.rows, [
@@ -87,8 +86,8 @@ void main() {
       for (var i = 1; i <= 10; i++) {
         await db.execute('INSERT INTO t VALUES ($i, $i)');
       }
-      final r = await db.execute(
-          'SELECT MIN(v), MAX(v), SUM(v), COUNT(*) FROM t');
+      final r =
+          await db.execute('SELECT MIN(v), MAX(v), SUM(v), COUNT(*) FROM t');
       expect(r.rows, [
         [1, 10, 55, 10],
       ]);
@@ -113,12 +112,10 @@ void main() {
     }
   });
 
-  test('SUM on non-indexed col falls through to generic aggregate',
-      () async {
+  test('SUM on non-indexed col falls through to generic aggregate', () async {
     final db = await Database.open();
     try {
-      await db.execute(
-          'CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)');
+      await db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)');
       // No index on v.
       for (var i = 1; i <= 4; i++) {
         await db.execute('INSERT INTO t VALUES ($i, $i)');

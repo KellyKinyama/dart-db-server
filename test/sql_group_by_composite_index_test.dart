@@ -22,8 +22,8 @@ void main() {
       [4, 10],
       [4, 40],
     ]) {
-      await db.execute(
-          'INSERT INTO t VALUES (${id++}, ${pair[0]}, ${pair[1]})');
+      await db
+          .execute('INSERT INTO t VALUES (${id++}, ${pair[0]}, ${pair[1]})');
     }
     return db;
   }
@@ -31,8 +31,8 @@ void main() {
   test('GROUP BY a uses composite index on (a,b) — COUNT(*)', () async {
     final db = await seed();
     try {
-      final r = await db
-          .execute('SELECT a, COUNT(*) FROM t GROUP BY a ORDER BY a');
+      final r =
+          await db.execute('SELECT a, COUNT(*) FROM t GROUP BY a ORDER BY a');
       expect(r.rows, [
         [1, 2],
         [2, 3],
@@ -63,8 +63,8 @@ void main() {
   test('GROUP BY a ORDER BY a DESC on composite index', () async {
     final db = await seed();
     try {
-      final r = await db.execute(
-          'SELECT a, COUNT(*) FROM t GROUP BY a ORDER BY a DESC');
+      final r = await db
+          .execute('SELECT a, COUNT(*) FROM t GROUP BY a ORDER BY a DESC');
       expect(r.rows, [
         [4, 2],
         [3, 1],
@@ -76,8 +76,7 @@ void main() {
     }
   });
 
-  test('GROUP BY a with MIN(a), MAX(a), AVG(a) on composite index',
-      () async {
+  test('GROUP BY a with MIN(a), MAX(a), AVG(a) on composite index', () async {
     final db = await seed();
     try {
       final r = await db.execute(
@@ -94,12 +93,13 @@ void main() {
     }
   });
 
-  test('GROUP BY a with WHERE on composite-leading col → bails to '
+  test(
+      'GROUP BY a with WHERE on composite-leading col → bails to '
       'generic path (still correct)', () async {
     final db = await seed();
     try {
-      final r = await db.execute(
-          'SELECT a, COUNT(*) FROM t WHERE a = 2 GROUP BY a');
+      final r =
+          await db.execute('SELECT a, COUNT(*) FROM t WHERE a = 2 GROUP BY a');
       expect(r.rows, [
         [2, 3],
       ]);

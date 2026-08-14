@@ -18,8 +18,7 @@ void main() {
 
     setUp(() async {
       db = await Database.open(null);
-      await db
-          .execute('CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)');
+      await db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)');
       await db.execute("INSERT INTO t VALUES (1, 'alice'), (2, 'bob')");
       server = MySqlServer(db, port: 0);
       await server.start();
@@ -47,7 +46,8 @@ void main() {
       w.send(_stmtPrepare('INSERT INTO t VALUES (?, ?)'), seq: 0);
       final ok = await r.next();
       expect(ok.payload[0], 0x00);
-      final stmtId = ok.payload[1] |
+      final stmtId =
+          ok.payload[1] |
           (ok.payload[2] << 8) |
           (ok.payload[3] << 16) |
           (ok.payload[4] << 24);
@@ -62,10 +62,7 @@ void main() {
 
       // EXECUTE with id=3, name='carol'.
       w.send(
-        _stmtExecute(stmtId, [
-          _Param.int64(3),
-          _Param.text('carol'),
-        ]),
+        _stmtExecute(stmtId, [_Param.int64(3), _Param.text('carol')]),
         seq: 0,
       );
       final exec = await r.next();
@@ -79,53 +76,57 @@ void main() {
       ]);
     });
 
-    test('PREPARE SELECT with parameter, EXECUTE returns binary rows',
-        () async {
-      w.send(_stmtPrepare('SELECT id, name FROM t WHERE id = ?'), seq: 0);
-      final ok = await r.next();
-      final stmtId = ok.payload[1] |
-          (ok.payload[2] << 8) |
-          (ok.payload[3] << 16) |
-          (ok.payload[4] << 24);
-      final numParams = ok.payload[7] | (ok.payload[8] << 8);
-      for (var i = 0; i < numParams; i++) {
-        await r.next();
-      }
+    test(
+      'PREPARE SELECT with parameter, EXECUTE returns binary rows',
+      () async {
+        w.send(_stmtPrepare('SELECT id, name FROM t WHERE id = ?'), seq: 0);
+        final ok = await r.next();
+        final stmtId =
+            ok.payload[1] |
+            (ok.payload[2] << 8) |
+            (ok.payload[3] << 16) |
+            (ok.payload[4] << 24);
+        final numParams = ok.payload[7] | (ok.payload[8] << 8);
+        for (var i = 0; i < numParams; i++) {
+          await r.next();
+        }
 
-      w.send(_stmtExecute(stmtId, [_Param.int64(2)]), seq: 0);
+        w.send(_stmtExecute(stmtId, [_Param.int64(2)]), seq: 0);
 
-      // Binary result set: column count packet, then column defs, then
-      // binary row packets, then EOF/OK terminator.
-      final cc = await r.next();
-      expect(cc.payload[0], 2);
-      for (var i = 0; i < 2; i++) {
-        await r.next();
-      }
-      final row = await r.next();
-      expect(row.payload[0], 0x00, reason: 'binary row header');
-      // Null bitmap is 1 byte for 2 cols.
-      // Then LONGLONG(8 bytes) for id, then lenenc str for name.
-      final pr = _PR(row.payload);
-      pr.u8(); // header
-      final bitmap = pr.bytes(1);
-      expect(bitmap[0], 0); // no nulls
-      var id = 0;
-      for (var i = 0; i < 8; i++) {
-        id |= pr.u8() << (8 * i);
-      }
-      expect(id, 2);
-      final nameLen = pr.u8();
-      final name = utf8.decode(pr.bytes(nameLen));
-      expect(name, 'bob');
+        // Binary result set: column count packet, then column defs, then
+        // binary row packets, then EOF/OK terminator.
+        final cc = await r.next();
+        expect(cc.payload[0], 2);
+        for (var i = 0; i < 2; i++) {
+          await r.next();
+        }
+        final row = await r.next();
+        expect(row.payload[0], 0x00, reason: 'binary row header');
+        // Null bitmap is 1 byte for 2 cols.
+        // Then LONGLONG(8 bytes) for id, then lenenc str for name.
+        final pr = _PR(row.payload);
+        pr.u8(); // header
+        final bitmap = pr.bytes(1);
+        expect(bitmap[0], 0); // no nulls
+        var id = 0;
+        for (var i = 0; i < 8; i++) {
+          id |= pr.u8() << (8 * i);
+        }
+        expect(id, 2);
+        final nameLen = pr.u8();
+        final name = utf8.decode(pr.bytes(nameLen));
+        expect(name, 'bob');
 
-      final terminator = await r.next();
-      expect(terminator.payload[0], 0xfe);
-    });
+        final terminator = await r.next();
+        expect(terminator.payload[0], 0xfe);
+      },
+    );
 
     test('CLOSE then EXECUTE on stale id returns ERR', () async {
       w.send(_stmtPrepare('SELECT 1'), seq: 0);
       final ok = await r.next();
-      final stmtId = ok.payload[1] |
+      final stmtId =
+          ok.payload[1] |
           (ok.payload[2] << 8) |
           (ok.payload[3] << 16) |
           (ok.payload[4] << 24);

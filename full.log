@@ -1,0 +1,1257 @@
+﻿00:00 +0: loading test\dart_db_server_test.dart
+00:00 +0: test\dart_db_server_test.dart: Database.open returns a usable instance
+00:00 +1: test\db_server_test.dart: Database (in-memory) CREATE TABLE / INSERT / SELECT *
+00:00 +1: test\mysql_caching_sha2_test.dart: MySqlServer caching_sha2_password empty password connects
+[mysql] listening on 127.0.0.1:57667 (mysql wire)
+00:00 +2: test\mysql_caching_sha2_test.dart: MySqlServer caching_sha2_password empty password connects
+00:00 +3: test\mysql_caching_sha2_test.dart: MySqlServer caching_sha2_password empty password connects
+00:00 +4: test\mysql_caching_sha2_test.dart: MySqlServer caching_sha2_password empty password connects
+00:00 +5: test\mysql_caching_sha2_test.dart: MySqlServer caching_sha2_password empty password connects
+00:00 +6: test\mysql_caching_sha2_test.dart: MySqlServer caching_sha2_password empty password connects
+[mysql] conn 1 login user=root db= plugin=caching_sha2_password
+00:00 +7: test\mysql_caching_sha2_test.dart: MySqlServer caching_sha2_password empty password connects
+00:00 +8: test\mysql_caching_sha2_test.dart: MySqlServer caching_sha2_password empty password connects
+00:00 +9: test\db_server_test.dart: Database (in-memory) INNER JOIN
+00:00 +9: test\mysql_caching_sha2_test.dart: MySqlServer caching_sha2_password correct password connects
+[mysql] listening on 127.0.0.1:57669 (mysql wire)
+00:00 +10: test\mysql_caching_sha2_test.dart: MySqlServer caching_sha2_password correct password connects
+00:00 +11: test\mysql_caching_sha2_test.dart: MySqlServer caching_sha2_password correct password connects
+[mysql] conn 1 login user=root db= plugin=caching_sha2_password
+00:00 +12: test\db_server_test.dart: Database (in-memory) Transaction commit and rollback
+00:00 +13: test\mysql_caching_sha2_test.dart: MySqlServer caching_sha2_password wrong password rejected
+[mysql] listening on 127.0.0.1:57671 (mysql wire)
+00:00 +14: test\mysql_caching_sha2_test.dart: MySqlServer caching_sha2_password wrong password rejected
+[mysql] conn 1 login user=root db= plugin=caching_sha2_password
+00:00 +15: test\db_server_test.dart: Database (in-memory) ALTER TABLE ADD COLUMN with DEFAULT
+00:00 +16: test\db_server_test.dart: Database (in-memory) SHOW TABLES
+00:00 +17: test\mysql_client_driver_test.dart: mysql_client driver compatibility plain COM_QUERY SELECT returns the expected rows
+[mysql] listening on 127.0.0.1:57673 (mysql wire)
+00:00 +18: test\mysql_client_driver_test.dart: mysql_client driver compatibility plain COM_QUERY SELECT returns the expected rows
+00:00 +18: test\db_server_test.dart: TCP server client/server round-trip
+[db] listening on 127.0.0.1:45550
+00:00 +19: test\mysql_client_driver_test.dart: mysql_client driver compatibility plain COM_QUERY SELECT returns the expected rows
+00:00 +19: test\db_server_test.dart: TCP server client/server round-trip
+[db] client connected: 127.0.0.1:57675
+00:00 +20: test\mysql_client_driver_test.dart: mysql_client driver compatibility plain COM_QUERY SELECT returns the expected rows
+00:00 +21: test\mysql_client_driver_test.dart: mysql_client driver compatibility plain COM_QUERY SELECT returns the expected rows
+[mysql] conn 1 login user=root db= plugin=mysql_native_password
+00:00 +22: test\mysql_client_driver_test.dart: mysql_client driver compatibility plain COM_QUERY SELECT returns the expected rows
+00:00 +23: test\mysql_client_driver_test.dart: mysql_client driver compatibility plain COM_QUERY SELECT returns the expected rows
+00:00 +23: test\db_server_test.dart: TCP server client/server round-trip
+[db] client disconnected: 127.0.0.1:57675
+00:00 +24: test\mysql_client_driver_test.dart: mysql_client driver compatibility plain COM_QUERY SELECT returns the expected rows
+00:00 +25: test\mysql_client_driver_test.dart: mysql_client driver compatibility plain COM_QUERY SELECT returns the expected rows
+00:00 +26: test\mysql_client_driver_test.dart: mysql_client driver compatibility plain COM_QUERY SELECT returns the expected rows
+00:00 +27: test\mysql_client_driver_test.dart: mysql_client driver compatibility plain COM_QUERY SELECT returns the expected rows
+00:00 +28: test\mysql_client_driver_test.dart: mysql_client driver compatibility plain COM_QUERY SELECT returns the expected rows
+00:00 +29: test\mysql_client_driver_test.dart: mysql_client driver compatibility plain COM_QUERY SELECT returns the expected rows
+00:00 +30: test\mysql_client_driver_test.dart: mysql_client driver compatibility plain COM_QUERY SELECT returns the expected rows
+00:00 +31: test\mysql_client_driver_test.dart: mysql_client driver compatibility plain COM_QUERY SELECT returns the expected rows
+00:00 +32: test\mysql_client_driver_test.dart: mysql_client driver compatibility plain COM_QUERY SELECT returns the expected rows
+00:00 +33: test\mysql_client_driver_test.dart: mysql_client driver compatibility plain COM_QUERY SELECT returns the expected rows
+00:00 +34: test\mysql_client_driver_test.dart: mysql_client driver compatibility plain COM_QUERY SELECT returns the expected rows
+00:00 +35: test\mysql_client_driver_test.dart: mysql_client driver compatibility plain COM_QUERY SELECT returns the expected rows
+00:00 +35: test\mysql_multi_statement_test.dart: MySqlServer multi-statement COM_QUERY SELECT; INSERT; SELECT chains 3 results with proper status flags
+[mysql] listening on 127.0.0.1:57676 (mysql wire)
+00:00 +35: test\mysql_prepared_test.dart: MySqlServer prepared statements PREPARE INSERT with one parameter, EXECUTE inserts row
+[mysql] listening on 127.0.0.1:57678 (mysql wire)
+00:00 +35: test\mysql_multi_statement_test.dart: MySqlServer multi-statement COM_QUERY SELECT; INSERT; SELECT chains 3 results with proper status flags
+[mysql] conn 1 login user=root db= plugin=mysql_native_password
+00:00 +36: test\mysql_client_driver_test.dart: mysql_client driver compatibility plain COM_QUERY SELECT returns the expected rows
+00:00 +36: test\mysql_prepared_test.dart: MySqlServer prepared statements PREPARE INSERT with one parameter, EXECUTE inserts row
+[mysql] conn 1 login user=root db= plugin=mysql_native_password
+00:00 +37: test\mysql_client_driver_test.dart: mysql_client driver compatibility plain COM_QUERY SELECT returns the expected rows
+00:00 +38: test\mysql_client_driver_test.dart: mysql_client driver compatibility plain COM_QUERY SELECT returns the expected rows
+00:00 +39: test\mysql_client_driver_test.dart: mysql_client driver compatibility plain COM_QUERY SELECT returns the expected rows
+00:00 +40: test\mysql_client_driver_test.dart: mysql_client driver compatibility plain COM_QUERY SELECT returns the expected rows
+00:00 +41: test\mysql_client_driver_test.dart: mysql_client driver compatibility plain COM_QUERY SELECT returns the expected rows
+00:00 +41: test\mysql_tls_test.dart: MySqlServer TLS upgrade handshake advertises CLIENT_SSL when context is set
+[mysql] listening on 127.0.0.1:57680 (mysql wire)
+00:00 +42: test\mysql_client_driver_test.dart: mysql_client driver compatibility plain COM_QUERY SELECT returns the expected rows
+00:00 +43: test\mysql_client_driver_test.dart: mysql_client driver compatibility plain COM_QUERY SELECT returns the expected rows
+00:00 +44: test\mysql_client_driver_test.dart: mysql_client driver compatibility plain COM_QUERY SELECT returns the expected rows
+00:00 +45: test\mysql_client_driver_test.dart: mysql_client driver compatibility plain COM_QUERY SELECT returns the expected rows
+00:00 +46: test\mysql_client_driver_test.dart: mysql_client driver compatibility plain COM_QUERY SELECT returns the expected rows
+00:00 +47: test\mysql_multi_statement_test.dart: MySqlServer multi-statement COM_QUERY SELECT; INSERT; SELECT chains 3 results with proper status flags
+00:00 +48: test\mysql_prepared_test.dart: MySqlServer prepared statements PREPARE INSERT with one parameter, EXECUTE inserts row
+00:00 +49: test\mysql_tls_test.dart: MySqlServer TLS upgrade handshake advertises CLIENT_SSL when context is set
+00:00 +49: test\mysql_client_driver_test.dart: mysql_client driver compatibility COM_QUERY INSERT reports affectedRows
+[mysql] listening on 127.0.0.1:57682 (mysql wire)
+00:00 +49: test\mysql_multi_statement_test.dart: MySqlServer multi-statement COM_QUERY without CLIENT_MULTI_STATEMENTS, only the first stmt is executed
+[mysql] listening on 127.0.0.1:57684 (mysql wire)
+00:00 +49: test\mysql_prepared_test.dart: MySqlServer prepared statements PREPARE SELECT with parameter, EXECUTE returns binary rows
+[mysql] listening on 127.0.0.1:57685 (mysql wire)
+00:00 +49: test\mysql_multi_statement_test.dart: MySqlServer multi-statement COM_QUERY without CLIENT_MULTI_STATEMENTS, only the first stmt is executed
+[mysql] conn 1 login user=root db= plugin=mysql_native_password
+00:00 +49: test\mysql_prepared_test.dart: MySqlServer prepared statements PREPARE SELECT with parameter, EXECUTE returns binary rows
+[mysql] conn 1 login user=root db= plugin=mysql_native_password
+00:00 +49: test\mysql_client_driver_test.dart: mysql_client driver compatibility COM_QUERY INSERT reports affectedRows
+[mysql] conn 1 login user=root db= plugin=mysql_native_password
+00:00 +49: test\mysql_multi_statement_test.dart: MySqlServer multi-statement COM_QUERY without CLIENT_MULTI_STATEMENTS, only the first stmt is executed
+[mysql] conn 2 login user=root db= plugin=mysql_native_password
+00:00 +50: test\mysql_upsert_test.dart: INSERT ... ON DUPLICATE KEY UPDATE inserts a new row when no key conflict
+00:00 +51: test\mysql_upsert_test.dart: INSERT ... ON DUPLICATE KEY UPDATE inserts a new row when no key conflict
+00:00 +51: test\mysql_wire_test.dart: MySqlServer wire handshake + COM_QUERY round-trip
+[mysql] listening on 127.0.0.1:57689 (mysql wire)
+00:00 +51: test\mysql_tls_test.dart: MySqlServer TLS upgrade SSLRequest upgrades the connection and a query round-trips
+[mysql] listening on 127.0.0.1:57690 (mysql wire)
+00:00 +52: test\mysql_upsert_test.dart: INSERT ... ON DUPLICATE KEY UPDATE inserts a new row when no key conflict
+00:00 +52: test\mysql_prepared_test.dart: MySqlServer prepared statements CLOSE then EXECUTE on stale id returns ERR
+[mysql] listening on 127.0.0.1:57692 (mysql wire)
+[mysql] conn 1 login user=root db= plugin=mysql_native_password
+00:00 +53: test\mysql_upsert_test.dart: INSERT ... ON DUPLICATE KEY UPDATE inserts a new row when no key conflict
+00:00 +54: test\mysql_wire_test.dart: MySqlServer wire handshake + COM_QUERY round-trip
+00:00 +55: test\mysql_wire_test.dart: MySqlServer wire handshake + COM_QUERY round-trip
+00:00 +56: test\mysql_wire_test.dart: MySqlServer wire handshake + COM_QUERY round-trip
+00:00 +57: test\mysql_wire_test.dart: MySqlServer wire handshake + COM_QUERY round-trip
+[mysql] conn 1 login user=root db= plugin=mysql_native_password
+00:00 +57: test\mysql_tls_test.dart: MySqlServer TLS upgrade SSLRequest upgrades the connection and a query round-trips
+[mysql] conn 1 login user=root db= plugin=mysql_native_password
+00:00 +58: test\mysql_wire_test.dart: MySqlServer wire handshake + COM_QUERY round-trip
+00:00 +59: test\mysql_client_driver_test.dart: mysql_client driver compatibility COM_QUERY INSERT reports affectedRows
+00:00 +59: test\mysql_wire_test.dart: MySqlServer wire rejects bad password
+[mysql] listening on 127.0.0.1:57695 (mysql wire)
+[mysql] listening on 127.0.0.1:57697 (mysql wire)
+[mysql] conn 1 login user=root db= plugin=mysql_native_password
+00:00 +60: test\mysql_client_driver_test.dart: mysql_client driver compatibility COM_QUERY INSERT reports affectedRows
+00:00 +61: test\mysql_client_driver_test.dart: mysql_client driver compatibility prepared statement with positional param returns the matching row
+[mysql] listening on 127.0.0.1:57699 (mysql wire)
+[mysql] conn 1 login user=root db= plugin=mysql_native_password
+00:00 +62: test\regression\sqlite_blob_datetime_test.dart: SQLite parity (BLOB) X'..' literal stores and reads as identical bytes
+00:00 +62: test\mysql_client_driver_test.dart: mysql_client driver compatibility prepared INSERT with two params adds a row
+[mysql] listening on 127.0.0.1:57701 (mysql wire)
+[mysql] conn 1 login user=root db= plugin=mysql_native_password
+00:00 +63: test\regression\sqlite_planner_test.dart: SQLite parity (planner) Equality on indexed column
+00:00 +64: test\regression\sqlite_planner_test.dart: SQLite parity (planner) Equality on indexed column
+00:00 +65: test\regression\sqlite_planner_test.dart: SQLite parity (planner) Equality on indexed column
+00:00 +66: test\regression\sqlite_planner_test.dart: SQLite parity (planner) Equality on indexed column
+00:00 +67: test\regression\sqlite_planner_test.dart: SQLite parity (planner) Equality on indexed column
+00:00 +68: test\regression\sqlite_planner_test.dart: SQLite parity (planner) Equality on indexed column
+00:00 +69: test\regression\sqlite_planner_test.dart: SQLite parity (planner) Equality on indexed column
+00:00 +70: test\regression\sqlite_planner_test.dart: SQLite parity (planner) Equality on indexed column
+00:00 +71: test\regression\sqlite_planner_test.dart: SQLite parity (planner) Equality on indexed column
+00:00 +72: test\regression\sqlite_planner_test.dart: SQLite parity (planner) Equality on indexed column
+00:00 +73: test\regression\sqlite_planner_test.dart: SQLite parity (planner) Equality on indexed column
+00:00 +74: test\regression\sqlite_planner_test.dart: SQLite parity (planner) Equality on indexed column
+00:00 +75: test\regression\sqlite_planner_test.dart: SQLite parity (planner) Equality on indexed column
+00:00 +76: test\regression\sqlite_planner_test.dart: SQLite parity (planner) Equality on indexed column
+00:00 +77: test\regression\sqlite_planner_test.dart: SQLite parity (planner) Equality on indexed column
+00:00 +78: test\regression\sqlite_planner_test.dart: SQLite parity (planner) Equality on indexed column
+00:00 +79: test\regression\sqlite_planner_test.dart: SQLite parity (planner) Equality on indexed column
+00:00 +80: test\regression\sqlite_planner_test.dart: SQLite parity (planner) Equality on indexed column
+00:00 +81: test\regression\sqlite_planner_test.dart: SQLite parity (planner) Equality on indexed column
+00:00 +82: test\regression\sqlite_planner_test.dart: SQLite parity (planner) Equality on indexed column
+00:00 +83: test\regression\sqlite_planner_test.dart: SQLite parity (planner) Equality on indexed column
+00:00 +84: test\regression\sqlite_planner_test.dart: SQLite parity (planner) Equality on indexed column
+00:00 +85: test\regression\sqlite_planner_test.dart: SQLite parity (planner) Equality on indexed column
+00:00 +86: test\regression\sqlite_planner_test.dart: SQLite parity (planner) Equality on indexed column
+00:00 +87: test\mysql_client_driver_test.dart: mysql_client driver compatibility prepared INSERT with two params adds a row
+00:00 +88: test\mysql_client_driver_test.dart: mysql_client driver compatibility prepared INSERT with two params adds a row
+00:00 +89: test\mysql_client_driver_test.dart: mysql_client driver compatibility prepared INSERT with two params adds a row
+00:00 +90: test\regression\sqlite_strict_numeric_test.dart: NUMERIC affinity vs SQLite text round-trip: integer-looking, real-looking, garbage
+00:00 +90: test\mysql_client_driver_test.dart: mysql_client driver compatibility multi-statement COM_QUERY returns one result per statement
+[mysql] listening on 127.0.0.1:57703 (mysql wire)
+00:00 +91: test\regression\sqlite_strict_numeric_test.dart: NUMERIC affinity vs SQLite text round-trip: integer-looking, real-looking, garbage
+00:00 +91: test\mysql_client_driver_test.dart: mysql_client driver compatibility multi-statement COM_QUERY returns one result per statement
+[mysql] conn 1 login user=root db= plugin=mysql_native_password
+00:00 +92: test\regression\sqlite_strict_numeric_test.dart: NUMERIC affinity vs SQLite text round-trip: integer-looking, real-looking, garbage
+00:00 +93: test\regression\sqlite_strict_numeric_test.dart: NUMERIC affinity vs SQLite text round-trip: integer-looking, real-looking, garbage
+00:00 +94: test\regression\sqlite_strict_numeric_test.dart: NUMERIC affinity vs SQLite text round-trip: integer-looking, real-looking, garbage
+00:00 +95: test\regression\sqlite_strict_numeric_test.dart: NUMERIC affinity vs SQLite text round-trip: integer-looking, real-looking, garbage
+00:00 +96: test\regression\sqlite_strict_numeric_test.dart: NUMERIC affinity vs SQLite text round-trip: integer-looking, real-looking, garbage
+00:00 +97: test\sql_a2_json_test.dart: JSON1 mutators json_set overwrites existing key, creates missing
+00:00 +98: test\sql_a2_json_test.dart: JSON1 mutators json_set overwrites existing key, creates missing
+00:00 +99: test\sql_a2_json_test.dart: JSON1 mutators json_set overwrites existing key, creates missing
+00:00 +100: test\sql_a2_json_test.dart: JSON1 mutators json_set overwrites existing key, creates missing
+00:00 +101: test\sql_a2_json_test.dart: JSON1 mutators json_set overwrites existing key, creates missing
+00:00 +102: test\sql_a2_json_test.dart: JSON1 mutators json_set overwrites existing key, creates missing
+00:00 +103: test\sql_a2_json_test.dart: JSON1 mutators json_set overwrites existing key, creates missing
+00:00 +104: test\sql_a2_json_test.dart: JSON1 mutators json_set overwrites existing key, creates missing
+00:00 +105: test\sql_a2_json_test.dart: JSON1 mutators json_set overwrites existing key, creates missing
+00:00 +106: test\sql_a2_json_test.dart: JSON1 mutators json_set overwrites existing key, creates missing
+00:00 +107: test\mysql_client_driver_test.dart: mysql_client driver compatibility multi-statement COM_QUERY returns one result per statement
+00:00 +108: test\mysql_client_driver_test.dart: mysql_client driver compatibility multi-statement COM_QUERY returns one result per statement
+00:00 +109: test\mysql_client_driver_test.dart: mysql_client driver compatibility multi-statement COM_QUERY returns one result per statement
+00:00 +110: test\mysql_client_driver_test.dart: mysql_client driver compatibility multi-statement COM_QUERY returns one result per statement
+00:00 +111: test\mysql_client_driver_test.dart: mysql_client driver compatibility multi-statement COM_QUERY returns one result per statement
+00:00 +112: test\mysql_client_driver_test.dart: mysql_client driver compatibility multi-statement COM_QUERY returns one result per statement
+00:00 +113: test\mysql_client_driver_test.dart: mysql_client driver compatibility multi-statement COM_QUERY returns one result per statement
+00:00 +114: test\mysql_client_driver_test.dart: mysql_client driver compatibility multi-statement COM_QUERY returns one result per statement
+00:00 +115: test\mysql_client_driver_test.dart: mysql_client driver compatibility multi-statement COM_QUERY returns one result per statement
+00:00 +116: test\mysql_client_driver_test.dart: mysql_client driver compatibility multi-statement COM_QUERY returns one result per statement
+00:00 +117: test\mysql_client_driver_test.dart: mysql_client driver compatibility multi-statement COM_QUERY returns one result per statement
+00:00 +118: test\mysql_client_driver_test.dart: mysql_client driver compatibility multi-statement COM_QUERY returns one result per statement
+00:00 +119: test\mysql_client_driver_test.dart: mysql_client driver compatibility multi-statement COM_QUERY returns one result per statement
+00:00 +120: test\mysql_client_driver_test.dart: mysql_client driver compatibility multi-statement COM_QUERY returns one result per statement
+00:00 +121: test\mysql_client_driver_test.dart: mysql_client driver compatibility multi-statement COM_QUERY returns one result per statement
+00:00 +122: test\mysql_client_driver_test.dart: mysql_client driver compatibility multi-statement COM_QUERY returns one result per statement
+00:00 +123: test\mysql_client_driver_test.dart: mysql_client driver compatibility multi-statement COM_QUERY returns one result per statement
+00:00 +124: test\mysql_client_driver_test.dart: mysql_client driver compatibility multi-statement COM_QUERY returns one result per statement
+00:00 +125: test\mysql_client_driver_test.dart: mysql_client driver compatibility multi-statement COM_QUERY returns one result per statement
+00:00 +126: test\mysql_client_driver_test.dart: mysql_client driver compatibility multi-statement COM_QUERY returns one result per statement
+00:00 +127: test\sql_a3_window_test.dart: A3 window extras NTILE buckets
+00:00 +128: test\sql_a3_window_test.dart: A3 window extras NTILE buckets
+00:00 +129: test\sql_a4_instead_of_test.dart: A4 INSTEAD OF triggers INSTEAD OF INSERT on view writes to underlying table
+00:00 +130: test\sql_a4_instead_of_test.dart: A4 INSTEAD OF triggers INSTEAD OF INSERT on view writes to underlying table
+00:00 +131: test\sql_a4_instead_of_test.dart: A4 INSTEAD OF triggers INSTEAD OF INSERT on view writes to underlying table
+00:00 +132: test\sql_a4_instead_of_test.dart: A4 INSTEAD OF triggers INSTEAD OF INSERT on view writes to underlying table
+00:00 +133: test\sql_a4_instead_of_test.dart: A4 INSTEAD OF triggers INSTEAD OF INSERT on view writes to underlying table
+00:00 +134: test\sql_a4_instead_of_test.dart: A4 INSTEAD OF triggers INSTEAD OF INSERT on view writes to underlying table
+00:00 +135: test\sql_a4_instead_of_test.dart: A4 INSTEAD OF triggers INSTEAD OF INSERT on view writes to underlying table
+00:00 +136: test\sql_a4_instead_of_test.dart: A4 INSTEAD OF triggers INSTEAD OF INSERT on view writes to underlying table
+00:00 +137: test\sql_a4_instead_of_test.dart: A4 INSTEAD OF triggers INSTEAD OF INSERT on view writes to underlying table
+00:00 +138: test\sql_a5_compat_test.dart: A5 SQLite syntax acceptance CREATE TABLE ... WITHOUT ROWID is accepted
+00:00 +139: test\sql_a5_compat_test.dart: A5 SQLite syntax acceptance CREATE TABLE ... WITHOUT ROWID is accepted
+00:00 +140: test\sql_a5_compat_test.dart: A5 SQLite syntax acceptance CREATE TABLE ... WITHOUT ROWID is accepted
+00:00 +141: test\sql_a5_compat_test.dart: A5 SQLite syntax acceptance CREATE TABLE ... WITHOUT ROWID is accepted
+00:00 +142: test\sql_a5_compat_test.dart: A5 SQLite syntax acceptance CREATE TABLE ... WITHOUT ROWID is accepted
+00:00 +143: test\sql_a5_compat_test.dart: A5 SQLite syntax acceptance CREATE TABLE ... WITHOUT ROWID is accepted
+00:00 +144: test\sql_a5_compat_test.dart: A5 SQLite syntax acceptance CREATE TABLE ... WITHOUT ROWID is accepted
+00:00 +145: test\sql_a5_compat_test.dart: A5 SQLite syntax acceptance CREATE TABLE ... WITHOUT ROWID is accepted
+00:00 +146: test\sql_a5_compat_test.dart: A5 SQLite syntax acceptance CREATE TABLE ... WITHOUT ROWID is accepted
+00:00 +147: test\sql_a6_correlated_test.dart: A6 correlated subqueries scalar subquery references outer column
+00:00 +148: test\sql_a6_correlated_test.dart: A6 correlated subqueries scalar subquery references outer column
+00:00 +149: test\sql_a6_correlated_test.dart: A6 correlated subqueries scalar subquery references outer column
+00:00 +150: test\sql_a6_correlated_test.dart: A6 correlated subqueries scalar subquery references outer column
+00:01 +151: test\sql_a6_correlated_test.dart: A6 correlated subqueries scalar subquery references outer column
+00:01 +152: test\sql_agg_distinct_where_test.dart: COUNT(DISTINCT v) WHERE v BETWEEN ΓÇö counts unique keys
+00:01 +153: test\sql_agg_distinct_where_test.dart: COUNT(DISTINCT v) WHERE v BETWEEN ΓÇö counts unique keys
+00:01 +154: test\sql_agg_distinct_where_test.dart: COUNT(DISTINCT v) WHERE v BETWEEN ΓÇö counts unique keys
+00:01 +155: test\sql_agg_distinct_where_test.dart: COUNT(DISTINCT v) WHERE v BETWEEN ΓÇö counts unique keys
+00:01 +156: test\sql_agg_distinct_where_test.dart: COUNT(DISTINCT v) WHERE v BETWEEN ΓÇö counts unique keys
+00:01 +157: test\sql_agg_distinct_where_test.dart: COUNT(DISTINCT v) WHERE v BETWEEN ΓÇö counts unique keys
+00:01 +158: test\sql_agg_isnull_where_test.dart: SUM(v) WHERE v IS NOT NULL ΓåÆ walks all entries
+00:01 +159: test\sql_agg_isnull_where_test.dart: SUM(v) WHERE v IS NOT NULL ΓåÆ walks all entries
+00:01 +160: test\sql_agg_isnull_where_test.dart: SUM(v) WHERE v IS NOT NULL ΓåÆ walks all entries
+00:01 +161: test\sql_agg_isnull_where_test.dart: SUM(v) WHERE v IS NOT NULL ΓåÆ walks all entries
+00:01 +162: test\sql_agg_isnull_where_test.dart: SUM(v) WHERE v IS NOT NULL ΓåÆ walks all entries
+00:01 +163: test\sql_agg_isnull_where_test.dart: SUM(v) WHERE v IS NOT NULL ΓåÆ walks all entries
+00:01 +164: test\sql_agg_isnull_where_test.dart: SUM(v) WHERE v IS NOT NULL ΓåÆ walks all entries
+00:01 +165: test\sql_agg_order_by_test.dart: CHAR_LENGTH and CHARACTER_LENGTH alias LENGTH
+00:01 +166: test\sql_agg_order_by_test.dart: CHAR_LENGTH and CHARACTER_LENGTH alias LENGTH
+00:01 +167: test\sql_agg_order_by_test.dart: CHAR_LENGTH and CHARACTER_LENGTH alias LENGTH
+00:01 +168: test\sql_agg_where_index_test.dart: SUM(v) WHERE v BETWEEN lo AND hi (range walk)
+00:01 +169: test\sql_agg_where_index_test.dart: SUM(v) WHERE v BETWEEN lo AND hi (range walk)
+00:01 +170: test\sql_agg_where_index_test.dart: SUM(v) WHERE v BETWEEN lo AND hi (range walk)
+00:01 +171: test\sql_agg_where_index_test.dart: SUM(v) WHERE v BETWEEN lo AND hi (range walk)
+00:01 +172: test\sql_agg_where_index_test.dart: SUM(v) WHERE v BETWEEN lo AND hi (range walk)
+00:01 +173: test\sql_agg_where_index_test.dart: SUM(v) WHERE v BETWEEN lo AND hi (range walk)
+00:01 +174: test\sql_agg_where_index_test.dart: SUM(v) WHERE v BETWEEN lo AND hi (range walk)
+00:01 +175: test\sql_agg_where_index_test.dart: SUM(v) WHERE v BETWEEN lo AND hi (range walk)
+00:01 +176: test\sql_agg_where_index_test.dart: SUM(v) WHERE v BETWEEN lo AND hi (range walk)
+00:01 +177: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +178: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +179: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +180: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +181: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +182: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +183: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +184: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +185: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +186: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +187: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +188: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +189: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +190: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +191: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +192: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +193: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +194: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +195: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +196: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +197: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +198: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +199: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +200: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +201: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +202: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +203: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +204: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +205: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +206: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +207: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +208: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +209: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +210: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +211: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +212: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +213: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +214: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +215: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +216: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +217: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +218: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +219: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +220: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +221: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +222: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +223: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +224: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +225: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +226: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +227: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip export: ANALYZE produces sqlite_stat1 readable by SQLite
+00:01 +228: test\sql_batch4_test.dart: Triggers AFTER INSERT trigger logs into another table using NEW.col
+00:01 +229: test\sql_batch4_test.dart: Triggers AFTER INSERT trigger logs into another table using NEW.col
+00:01 +230: test\sql_batch5_test.dart: Window functions ROW_NUMBER() OVER (ORDER BY amount)
+00:01 +231: test\sql_batch5_test.dart: Window functions ROW_NUMBER() OVER (ORDER BY amount)
+00:01 +232: test\sql_batch5_test.dart: Window functions ROW_NUMBER() OVER (ORDER BY amount)
+00:01 +233: test\sql_batch5_test.dart: Window functions ROW_NUMBER() OVER (ORDER BY amount)
+00:01 +234: test\sql_batch5_test.dart: Window functions ROW_NUMBER() OVER (ORDER BY amount)
+00:01 +235: test\sql_batch5_test.dart: Window functions ROW_NUMBER() OVER (ORDER BY amount)
+00:01 +236: test\sql_batch5_test.dart: Window functions ROW_NUMBER() OVER (ORDER BY amount)
+00:01 +237: test\sql_batch6_test.dart: JSON1 functions json_extract pulls scalar via path
+00:01 +238: test\sql_batch6_test.dart: JSON1 functions json_extract pulls scalar via path
+00:01 +239: test\sql_batch6_test.dart: JSON1 functions json_extract pulls scalar via path
+00:01 +240: test\sql_batch6_test.dart: JSON1 functions json_extract pulls scalar via path
+00:01 +241: test\sql_batch6_test.dart: JSON1 functions json_extract pulls scalar via path
+00:01 +242: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +243: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +244: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +245: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +246: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +247: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +248: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +249: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +250: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +251: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +252: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +253: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +254: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +255: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +256: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +257: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +258: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +259: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +260: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +261: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +262: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +263: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +264: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +265: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +266: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +267: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +268: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +269: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +270: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +271: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +272: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +273: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +274: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +275: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +276: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +277: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +278: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +279: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +280: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +281: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +282: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +283: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +284: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +285: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +286: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +287: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +288: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +289: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +290: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +291: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +292: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +293: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +294: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +295: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +296: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +297: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +298: test\sql_analyze_roundtrip_test.dart: ANALYZE round-trip import: SQLite ANALYZE stats restore planner cardinality
+00:01 +299: test\sql_collate_nocase_test.dart: COLLATE NOCASE indexes runtime: equality probe is case-insensitive
+00:01 +300: test\sql_collate_nocase_test.dart: COLLATE NOCASE indexes runtime: equality probe is case-insensitive
+00:01 +301: test\sql_collate_nocase_test.dart: COLLATE NOCASE indexes runtime: equality probe is case-insensitive
+00:01 +302: test\sql_collate_nocase_test.dart: COLLATE NOCASE indexes runtime: equality probe is case-insensitive
+00:01 +303: test\sql_collate_nocase_test.dart: COLLATE NOCASE indexes runtime: equality probe is case-insensitive
+00:01 +304: test\sql_composite_index_range_test.dart: composite index: leading equality + trailing range is correct
+00:01 +305: test\sql_count_col_notnull_test.dart: COUNT(id) on integer PK uses fast path
+00:01 +306: test\sql_count_col_notnull_test.dart: COUNT(id) on integer PK uses fast path
+00:01 +307: test\sql_count_col_notnull_test.dart: COUNT(id) on integer PK uses fast path
+00:01 +308: test\sql_count_col_notnull_test.dart: COUNT(id) on integer PK uses fast path
+00:01 +309: test\sql_count_col_notnull_test.dart: COUNT(id) on integer PK uses fast path
+00:01 +310: test\sql_collate_nocase_test.dart: COLLATE NOCASE indexes export: CREATE INDEX SQL preserves COLLATE NOCASE
+00:01 +311: test\sql_collate_nocase_test.dart: COLLATE NOCASE indexes export: CREATE INDEX SQL preserves COLLATE NOCASE
+00:01 +312: test\sql_collate_nocase_test.dart: COLLATE NOCASE indexes export: CREATE INDEX SQL preserves COLLATE NOCASE
+00:01 +313: test\sql_collate_nocase_test.dart: COLLATE NOCASE indexes export: CREATE INDEX SQL preserves COLLATE NOCASE
+00:01 +314: test\sql_collate_nocase_test.dart: COLLATE NOCASE indexes export: CREATE INDEX SQL preserves COLLATE NOCASE
+00:01 +315: test\sql_collate_nocase_test.dart: COLLATE NOCASE indexes export: CREATE INDEX SQL preserves COLLATE NOCASE
+00:01 +316: test\sql_collate_nocase_test.dart: COLLATE NOCASE indexes export: CREATE INDEX SQL preserves COLLATE NOCASE
+00:01 +317: test\sql_collate_nocase_test.dart: COLLATE NOCASE indexes export: CREATE INDEX SQL preserves COLLATE NOCASE
+00:01 +318: test\sql_count_eq_probe_test.dart: COUNT(*) WHERE col = literal hits posting list directly
+00:01 +319: test\sql_count_eq_probe_test.dart: COUNT(*) WHERE col = literal hits posting list directly
+00:01 +320: test\sql_count_eq_probe_test.dart: COUNT(*) WHERE col = literal hits posting list directly
+00:01 +321: test\sql_count_eq_probe_test.dart: COUNT(*) WHERE col = literal hits posting list directly
+00:01 +322: test\sql_count_eq_probe_test.dart: COUNT(*) WHERE col = literal hits posting list directly
+00:01 +323: test\sql_count_in_list_probe_test.dart: COUNT(*) WHERE col IN (a, b, c) sums posting lists
+00:01 +324: test\sql_count_in_list_probe_test.dart: COUNT(*) WHERE col IN (a, b, c) sums posting lists
+00:01 +325: test\sql_count_in_list_probe_test.dart: COUNT(*) WHERE col IN (a, b, c) sums posting lists
+00:01 +326: test\sql_count_in_list_probe_test.dart: COUNT(*) WHERE col IN (a, b, c) sums posting lists
+00:01 +327: test\sql_count_in_list_probe_test.dart: COUNT(*) WHERE col IN (a, b, c) sums posting lists
+00:01 +328: test\sql_count_in_list_probe_test.dart: COUNT(*) WHERE col IN (a, b, c) sums posting lists
+00:01 +329: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:01 +330: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:01 +331: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:01 +332: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:01 +333: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:01 +334: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:01 +335: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:01 +336: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:01 +337: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:01 +338: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:01 +339: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:01 +340: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:01 +341: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:01 +342: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +343: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +344: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +345: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +346: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +347: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +348: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +349: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +350: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +351: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +352: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +353: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +354: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +355: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +356: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +357: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +358: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +359: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +360: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +361: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +362: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +363: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +364: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +365: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +366: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +367: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +368: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +369: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +370: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +371: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +372: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +373: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +374: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +375: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +376: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +377: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +378: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +379: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +380: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +381: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +382: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +383: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +384: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +385: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +386: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +387: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +388: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +389: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +390: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +391: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +392: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +393: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +394: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +395: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +396: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +397: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +398: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +399: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +400: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +401: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +402: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +403: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +404: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +405: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +406: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +407: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +408: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +409: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +410: test\sql_count_col_notnull_test.dart: COUNT(id) on paged-table PK uses fast path
+00:02 +411: test\sql_durability_test.dart: JSON backend durability crash before rename: original file unchanged, .tmp reaped on open
+00:02 +412: test\sql_durability_test.dart: JSON backend durability crash before rename: original file unchanged, .tmp reaped on open
+00:02 +413: test\sql_durability_test.dart: JSON backend durability crash before rename: original file unchanged, .tmp reaped on open
+00:02 +414: test\sql_durability_test.dart: JSON backend durability crash before rename: original file unchanged, .tmp reaped on open
+00:02 +415: test\sql_durability_test.dart: JSON backend durability crash before rename: original file unchanged, .tmp reaped on open
+00:02 +416: test\sql_durability_test.dart: JSON backend durability crash before rename: original file unchanged, .tmp reaped on open
+00:02 +417: test\sql_durability_test.dart: JSON backend durability crash before rename: original file unchanged, .tmp reaped on open
+00:02 +418: test\sql_durability_test.dart: JSON backend durability crash before rename: original file unchanged, .tmp reaped on open
+00:02 +419: test\sql_explain_qp_dropix_test.dart: EXPLAIN QUERY PLAN parses and runs like EXPLAIN
+00:02 +420: test\sql_explain_qp_dropix_test.dart: EXPLAIN QUERY PLAN parses and runs like EXPLAIN
+00:02 +421: test\sql_explain_qp_dropix_test.dart: EXPLAIN QUERY PLAN parses and runs like EXPLAIN
+00:02 +422: test\sql_expr_index_test.dart: expression index narrowing planner uses an expression index when the query has the same expr
+00:02 +423: test\sql_expr_index_test.dart: expression index narrowing planner uses an expression index when the query has the same expr
+00:02 +424: test\sql_expr_index_test.dart: expression index narrowing planner uses an expression index when the query has the same expr
+00:02 +425: test\sql_expr_index_test.dart: expression index narrowing planner uses an expression index when the query has the same expr
+00:02 +426: test\sql_expr_index_test.dart: expression index narrowing planner uses an expression index when the query has the same expr
+00:02 +427: test\sql_expr_index_test.dart: expression index narrowing planner uses an expression index when the query has the same expr
+00:02 +428: test\sql_expr_index_test.dart: expression index narrowing planner uses an expression index when the query has the same expr
+00:02 +429: test\sql_expr_index_test.dart: expression index narrowing planner uses an expression index when the query has the same expr
+00:02 +430: test\sql_expr_index_test.dart: expression index narrowing planner uses an expression index when the query has the same expr
+00:02 +431: test\sql_expr_index_test.dart: expression index narrowing planner uses an expression index when the query has the same expr
+00:02 +432: test\sql_expr_index_test.dart: expression index narrowing planner uses an expression index when the query has the same expr
+00:02 +433: test\sql_expr_index_test.dart: expression index narrowing planner uses an expression index when the query has the same expr
+00:02 +434: test\sql_expr_index_test.dart: expression index narrowing planner uses an expression index when the query has the same expr
+00:02 +435: test\sql_expr_index_test.dart: expression index narrowing planner uses an expression index when the query has the same expr
+00:02 +436: test\sql_expr_index_test.dart: expression index narrowing planner uses an expression index when the query has the same expr
+00:02 +437: test\sql_expr_index_test.dart: expression index narrowing planner uses an expression index when the query has the same expr
+00:02 +438: test\sql_expr_index_test.dart: expression index narrowing planner uses an expression index when the query has the same expr
+00:02 +439: test\sql_default_table_kind_test.dart: auto-paged tables survive close/reopen
+00:02 +440: test\sql_default_table_kind_test.dart: auto-paged tables survive close/reopen
+00:02 +441: test\sql_default_table_kind_test.dart: auto-paged tables survive close/reopen
+00:02 +442: test\sql_default_table_kind_test.dart: auto-paged tables survive close/reopen
+00:02 +443: test\sql_default_table_kind_test.dart: auto-paged tables survive close/reopen
+00:02 +444: test\sql_default_table_kind_test.dart: auto-paged tables survive close/reopen
+00:02 +445: test\sql_default_table_kind_test.dart: auto-paged tables survive close/reopen
+00:02 +446: test\sql_default_table_kind_test.dart: auto-paged tables survive close/reopen
+00:02 +447: test\sql_default_table_kind_test.dart: auto-paged tables survive close/reopen
+00:02 +448: test\sql_default_table_kind_test.dart: auto-paged tables survive close/reopen
+00:02 +449: test\sql_durability_test.dart: SQLite-format backend durability stale .tmp from a crashed sqlite write is cleaned on open
+00:02 +450: test\sql_expr_index_test.dart: expression index narrowing planner ignores the expression index when the query uses the raw column
+00:02 +451: test\sql_features_test.dart: Aggregates & GROUP BY GROUP BY with SUM/AVG/MIN/MAX
+00:02 +452: test\sql_fts5_bm25_test.dart: SQL BM25 / FTS5_TF functions ORDER BY bm25(body, query) DESC ranks more relevant docs first
+00:02 +453: test\sql_fts5_bm25_test.dart: SQL BM25 / FTS5_TF functions ORDER BY bm25(body, query) DESC ranks more relevant docs first
+00:02 +454: test\sql_fts5_bm25_test.dart: SQL BM25 / FTS5_TF functions ORDER BY bm25(body, query) DESC ranks more relevant docs first
+00:02 +455: test\sql_fts5_bm25_test.dart: SQL BM25 / FTS5_TF functions ORDER BY bm25(body, query) DESC ranks more relevant docs first
+00:02 +456: test\sql_fts5_bm25_test.dart: SQL BM25 / FTS5_TF functions ORDER BY bm25(body, query) DESC ranks more relevant docs first
+00:02 +457: test\sql_fts5_bm25_test.dart: SQL BM25 / FTS5_TF functions ORDER BY bm25(body, query) DESC ranks more relevant docs first
+00:02 +458: test\sql_fts5_bm25_test.dart: SQL BM25 / FTS5_TF functions ORDER BY bm25(body, query) DESC ranks more relevant docs first
+00:02 +459: test\sql_fts5_bm25_test.dart: SQL BM25 / FTS5_TF functions ORDER BY bm25(body, query) DESC ranks more relevant docs first
+00:02 +460: test\sql_fts5_bm25_test.dart: SQL BM25 / FTS5_TF functions ORDER BY bm25(body, query) DESC ranks more relevant docs first
+00:02 +461: test\sql_fts5_bm25_test.dart: SQL BM25 / FTS5_TF functions ORDER BY bm25(body, query) DESC ranks more relevant docs first
+00:02 +462: test\sql_fts5_bm25_test.dart: SQL BM25 / FTS5_TF functions ORDER BY bm25(body, query) DESC ranks more relevant docs first
+00:02 +463: test\sql_fts5_bm25_test.dart: SQL BM25 / FTS5_TF functions ORDER BY bm25(body, query) DESC ranks more relevant docs first
+00:02 +464: test\sql_fts5_query_test.dart: tokenizeFts splits on punctuation and lowercases
+00:02 +465: test\sql_fts5_query_test.dart: tokenizeFts splits on punctuation and lowercases
+00:02 +466: test\sql_fts5_query_test.dart: tokenizeFts splits on punctuation and lowercases
+00:02 +467: test\sql_fts5_query_test.dart: tokenizeFts splits on punctuation and lowercases
+00:02 +468: test\sql_fts5_query_test.dart: tokenizeFts splits on punctuation and lowercases
+00:02 +469: test\sql_fts5_query_test.dart: tokenizeFts splits on punctuation and lowercases
+00:02 +470: test\sql_fts5_query_test.dart: tokenizeFts splits on punctuation and lowercases
+00:02 +471: test\sql_fts5_query_test.dart: tokenizeFts splits on punctuation and lowercases
+00:02 +472: test\sql_fts5_query_test.dart: tokenizeFts splits on punctuation and lowercases
+00:02 +473: test\sql_fts5_query_test.dart: tokenizeFts splits on punctuation and lowercases
+00:02 +474: test\sql_fts5_corpus_test.dart: Fts5Index (pure Dart) prefix query sums per-matching-token BM25 contributions
+00:02 +475: test\sql_features_test.dart: CASE / CAST / || / scalar functions searched CASE on column
+00:02 +476: test\sql_fts5_corpus_test.dart: BM25_CORPUS SQL function ranks rows with proper IDF + length normalisation
+00:02 +477: test\sql_fts5_corpus_test.dart: BM25_CORPUS SQL function ranks rows with proper IDF + length normalisation
+00:02 +478: test\sql_fts5_corpus_test.dart: BM25_CORPUS SQL function ranks rows with proper IDF + length normalisation
+00:02 +479: test\sql_fts5_corpus_test.dart: BM25_CORPUS SQL function ranks rows with proper IDF + length normalisation
+00:02 +480: test\sql_fts5_corpus_test.dart: BM25_CORPUS SQL function ranks rows with proper IDF + length normalisation
+00:02 +481: test\sql_fts5_corpus_test.dart: BM25_CORPUS SQL function ranks rows with proper IDF + length normalisation
+00:02 +482: test\sql_fts5_corpus_test.dart: BM25_CORPUS SQL function ranks rows with proper IDF + length normalisation
+00:02 +483: test\sql_fts5_corpus_test.dart: BM25_CORPUS SQL function ranks rows with proper IDF + length normalisation
+00:02 +484: test\sql_fts5_corpus_test.dart: BM25_CORPUS SQL function ranks rows with proper IDF + length normalisation
+00:02 +485: test\sql_fts5_corpus_test.dart: BM25_CORPUS SQL function ranks rows with proper IDF + length normalisation
+00:02 +486: test\sql_fts5_corpus_test.dart: BM25_CORPUS SQL function ranks rows with proper IDF + length normalisation
+00:02 +487: test\sql_fts5_corpus_test.dart: BM25_CORPUS SQL function ranks rows with proper IDF + length normalisation
+00:02 +488: test\sql_fts5_corpus_test.dart: BM25_CORPUS SQL function ranks rows with proper IDF + length normalisation
+00:02 +489: test\sql_fts5_corpus_test.dart: BM25_CORPUS SQL function ranks rows with proper IDF + length normalisation
+00:02 +490: test\sql_fts5_corpus_test.dart: BM25_CORPUS SQL function ranks rows with proper IDF + length normalisation
+00:02 +491: test\sql_fts5_corpus_test.dart: BM25_CORPUS SQL function ranks rows with proper IDF + length normalisation
+00:02 +492: test\sql_fts5_corpus_test.dart: BM25_CORPUS SQL function ranks rows with proper IDF + length normalisation
+00:02 +493: test\sql_fts5_corpus_test.dart: BM25_CORPUS SQL function ranks rows with proper IDF + length normalisation
+00:02 +494: test\sql_fts5_corpus_test.dart: BM25_CORPUS SQL function ranks rows with proper IDF + length normalisation
+00:02 +495: test\sql_fts5_corpus_test.dart: BM25_CORPUS SQL function ranks rows with proper IDF + length normalisation
+00:02 +496: test\sql_fts5_corpus_test.dart: BM25_CORPUS SQL function ranks rows with proper IDF + length normalisation
+00:02 +497: test\sql_fts5_test.dart: fts5 virtual table column MATCH "term" filters by case-insensitive substring
+00:02 +498: test\sql_fts5_test.dart: fts5 virtual table column MATCH "term" filters by case-insensitive substring
+00:02 +499: test\sql_fts5_test.dart: fts5 virtual table column MATCH "term" filters by case-insensitive substring
+00:02 +500: test\sql_fts5_test.dart: fts5 virtual table column MATCH "term" filters by case-insensitive substring
+00:02 +501: test\sql_fts5_test.dart: fts5 virtual table column MATCH "term" filters by case-insensitive substring
+00:02 +502: test\sql_fts5_test.dart: fts5 virtual table column MATCH "term" filters by case-insensitive substring
+00:02 +503: test\sql_fts5_test.dart: fts5 virtual table column MATCH "term" filters by case-insensitive substring
+00:02 +504: test\sql_fts5_test.dart: fts5 virtual table column MATCH "term" filters by case-insensitive substring
+00:02 +505: test\sql_fts5_test.dart: fts5 virtual table column MATCH "term" filters by case-insensitive substring
+00:02 +506: test\sql_groupby_pos_encoding_test.dart: GROUP BY positional GROUP BY 1 groups by the first projected column
+00:02 +507: test\sql_groupby_pos_encoding_test.dart: GROUP BY positional GROUP BY 1 groups by the first projected column
+00:02 +508: test\sql_groupby_pos_encoding_test.dart: GROUP BY positional GROUP BY 1 groups by the first projected column
+00:02 +509: test\sql_groupby_pos_encoding_test.dart: GROUP BY positional GROUP BY 1 groups by the first projected column
+00:02 +510: test\sql_groupby_pos_encoding_test.dart: GROUP BY positional GROUP BY 1 groups by the first projected column
+00:02 +511: test\sql_groupby_pos_encoding_test.dart: GROUP BY positional GROUP BY 1 groups by the first projected column
+00:02 +512: test\sql_groupby_pos_encoding_test.dart: GROUP BY positional GROUP BY 1 groups by the first projected column
+00:02 +513: test\sql_groupby_pos_encoding_test.dart: GROUP BY positional GROUP BY 1 groups by the first projected column
+00:02 +514: test\sql_groupby_pos_encoding_test.dart: GROUP BY positional GROUP BY 1 groups by the first projected column
+00:02 +515: test\sql_grouping_sets_test.dart: ROLLUP produces region/dept, region totals, grand total
+00:02 +516: test\sql_grouping_sets_test.dart: ROLLUP produces region/dept, region totals, grand total
+00:02 +517: test\sql_grouping_sets_test.dart: ROLLUP produces region/dept, region totals, grand total
+00:02 +518: test\sql_grouping_sets_test.dart: ROLLUP produces region/dept, region totals, grand total
+00:02 +519: test\sql_group_by_agg_index_test.dart: GROUP BY v with SUM(v) ΓÇö key * count per group
+00:02 +520: test\sql_group_by_agg_index_test.dart: GROUP BY v with SUM(v) ΓÇö key * count per group
+00:02 +521: test\sql_group_by_agg_index_test.dart: GROUP BY v with SUM(v) ΓÇö key * count per group
+00:02 +522: test\sql_group_by_agg_index_test.dart: GROUP BY v with SUM(v) ΓÇö key * count per group
+00:02 +523: test\sql_group_by_agg_index_test.dart: GROUP BY v with SUM(v) ΓÇö key * count per group
+00:02 +524: test\sql_group_by_agg_index_test.dart: GROUP BY v with SUM(v) ΓÇö key * count per group
+00:02 +525: test\sql_group_by_agg_index_test.dart: GROUP BY v with SUM(v) ΓÇö key * count per group
+00:02 +526: test\sql_group_by_agg_index_test.dart: GROUP BY v with SUM(v) ΓÇö key * count per group
+00:02 +527: test\sql_group_by_agg_index_test.dart: GROUP BY v with SUM(v) ΓÇö key * count per group
+00:02 +528: test\sql_group_by_composite_index_test.dart: GROUP BY a uses composite index on (a,b) ΓÇö COUNT(*)
+00:02 +529: test\sql_group_by_composite_index_test.dart: GROUP BY a uses composite index on (a,b) ΓÇö COUNT(*)
+00:02 +530: test\sql_group_by_composite_index_test.dart: GROUP BY a uses composite index on (a,b) ΓÇö COUNT(*)
+00:02 +531: test\sql_group_by_composite_index_test.dart: GROUP BY a uses composite index on (a,b) ΓÇö COUNT(*)
+00:02 +532: test\sql_group_by_composite_index_test.dart: GROUP BY a uses composite index on (a,b) ΓÇö COUNT(*)
+00:02 +533: test\sql_group_by_composite_index_test.dart: GROUP BY a uses composite index on (a,b) ΓÇö COUNT(*)
+00:02 +534: test\sql_group_by_composite_index_test.dart: GROUP BY a uses composite index on (a,b) ΓÇö COUNT(*)
+00:02 +535: test\sql_group_by_composite_index_test.dart: GROUP BY a uses composite index on (a,b) ΓÇö COUNT(*)
+00:02 +536: test\sql_group_by_composite_index_test.dart: GROUP BY a uses composite index on (a,b) ΓÇö COUNT(*)
+00:02 +537: test\sql_group_by_count_index_test.dart: SELECT v, COUNT(*) FROM t GROUP BY v
+00:02 +538: test\sql_group_by_count_index_test.dart: SELECT v, COUNT(*) FROM t GROUP BY v
+00:02 +539: test\sql_group_by_count_index_test.dart: SELECT v, COUNT(*) FROM t GROUP BY v
+00:02 +540: test\sql_group_by_having_aggs_test.dart: HAVING SUM(v) >= 9
+00:02 +541: test\sql_group_by_having_aggs_test.dart: HAVING SUM(v) >= 9
+00:02 +542: test\sql_group_by_having_index_test.dart: HAVING COUNT(*) > 1
+00:02 +543: test\sql_group_by_having_index_test.dart: HAVING COUNT(*) > 1
+00:02 +544: test\sql_group_by_having_index_test.dart: HAVING COUNT(*) > 1
+00:02 +545: test\sql_group_by_having_index_test.dart: HAVING COUNT(*) > 1
+00:02 +546: test\sql_group_by_having_index_test.dart: HAVING COUNT(*) > 1
+00:02 +547: test\sql_group_by_having_index_test.dart: HAVING COUNT(*) > 1
+00:02 +548: test\sql_group_by_having_index_test.dart: HAVING COUNT(*) > 1
+00:02 +549: test\sql_group_by_having_index_test.dart: HAVING COUNT(*) > 1
+00:02 +550: test\sql_group_by_having_index_test.dart: HAVING COUNT(*) > 1
+00:02 +551: test\sql_group_by_having_index_test.dart: HAVING COUNT(*) > 1
+00:02 +552: test\sql_group_by_having_index_test.dart: HAVING COUNT(*) > 1
+00:02 +553: test\sql_group_by_having_index_test.dart: HAVING COUNT(*) > 1
+00:02 +554: test\sql_group_by_having_index_test.dart: HAVING COUNT(*) > 1
+00:02 +555: test\sql_group_by_having_index_test.dart: HAVING COUNT(*) > 1
+00:02 +556: test\sql_group_by_having_index_test.dart: HAVING COUNT(*) > 1
+00:02 +557: test\sql_group_by_order_by_agg_test.dart: ORDER BY MIN(v) ASC matches ORDER BY v
+00:02 +558: test\sql_group_by_order_by_agg_test.dart: ORDER BY MIN(v) ASC matches ORDER BY v
+00:02 +559: test\sql_group_by_order_by_agg_test.dart: ORDER BY MIN(v) ASC matches ORDER BY v
+00:02 +560: test\sql_group_by_order_by_agg_test.dart: ORDER BY MIN(v) ASC matches ORDER BY v
+00:02 +561: test\sql_group_by_order_by_agg_test.dart: ORDER BY MIN(v) ASC matches ORDER BY v
+00:02 +562: test\sql_group_by_where_index_test.dart: GROUP BY v WHERE v = 3 ΓåÆ single group
+00:02 +563: test\sql_group_by_where_index_test.dart: GROUP BY v WHERE v = 3 ΓåÆ single group
+00:02 +564: test\sql_group_by_where_index_test.dart: GROUP BY v WHERE v = 3 ΓåÆ single group
+00:02 +565: test\sql_group_by_where_index_test.dart: GROUP BY v WHERE v = 3 ΓåÆ single group
+00:02 +566: test\sql_group_by_where_index_test.dart: GROUP BY v WHERE v = 3 ΓåÆ single group
+00:02 +567: test\sql_group_concat_test.dart: TOTAL aggregate returns 0.0 on empty set
+00:03 +568: test\sql_group_concat_test.dart: TOTAL aggregate returns 0.0 on empty set
+00:03 +569: test\sql_group_concat_test.dart: TOTAL aggregate returns 0.0 on empty set
+00:03 +570: test\sql_group_concat_test.dart: TOTAL aggregate returns 0.0 on empty set
+00:03 +571: test\sql_group_concat_test.dart: TOTAL aggregate returns 0.0 on empty set
+00:03 +572: test\sql_group_concat_test.dart: TOTAL aggregate returns 0.0 on empty set
+00:03 +573: test\sql_group_concat_test.dart: TOTAL aggregate returns 0.0 on empty set
+00:03 +574: test\sql_group_concat_test.dart: TOTAL aggregate returns 0.0 on empty set
+00:03 +575: test\sql_group_concat_test.dart: TOTAL aggregate returns 0.0 on empty set
+00:03 +576: test\sql_iif_cbrt_listagg_test.dart: IIF returns correct branch
+00:03 +577: test\sql_iif_math_test.dart: IIF returns then-branch when condition is true
+00:03 +578: test\sql_iif_math_test.dart: IIF returns then-branch when condition is true
+00:03 +579: test\sql_iif_math_test.dart: IIF returns then-branch when condition is true
+00:03 +580: test\sql_iif_math_test.dart: IIF returns then-branch when condition is true
+00:03 +581: test\sql_iif_math_test.dart: IIF returns then-branch when condition is true
+00:03 +582: test\sql_iif_math_test.dart: IIF returns then-branch when condition is true
+00:03 +583: test\sql_iif_math_test.dart: IIF returns then-branch when condition is true
+00:03 +584: test\sql_iif_math_test.dart: IIF returns then-branch when condition is true
+00:03 +585: test\sql_iif_math_test.dart: IIF returns then-branch when condition is true
+00:03 +586: test\sql_iif_math_test.dart: IIF returns then-branch when condition is true
+00:03 +587: test\sql_iif_math_test.dart: IIF returns then-branch when condition is true
+00:03 +588: test\sql_indexed_by_test.dart: INDEXED BY / NOT INDEXED hints INDEXED BY forces the named index even on tiny tables
+00:03 +589: test\sql_indexed_by_test.dart: INDEXED BY / NOT INDEXED hints INDEXED BY forces the named index even on tiny tables
+00:03 +590: test\sql_indexed_by_test.dart: INDEXED BY / NOT INDEXED hints INDEXED BY forces the named index even on tiny tables
+00:03 +591: test\sql_indexed_by_test.dart: INDEXED BY / NOT INDEXED hints INDEXED BY forces the named index even on tiny tables
+00:03 +592: test\sql_indexed_by_test.dart: INDEXED BY / NOT INDEXED hints INDEXED BY forces the named index even on tiny tables
+00:03 +593: test\sql_indexed_by_test.dart: INDEXED BY / NOT INDEXED hints INDEXED BY forces the named index even on tiny tables
+00:03 +594: test\sql_indexed_by_test.dart: INDEXED BY / NOT INDEXED hints INDEXED BY forces the named index even on tiny tables
+00:03 +595: test\sql_indexed_by_test.dart: INDEXED BY / NOT INDEXED hints INDEXED BY forces the named index even on tiny tables
+00:03 +596: test\sql_indexed_by_test.dart: INDEXED BY / NOT INDEXED hints INDEXED BY forces the named index even on tiny tables
+00:03 +597: test\sql_indexed_by_test.dart: INDEXED BY / NOT INDEXED hints INDEXED BY forces the named index even on tiny tables
+00:03 +598: test\sql_indexed_by_test.dart: INDEXED BY / NOT INDEXED hints INDEXED BY forces the named index even on tiny tables
+00:03 +599: test\sql_indexed_by_test.dart: INDEXED BY / NOT INDEXED hints INDEXED BY forces the named index even on tiny tables
+00:03 +600: test\sql_indexed_by_test.dart: INDEXED BY / NOT INDEXED hints INDEXED BY forces the named index even on tiny tables
+00:03 +601: test\sql_indexed_by_test.dart: INDEXED BY / NOT INDEXED hints INDEXED BY forces the named index even on tiny tables
+00:03 +602: test\sql_introspection_extras_test.dart: connection-state scalars last_insert_rowid follows successful inserts
+00:03 +603: test\sql_introspection_extras_test.dart: connection-state scalars last_insert_rowid follows successful inserts
+00:03 +604: test\sql_introspection_extras_test.dart: connection-state scalars last_insert_rowid follows successful inserts
+00:03 +605: test\sql_is_true_false_test.dart: IS TRUE / FALSE boolean literals
+00:03 +606: test\sql_is_true_false_test.dart: IS TRUE / FALSE boolean literals
+00:03 +607: test\sql_is_true_false_test.dart: IS TRUE / FALSE boolean literals
+00:03 +608: test\sql_is_true_false_test.dart: IS TRUE / FALSE boolean literals
+00:03 +609: test\sql_is_true_false_test.dart: IS TRUE / FALSE boolean literals
+00:03 +610: test\sql_is_true_false_test.dart: IS TRUE / FALSE boolean literals
+00:03 +611: test\sql_is_true_false_test.dart: IS TRUE / FALSE boolean literals
+00:03 +612: test\sql_is_true_false_test.dart: IS TRUE / FALSE boolean literals
+00:03 +613: test\sql_is_true_false_test.dart: IS TRUE / FALSE boolean literals
+00:03 +614: test\sql_is_true_false_test.dart: IS TRUE / FALSE boolean literals
+00:03 +615: test\sql_is_true_false_test.dart: IS TRUE / FALSE boolean literals
+00:03 +616: test\sql_join_reorder_test.dart: Planner: join reordering FROM big JOIN small => engine drives from small (correct rows)
+00:03 +617: test\sql_join_reorder_test.dart: Planner: join reordering FROM big JOIN small => engine drives from small (correct rows)
+00:03 +618: test\sql_join_reorder_test.dart: Planner: join reordering FROM big JOIN small => engine drives from small (correct rows)
+00:03 +619: test\sql_join_reorder_test.dart: Planner: join reordering FROM big JOIN small => engine drives from small (correct rows)
+00:03 +620: test\sql_join_reorder_test.dart: Planner: join reordering FROM big JOIN small => engine drives from small (correct rows)
+00:03 +621: test\sql_join_reorder_test.dart: Planner: join reordering FROM big JOIN small => engine drives from small (correct rows)
+00:03 +622: test\sql_join_reorder_test.dart: Planner: join reordering FROM big JOIN small => engine drives from small (correct rows)
+00:03 +623: test\sql_join_reorder_test.dart: Planner: join reordering FROM big JOIN small => engine drives from small (correct rows)
+00:03 +624: test\sql_join_reorder_test.dart: Planner: join reordering FROM big JOIN small => engine drives from small (correct rows)
+00:03 +625: test\sql_join_reorder_test.dart: Planner: join reordering FROM big JOIN small => engine drives from small (correct rows)
+00:03 +626: test\sql_join_reorder_test.dart: Planner: join reordering FROM big JOIN small => engine drives from small (correct rows)
+00:03 +627: test\sql_join_reorder_test.dart: Planner: join reordering FROM big JOIN small => engine drives from small (correct rows)
+00:03 +628: test\sql_join_reorder_test.dart: Planner: join reordering FROM big JOIN small => engine drives from small (correct rows)
+00:03 +629: test\sql_join_reorder_test.dart: Planner: join reordering FROM big JOIN small => engine drives from small (correct rows)
+00:03 +630: test\sql_join_reorder_test.dart: Planner: join reordering FROM big JOIN small => engine drives from small (correct rows)
+00:03 +631: test\sql_join_reorder_test.dart: Planner: join reordering FROM big JOIN small => engine drives from small (correct rows)
+00:03 +632: test\sql_join_reorder_test.dart: Planner: join reordering FROM big JOIN small => engine drives from small (correct rows)
+00:03 +633: test\sql_join_reorder_test.dart: Planner: join reordering FROM big JOIN small => engine drives from small (correct rows)
+00:03 +634: test\sql_join_reorder_test.dart: Planner: join reordering FROM big JOIN small => engine drives from small (correct rows)
+00:03 +635: test\sql_join_reorder_test.dart: Planner: join reordering FROM big JOIN small => engine drives from small (correct rows)
+00:03 +636: test\sql_join_reorder_test.dart: Planner: join reordering FROM big JOIN small => engine drives from small (correct rows)
+00:03 +637: test\sql_join_reorder_test.dart: Planner: join reordering FROM big JOIN small => engine drives from small (correct rows)
+00:03 +638: test\sql_join_reorder_test.dart: Planner: join reordering FROM big JOIN small => engine drives from small (correct rows)
+00:03 +639: test\sql_join_reorder_test.dart: Planner: join reordering FROM big JOIN small => engine drives from small (correct rows)
+00:03 +640: test\sql_join_reorder_test.dart: Planner: join reordering FROM big JOIN small => engine drives from small (correct rows)
+00:03 +641: test\sql_join_reorder_test.dart: Planner: join reordering FROM big JOIN small => engine drives from small (correct rows)
+00:03 +642: test\sql_join_reorder_test.dart: Planner: join reordering FROM big JOIN small => engine drives from small (correct rows)
+00:03 +643: test\sql_join_reorder_test.dart: Planner: join reordering FROM big JOIN small => engine drives from small (correct rows)
+00:03 +644: test\sql_join_reorder_test.dart: Planner: join reordering FROM big JOIN small => engine drives from small (correct rows)
+00:03 +645: test\sql_join_reorder_test.dart: Planner: join reordering FROM big JOIN small => engine drives from small (correct rows)
+00:03 +646: test\sql_join_reorder_test.dart: Planner: join reordering FROM big JOIN small => engine drives from small (correct rows)
+00:03 +647: test\sql_join_reorder_test.dart: Planner: join reordering FROM big JOIN small => engine drives from small (correct rows)
+00:03 +648: test\sql_join_reorder_test.dart: Planner: join reordering FROM big JOIN small => engine drives from small (correct rows)
+00:03 +649: test\sql_like_prefix_test.dart: LIKE prefix range optimization BINARY index serves LIKE prefix as a range scan
+00:03 +650: test\sql_like_prefix_test.dart: LIKE prefix range optimization BINARY index serves LIKE prefix as a range scan
+00:03 +651: test\sql_like_prefix_test.dart: LIKE prefix range optimization BINARY index serves LIKE prefix as a range scan
+00:03 +652: test\sql_like_prefix_test.dart: LIKE prefix range optimization BINARY index serves LIKE prefix as a range scan
+00:03 +653: test\sql_like_prefix_test.dart: LIKE prefix range optimization BINARY index serves LIKE prefix as a range scan
+00:03 +654: test\sql_like_prefix_test.dart: LIKE prefix range optimization BINARY index serves LIKE prefix as a range scan
+00:03 +655: test\sql_like_prefix_test.dart: LIKE prefix range optimization BINARY index serves LIKE prefix as a range scan
+00:03 +656: test\sql_min_max_count_combo_test.dart: MIN(col), MAX(col) on indexed col is index-only
+00:03 +657: test\sql_min_max_count_combo_test.dart: MIN(col), MAX(col) on indexed col is index-only
+00:03 +658: test\sql_min_max_count_combo_test.dart: MIN(col), MAX(col) on indexed col is index-only
+00:03 +659: test\sql_min_max_count_combo_test.dart: MIN(col), MAX(col) on indexed col is index-only
+00:03 +660: test\sql_min_max_count_combo_test.dart: MIN(col), MAX(col) on indexed col is index-only
+00:03 +661: test\sql_min_max_count_combo_test.dart: MIN(col), MAX(col) on indexed col is index-only
+00:03 +662: test\sql_min_max_count_combo_test.dart: MIN(col), MAX(col) on indexed col is index-only
+00:03 +663: test\sql_min_max_count_combo_test.dart: MIN(col), MAX(col) on indexed col is index-only
+00:03 +664: test\sql_min_max_count_combo_test.dart: MIN(col), MAX(col) on indexed col is index-only
+00:03 +665: test\sql_min_max_count_combo_test.dart: MIN(col), MAX(col) on indexed col is index-only
+00:03 +666: test\sql_min_max_count_combo_test.dart: MIN(col), MAX(col) on indexed col is index-only
+00:03 +667: test\sql_min_max_count_combo_test.dart: MIN(col), MAX(col) on indexed col is index-only
+00:03 +668: test\sql_min_max_distinct_test.dart: bare COUNT(v) on indexed col ΓåÆ posting-sum
+00:03 +669: test\sql_min_max_distinct_test.dart: bare COUNT(v) on indexed col ΓåÆ posting-sum
+00:03 +670: test\sql_min_max_distinct_test.dart: bare COUNT(v) on indexed col ΓåÆ posting-sum
+00:03 +671: test\sql_min_max_distinct_test.dart: bare COUNT(v) on indexed col ΓåÆ posting-sum
+00:03 +672: test\sql_min_max_distinct_test.dart: bare COUNT(v) on indexed col ΓåÆ posting-sum
+00:03 +673: test\sql_min_max_distinct_test.dart: bare COUNT(v) on indexed col ΓåÆ posting-sum
+00:03 +674: test\sql_min_max_index_test.dart: MIN(col) with index returns first index entry
+00:03 +675: test\sql_min_max_index_test.dart: MIN(col) with index returns first index entry
+00:03 +676: test\sql_min_max_index_test.dart: MIN(col) with index returns first index entry
+00:03 +677: test\sql_min_max_index_test.dart: MIN(col) with index returns first index entry
+00:03 +678: test\sql_min_max_index_test.dart: MIN(col) with index returns first index entry
+00:03 +679: test\sql_min_max_index_test.dart: MIN(col) with index returns first index entry
+00:03 +680: test\sql_min_max_index_test.dart: MIN(col) with index returns first index entry
+00:03 +681: test\sql_min_max_index_test.dart: MIN(col) with index returns first index entry
+00:03 +682: test\sql_min_max_index_test.dart: MIN(col) with index returns first index entry
+00:03 +683: test\sql_misc_scalars_test.dart: BIT_COUNT counts set bits
+00:03 +684: test\sql_misc_scalars_test.dart: BIT_COUNT counts set bits
+00:03 +685: test\sql_misc_scalars_test.dart: BIT_COUNT counts set bits
+00:03 +686: test\sql_misc_scalars_test.dart: BIT_COUNT counts set bits
+00:03 +687: test\sql_misc_scalars_test.dart: BIT_COUNT counts set bits
+00:03 +688: test\sql_misc_scalars_test.dart: BIT_COUNT counts set bits
+00:03 +689: test\sql_modulo_hints_test.dart: % modulo operator integer modulo
+00:03 +690: test\sql_modulo_hints_test.dart: % modulo operator integer modulo
+00:03 +691: test\sql_modulo_hints_test.dart: % modulo operator integer modulo
+00:03 +692: test\sql_modulo_hints_test.dart: % modulo operator integer modulo
+00:03 +693: test\sql_modulo_hints_test.dart: % modulo operator integer modulo
+00:03 +694: test\sql_more_parity_test.dart: introspection scalar stubs sqlite_offset returns NULL
+00:03 +695: test\sql_more_parity_test.dart: introspection scalar stubs sqlite_offset returns NULL
+00:03 +696: test\sql_more_parity_test.dart: introspection scalar stubs sqlite_offset returns NULL
+00:03 +697: test\sql_more_parity_test.dart: introspection scalar stubs sqlite_offset returns NULL
+00:03 +698: test\sql_more_parity_test.dart: introspection scalar stubs sqlite_offset returns NULL
+00:03 +699: test\sql_more_parity_test.dart: introspection scalar stubs sqlite_offset returns NULL
+00:03 +700: test\sql_more_parity_test.dart: introspection scalar stubs sqlite_offset returns NULL
+00:03 +701: test\sql_more_test.dart: INSERT ... SELECT copies rows from another table
+00:03 +702: test\sql_more_test.dart: INSERT ... SELECT copies rows from another table
+00:03 +703: test\sql_more_test.dart: INSERT ... SELECT copies rows from another table
+00:03 +704: test\sql_more_test.dart: INSERT ... SELECT copies rows from another table
+00:03 +705: test\sql_more_test.dart: INSERT ... SELECT copies rows from another table
+00:03 +706: test\sql_more_test.dart: INSERT ... SELECT copies rows from another table
+00:03 +707: test\sql_multicol_index_runtime_test.dart: multi-column index runtime UNIQUE multi-column rejects duplicates of the full key
+00:03 +708: test\sql_multicol_index_runtime_test.dart: multi-column index runtime UNIQUE multi-column rejects duplicates of the full key
+00:03 +709: test\sql_multicol_index_runtime_test.dart: multi-column index runtime UNIQUE multi-column rejects duplicates of the full key
+00:03 +710: test\sql_multicol_index_runtime_test.dart: multi-column index runtime UNIQUE multi-column rejects duplicates of the full key
+00:03 +711: test\sql_multicol_index_runtime_test.dart: multi-column index runtime UNIQUE multi-column rejects duplicates of the full key
+00:03 +712: test\sql_multicol_index_runtime_test.dart: multi-column index runtime UNIQUE multi-column rejects duplicates of the full key
+00:03 +713: test\sql_multicol_index_runtime_test.dart: multi-column index runtime UNIQUE multi-column rejects duplicates of the full key
+00:03 +714: test\sql_multicol_index_runtime_test.dart: multi-column index runtime UNIQUE multi-column rejects duplicates of the full key
+00:03 +715: test\sql_multicol_index_runtime_test.dart: multi-column index runtime UNIQUE multi-column rejects duplicates of the full key
+00:03 +716: test\sql_multicol_index_runtime_test.dart: multi-column index runtime UNIQUE multi-column rejects duplicates of the full key
+00:03 +717: test\sql_multicol_index_runtime_test.dart: multi-column index runtime UNIQUE multi-column rejects duplicates of the full key
+00:03 +718: test\sql_multicol_index_runtime_test.dart: multi-column index runtime UNIQUE multi-column rejects duplicates of the full key
+00:03 +719: test\sql_multicol_index_runtime_test.dart: multi-column index runtime UNIQUE multi-column rejects duplicates of the full key
+00:03 +720: test\sql_multicol_index_runtime_test.dart: multi-column index runtime UNIQUE multi-column rejects duplicates of the full key
+00:03 +721: test\sql_multicol_index_runtime_test.dart: multi-column index runtime UNIQUE multi-column rejects duplicates of the full key
+00:03 +722: test\sql_multicol_index_runtime_test.dart: multi-column index runtime UNIQUE multi-column rejects duplicates of the full key
+00:03 +723: test\sql_multicol_index_runtime_test.dart: multi-column index runtime UNIQUE multi-column rejects duplicates of the full key
+00:03 +724: test\sql_multicol_index_runtime_test.dart: multi-column index runtime UNIQUE multi-column rejects duplicates of the full key
+00:03 +725: test\sql_open_autodetect_test.dart: Database.open auto-detect opens a SQLite-format file directly
+00:03 +726: test\sql_open_autodetect_test.dart: Database.open auto-detect opens a SQLite-format file directly
+00:03 +727: test\sql_open_autodetect_test.dart: Database.open auto-detect opens a SQLite-format file directly
+00:03 +728: test\sql_open_autodetect_test.dart: Database.open auto-detect opens a SQLite-format file directly
+00:03 +729: test\sql_open_autodetect_test.dart: Database.open auto-detect opens a SQLite-format file directly
+00:03 +730: test\sql_open_autodetect_test.dart: Database.open auto-detect opens a SQLite-format file directly
+00:03 +731: test\sql_open_autodetect_test.dart: Database.open auto-detect opens a SQLite-format file directly
+00:03 +732: test\sql_open_autodetect_test.dart: Database.open auto-detect opens a SQLite-format file directly
+00:03 +733: test\sql_open_autodetect_test.dart: Database.open auto-detect opens a SQLite-format file directly
+00:03 +734: test\sql_open_autodetect_test.dart: Database.open auto-detect opens a SQLite-format file directly
+00:03 +735: test\sql_open_autodetect_test.dart: Database.open auto-detect opens a SQLite-format file directly
+00:03 +736: test\sql_open_autodetect_test.dart: Database.open auto-detect opens a SQLite-format file directly
+00:03 +737: test\sql_open_autodetect_test.dart: Database.open auto-detect opens a SQLite-format file directly
+00:03 +738: test\sql_open_autodetect_test.dart: Database.open auto-detect opens a SQLite-format file directly
+00:03 +739: test\sql_open_autodetect_test.dart: Database.open auto-detect opens a SQLite-format file directly
+00:03 +740: test\sql_open_autodetect_test.dart: Database.open auto-detect opens a SQLite-format file directly
+00:03 +741: test\sql_open_autodetect_test.dart: Database.open auto-detect opens a SQLite-format file directly
+00:03 +742: test\sql_open_autodetect_test.dart: Database.open auto-detect opens a SQLite-format file directly
+00:03 +743: test\sql_open_autodetect_test.dart: Database.open auto-detect opens a SQLite-format file directly
+00:03 +744: test\sql_open_autodetect_test.dart: Database.open auto-detect opens a SQLite-format file directly
+00:03 +745: test\sql_open_autodetect_test.dart: Database.open auto-detect opens a SQLite-format file directly
+00:03 +746: test\sql_open_autodetect_test.dart: Database.open auto-detect opens a SQLite-format file directly
+00:03 +747: test\sql_open_autodetect_test.dart: Database.open auto-detect opens a SQLite-format file directly
+00:03 +748: test\sql_open_autodetect_test.dart: Database.open auto-detect opens a SQLite-format file directly
+00:03 +749: test\sql_open_autodetect_test.dart: Database.open auto-detect opens a SQLite-format file directly
+00:03 +750: test\sql_open_autodetect_test.dart: Database.open auto-detect opens a SQLite-format file directly
+00:03 +751: test\sql_open_autodetect_test.dart: Database.open auto-detect opens a SQLite-format file directly
+00:03 +752: test\sql_open_autodetect_test.dart: Database.open auto-detect opens a SQLite-format file directly
+00:03 +753: test\sql_open_autodetect_test.dart: Database.open auto-detect opens a SQLite-format file directly
+00:03 +754: test\sql_open_autodetect_test.dart: Database.open auto-detect opens a SQLite-format file directly
+00:03 +755: test\sql_open_autodetect_test.dart: Database.open auto-detect opens a SQLite-format file directly
+00:03 +756: test\sql_multicol_index_runtime_test.dart: multi-column index runtime cross-engine parity vs sqlite3 on a 2k-row composite-index dataset
+00:03 +757: test\sql_multicol_index_runtime_test.dart: multi-column index runtime cross-engine parity vs sqlite3 on a 2k-row composite-index dataset
+00:03 +758: test\sql_multicol_index_runtime_test.dart: multi-column index runtime cross-engine parity vs sqlite3 on a 2k-row composite-index dataset
+00:03 +759: test\sql_multicol_index_runtime_test.dart: multi-column index runtime cross-engine parity vs sqlite3 on a 2k-row composite-index dataset
+00:03 +760: test\sql_multicol_index_runtime_test.dart: multi-column index runtime cross-engine parity vs sqlite3 on a 2k-row composite-index dataset
+00:03 +761: test\sql_multicol_index_runtime_test.dart: multi-column index runtime cross-engine parity vs sqlite3 on a 2k-row composite-index dataset
+00:03 +762: test\sql_multicol_index_runtime_test.dart: multi-column index runtime cross-engine parity vs sqlite3 on a 2k-row composite-index dataset
+00:03 +763: test\sql_multicol_index_runtime_test.dart: multi-column index runtime cross-engine parity vs sqlite3 on a 2k-row composite-index dataset
+00:03 +764: test\sql_multicol_index_runtime_test.dart: multi-column index runtime cross-engine parity vs sqlite3 on a 2k-row composite-index dataset
+00:03 +765: test\sql_multicol_index_runtime_test.dart: multi-column index runtime cross-engine parity vs sqlite3 on a 2k-row composite-index dataset
+00:03 +766: test\sql_multicol_index_runtime_test.dart: multi-column index runtime cross-engine parity vs sqlite3 on a 2k-row composite-index dataset
+00:03 +767: test\sql_multicol_index_runtime_test.dart: multi-column index runtime cross-engine parity vs sqlite3 on a 2k-row composite-index dataset
+00:03 +768: test\sql_multicol_index_runtime_test.dart: multi-column index runtime cross-engine parity vs sqlite3 on a 2k-row composite-index dataset
+00:03 +769: test\sql_multicol_index_runtime_test.dart: multi-column index runtime cross-engine parity vs sqlite3 on a 2k-row composite-index dataset
+00:03 +770: test\sql_multicol_index_runtime_test.dart: multi-column index runtime cross-engine parity vs sqlite3 on a 2k-row composite-index dataset
+00:03 +771: test\sql_multicol_index_runtime_test.dart: multi-column index runtime cross-engine parity vs sqlite3 on a 2k-row composite-index dataset
+00:03 +772: test\sql_multicol_index_runtime_test.dart: multi-column index runtime cross-engine parity vs sqlite3 on a 2k-row composite-index dataset
+00:03 +773: test\sql_multicol_index_runtime_test.dart: multi-column index runtime cross-engine parity vs sqlite3 on a 2k-row composite-index dataset
+00:03 +774: test\sql_multicol_index_runtime_test.dart: multi-column index runtime cross-engine parity vs sqlite3 on a 2k-row composite-index dataset
+00:03 +775: test\sql_paged_composite_index_test.dart: CREATE INDEX on (country, city) succeeds
+00:03 +776: test\sql_paged_composite_index_test.dart: CREATE INDEX on (country, city) succeeds
+00:03 +777: test\sql_paged_composite_index_test.dart: CREATE INDEX on (country, city) succeeds
+00:03 +778: test\sql_paged_composite_index_test.dart: CREATE INDEX on (country, city) succeeds
+00:04 +779: test\sql_paged_composite_index_test.dart: CREATE INDEX on (country, city) succeeds
+00:04 +780: test\sql_paged_composite_index_test.dart: CREATE INDEX on (country, city) succeeds
+00:04 +781: test\sql_paged_composite_index_test.dart: CREATE INDEX on (country, city) succeeds
+00:04 +782: test\sql_paged_composite_index_test.dart: CREATE INDEX on (country, city) succeeds
+00:04 +783: test\sql_paged_composite_index_test.dart: CREATE INDEX on (country, city) succeeds
+00:04 +784: test\sql_paged_btree_test.dart: PagedBTree growth and splits inserts that overflow many pages stay correct
+00:04 +785: test\sql_paged_btree_test.dart: PagedBTree growth and splits inserts that overflow many pages stay correct
+00:04 +786: test\sql_paged_btree_test.dart: PagedBTree growth and splits inserts that overflow many pages stay correct
+00:04 +787: test\sql_paged_btree_test.dart: PagedBTree growth and splits inserts that overflow many pages stay correct
+00:04 +788: test\sql_paged_btree_test.dart: PagedBTree growth and splits inserts that overflow many pages stay correct
+00:04 +789: test\sql_paged_btree_test.dart: PagedBTree growth and splits inserts that overflow many pages stay correct
+00:04 +790: test\sql_paged_btree_test.dart: PagedBTree growth and splits inserts that overflow many pages stay correct
+00:04 +791: test\sql_paged_btree_test.dart: PagedBTree growth and splits inserts that overflow many pages stay correct
+00:04 +792: test\sql_paged_btree_test.dart: PagedBTree growth and splits inserts that overflow many pages stay correct
+00:04 +793: test\sql_paged_btree_test.dart: PagedBTree growth and splits inserts that overflow many pages stay correct
+00:04 +794: test\sql_paged_btree_test.dart: PagedBTree growth and splits inserts that overflow many pages stay correct
+00:04 +795: test\sql_paged_btree_test.dart: PagedBTree growth and splits inserts that overflow many pages stay correct
+00:04 +796: test\sql_paged_btree_test.dart: PagedBTree growth and splits inserts that overflow many pages stay correct
+00:04 +797: test\sql_paged_btree_test.dart: PagedBTree growth and splits inserts that overflow many pages stay correct
+00:04 +798: test\sql_paged_btree_test.dart: PagedBTree growth and splits inserts that overflow many pages stay correct
+00:04 +799: test\sql_paged_btree_test.dart: PagedBTree growth and splits inserts that overflow many pages stay correct
+00:04 +800: test\sql_paged_btree_test.dart: PagedBTree growth and splits inserts that overflow many pages stay correct
+00:04 +801: test\sql_paged_btree_test.dart: PagedBTree growth and splits inserts that overflow many pages stay correct
+00:04 +802: test\sql_paged_btree_test.dart: PagedBTree growth and splits inserts that overflow many pages stay correct
+00:04 +803: test\sql_paged_btree_test.dart: PagedBTree growth and splits inserts that overflow many pages stay correct
+00:04 +804: test\sql_paged_btree_test.dart: PagedBTree growth and splits inserts that overflow many pages stay correct
+00:04 +805: test\sql_paged_btree_test.dart: PagedBTree growth and splits inserts that overflow many pages stay correct
+00:04 +806: test\sql_paged_btree_test.dart: PagedBTree growth and splits inserts that overflow many pages stay correct
+00:04 +807: test\sql_paged_btree_test.dart: PagedBTree growth and splits inserts that overflow many pages stay correct
+00:04 +808: test\sql_paged_btree_test.dart: PagedBTree growth and splits inserts that overflow many pages stay correct
+00:04 +809: test\sql_paged_btree_test.dart: PagedBTree growth and splits inserts that overflow many pages stay correct
+00:04 +810: test\sql_paged_btree_test.dart: PagedBTree growth and splits inserts that overflow many pages stay correct
+00:04 +811: test\sql_paged_btree_test.dart: PagedBTree growth and splits inserts that overflow many pages stay correct
+00:04 +812: test\sql_paged_btree_test.dart: PagedBTree growth and splits inserts that overflow many pages stay correct
+00:04 +813: test\sql_paged_btree_test.dart: PagedBTree growth and splits inserts that overflow many pages stay correct
+00:04 +814: test\sql_paged_btree_test.dart: PagedBTree growth and splits inserts that overflow many pages stay correct
+00:04 +815: test\sql_paged_btree_test.dart: PagedBTree growth and splits inserts that overflow many pages stay correct
+00:04 +816: test\sql_paged_btree_test.dart: PagedBTree growth and splits inserts that overflow many pages stay correct
+00:04 +817: test\sql_paged_btree_test.dart: PagedBTree growth and splits inserts that overflow many pages stay correct
+00:04 +818: test\sql_paged_btree_test.dart: PagedBTree growth and splits inserts that overflow many pages stay correct
+00:04 +819: test\sql_paged_btree_test.dart: PagedBTree growth and splits inserts that overflow many pages stay correct
+00:04 +820: test\sql_paged_btree_test.dart: PagedBTree growth and splits inserts that overflow many pages stay correct
+00:04 +821: test\sql_paged_btree_test.dart: PagedBTree growth and splits inserts that overflow many pages stay correct
+00:04 +822: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:04 +823: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:04 +824: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:04 +825: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:04 +826: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:04 +827: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:04 +828: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:04 +829: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:05 +830: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:05 +831: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:05 +832: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:05 +833: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:05 +834: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:05 +835: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:05 +836: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:05 +837: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:05 +838: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:05 +839: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:05 +840: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:05 +841: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:05 +842: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:05 +843: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:05 +844: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:05 +845: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:05 +846: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:05 +847: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:05 +848: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:05 +849: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:05 +850: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:05 +851: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:05 +852: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:05 +853: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:05 +854: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:05 +855: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:05 +856: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:05 +857: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:05 +858: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:05 +859: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:05 +860: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:06 +861: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:06 +862: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:06 +863: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:06 +864: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:06 +865: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:06 +866: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:06 +867: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:06 +868: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:06 +869: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:06 +870: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:06 +871: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:06 +872: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:06 +873: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:06 +874: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:06 +875: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:06 +876: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:06 +877: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:06 +878: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:06 +879: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:06 +880: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:06 +881: test\sql_paged_count_star_test.dart: COUNT(*) on paged table returns row count
+00:06 +882: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:06 +883: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:06 +884: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:06 +885: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:06 +886: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:06 +887: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:06 +888: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:06 +889: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:06 +890: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:06 +891: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:06 +892: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:06 +893: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:06 +894: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:06 +895: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:07 +896: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:07 +897: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:07 +898: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:07 +899: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:07 +900: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:07 +901: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:07 +902: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:07 +903: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:07 +904: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:07 +905: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:07 +906: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:07 +907: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:07 +908: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:07 +909: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:07 +910: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:07 +911: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:07 +912: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:07 +913: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:07 +914: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:07 +915: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:07 +916: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:07 +917: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:07 +918: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:07 +919: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:07 +920: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:07 +921: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:07 +922: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:07 +923: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:07 +924: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:07 +925: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:07 +926: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:07 +927: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:07 +928: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:07 +929: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:07 +930: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:07 +931: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:07 +932: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:08 +933: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:08 +934: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:08 +935: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:08 +936: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:08 +937: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:08 +938: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:08 +939: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:08 +940: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:08 +941: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:08 +942: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:08 +943: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:08 +944: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:08 +945: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:08 +946: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:08 +947: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:08 +948: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:08 +949: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:08 +950: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:08 +951: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:08 +952: test\sql_paged_orderby_stream_test.dart: ASC + LIMIT streams in PK order and terminates early
+00:08 +953: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +954: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +955: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +956: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +957: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +958: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +959: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +960: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +961: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +962: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +963: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +964: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +965: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +966: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +967: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +968: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +969: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +970: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +971: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +972: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +973: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +974: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +975: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +976: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +977: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +978: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +979: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +980: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +981: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +982: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +983: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +984: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +985: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +986: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +987: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +988: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +989: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +990: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +991: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +992: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +993: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +994: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +995: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +996: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +997: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +998: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +999: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +1000: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +1001: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +1002: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +1003: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +1004: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +1005: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +1006: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +1007: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +1008: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +1009: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +1010: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +1011: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +1012: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +1013: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +1014: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +1015: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +1016: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +1017: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +1018: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +1019: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +1020: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +1021: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +1022: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +1023: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +1024: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +1025: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +1026: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +1027: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +1028: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +1029: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +1030: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +1031: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +1032: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:08 +1033: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1034: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1035: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1036: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1037: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1038: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1039: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1040: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1041: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1042: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1043: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1044: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1045: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1046: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1047: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1048: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1049: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1050: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1051: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1052: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1053: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1054: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1055: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1056: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1057: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1058: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1059: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1060: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1061: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1062: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1063: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1064: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1065: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1066: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1067: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1068: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1069: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1070: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1071: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1072: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1073: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1074: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1075: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1076: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1077: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1078: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1079: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1080: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1081: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1082: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1083: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1084: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1085: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1086: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1087: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1088: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1089: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1090: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1091: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1092: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1093: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1094: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1095: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1096: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1097: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1098: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1099: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1100: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1101: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1102: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1103: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1104: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1105: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1106: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1107: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1108: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1109: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1110: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1111: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1112: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1113: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1114: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:09 +1115: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1116: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1117: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1118: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1119: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1120: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1121: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1122: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1123: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1124: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1125: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1126: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1127: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1128: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1129: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1130: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1131: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1132: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1133: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1134: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1135: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1136: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1137: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1138: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1139: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1140: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1141: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1142: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1143: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1144: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1145: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1146: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1147: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1148: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1149: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1150: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1151: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1152: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1153: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1154: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1155: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1156: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1157: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1158: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1159: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1160: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1161: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1162: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1163: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1164: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1165: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1166: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1167: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1168: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1169: test\sql_paged_pragmas_test.dart: PRAGMA cache_size = -512 (KiB) does not break inserts
+00:10 +1170: test\sql_sqlite_without_rowid_test.dart: WITHOUT ROWID reader: many rows across multiple leaves
+00:10 +1171: test\sql_sqlite_without_rowid_test.dart: WITHOUT ROWID reader: many rows across multiple leaves
+00:10 +1172: test\sql_sqlite_without_rowid_test.dart: WITHOUT ROWID reader: many rows across multiple leaves
+00:10 +1173: test\sql_sqlite_without_rowid_test.dart: WITHOUT ROWID reader: many rows across multiple leaves
+00:10 +1174: test\sql_sqlite_without_rowid_test.dart: WITHOUT ROWID reader: many rows across multiple leaves
+00:10 +1175: test\sql_sqlite_without_rowid_test.dart: WITHOUT ROWID reader: many rows across multiple leaves
+00:10 +1176: test\sql_sqlite_without_rowid_test.dart: WITHOUT ROWID reader: many rows across multiple leaves
+00:10 +1177: test\sql_sqlite_without_rowid_test.dart: WITHOUT ROWID reader: many rows across multiple leaves
+00:10 +1178: test\sql_sqlite_without_rowid_test.dart: WITHOUT ROWID reader: many rows across multiple leaves
+00:10 +1179: test\sql_sqlite_without_rowid_test.dart: WITHOUT ROWID reader: many rows across multiple leaves
+00:10 +1180: test\sql_sqlite_without_rowid_test.dart: WITHOUT ROWID reader: many rows across multiple leaves
+00:10 +1181: test\sql_sqlite_without_rowid_test.dart: WITHOUT ROWID reader: many rows across multiple leaves
+00:11 +1182: test\sql_sqlite_without_rowid_test.dart: WITHOUT ROWID reader: many rows across multiple leaves
+00:12 +1183: test\sql_sqlite_without_rowid_test.dart: WITHOUT ROWID reader: many rows across multiple leaves
+00:12 +1184: test\sql_sqlite_without_rowid_test.dart: WITHOUT ROWID reader: many rows across multiple leaves
+00:12 +1185: test\sql_sqlite_without_rowid_test.dart: WITHOUT ROWID reader: many rows across multiple leaves
+00:12 +1186: test\sql_sqlite_without_rowid_test.dart: WITHOUT ROWID reader: many rows across multiple leaves
+00:12 +1187: test\sql_sqlite_without_rowid_test.dart: WITHOUT ROWID reader: many rows across multiple leaves
+00:13 +1188: test\sql_sqlite_without_rowid_test.dart: WITHOUT ROWID Database.open reads a WITHOUT ROWID file end-to-end
+00:13 +1189: test\sql_sqlite_without_rowid_test.dart: WITHOUT ROWID reader: PK not at position 0 needs column-order remap
+00:13 +1190: test\sql_sqlite_without_rowid_test.dart: WITHOUT ROWID importSqlite remaps WITHOUT ROWID rows to declared column order
+00:13 +1191: test\sql_sqlite_without_rowid_test.dart: WITHOUT ROWID importSqlite handles composite PK WITHOUT ROWID
+00:13 +1192: All tests passed!

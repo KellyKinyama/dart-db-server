@@ -23,8 +23,8 @@ void main() {
       [2, 20],
       [6, 60],
     ]) {
-      await db.execute(
-          'INSERT INTO t VALUES (${id++}, ${pair[0]}, ${pair[1]})');
+      await db
+          .execute('INSERT INTO t VALUES (${id++}, ${pair[0]}, ${pair[1]})');
     }
     return db;
   }
@@ -65,7 +65,8 @@ void main() {
     }
   });
 
-  test('MIN(b) on TRAILING composite col bails (only single-col index '
+  test(
+      'MIN(b) on TRAILING composite col bails (only single-col index '
       'on b would qualify)', () async {
     final db = await seed();
     try {

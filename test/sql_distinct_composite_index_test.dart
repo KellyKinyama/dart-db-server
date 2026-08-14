@@ -22,8 +22,8 @@ void main() {
       [2, 20],
       [3, 30],
     ]) {
-      await db.execute(
-          'INSERT INTO t VALUES (${id++}, ${pair[0]}, ${pair[1]})');
+      await db
+          .execute('INSERT INTO t VALUES (${id++}, ${pair[0]}, ${pair[1]})');
     }
     return db;
   }
@@ -31,8 +31,7 @@ void main() {
   test('SELECT DISTINCT a, b uses composite index', () async {
     final db = await seed();
     try {
-      final r = await db
-          .execute('SELECT DISTINCT a, b FROM t ORDER BY a, b');
+      final r = await db.execute('SELECT DISTINCT a, b FROM t ORDER BY a, b');
       expect(r.rows, [
         [1, 10],
         [1, 20],
@@ -65,8 +64,8 @@ void main() {
   test('SELECT DISTINCT a, b LIMIT 3', () async {
     final db = await seed();
     try {
-      final r = await db
-          .execute('SELECT DISTINCT a, b FROM t ORDER BY a, b LIMIT 3');
+      final r =
+          await db.execute('SELECT DISTINCT a, b FROM t ORDER BY a, b LIMIT 3');
       expect(r.rows, [
         [1, 10],
         [1, 20],
@@ -91,7 +90,8 @@ void main() {
     }
   });
 
-  test('SELECT DISTINCT a (prefix of composite index) — falls to '
+  test(
+      'SELECT DISTINCT a (prefix of composite index) — falls to '
       'covering scan, dedupes via that path', () async {
     final db = await seed();
     try {

@@ -64,8 +64,7 @@ void main() {
   test('HAVING AVG(v) BETWEEN 2 AND 4', () async {
     final db = await seed();
     try {
-      final r = await db.execute(
-          'SELECT v, COUNT(*) FROM t GROUP BY v '
+      final r = await db.execute('SELECT v, COUNT(*) FROM t GROUP BY v '
           'HAVING AVG(v) BETWEEN 2 AND 4 ORDER BY v');
       expect(r.rows, [
         [2, 2],
@@ -80,8 +79,7 @@ void main() {
   test('HAVING TOTAL(v) > 5.0', () async {
     final db = await seed();
     try {
-      final r = await db.execute(
-          'SELECT v, COUNT(*) FROM t GROUP BY v '
+      final r = await db.execute('SELECT v, COUNT(*) FROM t GROUP BY v '
           'HAVING TOTAL(v) > 5.0 ORDER BY v');
       // TOTAL(v) per group = key*cnt: 1,4,9,4,10. > 5 → keys 3 and 5.
       expect(r.rows, [
@@ -96,8 +94,7 @@ void main() {
   test('HAVING SUM(v) IN (4, 9)', () async {
     final db = await seed();
     try {
-      final r = await db.execute(
-          'SELECT v, SUM(v) FROM t GROUP BY v '
+      final r = await db.execute('SELECT v, SUM(v) FROM t GROUP BY v '
           'HAVING SUM(v) IN (4, 9) ORDER BY v');
       // SUM per group: 1,4,9,4,10 → matches 4 (v=2), 9 (v=3), 4 (v=4).
       expect(r.rows, [
@@ -113,8 +110,7 @@ void main() {
   test('HAVING SUM(v) > 5 AND COUNT(*) > 1', () async {
     final db = await seed();
     try {
-      final r = await db.execute(
-          'SELECT v, SUM(v), COUNT(*) FROM t GROUP BY v '
+      final r = await db.execute('SELECT v, SUM(v), COUNT(*) FROM t GROUP BY v '
           'HAVING SUM(v) > 5 AND COUNT(*) > 1 ORDER BY v');
       expect(r.rows, [
         [3, 9, 3],

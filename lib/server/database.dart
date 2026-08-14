@@ -33,8 +33,8 @@ enum AuthorizerResult { allow, deny, ignore }
 /// Authorizer callback. Invoked by [Database.executeStmt] for every
 /// dispatched statement; the second argument is the primary table the
 /// statement targets (or null when there is none, e.g. PRAGMA).
-typedef AuthorizerCallback = AuthorizerResult Function(
-    Statement action, String? tableName);
+typedef AuthorizerCallback =
+    AuthorizerResult Function(Statement action, String? tableName);
 
 class Database {
   final Map<String, Table> _tables = <String, Table>{};
@@ -268,8 +268,9 @@ class Database {
     if (t == null) {
       throw StateError('No such table: $tableName');
     }
-    final colIdx = t.columns
-        .indexWhere((c) => c.name.toLowerCase() == columnName.toLowerCase());
+    final colIdx = t.columns.indexWhere(
+      (c) => c.name.toLowerCase() == columnName.toLowerCase(),
+    );
     if (colIdx < 0) {
       throw StateError('No such column: $tableName.$columnName');
     }
@@ -342,10 +343,12 @@ class Database {
   void _refreshPartialIndexes(Table t) {
     for (final def in t.indexDefs.values) {
       if (def.whereSql == null && def.exprSql == null) continue;
-      final pred =
-          def.whereSql == null ? null : _compilePartialPredicate(def.whereSql);
-      final exprFn =
-          def.exprSql == null ? null : _compileIndexExpression(def.exprSql!);
+      final pred = def.whereSql == null
+          ? null
+          : _compilePartialPredicate(def.whereSql);
+      final exprFn = def.exprSql == null
+          ? null
+          : _compileIndexExpression(def.exprSql!);
       final tree = t.indexes[def.name];
       if (tree == null) continue;
       tree.clear();
@@ -364,8 +367,9 @@ class Database {
         final list = tree.putIfAbsent(key, () => <int>[]);
         if (def.unique && list.isNotEmpty) {
           throw StateError(
-              'UNIQUE index ${def.name} violation while refreshing '
-              'partial index: $key');
+            'UNIQUE index ${def.name} violation while refreshing '
+            'partial index: $key',
+          );
         }
         list.add(i);
       }
@@ -385,8 +389,9 @@ class Database {
   bool _partialIndexUsable(IndexDef def) {
     if (def.whereSql == null) return true;
     final ast = _partialIndexAstCache.putIfAbsent(def.name, () {
-      final stmt = Parser.fromString('SELECT ${def.whereSql}').parseStatement()
-          as SelectStmt;
+      final stmt =
+          Parser.fromString('SELECT ${def.whereSql}').parseStatement()
+              as SelectStmt;
       return stmt.projection.first.expr!;
     });
     for (final c in _currentScanConjuncts) {
@@ -528,12 +533,7 @@ class Database {
   /// `mydb.paged/`.
   static String _derivePagedDir(String path) {
     final lower = path.toLowerCase();
-    for (final ext in const [
-      '.json',
-      '.sqlite3',
-      '.sqlite',
-      '.db',
-    ]) {
+    for (final ext in const ['.json', '.sqlite3', '.sqlite', '.db']) {
       if (lower.endsWith(ext)) {
         return '${path.substring(0, path.length - ext.length)}.paged';
       }
@@ -646,7 +646,8 @@ class Database {
   Future<QueryResult> executeStmt(Statement stmt) async {
     // Statements that span a transaction boundary always need exclusive
     // access; otherwise SELECT-ish statements take the shared arm.
-    final wantsWrite = inTransaction ||
+    final wantsWrite =
+        inTransaction ||
         _isMutation(stmt) ||
         stmt is BeginStmt ||
         stmt is CommitStmt ||
@@ -658,7 +659,8 @@ class Database {
     Future<QueryResult> body() async {
       if (_readOnlySnapshot && _isMutation(stmt)) {
         throw StateError(
-            'Cannot mutate inside a read-only snapshot transaction');
+          'Cannot mutate inside a read-only snapshot transaction',
+        );
       }
       final cb = authorizer;
       if (cb != null) {
@@ -711,7 +713,9 @@ class Database {
           for (final pt in pending) {
             try {
               await pt.rollback();
-            } catch (_) {/* best-effort */}
+            } catch (_) {
+              /* best-effort */
+            }
           }
         }
         if (_pendingPagedCommit.isNotEmpty) {
@@ -757,24 +761,22 @@ class Database {
   /// writer arm of [rwLock] until the snapshot is committed/rolled back.
   /// Any mutation inside the snapshot is rejected.
   Future<QueryResult> beginSnapshot() => _lock.write(() async {
-        if (inTransaction) {
-          throw StateError('Already in a transaction');
-        }
-        // Stash the live state; install a deep-cloned view as _tables
-        // so all read paths transparently see the snapshot.
-        _liveTables = Map<String, Table>.from(_tables);
-        _liveViews = Map<String, SelectStmt>.from(_views);
-        final cloned = {
-          for (final e in _tables.entries) e.key: e.value.clone(),
-        };
-        _snapshot = Map<String, Table>.from(cloned);
-        _viewSnapshot = Map<String, SelectStmt>.from(_views);
-        _tables
-          ..clear()
-          ..addAll(cloned);
-        _readOnlySnapshot = true;
-        return QueryResult.message('Snapshot transaction started');
-      });
+    if (inTransaction) {
+      throw StateError('Already in a transaction');
+    }
+    // Stash the live state; install a deep-cloned view as _tables
+    // so all read paths transparently see the snapshot.
+    _liveTables = Map<String, Table>.from(_tables);
+    _liveViews = Map<String, SelectStmt>.from(_views);
+    final cloned = {for (final e in _tables.entries) e.key: e.value.clone()};
+    _snapshot = Map<String, Table>.from(cloned);
+    _viewSnapshot = Map<String, SelectStmt>.from(_views);
+    _tables
+      ..clear()
+      ..addAll(cloned);
+    _readOnlySnapshot = true;
+    return QueryResult.message('Snapshot transaction started');
+  });
 
   /// Snapshot-read primitive: clones the current table set and runs
   /// [body] against the clone. Multiple [snapshotRead] calls can
@@ -787,9 +789,9 @@ class Database {
   /// This is the closest the engine gets to "real MVCC": readers and
   /// writers don't block each other once the snapshot is taken.
   Future<T> snapshotRead<T>(FutureOr<T> Function(Database snap) body) async {
-    final clonedTables = await _lock.read(() => {
-          for (final e in _tables.entries) e.key: e.value.clone(),
-        });
+    final clonedTables = await _lock.read(
+      () => {for (final e in _tables.entries) e.key: e.value.clone()},
+    );
     final snap = Database();
     snap._tables.addAll(clonedTables);
     snap._views.addAll(_views);
@@ -851,7 +853,9 @@ class Database {
       result = _showVariables(stmt.likePattern);
     } else if (stmt is ShowStatusStmt) {
       result = QueryResult(
-          columns: const ['Variable_name', 'Value'], rows: const []);
+        columns: const ['Variable_name', 'Value'],
+        rows: const [],
+      );
     } else if (stmt is UseDatabaseStmt) {
       result = QueryResult.message('Database changed');
     } else if (stmt is SetSessionStmt) {
@@ -943,8 +947,9 @@ class Database {
   void _assertNoPagedDdlInTx(String action) {
     if (inTransaction) {
       throw UnsupportedError(
-          '$action is not supported inside an active transaction. '
-          'COMMIT or ROLLBACK first.');
+        '$action is not supported inside an active transaction. '
+        'COMMIT or ROLLBACK first.',
+      );
     }
   }
 
@@ -955,8 +960,9 @@ class Database {
   void _assertPagedWriteAllowed(String action) {
     if (_savepoints.isNotEmpty) {
       throw UnsupportedError(
-          '$action is not supported while a SAVEPOINT is open. '
-          'RELEASE the savepoint first.');
+        '$action is not supported while a SAVEPOINT is open. '
+        'RELEASE the savepoint first.',
+      );
     }
   }
 
@@ -1043,48 +1049,58 @@ class Database {
     }
     if (stmt is DescribeStmt) {
       // Cheap: synthesize a Table row-set off the paged columns.
-      return QueryResult(columns: const [
-        'name',
-        'type',
-      ], rows: [
-        for (final c in pt.columns) [c.name, c.type.name],
-      ]);
+      return QueryResult(
+        columns: const ['name', 'type'],
+        rows: [
+          for (final c in pt.columns) [c.name, c.type.name],
+        ],
+      );
     }
     throw UnsupportedError(
-        'Statement ${stmt.runtimeType} not supported on USING paged table '
-        '"$tname". Paged tables currently support: INSERT, SELECT (full '
-        'scan or WHERE pk = literal), UPDATE/DELETE WHERE pk = literal, '
-        'DROP TABLE, TRUNCATE TABLE, DESCRIBE.');
+      'Statement ${stmt.runtimeType} not supported on USING paged table '
+      '"$tname". Paged tables currently support: INSERT, SELECT (full '
+      'scan or WHERE pk = literal), UPDATE/DELETE WHERE pk = literal, '
+      'DROP TABLE, TRUNCATE TABLE, DESCRIBE.',
+    );
   }
 
   Future<QueryResult> _pagedCreateIndex(
-      CreateIndexStmt s, PagedTable pt) async {
+    CreateIndexStmt s,
+    PagedTable pt,
+  ) async {
     if (s.exprSql != null) {
       throw UnsupportedError(
-          'CREATE INDEX on paged table ${s.table}: expression indexes '
-          'are not supported.');
+        'CREATE INDEX on paged table ${s.table}: expression indexes '
+        'are not supported.',
+      );
     }
     if (s.whereSql != null) {
       throw UnsupportedError(
-          'CREATE INDEX on paged table ${s.table}: partial indexes are '
-          'not supported.');
+        'CREATE INDEX on paged table ${s.table}: partial indexes are '
+        'not supported.',
+      );
     }
     if (_pagedIndexOwners.containsKey(s.indexName)) {
-      throw StateError('Index ${s.indexName} already exists on paged table '
-          '${_pagedIndexOwners[s.indexName]}');
+      throw StateError(
+        'Index ${s.indexName} already exists on paged table '
+        '${_pagedIndexOwners[s.indexName]}',
+      );
     }
     await pt.createIndex(s.indexName, s.columns, unique: s.unique);
     _pagedIndexOwners[s.indexName] = s.table;
-    return QueryResult.message('index ${s.indexName} '
-        '${s.unique ? "(unique) " : ""}'
-        'created on ${s.table}(${s.columns.join(', ')})');
+    return QueryResult.message(
+      'index ${s.indexName} '
+      '${s.unique ? "(unique) " : ""}'
+      'created on ${s.table}(${s.columns.join(', ')})',
+    );
   }
 
   Future<QueryResult> _pagedDropIndex(DropIndexStmt s, PagedTable pt) async {
     final dropped = await pt.dropIndex(s.indexName);
     if (dropped) _pagedIndexOwners.remove(s.indexName);
     return QueryResult.message(
-        dropped ? 'index ${s.indexName} dropped' : 'no such index');
+      dropped ? 'index ${s.indexName} dropped' : 'no such index',
+    );
   }
 
   /// Map a SQL [DataType] to the PagedTable column-type enum.
@@ -1144,7 +1160,9 @@ class Database {
   ///     found.
   /// Falling back preserves correctness in every case.
   Future<QueryResult> _pagedJoinSelect(
-      SelectStmt s, List<String> pagedNames) async {
+    SelectStmt s,
+    List<String> pagedNames,
+  ) async {
     final installed = <String>[];
     try {
       // Decide pre-filter eligibility for each paged participant.
@@ -1153,8 +1171,9 @@ class Database {
         if (!_isPaged(name)) continue;
         if (_tables.containsKey(name)) {
           throw StateError(
-              'paged join: name collision with in-memory table $name '
-              '(should not happen — names are unique across maps)');
+            'paged join: name collision with in-memory table $name '
+            '(should not happen — names are unique across maps)',
+          );
         }
         final pt = _pagedTable(name)!;
         final colDefs = <ColumnDef>[
@@ -1192,7 +1211,9 @@ class Database {
   /// the in-memory side. Returns an empty map if no participant is
   /// eligible — callers fall back to the full-scan path.
   Map<String, ({String pagedCol, Set<Object> keys})> _pagedJoinFilters(
-      SelectStmt s, List<String> pagedNames) {
+    SelectStmt s,
+    List<String> pagedNames,
+  ) {
     final result = <String, ({String pagedCol, Set<Object> keys})>{};
     // Only safe when no preserving-side semantics are involved.
     for (final j in s.joins) {
@@ -1251,8 +1272,9 @@ class Database {
       if (memName == null) continue;
       final mem = _tables[memName];
       if (mem == null) continue; // not in-memory, or unknown
-      final colIdx = mem.columns
-          .indexWhere((cd) => cd.name.toLowerCase() == memCol!.toLowerCase());
+      final colIdx = mem.columns.indexWhere(
+        (cd) => cd.name.toLowerCase() == memCol!.toLowerCase(),
+      );
       if (colIdx < 0) continue;
       final keys = <Object>{};
       for (final row in mem.rows) {
@@ -1318,8 +1340,9 @@ class Database {
   Future<QueryResult> _createPagedTable(CreateTableStmt s) async {
     if (_pagedDir == null) {
       throw StateError(
-          'CREATE TABLE ${s.name} USING paged: requires a path-backed '
-          'database (in-memory databases cannot host paged tables).');
+        'CREATE TABLE ${s.name} USING paged: requires a path-backed '
+        'database (in-memory databases cannot host paged tables).',
+      );
     }
     if (_tables.containsKey(s.name) ||
         _views.containsKey(s.name) ||
@@ -1335,8 +1358,9 @@ class Database {
       if (c.primaryKey) {
         if (pkName != null) {
           throw StateError(
-              'CREATE TABLE ${s.name} USING paged: composite primary '
-              'keys are not supported (already had $pkName).');
+            'CREATE TABLE ${s.name} USING paged: composite primary '
+            'keys are not supported (already had $pkName).',
+          );
         }
         pkName = c.name;
       }
@@ -1345,21 +1369,24 @@ class Database {
       if (tc is PrimaryKeyConstraint) {
         if (tc.columns.length != 1) {
           throw StateError(
-              'CREATE TABLE ${s.name} USING paged: composite primary '
-              'keys are not supported.');
+            'CREATE TABLE ${s.name} USING paged: composite primary '
+            'keys are not supported.',
+          );
         }
         if (pkName != null && pkName != tc.columns.single) {
           throw StateError(
-              'CREATE TABLE ${s.name} USING paged: conflicting primary '
-              'keys ($pkName vs ${tc.columns.single}).');
+            'CREATE TABLE ${s.name} USING paged: conflicting primary '
+            'keys ($pkName vs ${tc.columns.single}).',
+          );
         }
         pkName = tc.columns.single;
       }
     }
     if (pkName == null) {
       throw StateError(
-          'CREATE TABLE ${s.name} USING paged: a single-column PRIMARY '
-          'KEY is required.');
+        'CREATE TABLE ${s.name} USING paged: a single-column PRIMARY '
+        'KEY is required.',
+      );
     }
     final cols = [
       for (final c in s.columns) PagedColumn(c.name, _toPagedType(c.type)),
@@ -1444,8 +1471,13 @@ class Database {
     }
     final ps = _pragmaPageSize();
     final cc = _pragmaCacheCapacity(ps);
-    final fresh = await PagedTable.create(base,
-        columns: cols, primaryKey: pkName, pageSize: ps, cacheCapacity: cc);
+    final fresh = await PagedTable.create(
+      base,
+      columns: cols,
+      primaryKey: pkName,
+      pageSize: ps,
+      cacheCapacity: cc,
+    );
     fresh.tableName = s.name;
     _pagedTables[s.name] = fresh;
     return QueryResult.message('paged table ${s.name} truncated');
@@ -1459,7 +1491,8 @@ class Database {
       return e.eval(const <String, Object?>{});
     } catch (_) {
       throw UnsupportedError(
-          '$context: only literal values are supported on paged tables.');
+        '$context: only literal values are supported on paged tables.',
+      );
     }
   }
 
@@ -1633,7 +1666,8 @@ class Database {
     if (a is num && b is num) return a.compareTo(b);
     if (a is String && b is String) return a.compareTo(b);
     throw UnsupportedError(
-        'paged table: cannot compare ${a.runtimeType} with ${b.runtimeType}.');
+      'paged table: cannot compare ${a.runtimeType} with ${b.runtimeType}.',
+    );
   }
 
   /// Stream rows matching a parsed range. Honours [_PagedRange.eq] as
@@ -1648,7 +1682,9 @@ class Database {
   /// The residual still runs on every yielded row, so any remaining
   /// conjuncts (`age > 25` etc.) keep filtering correctly.
   Stream<Map<String, Object?>> _pagedRangeStream(
-      PagedTable pt, _PagedRange r) async* {
+    PagedTable pt,
+    _PagedRange r,
+  ) async* {
     if (r.contradiction) return;
     final residual = r.residual;
     bool passes(Map<String, Object?> row) {
@@ -1668,8 +1704,10 @@ class Database {
       final plan = _findIndexPlan(pt, residual);
       if (plan != null) {
         if (plan.isEquality) {
-          await for (final row
-              in pt.indexLookup(plan.indexName, plan.equalPrefix)) {
+          await for (final row in pt.indexLookup(
+            plan.indexName,
+            plan.equalPrefix,
+          )) {
             if (passes(row)) yield row;
           }
         } else {
@@ -1754,9 +1792,10 @@ class Database {
         return;
       }
       if (v == null) return;
-      byCol
-          .putIfAbsent(col.name.toLowerCase(), () => [])
-          .add((op: op, value: v));
+      byCol.putIfAbsent(col.name.toLowerCase(), () => []).add((
+        op: op,
+        value: v,
+      ));
     }
 
     visit(e);
@@ -1796,8 +1835,9 @@ class Database {
       // If any indexed column has an IS NULL predicate in the residual,
       // routing through this index is unsound (it would miss the very
       // rows the predicate wants to match).
-      final disqualified =
-          idxCols.any((c) => nullCols.contains(c.toLowerCase()));
+      final disqualified = idxCols.any(
+        (c) => nullCols.contains(c.toLowerCase()),
+      );
       if (disqualified) continue;
 
       // Walk leading columns collecting equality values.
@@ -1875,15 +1915,17 @@ class Database {
 
       final isEquality =
           rangeColIdx < 0 && equalPrefix.length == idxCols.length;
-      candidates.add(_PagedIndexPlan(
-        indexName: name,
-        isEquality: isEquality,
-        equalPrefix: equalPrefix,
-        lower: lo,
-        lowerInclusive: loInc,
-        upper: hi,
-        upperInclusive: hiInc,
-      ));
+      candidates.add(
+        _PagedIndexPlan(
+          indexName: name,
+          isEquality: isEquality,
+          equalPrefix: equalPrefix,
+          lower: lo,
+          lowerInclusive: loInc,
+          upper: hi,
+          upperInclusive: hiInc,
+        ),
+      );
     }
     if (candidates.isEmpty) return null;
     // Rank candidates by selectivity proxy:
@@ -1913,8 +1955,9 @@ class Database {
     final onConflict = s.onConflict;
     if (onConflict != null && s.mode != InsertMode.normal) {
       throw UnsupportedError(
-          'INSERT OR ${s.mode.name} … ON CONFLICT is not supported on '
-          'paged table ${s.table}; pick one conflict resolution.');
+        'INSERT OR ${s.mode.name} … ON CONFLICT is not supported on '
+        'paged table ${s.table}; pick one conflict resolution.',
+      );
     }
     // Resolve the conflict target to a concrete probe strategy:
     //   - null         : no ON CONFLICT clause
@@ -1934,9 +1977,10 @@ class Database {
         final idx = pt.findUniqueIndexByColumns(onConflict.targetColumns);
         if (idx == null) {
           throw UnsupportedError(
-              'INSERT … ON CONFLICT (${onConflict.targetColumns.join(", ")}) '
-              'on paged table ${s.table}: no matching primary key or UNIQUE '
-              'index covers exactly those columns.');
+            'INSERT … ON CONFLICT (${onConflict.targetColumns.join(", ")}) '
+            'on paged table ${s.table}: no matching primary key or UNIQUE '
+            'index covers exactly those columns.',
+          );
         }
         conflictProbe = idx;
       }
@@ -1965,8 +2009,9 @@ class Database {
       // requires a complete row map).
       // Keep the diagnostic strict for now; relax later if needed.
       throw UnsupportedError(
-          'INSERT into paged table ${s.table}: every column must be '
-          'supplied (got ${colNames.length}, want ${pt.columns.length}).');
+        'INSERT into paged table ${s.table}: every column must be '
+        'supplied (got ${colNames.length}, want ${pt.columns.length}).',
+      );
     }
     // Set up RETURNING projection, if any.
     final returningCols = <String>[];
@@ -1989,19 +2034,26 @@ class Database {
     for (final r in sourceRows) {
       if (r.length != colNames.length) {
         throw StateError(
-            'INSERT into ${s.table}: row arity ${r.length} ≠ column '
-            'count ${colNames.length}.');
+          'INSERT into ${s.table}: row arity ${r.length} ≠ column '
+          'count ${colNames.length}.',
+        );
       }
       final map = <String, Object?>{};
       for (var i = 0; i < colNames.length; i++) {
-        map[colNames[i]] =
-            _evalLiteral(r[i], 'INSERT into paged table ${s.table}');
+        map[colNames[i]] = _evalLiteral(
+          r[i],
+          'INSERT into paged table ${s.table}',
+        );
       }
       // ON CONFLICT path takes precedence over INSERT-mode handling
       // (we already rejected the two combined upstream).
       if (onConflict != null) {
-        final hitPk =
-            await _pagedFindConflictPk(pt, map, conflictProbe!, pkName);
+        final hitPk = await _pagedFindConflictPk(
+          pt,
+          map,
+          conflictProbe!,
+          pkName,
+        );
         if (hitPk == null) {
           await pt.insert(map);
           affected++;
@@ -2028,21 +2080,24 @@ class Database {
               final hit = pt.columns.firstWhere(
                 (c) => c.name.toLowerCase() == col.toLowerCase(),
                 orElse: () => throw StateError(
-                    'ON CONFLICT DO UPDATE on paged table ${s.table}: '
-                    'unknown column $col'),
+                  'ON CONFLICT DO UPDATE on paged table ${s.table}: '
+                  'unknown column $col',
+                ),
               );
               newRow[hit.name] = _bindExpr(expr).eval(ctx);
             });
             if (newRow[pkName] != existing[pkName]) {
               throw UnsupportedError(
-                  'ON CONFLICT DO UPDATE on paged table ${s.table}: '
-                  'cannot reassign the primary key column "$pkName".');
+                'ON CONFLICT DO UPDATE on paged table ${s.table}: '
+                'cannot reassign the primary key column "$pkName".',
+              );
             }
             await pt.update(hitPk, newRow);
             affected++;
             if (returningExprs.isNotEmpty) {
-              returnedRows
-                  .add([for (final e in returningExprs) e.eval(newRow)]);
+              returnedRows.add([
+                for (final e in returningExprs) e.eval(newRow),
+              ]);
             }
           }
         }
@@ -2083,7 +2138,10 @@ class Database {
     }
     if (returningExprs.isNotEmpty) {
       return QueryResult(
-          columns: returningCols, rows: returnedRows, affected: affected);
+        columns: returningCols,
+        rows: returnedRows,
+        affected: affected,
+      );
     }
     return QueryResult(affected: affected, message: '$affected row(s)');
   }
@@ -2094,8 +2152,12 @@ class Database {
   /// [probe] is one of: `pk` (PK only), `any` (PK then every UNIQUE
   /// secondary index, first hit wins), or a UNIQUE secondary-index
   /// name.
-  Future<Object?> _pagedFindConflictPk(PagedTable pt, Map<String, Object?> row,
-      String probe, String pkName) async {
+  Future<Object?> _pagedFindConflictPk(
+    PagedTable pt,
+    Map<String, Object?> row,
+    String probe,
+    String pkName,
+  ) async {
     if (probe == 'pk' || probe == 'any') {
       final pk = row[pkName];
       if (pk != null && (await pt.get(pk)) != null) return pk;
@@ -2128,15 +2190,19 @@ class Database {
     for (final p in s.projection) {
       if (p.isStar) {
         throw UnsupportedError(
-            'SELECT on paged table ${s.fromTable}: SELECT * with '
-            'GROUP BY / aggregates is not supported.');
+          'SELECT on paged table ${s.fromTable}: SELECT * with '
+          'GROUP BY / aggregates is not supported.',
+        );
       }
     }
 
     // Buffer all matched rows. Aggregation needs to revisit rows
     // per-group, so streaming isn't enough.
     final range = _pagedExtractPkRange(
-        s.where, pkName, 'SELECT on paged table ${s.fromTable}');
+      s.where,
+      pkName,
+      'SELECT on paged table ${s.fromTable}',
+    );
     final rows = <Map<String, Object?>>[];
     await for (final row in _pagedRangeStream(pt, range)) {
       rows.add(row);
@@ -2151,14 +2217,14 @@ class Database {
       groupOrder.add('');
     } else {
       for (final row in rows) {
-        final keyVals = <Object?>[
-          for (final ge in groupExprs) ge.eval(row),
-        ];
+        final keyVals = <Object?>[for (final ge in groupExprs) ge.eval(row)];
         final keyStr = jsonEncode(keyVals);
-        groups.putIfAbsent(keyStr, () {
-          groupOrder.add(keyStr);
-          return <Map<String, Object?>>[];
-        }).add(row);
+        groups
+            .putIfAbsent(keyStr, () {
+              groupOrder.add(keyStr);
+              return <Map<String, Object?>>[];
+            })
+            .add(row);
       }
     }
 
@@ -2167,7 +2233,10 @@ class Database {
     // ordinary column refs / literals / non-aggregate functions are
     // evaluated against [sample] (the first row of the group).
     Object? evalInGroup(
-        Expr e, List<Map<String, Object?>> grp, Map<String, Object?> sample) {
+      Expr e,
+      List<Map<String, Object?>> grp,
+      Map<String, Object?> sample,
+    ) {
       if (e is FunctionCallExpr && e.isAggregate) {
         return _aggregateValue(e, grp);
       }
@@ -2194,11 +2263,14 @@ class Database {
     ];
 
     // Build per-group output rows, applying HAVING.
-    final survivors = <({
-      List<Object?> outRow,
-      List<Map<String, Object?>> grp,
-      Map<String, Object?> sample,
-    })>[];
+    final survivors =
+        <
+          ({
+            List<Object?> outRow,
+            List<Map<String, Object?>> grp,
+            Map<String, Object?> sample,
+          })
+        >[];
     final having = s.having;
     for (final keyStr in groupOrder) {
       final grp = groups[keyStr]!;
@@ -2271,8 +2343,9 @@ class Database {
         s.distinct ||
         s.fromFunction != null) {
       throw UnsupportedError(
-          'SELECT on paged table ${s.fromTable}: joins, DISTINCT and '
-          'set ops are not supported.');
+        'SELECT on paged table ${s.fromTable}: joins, DISTINCT and '
+        'set ops are not supported.',
+      );
     }
     // Detect aggregation: any aggregate function call in the
     // projection, in HAVING, in ORDER BY, or any explicit GROUP BY.
@@ -2301,7 +2374,8 @@ class Database {
       return found;
     }
 
-    final hasAggregates = s.groupBy.isNotEmpty ||
+    final hasAggregates =
+        s.groupBy.isNotEmpty ||
         s.having != null ||
         s.projection.any((p) => p.expr != null && isAggregate(p.expr)) ||
         s.orderBy.any((o) => isAggregate(o.expr));
@@ -2345,15 +2419,17 @@ class Database {
       hasOrderBy = true;
       if (s.orderBy.length > 1) {
         throw UnsupportedError(
-            'SELECT on paged table ${s.fromTable}: ORDER BY may only '
-            'reference a single column (the primary key).');
+          'SELECT on paged table ${s.fromTable}: ORDER BY may only '
+          'reference a single column (the primary key).',
+        );
       }
       final ob = s.orderBy.single;
       final e = ob.expr;
       if (e is! ColumnExpr || e.name.toLowerCase() != pkName.toLowerCase()) {
         throw UnsupportedError(
-            'SELECT on paged table ${s.fromTable}: ORDER BY must '
-            'reference the primary key column "$pkName".');
+          'SELECT on paged table ${s.fromTable}: ORDER BY must '
+          'reference the primary key column "$pkName".',
+        );
       }
       descending = ob.descending;
     }
@@ -2384,21 +2460,24 @@ class Database {
       for (final p in s.projection) {
         if (p.isStar) {
           throw UnsupportedError(
-              'SELECT on paged table ${s.fromTable}: mixed `*` with '
-              'other projections is not supported.');
+            'SELECT on paged table ${s.fromTable}: mixed `*` with '
+            'other projections is not supported.',
+          );
         }
         final e = p.expr!;
         if (e is FunctionCallExpr && e.isAggregate) {
           throw UnsupportedError(
-              'SELECT on paged table ${s.fromTable}: aggregate '
-              '${e.name}() is not supported (only bare COUNT(*) is).');
+            'SELECT on paged table ${s.fromTable}: aggregate '
+            '${e.name}() is not supported (only bare COUNT(*) is).',
+          );
         }
         if (e is ColumnExpr) {
           final hit = colNames.firstWhere(
             (c) => c.toLowerCase() == e.name.toLowerCase(),
             orElse: () => throw StateError(
-                'SELECT on paged table ${s.fromTable}: unknown column '
-                '${e.name}'),
+              'SELECT on paged table ${s.fromTable}: unknown column '
+              '${e.name}',
+            ),
           );
           outCols.add(p.alias ?? e.name);
           projectors.add((row) => row[hit]);
@@ -2410,7 +2489,10 @@ class Database {
     }
 
     final range = _pagedExtractPkRange(
-        s.where, pkName, 'SELECT on paged table ${s.fromTable}');
+      s.where,
+      pkName,
+      'SELECT on paged table ${s.fromTable}',
+    );
 
     // LIMIT / OFFSET. Negative LIMIT means "no limit" (SQLite-ish).
     final offset = (s.offset ?? 0) < 0 ? 0 : (s.offset ?? 0);
@@ -2446,7 +2528,8 @@ class Database {
     // upper/lower bound, or no predicate at all (full PK scan). When
     // the residual would route through a *secondary index*, the
     // stream emits in index order, not PK order — keep buffering.
-    final streamIsPkOrdered = range.eq != null ||
+    final streamIsPkOrdered =
+        range.eq != null ||
         range.lower != null ||
         range.upper != null ||
         range.residual == null ||
@@ -2499,7 +2582,10 @@ class Database {
   Future<QueryResult> _pagedUpdate(UpdateStmt s, PagedTable pt) async {
     final pkName = pt.columns[pt.primaryKeyIndex].name;
     final range = _pagedExtractPkRange(
-        s.where, pkName, 'UPDATE on paged table ${s.table}');
+      s.where,
+      pkName,
+      'UPDATE on paged table ${s.table}',
+    );
     // Resolve assignment columns once. Each RHS expression is kept
     // as an Expr so it can be evaluated against the current row at
     // mutation time — that supports things like `SET qty = qty + 1`.
@@ -2508,7 +2594,8 @@ class Database {
       final hit = pt.columns.firstWhere(
         (c) => c.name.toLowerCase() == col.toLowerCase(),
         orElse: () => throw StateError(
-            'UPDATE on paged table ${s.table}: unknown column $col'),
+          'UPDATE on paged table ${s.table}: unknown column $col',
+        ),
       );
       assignExprs[hit.name] = expr;
     });
@@ -2539,7 +2626,10 @@ class Database {
     if (range.contradiction) {
       if (s.returning != null) {
         return QueryResult(
-            columns: returningCols, rows: returnedRows, affected: 0);
+          columns: returningCols,
+          rows: returnedRows,
+          affected: 0,
+        );
       }
       return QueryResult(affected: 0, message: '0 row(s)');
     }
@@ -2573,8 +2663,9 @@ class Database {
         final newPk = updated[pkName];
         if (newPk == null) {
           throw StateError(
-              'UPDATE on paged table ${s.table}: primary key column '
-              '"$pkName" cannot be set to NULL.');
+            'UPDATE on paged table ${s.table}: primary key column '
+            '"$pkName" cannot be set to NULL.',
+          );
         }
         plan.add((oldPk: pkVal, newPk: newPk, row: updated));
       }
@@ -2584,13 +2675,11 @@ class Database {
       // enforces UNIQUE-index constraints).
       final moving = [
         for (final p in plan)
-          if (_compareLiteral(p.oldPk, p.newPk) != 0) p
+          if (_compareLiteral(p.oldPk, p.newPk) != 0) p,
       ];
       // Set of oldPks being vacated by this UPDATE. JSON-encode for
       // stable equality on heterogeneous PK types.
-      final vacated = <String>{
-        for (final p in moving) jsonEncode(p.oldPk),
-      };
+      final vacated = <String>{for (final p in moving) jsonEncode(p.oldPk)};
       // 1. New PKs must be distinct within the plan and must not
       //    already exist outside the vacated set.
       final seenNewPk = <String>{};
@@ -2598,13 +2687,16 @@ class Database {
         final tag = jsonEncode(p.newPk);
         if (!seenNewPk.add(tag)) {
           throw StateError(
-              'UPDATE on paged table ${s.table}: multiple rows would '
-              'be assigned primary key ${jsonEncode(p.newPk)}.');
+            'UPDATE on paged table ${s.table}: multiple rows would '
+            'be assigned primary key ${jsonEncode(p.newPk)}.',
+          );
         }
         if (vacated.contains(tag)) continue;
         if ((await pt.get(p.newPk)) != null) {
-          throw StateError('UPDATE on paged table ${s.table}: cannot reassign '
-              'primary key to ${jsonEncode(p.newPk)} — row already exists.');
+          throw StateError(
+            'UPDATE on paged table ${s.table}: cannot reassign '
+            'primary key to ${jsonEncode(p.newPk)} — row already exists.',
+          );
         }
       }
       // 2. UNIQUE-index pre-check: per index, ensure new prefixes
@@ -2631,16 +2723,18 @@ class Database {
           final tag = jsonEncode(parts);
           if (!seenPrefix.add(tag)) {
             throw StateError(
-                'UPDATE on paged table ${s.table}: UNIQUE constraint '
-                'violated on index $idxName (${cols.join(", ")}) — '
-                'multiple updated rows share the same value.');
+              'UPDATE on paged table ${s.table}: UNIQUE constraint '
+              'violated on index $idxName (${cols.join(", ")}) — '
+              'multiple updated rows share the same value.',
+            );
           }
           final hitPk = await pt.findConflictByUniqueIndex(idxName, p.row);
           if (hitPk == null) continue;
           if (vacated.contains(jsonEncode(hitPk))) continue;
           throw StateError(
-              'UPDATE on paged table ${s.table}: UNIQUE constraint '
-              'violated on index $idxName (${cols.join(", ")}).');
+            'UPDATE on paged table ${s.table}: UNIQUE constraint '
+            'violated on index $idxName (${cols.join(", ")}).',
+          );
         }
       }
       // Phase 1: in-place updates for rows whose PK didn't change.
@@ -2690,7 +2784,10 @@ class Database {
     }
     if (s.returning != null) {
       return QueryResult(
-          columns: returningCols, rows: returnedRows, affected: affected);
+        columns: returningCols,
+        rows: returnedRows,
+        affected: affected,
+      );
     }
     return QueryResult(affected: affected, message: '$affected row(s)');
   }
@@ -2698,7 +2795,10 @@ class Database {
   Future<QueryResult> _pagedDelete(DeleteStmt s, PagedTable pt) async {
     final pkName = pt.columns[pt.primaryKeyIndex].name;
     final range = _pagedExtractPkRange(
-        s.where, pkName, 'DELETE on paged table ${s.table}');
+      s.where,
+      pkName,
+      'DELETE on paged table ${s.table}',
+    );
     // Set up RETURNING projection, if any. SQLite returns the *pre-
     // deletion* row values for DELETE … RETURNING.
     final returningCols = <String>[];
@@ -2720,7 +2820,10 @@ class Database {
     if (range.contradiction) {
       if (s.returning != null) {
         return QueryResult(
-            columns: returningCols, rows: returnedRows, affected: 0);
+          columns: returningCols,
+          rows: returnedRows,
+          affected: 0,
+        );
       }
       return QueryResult(affected: 0, message: '0 row(s)');
     }
@@ -2751,7 +2854,10 @@ class Database {
     }
     if (s.returning != null) {
       return QueryResult(
-          columns: returningCols, rows: returnedRows, affected: affected);
+        columns: returningCols,
+        rows: returnedRows,
+        affected: affected,
+      );
     }
     return QueryResult(affected: affected, message: '$affected row(s)');
   }
@@ -2766,10 +2872,13 @@ class Database {
       }
       throw StateError('Table ${s.name} already exists');
     }
-    final t = Table(s.name, s.columns,
-        constraints: s.constraints,
-        strict: s.strict,
-        withoutRowid: s.withoutRowid);
+    final t = Table(
+      s.name,
+      s.columns,
+      constraints: s.constraints,
+      strict: s.strict,
+      withoutRowid: s.withoutRowid,
+    );
     _tables[s.name] = t;
     // Auto-create unique indexes for column-level PK/UNIQUE.
     for (final c in s.columns) {
@@ -2793,7 +2902,8 @@ class Database {
       for (final con in _foreignKeysOf(other)) {
         if (con.references.table == s.name) {
           throw StateError(
-              'Cannot drop ${s.name}: referenced by ${other.name}');
+            'Cannot drop ${s.name}: referenced by ${other.name}',
+          );
         }
       }
     }
@@ -2813,8 +2923,10 @@ class Database {
       t.dropIndex(d.name);
       t.createIndex(d);
     }
-    return QueryResult.message('Truncated $n row(s) from ${s.name}',
-        affected: n);
+    return QueryResult.message(
+      'Truncated $n row(s) from ${s.name}',
+      affected: n,
+    );
   }
 
   QueryResult _alterAddColumn(AlterTableAddColumnStmt s) {
@@ -2822,7 +2934,8 @@ class Database {
     t.addColumn(s.column);
     if (s.column.primaryKey || s.column.unique) {
       t.createIndex(
-          IndexDef('${t.name}__${s.column.name}', s.column.name, unique: true));
+        IndexDef('${t.name}__${s.column.name}', s.column.name, unique: true),
+      );
     }
     // Backfill GENERATED ALWAYS values for existing rows.
     if (s.column.generatedExprSql != null) {
@@ -2876,8 +2989,11 @@ class Database {
     final renamed = <String, IndexDef>{};
     for (final e in t.indexDefs.entries) {
       if (e.value.column.toLowerCase() == s.oldName.toLowerCase()) {
-        renamed[e.key] =
-            IndexDef(e.value.name, s.newName, unique: e.value.unique);
+        renamed[e.key] = IndexDef(
+          e.value.name,
+          s.newName,
+          unique: e.value.unique,
+        );
       }
     }
     renamed.forEach((k, v) {
@@ -2885,7 +3001,8 @@ class Database {
     });
     t.invalidateKeyCache();
     return QueryResult.message(
-        'Column ${s.oldName} renamed to ${s.newName} in ${s.table}');
+      'Column ${s.oldName} renamed to ${s.newName} in ${s.table}',
+    );
   }
 
   QueryResult _alterRenameTable(AlterTableRenameStmt s) {
@@ -2914,12 +3031,17 @@ class Database {
   QueryResult _createIndex(CreateIndexStmt s) {
     final t = _requireTable(s.table);
     final hasNonBinary = s.collations.any((c) => c.toUpperCase() != 'BINARY');
-    t.createIndex(IndexDef(s.indexName, s.column,
+    t.createIndex(
+      IndexDef(
+        s.indexName,
+        s.column,
         unique: s.unique,
         whereSql: s.whereSql,
         exprSql: s.exprSql,
         columns: s.columns.length > 1 ? s.columns : null,
-        collations: hasNonBinary ? s.collations : null));
+        collations: hasNonBinary ? s.collations : null,
+      ),
+    );
     // Drop any stale cached AST for this name (in case the same name was
     // previously used for a different predicate).
     _partialIndexAstCache.remove(s.indexName);
@@ -2973,8 +3095,11 @@ class Database {
   // INSERT / REPLACE
   // ---------------------------------------------------------------------------
   QueryResult _insert(InsertStmt s) {
-    final pushed = _pushCtes(s.ctes,
-        recursive: s.ctesRecursive, columnsOverride: s.cteColumns);
+    final pushed = _pushCtes(
+      s.ctes,
+      recursive: s.ctesRecursive,
+      columnsOverride: s.cteColumns,
+    );
     try {
       return _insertCore(s);
     } finally {
@@ -2997,7 +3122,7 @@ class Database {
     if (s.select != null) {
       final res = _selectTopLevel(s.select!);
       sourceRows = [
-        for (final row in res.rows) [for (final v in row) LiteralExpr(v)]
+        for (final row in res.rows) [for (final v in row) LiteralExpr(v)],
       ];
     } else {
       sourceRows = s.rows ?? const <List<Expr>>[];
@@ -3037,11 +3162,15 @@ class Database {
           // INSERT INTO t DEFAULT VALUES — leave row as defaults/NULLs.
         } else if (values.length != t.columns.length) {
           throw StateError(
-              'Expected ${t.columns.length} values, got ${values.length}');
+            'Expected ${t.columns.length} values, got ${values.length}',
+          );
         } else {
           for (var i = 0; i < values.length; i++) {
-            row[i] = coerceForColumn(_evalScalar(values[i]), t.columns[i],
-                strict: t.strict);
+            row[i] = coerceForColumn(
+              _evalScalar(values[i]),
+              t.columns[i],
+              strict: t.strict,
+            );
           }
         }
       } else {
@@ -3053,11 +3182,14 @@ class Database {
           // Generated columns cannot be assigned by an INSERT.
           if (t.columns[colIdx].generatedExprSql != null) {
             throw StateError(
-                'cannot INSERT into generated column "${t.columns[colIdx].name}"');
+              'cannot INSERT into generated column "${t.columns[colIdx].name}"',
+            );
           }
           row[colIdx] = coerceForColumn(
-              _evalScalar(values[i]), t.columns[colIdx],
-              strict: t.strict);
+            _evalScalar(values[i]),
+            t.columns[colIdx],
+            strict: t.strict,
+          );
         }
       }
       // AUTOINCREMENT
@@ -3092,7 +3224,10 @@ class Database {
         // for the rows it matches.
         if (s.onConflict != null) {
           final conflictIdx = _findUniqueConflictsForTarget(
-              t, row, s.onConflict!.targetColumns);
+            t,
+            row,
+            s.onConflict!.targetColumns,
+          );
           if (conflictIdx.isNotEmpty) {
             if (s.onConflict!.doNothing) {
               continue;
@@ -3104,8 +3239,9 @@ class Database {
             if (returningExprs.isNotEmpty) {
               for (final i in conflictIdx) {
                 final view = t.rowToMap(t.rows[i]);
-                returnedRows
-                    .add(returningExprs.map((e) => e.eval(view)).toList());
+                returnedRows.add(
+                  returningExprs.map((e) => e.eval(view)).toList(),
+                );
               }
             }
             continue;
@@ -3125,8 +3261,9 @@ class Database {
             inserted++;
             if (returningExprs.isNotEmpty) {
               final view = t.rowToMap(row);
-              returnedRows
-                  .add(returningExprs.map((e) => e.eval(view)).toList());
+              returnedRows.add(
+                returningExprs.map((e) => e.eval(view)).toList(),
+              );
             }
             continue;
           }
@@ -3136,7 +3273,10 @@ class Database {
     }
     if (s.returning != null) {
       return QueryResult(
-          columns: returningCols, rows: returnedRows, affected: inserted);
+        columns: returningCols,
+        rows: returnedRows,
+        affected: inserted,
+      );
     }
     return QueryResult.message('$inserted row(s) inserted', affected: inserted);
   }
@@ -3217,7 +3357,10 @@ class Database {
   /// Like [_findUniqueConflicts] but optionally restricted to a specific
   /// `ON CONFLICT (cols)` target. Empty [target] => any unique conflict.
   Set<int> _findUniqueConflictsForTarget(
-      Table t, List<Object?> newRow, List<String> target) {
+    Table t,
+    List<Object?> newRow,
+    List<String> target,
+  ) {
     if (target.isEmpty) return _findUniqueConflicts(t, newRow);
     final idxs = target.map(t.columnIndex).toList();
     final out = <int>{};
@@ -3244,7 +3387,11 @@ class Database {
   /// [rowIdx]. The proposed-insert row [excludedRow] is exposed as
   /// `excluded.col` references inside the assignment expressions.
   void _applyUpsertUpdate(
-      Table t, int rowIdx, List<Object?> excludedRow, OnConflictClause c) {
+    Table t,
+    int rowIdx,
+    List<Object?> excludedRow,
+    OnConflictClause c,
+  ) {
     // Build evaluation context with bare column names from the existing row
     // plus `excluded.col` from the proposed insert.
     final existing = t.rowToMap(t.rows[rowIdx]);
@@ -3261,17 +3408,32 @@ class Database {
     final newRow = List<Object?>.from(t.rows[rowIdx]);
     c.assignments.forEach((col, expr) {
       final ci = t.columnIndex(col);
-      newRow[ci] = coerceForColumn(_bindExpr(expr).eval(ctx), t.columns[ci],
-          strict: t.strict);
+      newRow[ci] = coerceForColumn(
+        _bindExpr(expr).eval(ctx),
+        t.columns[ci],
+        strict: t.strict,
+      );
     });
     _evaluateGenerated(t, newRow);
     _enforceChecks(t, newRow);
-    _fireTriggers(t.name, 'UPDATE', 'BEFORE',
-        newRow: newRow, oldRow: oldRow, sourceTable: t);
+    _fireTriggers(
+      t.name,
+      'UPDATE',
+      'BEFORE',
+      newRow: newRow,
+      oldRow: oldRow,
+      sourceTable: t,
+    );
     t.rows[rowIdx] = newRow;
     _rebuildIndexes(t);
-    _fireTriggers(t.name, 'UPDATE', 'AFTER',
-        newRow: newRow, oldRow: oldRow, sourceTable: t);
+    _fireTriggers(
+      t.name,
+      'UPDATE',
+      'AFTER',
+      newRow: newRow,
+      oldRow: oldRow,
+      sourceTable: t,
+    );
     _recordChange(t, 'UPDATE', oldRow, newRow);
   }
 
@@ -3279,8 +3441,11 @@ class Database {
   // UPDATE / DELETE
   // ---------------------------------------------------------------------------
   QueryResult _update(UpdateStmt s) {
-    final pushed = _pushCtes(s.ctes,
-        recursive: s.ctesRecursive, columnsOverride: s.cteColumns);
+    final pushed = _pushCtes(
+      s.ctes,
+      recursive: s.ctesRecursive,
+      columnsOverride: s.cteColumns,
+    );
     try {
       if (_views.containsKey(s.table) &&
           _triggersFor(s.table, 'UPDATE', 'INSTEAD OF').isNotEmpty) {
@@ -3312,7 +3477,8 @@ class Database {
       // INDEXED BY: resolve a candidate rowId set up-front. NOT INDEXED
       // and the absence of any hint both fall through to a full scan.
       final hintedRows = _resolveHintedRowIds(t, s.where, s.indexedBy);
-      final rowOrder = hintedRows ??
+      final rowOrder =
+          hintedRows ??
           List<int>.generate(t.rows.length, (i) => i, growable: false);
       final lim = s.limit == null
           ? -1
@@ -3351,24 +3517,39 @@ class Database {
           continue;
         }
         final old = List<Object?>.from(row);
-        _fireTriggers(t.name, 'UPDATE', 'BEFORE',
-            oldRow: old, newRow: row, sourceTable: t);
+        _fireTriggers(
+          t.name,
+          'UPDATE',
+          'BEFORE',
+          oldRow: old,
+          newRow: row,
+          sourceTable: t,
+        );
         s.assignments.forEach((col, expr) {
           final colIdx = t.columnIndex(col);
           if (t.columns[colIdx].generatedExprSql != null) {
             throw StateError(
-                'cannot UPDATE generated column "${t.columns[colIdx].name}"');
+              'cannot UPDATE generated column "${t.columns[colIdx].name}"',
+            );
           }
           row[colIdx] = coerceForColumn(
-              _evalScalar(expr, matchedView!), t.columns[colIdx],
-              strict: t.strict);
+            _evalScalar(expr, matchedView!),
+            t.columns[colIdx],
+            strict: t.strict,
+          );
         });
         _evaluateGenerated(t, row);
         _enforceChecks(t, row);
         _enforceForeignKeysOnInsert(t, row);
         _cascadeOnUpdate(t, old, row);
-        _fireTriggers(t.name, 'UPDATE', 'AFTER',
-            oldRow: old, newRow: row, sourceTable: t);
+        _fireTriggers(
+          t.name,
+          'UPDATE',
+          'AFTER',
+          oldRow: old,
+          newRow: row,
+          sourceTable: t,
+        );
         _recordChange(t, 'UPDATE', old, row);
         if (returningExprs.isNotEmpty) {
           final v2 = t.rowToMap(row);
@@ -3379,7 +3560,10 @@ class Database {
       if (count > 0) _rebuildIndexes(t);
       if (s.returning != null) {
         return QueryResult(
-            columns: returningCols, rows: returnedRows, affected: count);
+          columns: returningCols,
+          rows: returnedRows,
+          affected: count,
+        );
       }
       return QueryResult.message('$count row(s) updated', affected: count);
     } finally {
@@ -3388,8 +3572,11 @@ class Database {
   }
 
   QueryResult _delete(DeleteStmt s) {
-    final pushed = _pushCtes(s.ctes,
-        recursive: s.ctesRecursive, columnsOverride: s.cteColumns);
+    final pushed = _pushCtes(
+      s.ctes,
+      recursive: s.ctesRecursive,
+      columnsOverride: s.cteColumns,
+    );
     try {
       if (_views.containsKey(s.table) &&
           _triggersFor(s.table, 'DELETE', 'INSTEAD OF').isNotEmpty) {
@@ -3442,8 +3629,9 @@ class Database {
             deleted.add(row);
             toDelete.add(ri);
             if (returningExprs.isNotEmpty) {
-              returnedRows
-                  .add(returningExprs.map((e) => e.eval(view)).toList());
+              returnedRows.add(
+                returningExprs.map((e) => e.eval(view)).toList(),
+              );
             }
           }
         }
@@ -3458,8 +3646,9 @@ class Database {
           if (shouldDelete && admit()) {
             deleted.add(row);
             if (returningExprs.isNotEmpty) {
-              returnedRows
-                  .add(returningExprs.map((e) => e.eval(view)).toList());
+              returnedRows.add(
+                returningExprs.map((e) => e.eval(view)).toList(),
+              );
             }
           } else {
             keep.add(row);
@@ -3480,12 +3669,15 @@ class Database {
       }
       if (s.returning != null) {
         return QueryResult(
-            columns: returningCols,
-            rows: returnedRows,
-            affected: deleted.length);
+          columns: returningCols,
+          rows: returnedRows,
+          affected: deleted.length,
+        );
       }
-      return QueryResult.message('${deleted.length} row(s) deleted',
-          affected: deleted.length);
+      return QueryResult.message(
+        '${deleted.length} row(s) deleted',
+        affected: deleted.length,
+      );
     } finally {
       if (pushed) _cteStack.removeLast();
     }
@@ -3577,7 +3769,8 @@ class Database {
           : _primaryKeyColumns(parent);
       if (parentCols.length != values.length) {
         throw StateError(
-            'FK column arity mismatch (${values.length} -> ${parentCols.length})');
+          'FK column arity mismatch (${values.length} -> ${parentCols.length})',
+        );
       }
       var found = false;
       for (final r in parent.rows) {
@@ -3595,9 +3788,11 @@ class Database {
         }
       }
       if (!found) {
-        throw StateError('FOREIGN KEY constraint failed: '
-            '${child.name}.${fk.columns.join(",")} -> '
-            '${parent.name}.${parentCols.join(",")} = $values');
+        throw StateError(
+          'FOREIGN KEY constraint failed: '
+          '${child.name}.${fk.columns.join(",")} -> '
+          '${parent.name}.${parentCols.join(",")} = $values',
+        );
       }
     }
   }
@@ -3609,8 +3804,9 @@ class Database {
         final parentCols = fk.references.column != null
             ? [fk.references.column!]
             : _primaryKeyColumns(parent);
-        final parentValues =
-            parentCols.map((c) => parentRow[parent.columnIndex(c)]).toList();
+        final parentValues = parentCols
+            .map((c) => parentRow[parent.columnIndex(c)])
+            .toList();
         // Find matching child rows.
         final matchingChildren = <int>[];
         for (var i = 0; i < child.rows.length; i++) {
@@ -3651,15 +3847,20 @@ class Database {
           case 'NO ACTION':
           case 'RESTRICT':
           default:
-            throw StateError('FOREIGN KEY constraint failed: '
-                '${child.name} references ${parent.name}');
+            throw StateError(
+              'FOREIGN KEY constraint failed: '
+              '${child.name} references ${parent.name}',
+            );
         }
       }
     }
   }
 
   void _cascadeOnUpdate(
-      Table parent, List<Object?> oldRow, List<Object?> newRow) {
+    Table parent,
+    List<Object?> oldRow,
+    List<Object?> newRow,
+  ) {
     final pkCols = _primaryKeyColumns(parent);
     if (pkCols.isEmpty) return;
     final oldPk = pkCols.map((c) => oldRow[parent.columnIndex(c)]).toList();
@@ -3675,8 +3876,9 @@ class Database {
     for (final child in _tables.values) {
       for (final fk in _foreignKeysOf(child)) {
         if (fk.references.table != parent.name) continue;
-        final parentCols =
-            fk.references.column != null ? [fk.references.column!] : pkCols;
+        final parentCols = fk.references.column != null
+            ? [fk.references.column!]
+            : pkCols;
         if (parentCols.length != fk.columns.length) continue;
         for (var ri = 0; ri < child.rows.length; ri++) {
           final cr = child.rows[ri];
@@ -3703,8 +3905,10 @@ class Database {
             case 'NO ACTION':
             case 'RESTRICT':
             default:
-              throw StateError('FOREIGN KEY constraint failed on update: '
-                  '${child.name} references ${parent.name}');
+              throw StateError(
+                'FOREIGN KEY constraint failed on update: '
+                '${child.name} references ${parent.name}',
+              );
           }
         }
       }
@@ -3727,13 +3931,18 @@ class Database {
   // ---------------------------------------------------------------------------
   // SELECT (top-level entry — handles UNION chaining)
   // ---------------------------------------------------------------------------
-  QueryResult _selectTopLevel(SelectStmt s,
-      [Map<String, Object?> outer = const {}]) {
+  QueryResult _selectTopLevel(
+    SelectStmt s, [
+    Map<String, Object?> outer = const {},
+  ]) {
     if (s.cteMaterialized.isNotEmpty) {
       _lastCteHints = Map<String, bool>.from(s.cteMaterialized);
     }
-    final pushed = _pushCtes(s.ctes,
-        recursive: s.ctesRecursive, columnsOverride: s.cteColumns);
+    final pushed = _pushCtes(
+      s.ctes,
+      recursive: s.ctesRecursive,
+      columnsOverride: s.cteColumns,
+    );
     try {
       // Non-compound: nothing special.
       if (s.setOp == null) return _selectInner(s, outer);
@@ -3833,7 +4042,8 @@ class Database {
           if (i >= 0) return i;
         }
         throw StateError(
-            'Compound ORDER BY only supports projected columns or positions');
+          'Compound ORDER BY only supports projected columns or positions',
+        );
       }
 
       final keys = s.orderBy.map((ob) => (resolveIndex(ob.expr), ob)).toList();
@@ -3866,9 +4076,11 @@ class Database {
 
   /// Materialize each CTE eagerly and push the bindings on [_cteStack].
   /// Returns true iff a frame was pushed (caller must pop).
-  bool _pushCtes(Map<String, SelectStmt> ctes,
-      {bool recursive = false,
-      Map<String, List<String>> columnsOverride = const {}}) {
+  bool _pushCtes(
+    Map<String, SelectStmt> ctes, {
+    bool recursive = false,
+    Map<String, List<String>> columnsOverride = const {},
+  }) {
     if (ctes.isEmpty) return false;
     final frame = <String, _CteRel>{};
     _cteStack.add(frame);
@@ -3877,8 +4089,11 @@ class Database {
       final body = entry.value;
       _CteRel rel;
       if (recursive && _isRecursiveCte(entry.key, body)) {
-        rel =
-            _materializeRecursive(entry.key, body, columnsOverride[entry.key]);
+        rel = _materializeRecursive(
+          entry.key,
+          body,
+          columnsOverride[entry.key],
+        );
       } else {
         final res = _selectTopLevel(body);
         rel = _CteRel(res.columns, res.rows);
@@ -3923,7 +4138,10 @@ class Database {
   /// previous step. Stops when no new rows are produced or the safety cap
   /// is hit.
   _CteRel _materializeRecursive(
-      String name, SelectStmt body, List<String>? columnNames) {
+    String name,
+    SelectStmt body,
+    List<String>? columnNames,
+  ) {
     final op = body.setOp!; // 'UNION' or 'UNION ALL' typically
     // Anchor: same SelectStmt with setOp stripped.
     final anchor = SelectStmt(
@@ -3943,8 +4161,8 @@ class Database {
     final anchorRes = _selectTopLevel(anchor);
     final cols =
         (columnNames != null && columnNames.length == anchorRes.columns.length)
-            ? List<String>.from(columnNames)
-            : anchorRes.columns;
+        ? List<String>.from(columnNames)
+        : anchorRes.columns;
     final all = <List<Object?>>[...anchorRes.rows];
     final seen = <String>{for (final r in all) jsonEncode(r)};
     var queue = <List<Object?>>[...anchorRes.rows];
@@ -4010,7 +4228,10 @@ class Database {
           if (seen.add(key(r))) out.add(r);
         }
         return QueryResult(
-            columns: left.columns, rows: out, affected: out.length);
+          columns: left.columns,
+          rows: out,
+          affected: out.length,
+        );
       case 'INTERSECT':
         final rk = right.rows.map(key).toSet();
         final out = <List<Object?>>[];
@@ -4019,7 +4240,10 @@ class Database {
           if (rk.contains(key(r)) && seen.add(key(r))) out.add(r);
         }
         return QueryResult(
-            columns: left.columns, rows: out, affected: out.length);
+          columns: left.columns,
+          rows: out,
+          affected: out.length,
+        );
       case 'EXCEPT':
         final rk = right.rows.map(key).toSet();
         final out = <List<Object?>>[];
@@ -4028,14 +4252,19 @@ class Database {
           if (!rk.contains(key(r)) && seen.add(key(r))) out.add(r);
         }
         return QueryResult(
-            columns: left.columns, rows: out, affected: out.length);
+          columns: left.columns,
+          rows: out,
+          affected: out.length,
+        );
     }
     throw StateError('Unknown set op: $op');
   }
 
   // ---- Single SELECT (no set-op) -----------------------------------------
-  QueryResult _selectInner(SelectStmt s,
-      [Map<String, Object?> outer = const {}]) {
+  QueryResult _selectInner(
+    SelectStmt s, [
+    Map<String, Object?> outer = const {},
+  ]) {
     // GROUPING SETS / ROLLUP / CUBE: run aggregation once per set,
     // blank out any projection that uses a grouping-key NOT in the
     // current set, and concatenate.
@@ -4148,8 +4377,10 @@ class Database {
     return combined;
   }
 
-  QueryResult _selectInnerCore(SelectStmt s,
-      [Map<String, Object?> outer = const {}]) {
+  QueryResult _selectInnerCore(
+    SelectStmt s, [
+    Map<String, Object?> outer = const {},
+  ]) {
     _planTrace = const [];
     _planScanOrderedAsc = const [];
     _planScanEqualityCols = const {};
@@ -4209,7 +4440,8 @@ class Database {
     }
 
     // Detect aggregates anywhere in projection or HAVING.
-    final hasAggregates = s.groupBy.isNotEmpty ||
+    final hasAggregates =
+        s.groupBy.isNotEmpty ||
         _containsAggregate(s.having) ||
         s.projection.any((p) => p.expr != null && _containsAggregate(p.expr));
 
@@ -4293,7 +4525,9 @@ class Database {
         resultRows = resultRows.reversed.toList();
       } else {
         final paired = List.generate(
-            resultRows.length, (i) => _Pair(orderingMaps[i], resultRows[i]));
+          resultRows.length,
+          (i) => _Pair(orderingMaps[i], resultRows[i]),
+        );
         paired.sort((a, b) {
           for (final ob in s.orderBy) {
             // ORDER BY <integer literal> => 1-based projected column position.
@@ -4379,7 +4613,10 @@ class Database {
     resultRows = resultRows.sublist(start, end);
 
     return QueryResult(
-        columns: outCols, rows: resultRows, affected: resultRows.length);
+      columns: outCols,
+      rows: resultRows,
+      affected: resultRows.length,
+    );
   }
 
   // Build initial row maps from FROM table (real or view) and JOINs.
@@ -4458,8 +4695,9 @@ class Database {
       } else {
         final tt = _tables[tname];
         if (tt == null) return null;
-        final ci = tt.columns
-            .indexWhere((c) => c.name.toLowerCase() == arg.name.toLowerCase());
+        final ci = tt.columns.indexWhere(
+          (c) => c.name.toLowerCase() == arg.name.toLowerCase(),
+        );
         if (ci < 0) return null;
         final col = tt.columns[ci];
         if (!(col.notNull || col.primaryKey)) return null;
@@ -4648,7 +4886,9 @@ class Database {
   /// index on [t]. Returns the (def, treeMap) pair or null when no
   /// such index exists.
   (IndexDef, SplayTreeMap<Object, List<int>>)? _resolveSingleColIndex(
-      Table t, String colName) {
+    Table t,
+    String colName,
+  ) {
     final idx = _findIndexForColumn(t, colName);
     if (idx == null) return null;
     if (idx.columns.length != 1) return null;
@@ -4668,7 +4908,9 @@ class Database {
   /// and a flag indicating composite. Used by GROUP BY / DISTINCT
   /// fast paths that bucket adjacent entries by `parts[0]`.
   (IndexDef, SplayTreeMap<Object, List<int>>, bool)? _resolveLeadingColIndex(
-      Table t, String colName) {
+    Table t,
+    String colName,
+  ) {
     final single = _resolveSingleColIndex(t, colName);
     if (single != null) return (single.$1, single.$2, false);
     final idx = _findIndexForColumn(t, colName);
@@ -4691,7 +4933,7 @@ class Database {
   /// the bound is inclusive. Returns null on any other shape or NULL
   /// literal.
   ({String col, Object value, bool isLower, bool inclusive})?
-      _extractRangeBound(BinaryExpr e) {
+  _extractRangeBound(BinaryExpr e) {
     var op = e.op;
     ColumnExpr? col;
     LiteralExpr? lit;
@@ -4722,28 +4964,28 @@ class Database {
           col: col.name,
           value: lit.value!,
           isLower: true,
-          inclusive: false
+          inclusive: false,
         );
       case '>=':
         return (
           col: col.name,
           value: lit.value!,
           isLower: true,
-          inclusive: true
+          inclusive: true,
         );
       case '<':
         return (
           col: col.name,
           value: lit.value!,
           isLower: false,
-          inclusive: false
+          inclusive: false,
         );
       case '<=':
         return (
           col: col.name,
           value: lit.value!,
           isLower: false,
-          inclusive: true
+          inclusive: true,
         );
     }
     return null;
@@ -4752,8 +4994,13 @@ class Database {
   /// Sum posting-list lengths for every key in [m] within
   /// `[loK, hiK]` (or open variants). Walks the SplayTreeMap in
   /// sorted order; O(matching keys + matching rows).
-  int _countRange(SplayTreeMap<Object, List<int>> m, Object loK, bool loInc,
-      Object hiK, bool hiInc) {
+  int _countRange(
+    SplayTreeMap<Object, List<int>> m,
+    Object loK,
+    bool loInc,
+    Object hiK,
+    bool hiInc,
+  ) {
     var n = 0;
     for (final entry in m.entries) {
       final cLo = sqlCompare(entry.key, loK);
@@ -4906,8 +5153,10 @@ class Database {
           value = raw;
         }
       }
-      cols.add(p.alias ??
-          '${name.toLowerCase()}(${dist ? "DISTINCT " : ""}${arg.name})');
+      cols.add(
+        p.alias ??
+            '${name.toLowerCase()}(${dist ? "DISTINCT " : ""}${arg.name})',
+      );
       values.add(value);
     }
     var rows = <List<Object?>>[values];
@@ -5155,10 +5404,11 @@ class Database {
         value = cnt == 0 ? 0.0 : sumAcc.toDouble();
     }
 
-    final col = p.alias ??
+    final col =
+        p.alias ??
         '${name.toLowerCase()}(${isDistinct ? "DISTINCT " : ""}${arg.name})';
     var rows = <List<Object?>>[
-      [value]
+      [value],
     ];
     if (s.limit != null && s.limit! <= 0) rows = const <List<Object?>>[];
     if ((s.offset ?? 0) >= 1) rows = const <List<Object?>>[];
@@ -5303,8 +5553,9 @@ class Database {
               (where.right is ColumnExpr && where.left is LiteralExpr))) {
         final col =
             (where.left is ColumnExpr ? where.left : where.right) as ColumnExpr;
-        final lit = (where.left is LiteralExpr ? where.left : where.right)
-            as LiteralExpr;
+        final lit =
+            (where.left is LiteralExpr ? where.left : where.right)
+                as LiteralExpr;
         if (col.name.toLowerCase() != geNameLower) return null;
         if (lit.value == null) {
           whereEmpty = true;
@@ -5504,7 +5755,9 @@ class Database {
   /// HAVING clause. Returns `null` if any sub-shape is unsupported, in
   /// which case the caller bails to the generic group-by path.
   bool Function(Object key, int cnt)? _buildGroupByHavingPred(
-      Expr h, String geNameLower) {
+    Expr h,
+    String geNameLower,
+  ) {
     // <term> resolves to either `key` or `cnt`. null → unsupported.
     Object? Function(Object key, int cnt)? termOf(Expr e) {
       if (e is ColumnExpr) {
@@ -5732,8 +5985,9 @@ class Database {
       return true;
     }
 
-    Iterable<Object> keysIter =
-        descending ? indexMap.keys.toList().reversed : indexMap.keys;
+    Iterable<Object> keysIter = descending
+        ? indexMap.keys.toList().reversed
+        : indexMap.keys;
     for (final raw in keysIter) {
       final tuple = <Object?>[];
       if (isComposite) {
@@ -5765,8 +6019,12 @@ class Database {
 
   /// Empty-input aggregate result for the `_tryAggregateWithWhereFast`
   /// path. Mirrors SQLite: COUNT/TOTAL are 0/0.0, everything else NULL.
-  QueryResult _emitEmptyAggregate(String name, SelectItem p, String argName,
-      {bool distinct = false}) {
+  QueryResult _emitEmptyAggregate(
+    String name,
+    SelectItem p,
+    String argName, {
+    bool distinct = false,
+  }) {
     Object? value;
     switch (name) {
       case 'COUNT':
@@ -5776,13 +6034,16 @@ class Database {
       default:
         value = null;
     }
-    final col = p.alias ??
+    final col =
+        p.alias ??
         '${name.toLowerCase()}(${distinct ? "DISTINCT " : ""}$argName)';
-    return QueryResult(columns: [
-      col
-    ], rows: [
-      [value]
-    ], affected: 1);
+    return QueryResult(
+      columns: [col],
+      rows: [
+        [value],
+      ],
+      affected: 1,
+    );
   }
 
   /// Index-only / covering-scan fast path.
@@ -6044,19 +6305,23 @@ class Database {
 
     // Build relation slots: id 0 is the FROM, then each join.
     final slots = <_JoinSlot>[];
-    slots.add(_JoinSlot(
-      tableName: s.fromTable!,
-      alias: s.fromAlias,
-      on: null,
-      rowCount: _tableRowCountEstimate(s.fromTable!),
-    ));
+    slots.add(
+      _JoinSlot(
+        tableName: s.fromTable!,
+        alias: s.fromAlias,
+        on: null,
+        rowCount: _tableRowCountEstimate(s.fromTable!),
+      ),
+    );
     for (final j in s.joins) {
-      slots.add(_JoinSlot(
-        tableName: j.table!,
-        alias: j.alias,
-        on: j.on,
-        rowCount: _tableRowCountEstimate(j.table!),
-      ));
+      slots.add(
+        _JoinSlot(
+          tableName: j.table!,
+          alias: j.alias,
+          on: j.on,
+          rowCount: _tableRowCountEstimate(j.table!),
+        ),
+      );
     }
     // Compute provided column-keys for each slot. We over-approximate by
     // using both the bare column name and the qualified `alias.column`
@@ -6075,8 +6340,9 @@ class Database {
     // include any slot whose `provides` contains those keys.
     for (final p in pending) {
       for (var i = 0; i < slots.length; i++) {
-        if (p.requiredKeys
-            .any((k) => slots[i].provides.contains(k.toLowerCase()))) {
+        if (p.requiredKeys.any(
+          (k) => slots[i].provides.contains(k.toLowerCase()),
+        )) {
           p.requiredSlots.add(i);
         }
       }
@@ -6170,8 +6436,9 @@ class Database {
           if (pos > latest) latest = pos;
         }
         if (order[latest] != id) continue;
-        mergedOn =
-            mergedOn == null ? p.expr : BinaryExpr('AND', mergedOn, p.expr);
+        mergedOn = mergedOn == null
+            ? p.expr
+            : BinaryExpr('AND', mergedOn, p.expr);
       }
       newJoins.add(JoinClause('INNER', slot.tableName, slot.alias, mergedOn));
     }
@@ -6248,9 +6515,11 @@ class Database {
     final out = <String>{};
     void walk(Expr x) {
       if (x is ColumnExpr) {
-        out.add(x.table == null
-            ? x.name.toLowerCase()
-            : '${x.table!.toLowerCase()}.${x.name.toLowerCase()}');
+        out.add(
+          x.table == null
+              ? x.name.toLowerCase()
+              : '${x.table!.toLowerCase()}.${x.name.toLowerCase()}',
+        );
         return;
       }
       if (x is UnaryExpr) {
@@ -6296,7 +6565,9 @@ class Database {
   /// caller, so this is always semantically safe — at worst we miss an
   /// optimisation and fall back to scanning everything.
   List<Map<String, Object?>>? _planScan(
-      SelectStmt s, Map<String, Object?> outer) {
+    SelectStmt s,
+    Map<String, Object?> outer,
+  ) {
     if (s.fromTable == null) return null;
     if (s.joins.isNotEmpty) return null;
     if (s.fromFunction != null || s.fromSubquery != null) return null;
@@ -6341,11 +6612,13 @@ class Database {
       // If no plan can use the named index, raise like SQLite does.
       if (hint != null && hint.indexName != null) {
         final wanted = hint.indexName!.toLowerCase();
-        final usable =
-            candidates.where((p) => p.index.toLowerCase() == wanted).toList();
+        final usable = candidates
+            .where((p) => p.index.toLowerCase() == wanted)
+            .toList();
         if (usable.isEmpty) {
           throw FormatException(
-              'no query solution for INDEXED BY ${hint.indexName} on ${t.name}');
+            'no query solution for INDEXED BY ${hint.indexName} on ${t.name}',
+          );
         }
         usable.sort((a, b) {
           final c = a.estHits.compareTo(b.estHits);
@@ -6405,14 +6678,16 @@ class Database {
     if (hint.indexName == null) return null;
     final wanted = hint.indexName!.toLowerCase();
     // Validate the index name exists on this table at all.
-    final indexExists =
-        t.indexDefs.values.any((ix) => ix.name.toLowerCase() == wanted);
+    final indexExists = t.indexDefs.values.any(
+      (ix) => ix.name.toLowerCase() == wanted,
+    );
     if (!indexExists) {
       throw FormatException('no such index: ${hint.indexName} on ${t.name}');
     }
     if (where == null) {
       throw FormatException(
-          'no query solution for INDEXED BY ${hint.indexName} on ${t.name}');
+        'no query solution for INDEXED BY ${hint.indexName} on ${t.name}',
+      );
     }
     final conjuncts = [
       for (final c in _splitAndConjuncts(where)) _orChainToIn(c),
@@ -6427,11 +6702,13 @@ class Database {
       }
       candidates.addAll(_classifyMultiColumnPlans(t, conjuncts));
       candidates.addAll(_classifyExpressionIndexPlans(t, conjuncts));
-      final usable =
-          candidates.where((p) => p.index.toLowerCase() == wanted).toList();
+      final usable = candidates
+          .where((p) => p.index.toLowerCase() == wanted)
+          .toList();
       if (usable.isEmpty) {
         throw FormatException(
-            'no query solution for INDEXED BY ${hint.indexName} on ${t.name}');
+          'no query solution for INDEXED BY ${hint.indexName} on ${t.name}',
+        );
       }
       usable.sort((a, b) => a.estHits.compareTo(b.estHits));
       final best = usable.first;
@@ -6449,7 +6726,11 @@ class Database {
   /// re-evaluation of the original WHERE is left to the caller, so it's
   /// safe to be conservative: unrecognised shapes just fall through.
   List<Map<String, Object?>>? _planRtreeScan(
-      Table t, List<Expr> conjuncts, SelectStmt s, Map<String, Object?> outer) {
+    Table t,
+    List<Expr> conjuncts,
+    SelectStmt s,
+    Map<String, Object?> outer,
+  ) {
     final dims = (t.columns.length - 1) ~/ 2;
     if (dims <= 0) return null;
     // Lower/upper bounds of the query bbox per axis; default to ±∞.
@@ -6617,9 +6898,10 @@ class Database {
         final (col, key, flipped) = _columnLiteralPair(c);
         if (col == null || key == null) continue;
         final effective = flipped ? _flipComparison(op) : op;
-        rangesByCol
-            .putIfAbsent(col.toLowerCase(), () => [])
-            .add((op: effective, value: key));
+        rangesByCol.putIfAbsent(col.toLowerCase(), () => []).add((
+          op: effective,
+          value: key,
+        ));
       }
     }
     if (eqByCol.isEmpty && rangesByCol.isEmpty) return out;
@@ -6644,13 +6926,15 @@ class Database {
       final est = (perCol / divisor).ceil().clamp(1, t.rows.length);
       if (parts.length == def.columns.length) {
         // Full key probe — single composite key into the SplayTreeMap.
-        out.add(_IndexPlan.equality(
-          table: t.name,
-          index: def.name,
-          column: def.columns.join(','),
-          equalityKey: CompositeIndexKey(parts),
-          estHits: est,
-        ));
+        out.add(
+          _IndexPlan.equality(
+            table: t.name,
+            index: def.name,
+            column: def.columns.join(','),
+            equalityKey: CompositeIndexKey(parts),
+            estHits: est,
+          ),
+        );
         continue;
       }
       // Prefix is short by 1+ columns. If we have range predicates on
@@ -6698,25 +6982,29 @@ class Database {
       if (lo != null || hi != null) {
         // Range halves the prefix estimate as a coarse selectivity hint.
         final rangedEst = (est / 2).ceil().clamp(1, t.rows.length);
-        out.add(_IndexPlan.prefixRange(
-          table: t.name,
-          index: def.name,
-          column: def.columns.take(parts.length + 1).join(','),
-          prefixKey: parts,
-          lo: lo,
-          hi: hi,
-          loInclusive: loInc,
-          hiInclusive: hiInc,
-          estHits: rangedEst,
-        ));
+        out.add(
+          _IndexPlan.prefixRange(
+            table: t.name,
+            index: def.name,
+            column: def.columns.take(parts.length + 1).join(','),
+            prefixKey: parts,
+            lo: lo,
+            hi: hi,
+            loInclusive: loInc,
+            hiInclusive: hiInc,
+            estHits: rangedEst,
+          ),
+        );
       } else {
-        out.add(_IndexPlan.prefix(
-          table: t.name,
-          index: def.name,
-          column: def.columns.take(parts.length).join(','),
-          prefixKey: parts,
-          estHits: est,
-        ));
+        out.add(
+          _IndexPlan.prefix(
+            table: t.name,
+            index: def.name,
+            column: def.columns.take(parts.length).join(','),
+            prefixKey: parts,
+            estHits: est,
+          ),
+        );
       }
     }
     return out;
@@ -6730,14 +7018,17 @@ class Database {
   /// [conjuncts] for `<expr> = <literal>` (or the literal-on-left form)
   /// where `<expr>` structurally matches one of [t]'s expression indexes.
   List<_IndexPlan> _classifyExpressionIndexPlans(
-      Table t, List<Expr> conjuncts) {
+    Table t,
+    List<Expr> conjuncts,
+  ) {
     final out = <_IndexPlan>[];
     for (final def in t.indexDefs.values) {
       if (def.exprSql == null) continue;
       if (!_partialIndexUsable(def)) continue;
       final ast = _exprIndexAstCache.putIfAbsent(def.name, () {
-        final stmt = Parser.fromString('SELECT ${def.exprSql}').parseStatement()
-            as SelectStmt;
+        final stmt =
+            Parser.fromString('SELECT ${def.exprSql}').parseStatement()
+                as SelectStmt;
         return stmt.projection.first.expr!;
       });
       for (final c in conjuncts) {
@@ -6751,13 +7042,15 @@ class Database {
         if (other == null) continue;
         final key = _evalConst(other);
         if (key == null) continue;
-        out.add(_IndexPlan.equality(
-          table: t.name,
-          index: def.name,
-          column: def.exprSql!,
-          equalityKey: key,
-          estHits: _estimateEqualityHits(t, def.column),
-        ));
+        out.add(
+          _IndexPlan.equality(
+            table: t.name,
+            index: def.name,
+            column: def.exprSql!,
+            equalityKey: key,
+            estHits: _estimateEqualityHits(t, def.column),
+          ),
+        );
       }
     }
     return out;
@@ -6795,44 +7088,48 @@ class Database {
         switch (effOp) {
           case '<':
             return _IndexPlan.range(
-                table: t.name,
-                index: idx.name,
-                column: col,
-                lo: null,
-                hi: key,
-                loInclusive: false,
-                hiInclusive: false,
-                estHits: estHits);
+              table: t.name,
+              index: idx.name,
+              column: col,
+              lo: null,
+              hi: key,
+              loInclusive: false,
+              hiInclusive: false,
+              estHits: estHits,
+            );
           case '<=':
             return _IndexPlan.range(
-                table: t.name,
-                index: idx.name,
-                column: col,
-                lo: null,
-                hi: key,
-                loInclusive: false,
-                hiInclusive: true,
-                estHits: estHits);
+              table: t.name,
+              index: idx.name,
+              column: col,
+              lo: null,
+              hi: key,
+              loInclusive: false,
+              hiInclusive: true,
+              estHits: estHits,
+            );
           case '>':
             return _IndexPlan.range(
-                table: t.name,
-                index: idx.name,
-                column: col,
-                lo: key,
-                hi: null,
-                loInclusive: false,
-                hiInclusive: false,
-                estHits: estHits);
+              table: t.name,
+              index: idx.name,
+              column: col,
+              lo: key,
+              hi: null,
+              loInclusive: false,
+              hiInclusive: false,
+              estHits: estHits,
+            );
           case '>=':
             return _IndexPlan.range(
-                table: t.name,
-                index: idx.name,
-                column: col,
-                lo: key,
-                hi: null,
-                loInclusive: true,
-                hiInclusive: false,
-                estHits: estHits);
+              table: t.name,
+              index: idx.name,
+              column: col,
+              lo: key,
+              hi: null,
+              loInclusive: true,
+              hiInclusive: false,
+              estHits: estHits,
+            );
         }
       }
     }
@@ -6847,14 +7144,15 @@ class Database {
       final hi = _evalConst(conjunct.high);
       if (lo == null || hi == null) return null;
       return _IndexPlan.range(
-          table: t.name,
-          index: idx.name,
-          column: col,
-          lo: lo,
-          hi: hi,
-          loInclusive: true,
-          hiInclusive: true,
-          estHits: _estimateRangeHits(t));
+        table: t.name,
+        index: idx.name,
+        column: col,
+        lo: lo,
+        hi: hi,
+        loInclusive: true,
+        hiInclusive: true,
+        estHits: _estimateRangeHits(t),
+      );
     }
     // IN (literal-list): probe each key. Cost = perKey * list length, but
     // bounded by the table size (and crucially, lower bound 1 so a tiny
@@ -6899,7 +7197,8 @@ class Database {
       // lower-cased keys; the pattern's case would have to be normalised
       // first, but since LIKE is already case-sensitive here a NOCASE
       // index can never be used safely for LIKE prefix.
-      final isNocase = idx.collations.isNotEmpty &&
+      final isNocase =
+          idx.collations.isNotEmpty &&
           idx.collations[0].toUpperCase() == 'NOCASE';
       if (isNocase) return null;
       final pat = _evalConst(conjunct.right);
@@ -6909,14 +7208,15 @@ class Database {
       // Build the half-open range [prefix, succ(prefix)).
       final hi = _stringSuccessor(prefix);
       return _IndexPlan.range(
-          table: t.name,
-          index: idx.name,
-          column: col,
-          lo: prefix,
-          hi: hi,
-          loInclusive: true,
-          hiInclusive: false,
-          estHits: _estimateRangeHits(t));
+        table: t.name,
+        index: idx.name,
+        column: col,
+        lo: prefix,
+        hi: hi,
+        loInclusive: true,
+        hiInclusive: false,
+        estHits: _estimateRangeHits(t),
+      );
     }
     return null;
   }
@@ -6963,12 +7263,12 @@ class Database {
   Object? _evalConst(Expr e) => e.eval(const {});
 
   String _flipComparison(String op) => switch (op) {
-        '<' => '>',
-        '<=' => '>=',
-        '>' => '<',
-        '>=' => '<=',
-        _ => op,
-      };
+    '<' => '>',
+    '<=' => '>=',
+    '>' => '<',
+    '>=' => '<=',
+    _ => op,
+  };
 
   IndexDef? _findIndexForColumn(Table t, String column) {
     final lc = column.toLowerCase();
@@ -7037,7 +7337,7 @@ class Database {
       final prefixRaw = plan.prefixKey!;
       final prefix = <Object?>[
         for (var i = 0; i < prefixRaw.length; i++)
-          def == null ? prefixRaw[i] : def.collate(i, prefixRaw[i])
+          def == null ? prefixRaw[i] : def.collate(i, prefixRaw[i]),
       ];
       final hasRange = plan.lo != null || plan.hi != null;
       final rangeColPos = prefix.length;
@@ -7134,7 +7434,7 @@ class Database {
       final pLen = plan.prefixKey!.length;
       _planScanOrderedAsc = List<String>.unmodifiable(cols);
       _planScanEqualityCols = {
-        for (var i = 0; i < pLen && i < cols.length; i++) cols[i].toLowerCase()
+        for (var i = 0; i < pLen && i < cols.length; i++) cols[i].toLowerCase(),
       };
       return;
     }
@@ -7211,8 +7511,10 @@ class Database {
     return direction ?? 1;
   }
 
-  List<Map<String, Object?>> _resolveFromRows(SelectStmt s,
-      [Map<String, Object?> outer = const {}]) {
+  List<Map<String, Object?>> _resolveFromRows(
+    SelectStmt s, [
+    Map<String, Object?> outer = const {},
+  ]) {
     if (s.fromTable == null &&
         s.fromSubquery == null &&
         s.fromFunction == null) {
@@ -7258,7 +7560,8 @@ class Database {
       // tuple of those right-side keys and probe per left row instead of
       // doing a full nested loop.
       final rightAlias = (j.alias ?? j.table)?.toLowerCase();
-      final hashPlan = (j.type == 'INNER' || j.type == 'LEFT') &&
+      final hashPlan =
+          (j.type == 'INNER' || j.type == 'LEFT') &&
               boundOn != null &&
               rightAlias != null
           ? _tryEquiHashPlan(boundOn, rightAlias)
@@ -7382,7 +7685,9 @@ class Database {
   /// Approximate the unqualified column list of the current working set.
   /// Used by NATURAL JOIN to discover common columns.
   List<String> _columnsOfWorking(
-      List<Map<String, Object?>> working, SelectStmt s) {
+    List<Map<String, Object?>> working,
+    SelectStmt s,
+  ) {
     if (working.isEmpty) {
       // Fall back to the FROM source's columns.
       if (s.fromTable != null) return _materializeColumns(s.fromTable!);
@@ -7488,7 +7793,10 @@ class Database {
     Expr? out;
     for (final c in cols) {
       final eq = BinaryExpr(
-          '=', ColumnExpr(c, table: leftQ), ColumnExpr(c, table: rightQ));
+        '=',
+        ColumnExpr(c, table: leftQ),
+        ColumnExpr(c, table: rightQ),
+      );
       out = out == null ? eq : BinaryExpr('AND', out, eq);
     }
     return out;
@@ -7497,7 +7805,10 @@ class Database {
   /// Materialize a derived-table subquery into row maps (with bare and
   /// aliased keys).
   List<Map<String, Object?>> _materializeSubquery(
-      SelectStmt s, String? alias, Map<String, Object?> outer) {
+    SelectStmt s,
+    String? alias,
+    Map<String, Object?> outer,
+  ) {
     final res = _selectTopLevel(s, outer);
     final out = <Map<String, Object?>>[];
     for (final row in res.rows) {
@@ -7533,8 +7844,11 @@ class Database {
   /// row maps with bare and qualified keys. Each row is merged with the
   /// optional [outer] scope so correlated subqueries can resolve outer
   /// column references.
-  List<Map<String, Object?>> _materializeRelation(String name, String? alias,
-      [Map<String, Object?> outer = const {}]) {
+  List<Map<String, Object?>> _materializeRelation(
+    String name,
+    String? alias, [
+    Map<String, Object?> outer = const {},
+  ]) {
     // SQLite schema introspection: sqlite_master / sqlite_schema /
     // sqlite_temp_master. We synthesise rows from the in-memory schema.
     final lower = name.toLowerCase();
@@ -7578,7 +7892,7 @@ class Database {
         return out;
       }
       return [
-        for (final r in t.rows) {...outer, ...t.rowToMap(r, alias: alias)}
+        for (final r in t.rows) {...outer, ...t.rowToMap(r, alias: alias)},
       ];
     }
     if (_views.containsKey(name)) {
@@ -7602,7 +7916,10 @@ class Database {
   /// `sqlite_schema`. One row per base table, view, and named index;
   /// columns: type, name, tbl_name, rootpage (always 0), sql.
   List<Map<String, Object?>> _sqliteMasterRows(
-      String name, String? alias, Map<String, Object?> outer) {
+    String name,
+    String? alias,
+    Map<String, Object?> outer,
+  ) {
     final rows = <Map<String, Object?>>[];
     void emit(String type, String objName, String tblName, String? sql) {
       final base = <String, Object?>{
@@ -7661,7 +7978,10 @@ class Database {
   /// per-statement bytecode cache, so this is always empty but presents
   /// the right column shape so SELECTs against it succeed.
   List<Map<String, Object?>> _sqliteStmtRows(
-      String name, String? alias, Map<String, Object?> outer) {
+    String name,
+    String? alias,
+    Map<String, Object?> outer,
+  ) {
     const cols = <String>[
       'sql',
       'ncol',
@@ -7690,7 +8010,10 @@ class Database {
   /// numbers 1..page_count with NULL data, so SELECT count(*) and
   /// SELECT pgno work but raw page bytes are not surfaced.
   List<Map<String, Object?>> _sqliteDbpageRows(
-      String name, String? alias, Map<String, Object?> outer) {
+    String name,
+    String? alias,
+    Map<String, Object?> outer,
+  ) {
     final pageCount = (_pragmas['page_count'] as num?)?.toInt() ?? 0;
     final qual = alias ?? name;
     final out = <Map<String, Object?>>[];
@@ -7711,7 +8034,9 @@ class Database {
   /// a relation. Result column names follow SQLite conventions: each
   /// supported function exposes a fixed schema.
   List<Map<String, Object?>> _materializeTableFunction(
-      FunctionCallExpr fn, String? alias) {
+    FunctionCallExpr fn,
+    String? alias,
+  ) {
     final upper = fn.name.toUpperCase();
     final args = fn.args.map((e) => _bindExpr(e).eval(const {})).toList();
     final qual = alias ?? fn.name.toLowerCase();
@@ -7734,17 +8059,21 @@ class Database {
         throw StateError('Unknown table-valued function: ${fn.name}');
     }
     return rows
-        .map((r) => <String, Object?>{
-              ...r,
-              for (final e in r.entries) '$qual.${e.key}': e.value,
-            })
+        .map(
+          (r) => <String, Object?>{
+            ...r,
+            for (final e in r.entries) '$qual.${e.key}': e.value,
+          },
+        )
         .toList();
   }
 
   /// Synthesise rows for `pragma_table_info('t')` style table-valued
   /// PRAGMA wrappers by reusing [_pragma]'s introspection logic.
   List<Map<String, Object?>> _pragmaTableFunctionRows(
-      String upper, List<Object?> args) {
+    String upper,
+    List<Object?> args,
+  ) {
     final pragmaName = upper.substring('PRAGMA_'.length).toLowerCase();
     final value = args.isNotEmpty ? args[0]?.toString() : null;
     final result = _pragma(PragmaStmt(pragmaName, value));
@@ -7753,7 +8082,7 @@ class Database {
         <String, Object?>{
           for (var i = 0; i < result.columns.length; i++)
             result.columns[i]: i < row.length ? row[i] : null,
-        }
+        },
     ];
   }
 
@@ -7764,10 +8093,12 @@ class Database {
   List<Map<String, Object?>> _generateSeriesRows(List<Object?> args) {
     if (args.isEmpty || args[0] == null) return const [];
     final start = (args[0] as num).toInt();
-    final stop =
-        args.length >= 2 && args[1] != null ? (args[1] as num).toInt() : start;
-    final step =
-        args.length >= 3 && args[2] != null ? (args[2] as num).toInt() : 1;
+    final stop = args.length >= 2 && args[1] != null
+        ? (args[1] as num).toInt()
+        : start;
+    final step = args.length >= 3 && args[2] != null
+        ? (args[2] as num).toInt()
+        : 1;
     if (step == 0) return const [];
     final out = <Map<String, Object?>>[];
     if (step > 0) {
@@ -7785,8 +8116,10 @@ class Database {
   /// Implementation of `json_each` / `json_tree`. Returns rows with the
   /// SQLite-standard columns `key, value, type, atom, id, parent, fullkey,
   /// path`. [recursive] = true visits descendants too (json_tree).
-  List<Map<String, Object?>> _jsonEachRows(List<Object?> args,
-      {required bool recursive}) {
+  List<Map<String, Object?>> _jsonEachRows(
+    List<Object?> args, {
+    required bool recursive,
+  }) {
     if (args.isEmpty || args[0] == null) return const [];
     Object? root;
     try {
@@ -7800,13 +8133,20 @@ class Database {
     final out = <Map<String, Object?>>[];
     var nextId = 0;
     void emit(
-        Object? key, Object? value, int? parent, String fullkey, String path) {
+      Object? key,
+      Object? value,
+      int? parent,
+      String fullkey,
+      String path,
+    ) {
       final id = nextId++;
       final type = _jsonTypeName(value);
-      final atom =
-          (value is num || value is bool || value is String) ? value : null;
-      final outVal =
-          (value is List || value is Map) ? jsonEncode(value) : value;
+      final atom = (value is num || value is bool || value is String)
+          ? value
+          : null;
+      final outVal = (value is List || value is Map)
+          ? jsonEncode(value)
+          : value;
       out.add({
         'key': key,
         'value': outVal,
@@ -7898,7 +8238,8 @@ class Database {
           for (final c in tCols) {
             outCols.add(c);
             exprs.add(
-                _bindExpr(ColumnExpr(c, table: s.fromAlias ?? s.fromTable!)));
+              _bindExpr(ColumnExpr(c, table: s.fromAlias ?? s.fromTable!)),
+            );
           }
           for (final j in s.joins) {
             final List<String> src;
@@ -7927,8 +8268,11 @@ class Database {
           final qual = s.fromAlias ?? '';
           for (final c in src) {
             outCols.add(c);
-            exprs.add(_bindExpr(
-                qual.isEmpty ? ColumnExpr(c) : ColumnExpr(c, table: qual)));
+            exprs.add(
+              _bindExpr(
+                qual.isEmpty ? ColumnExpr(c) : ColumnExpr(c, table: qual),
+              ),
+            );
           }
         }
       } else {
@@ -8023,7 +8367,8 @@ class Database {
           for (final c in _materializeColumns(s.fromTable!)) {
             outCols.add(c);
             projExprs.add(
-                _bindExpr(ColumnExpr(c, table: s.fromAlias ?? s.fromTable!)));
+              _bindExpr(ColumnExpr(c, table: s.fromAlias ?? s.fromTable!)),
+            );
           }
         }
       } else {
@@ -8087,7 +8432,10 @@ class Database {
   }
 
   Object? _evalProjectedWithAggregates(
-      Expr e, List<Map<String, Object?>> grp, Map<String, Object?> ctx) {
+    Expr e,
+    List<Map<String, Object?>> grp,
+    Map<String, Object?> ctx,
+  ) {
     if (e is FunctionCallExpr && e.isAggregate) {
       return _aggregateValue(e, grp);
     }
@@ -8114,11 +8462,13 @@ class Database {
       return null;
     }
     if (e is FunctionCallExpr) {
-      final args =
-          e.args.map((a) => _evalProjectedWithAggregates(a, grp, ctx)).toList();
+      final args = e.args
+          .map((a) => _evalProjectedWithAggregates(a, grp, ctx))
+          .toList();
       return FunctionCallExpr(
-              e.name, args.map((v) => LiteralExpr(v) as Expr).toList())
-          .eval(ctx);
+        e.name,
+        args.map((v) => LiteralExpr(v) as Expr).toList(),
+      ).eval(ctx);
     }
     if (e is CastExpr) {
       final v = _evalProjectedWithAggregates(e.expr, grp, ctx);
@@ -8128,7 +8478,10 @@ class Database {
   }
 
   bool _evalHaving(
-      Expr e, List<Map<String, Object?>> grp, Map<String, Object?> ctx) {
+    Expr e,
+    List<Map<String, Object?>> grp,
+    Map<String, Object?> ctx,
+  ) {
     final v = _evalProjectedWithAggregates(e, grp, ctx);
     return v is bool && v;
   }
@@ -8141,9 +8494,7 @@ class Database {
       }).toList();
     }
     if (e.aggOrderBy != null && e.aggOrderBy!.isNotEmpty) {
-      final bound = [
-        for (final ob in e.aggOrderBy!) (_bindExpr(ob.expr), ob),
-      ];
+      final bound = [for (final ob in e.aggOrderBy!) (_bindExpr(ob.expr), ob)];
       grp = List<Map<String, Object?>>.from(grp)
         ..sort((a, b) {
           for (final pair in bound) {
@@ -8456,7 +8807,9 @@ class Database {
   }
 
   Iterable<Object?> _aggValues(
-      FunctionCallExpr e, List<Map<String, Object?>> grp) sync* {
+    FunctionCallExpr e,
+    List<Map<String, Object?>> grp,
+  ) sync* {
     if (e.args.isEmpty) {
       for (final _ in grp) {
         yield null;
@@ -8488,8 +8841,10 @@ class Database {
   ///   LAG(expr [, offset [, default]]), LEAD(expr [, offset [, default]]),
   ///   COUNT(*|expr), SUM/AVG/MIN/MAX(expr) — computed over the partition.
   List<Object?> _evalWindowFn(
-      FunctionCallExpr fn, List<Map<String, Object?>> rows,
-      [Map<String, WindowSpec> namedWindows = const {}]) {
+    FunctionCallExpr fn,
+    List<Map<String, Object?>> rows, [
+    Map<String, WindowSpec> namedWindows = const {},
+  ]) {
     final spec = _resolveWindowSpec(fn.window!, namedWindows);
     final n = rows.length;
     final out = List<Object?>.filled(n, null);
@@ -8619,8 +8974,9 @@ class Database {
               for (var i = k; i < ordered.length; i++) {
                 final v = ob.expr.eval(partRows[i]);
                 if (v is! num) break;
-                final inWindow =
-                    ob.descending ? v >= desired - 1e-12 : v <= desired + 1e-12;
+                final inWindow = ob.descending
+                    ? v >= desired - 1e-12
+                    : v <= desired + 1e-12;
                 if (inWindow) {
                   best = i;
                 } else {
@@ -8631,8 +8987,9 @@ class Database {
               for (var i = k; i >= 0; i--) {
                 final v = ob.expr.eval(partRows[i]);
                 if (v is! num) break;
-                final inWindow =
-                    ob.descending ? v <= desired + 1e-12 : v >= desired - 1e-12;
+                final inWindow = ob.descending
+                    ? v <= desired + 1e-12
+                    : v >= desired - 1e-12;
                 if (inWindow) {
                   best = i;
                 } else {
@@ -8694,8 +9051,10 @@ class Database {
         return [lo, hi];
       }
 
-      List<Map<String, Object?>> frameRows(int k,
-          {bool excludeCurrent = false}) {
+      List<Map<String, Object?>> frameRows(
+        int k, {
+        bool excludeCurrent = false,
+      }) {
         final r = frameRange(k);
         if (r[1] < r[0]) return const [];
         final result = <Map<String, Object?>>[];
@@ -8803,8 +9162,9 @@ class Database {
             final offset = fn.args.length >= 2
                 ? (fn.args[1].eval(const {}) as num).toInt()
                 : 1;
-            final defaultVal =
-                fn.args.length >= 3 ? fn.args[2].eval(const {}) : null;
+            final defaultVal = fn.args.length >= 3
+                ? fn.args[2].eval(const {})
+                : null;
             for (var k = 0; k < ordered.length; k++) {
               final target = k + dir * offset;
               if (target < 0 || target >= ordered.length) {
@@ -8885,15 +9245,18 @@ class Database {
   /// in the SELECT's WINDOW clause. The inline spec extends/overrides the
   /// named one (partition/order can be inherited; frame can be added).
   WindowSpec _resolveWindowSpec(
-      WindowSpec spec, Map<String, WindowSpec> namedWindows) {
+    WindowSpec spec,
+    Map<String, WindowSpec> namedWindows,
+  ) {
     if (spec.baseName == null) return spec;
     final base = namedWindows[spec.baseName!];
     if (base == null) {
       throw StateError('Unknown window: ${spec.baseName}');
     }
     return WindowSpec(
-      partitionBy:
-          spec.partitionBy.isNotEmpty ? spec.partitionBy : base.partitionBy,
+      partitionBy: spec.partitionBy.isNotEmpty
+          ? spec.partitionBy
+          : base.partitionBy,
       orderBy: spec.orderBy.isNotEmpty ? spec.orderBy : base.orderBy,
       frame: spec.frame ?? base.frame,
     );
@@ -8940,26 +9303,35 @@ class Database {
     }
     if (e is BinaryExpr) {
       return BinaryExpr(
-          e.op, _bindExpr(e.left, outerScope), _bindExpr(e.right, outerScope));
+        e.op,
+        _bindExpr(e.left, outerScope),
+        _bindExpr(e.right, outerScope),
+      );
     }
     if (e is UnaryExpr) {
       return UnaryExpr(e.op, _bindExpr(e.operand, outerScope));
     }
     if (e is BetweenExpr) {
-      return BetweenExpr(_bindExpr(e.value, outerScope),
-          _bindExpr(e.low, outerScope), _bindExpr(e.high, outerScope),
-          negated: e.negated);
+      return BetweenExpr(
+        _bindExpr(e.value, outerScope),
+        _bindExpr(e.low, outerScope),
+        _bindExpr(e.high, outerScope),
+        negated: e.negated,
+      );
     }
     if (e is InExpr) {
-      return InExpr(_bindExpr(e.value, outerScope),
-          e.values.map((x) => _bindExpr(x, outerScope)).toList(),
-          negated: e.negated);
+      return InExpr(
+        _bindExpr(e.value, outerScope),
+        e.values.map((x) => _bindExpr(x, outerScope)).toList(),
+        negated: e.negated,
+      );
     }
     if (e is CaseExpr) {
       return CaseExpr(
-          e.whens.map((x) => _bindExpr(x, outerScope)).toList(),
-          e.thens.map((x) => _bindExpr(x, outerScope)).toList(),
-          e.elseExpr == null ? null : _bindExpr(e.elseExpr!, outerScope));
+        e.whens.map((x) => _bindExpr(x, outerScope)).toList(),
+        e.thens.map((x) => _bindExpr(x, outerScope)).toList(),
+        e.elseExpr == null ? null : _bindExpr(e.elseExpr!, outerScope),
+      );
     }
     if (e is CastExpr) {
       return CastExpr(_bindExpr(e.expr, outerScope), e.targetType);
@@ -8974,22 +9346,29 @@ class Database {
               .map((x) => _bindExpr(x, outerScope))
               .toList(),
           orderBy: e.window!.orderBy
-              .map((o) => WindowOrderItem(_bindExpr(o.expr, outerScope),
-                  descending: o.descending, nullsFirst: o.nullsFirst))
+              .map(
+                (o) => WindowOrderItem(
+                  _bindExpr(o.expr, outerScope),
+                  descending: o.descending,
+                  nullsFirst: o.nullsFirst,
+                ),
+              )
               .toList(),
           frame: e.window!.frame,
           baseName: e.window!.baseName,
         );
       }
       return FunctionCallExpr(
-          e.name, e.args.map((x) => _bindExpr(x, outerScope)).toList(),
-          isStarArg: e.isStarArg,
-          distinct: e.distinct,
-          window: boundWindow,
-          filterExpr: e.filterExpr == null
-              ? null
-              : _bindExpr(e.filterExpr!, outerScope),
-          aggOrderBy: e.aggOrderBy);
+        e.name,
+        e.args.map((x) => _bindExpr(x, outerScope)).toList(),
+        isStarArg: e.isStarArg,
+        distinct: e.distinct,
+        window: boundWindow,
+        filterExpr: e.filterExpr == null
+            ? null
+            : _bindExpr(e.filterExpr!, outerScope),
+        aggOrderBy: e.aggOrderBy,
+      );
     }
     return e;
   }
@@ -9022,13 +9401,15 @@ class Database {
         try {
           // Re-check synchronously; bypass the deferral path.
           for (final fk in _foreignKeysOf(t)) {
-            final values =
-                fk.columns.map((c) => d.row[t.columnIndex(c)]).toList();
+            final values = fk.columns
+                .map((c) => d.row[t.columnIndex(c)])
+                .toList();
             if (values.any((v) => v == null)) continue;
             final parent = _tables[fk.references.table];
             if (parent == null) {
               throw StateError(
-                  'FK references missing table ${fk.references.table}');
+                'FK references missing table ${fk.references.table}',
+              );
             }
             final parentCols = fk.references.column != null
                 ? [fk.references.column!]
@@ -9049,9 +9430,11 @@ class Database {
               }
             }
             if (!found) {
-              throw StateError('FOREIGN KEY constraint failed: '
-                  '${t.name}.${fk.columns.join(",")} -> '
-                  '${parent.name}.${parentCols.join(",")} = $values');
+              throw StateError(
+                'FOREIGN KEY constraint failed: '
+                '${t.name}.${fk.columns.join(",")} -> '
+                '${parent.name}.${parentCols.join(",")} = $values',
+              );
             }
           }
         } catch (e) {
@@ -9135,44 +9518,50 @@ class Database {
   // Introspection
   // ---------------------------------------------------------------------------
   QueryResult _showTables() => QueryResult(
-        columns: const ['name', 'kind'],
-        rows: [
-          ..._tables.keys.map((n) => <Object?>[n, 'TABLE']),
-          ..._views.keys.map((n) => <Object?>[n, 'VIEW']),
-        ],
-        affected: _tables.length + _views.length,
-      );
+    columns: const ['name', 'kind'],
+    rows: [
+      ..._tables.keys.map((n) => <Object?>[n, 'TABLE']),
+      ..._views.keys.map((n) => <Object?>[n, 'VIEW']),
+    ],
+    affected: _tables.length + _views.length,
+  );
 
   QueryResult _showDatabases() {
     final names = <String>['main'];
     return QueryResult(
-        columns: const ['Database'],
-        rows: names.map((n) => <Object?>[n]).toList(),
-        affected: names.length);
+      columns: const ['Database'],
+      rows: names.map((n) => <Object?>[n]).toList(),
+      affected: names.length,
+    );
   }
 
   QueryResult _showCreateTable(String name) {
     final t = _requireTable(name);
-    final colDefs = t.columns.map((c) {
-      final parts = <String>['`${c.name}`', dataTypeName(c.type)];
-      if (c.primaryKey) {
-        parts.add('PRIMARY KEY');
-        if (c.autoIncrement) parts.add('AUTOINCREMENT');
-      }
-      if (c.notNull) parts.add('NOT NULL');
-      if (c.unique && !c.primaryKey) parts.add('UNIQUE');
-      if (c.defaultValue != null) {
-        final v = c.defaultValue;
-        final lit = v is num ? v.toString() : "'$v'";
-        parts.add('DEFAULT $lit');
-      }
-      return '  ${parts.join(' ')}';
-    }).join(',\n');
+    final colDefs = t.columns
+        .map((c) {
+          final parts = <String>['`${c.name}`', dataTypeName(c.type)];
+          if (c.primaryKey) {
+            parts.add('PRIMARY KEY');
+            if (c.autoIncrement) parts.add('AUTOINCREMENT');
+          }
+          if (c.notNull) parts.add('NOT NULL');
+          if (c.unique && !c.primaryKey) parts.add('UNIQUE');
+          if (c.defaultValue != null) {
+            final v = c.defaultValue;
+            final lit = v is num ? v.toString() : "'$v'";
+            parts.add('DEFAULT $lit');
+          }
+          return '  ${parts.join(' ')}';
+        })
+        .join(',\n');
     final ddl = 'CREATE TABLE `${t.name}` (\n$colDefs\n)';
     return QueryResult(
-        columns: const ['Table', 'Create Table'],
-        rows: [<Object?>[t.name, ddl]],
-        affected: 1);
+      columns: const ['Table', 'Create Table'],
+      rows: [
+        <Object?>[t.name, ddl],
+      ],
+      affected: 1,
+    );
   }
 
   QueryResult _showVariables(String? likePattern) {
@@ -9205,14 +9594,16 @@ class Database {
     Iterable<List<String>> rows = all;
     if (likePattern != null) {
       final re = RegExp(
-          '^${RegExp.escape(likePattern).replaceAll('%', '.*').replaceAll('_', '.')}\$',
-          caseSensitive: false);
+        '^${RegExp.escape(likePattern).replaceAll('%', '.*').replaceAll('_', '.')}\$',
+        caseSensitive: false,
+      );
       rows = all.where((r) => re.hasMatch(r[0]));
     }
     return QueryResult(
-        columns: const ['Variable_name', 'Value'],
-        rows: rows.map((r) => <Object?>[r[0], r[1]]).toList(),
-        affected: rows.length);
+      columns: const ['Variable_name', 'Value'],
+      rows: rows.map((r) => <Object?>[r[0], r[1]]).toList(),
+      affected: rows.length,
+    );
   }
 
   QueryResult _describe(DescribeStmt s) {
@@ -9233,18 +9624,20 @@ class Database {
         'primaryKey',
         'unique',
         'autoIncrement',
-        'default'
+        'default',
       ],
       rows: t.columns
-          .map((c) => <Object?>[
-                c.name,
-                dataTypeName(c.type),
-                c.notNull,
-                c.primaryKey,
-                c.unique,
-                c.autoIncrement,
-                c.defaultValue,
-              ])
+          .map(
+            (c) => <Object?>[
+              c.name,
+              dataTypeName(c.type),
+              c.notNull,
+              c.primaryKey,
+              c.unique,
+              c.autoIncrement,
+              c.defaultValue,
+            ],
+          )
           .toList(),
       affected: t.columns.length,
     );
@@ -9316,8 +9709,12 @@ class Database {
       }
       if (stmt.setOp != null && stmt.setOpRight != null) {
         out.add([nextId[0]++, myId, 0, 'COMPOUND ${stmt.setOp}']);
-        _explainQueryPlanInto(stmt.setOpRight!,
-            parentId: myId, nextId: nextId, out: out);
+        _explainQueryPlanInto(
+          stmt.setOpRight!,
+          parentId: myId,
+          nextId: nextId,
+          out: out,
+        );
       }
     } else {
       out.add([nextId[0]++, parentId, 0, stmt.runtimeType.toString()]);
@@ -9361,13 +9758,15 @@ class Database {
   List<List<Object?>> _explainBytecode(Statement stmt) {
     final rows = <List<Object?>>[];
     var addr = 0;
-    void emit(String opcode,
-        [int p1 = 0,
-        int p2 = 0,
-        int p3 = 0,
-        Object? p4,
-        int p5 = 0,
-        String comment = '']) {
+    void emit(
+      String opcode, [
+      int p1 = 0,
+      int p2 = 0,
+      int p3 = 0,
+      Object? p4,
+      int p5 = 0,
+      String comment = '',
+    ]) {
       rows.add([addr++, opcode, p1, p2, p3, p4, p5, comment]);
     }
 
@@ -9380,8 +9779,15 @@ class Database {
       emit('Rewind', 0, 0, 0, null, 0, 'jump if empty');
       final loopStart = addr;
       for (var i = 0; i < cols; i++) {
-        emit('Column', 0, i, i + 1, null, 0,
-            t != null ? t.columns[i].name : 'col$i');
+        emit(
+          'Column',
+          0,
+          i,
+          i + 1,
+          null,
+          0,
+          t != null ? t.columns[i].name : 'col$i',
+        );
       }
       emit('ResultRow', 1, cols, 0, null, 0, '');
       emit('Next', 0, loopStart, 0, null, 1, '');
@@ -9463,25 +9869,27 @@ class Database {
               ]);
             }
           }
-          return QueryResult(columns: const [
-            'cid',
-            'name',
-            'type',
-            'notnull',
-            'dflt_value',
-            'pk'
-          ], rows: rows);
+          return QueryResult(
+            columns: const [
+              'cid',
+              'name',
+              'type',
+              'notnull',
+              'dflt_value',
+              'pk',
+            ],
+            rows: rows,
+          );
         }
       case 'database_list':
-        return QueryResult(columns: const [
-          'seq',
-          'name',
-          'file'
-        ], rows: [
-          [0, 'main', path ?? ''],
-          for (final e in _attached.entries.toList().asMap().entries)
-            [e.key + 1, e.value.key, e.value.value],
-        ]);
+        return QueryResult(
+          columns: const ['seq', 'name', 'file'],
+          rows: [
+            [0, 'main', path ?? ''],
+            for (final e in _attached.entries.toList().asMap().entries)
+              [e.key + 1, e.value.key, e.value.value],
+          ],
+        );
       case 'index_list':
         {
           final rows = <List<Object?>>[];
@@ -9493,7 +9901,9 @@ class Database {
             }
           }
           return QueryResult(
-              columns: const ['seq', 'name', 'unique'], rows: rows);
+            columns: const ['seq', 'name', 'unique'],
+            rows: rows,
+          );
         }
       case 'index_info':
       case 'index_xinfo':
@@ -9511,7 +9921,9 @@ class Database {
             }
           }
           return QueryResult(
-              columns: const ['seqno', 'cid', 'name'], rows: rows);
+            columns: const ['seqno', 'cid', 'name'],
+            rows: rows,
+          );
         }
       case 'foreign_key_list':
         {
@@ -9535,66 +9947,72 @@ class Database {
               id++;
             }
           }
-          return QueryResult(columns: const [
-            'id',
-            'seq',
-            'table',
-            'from',
-            'to',
-            'on_update',
-            'on_delete',
-            'match'
-          ], rows: rows);
+          return QueryResult(
+            columns: const [
+              'id',
+              'seq',
+              'table',
+              'from',
+              'to',
+              'on_update',
+              'on_delete',
+              'match',
+            ],
+            rows: rows,
+          );
         }
       case 'integrity_check':
       case 'quick_check':
-        return QueryResult(columns: const [
-          'integrity_check'
-        ], rows: const [
-          ['ok']
-        ]);
+        return QueryResult(
+          columns: const ['integrity_check'],
+          rows: const [
+            ['ok'],
+          ],
+        );
       case 'compile_options':
-        return QueryResult(columns: const [
-          'compile_options'
-        ], rows: const [
-          ['ENABLE_JSON1'],
-          ['ENABLE_WINDOW_FUNCTIONS'],
-          ['ENABLE_FTS5'],
-          ['ENABLE_RTREE'],
-          ['ENABLE_UPDATE_DELETE_LIMIT'],
-        ]);
+        return QueryResult(
+          columns: const ['compile_options'],
+          rows: const [
+            ['ENABLE_JSON1'],
+            ['ENABLE_WINDOW_FUNCTIONS'],
+            ['ENABLE_FTS5'],
+            ['ENABLE_RTREE'],
+            ['ENABLE_UPDATE_DELETE_LIMIT'],
+          ],
+        );
       case 'collation_list':
-        return QueryResult(columns: const [
-          'seq',
-          'name'
-        ], rows: const [
-          [0, 'BINARY'],
-          [1, 'NOCASE'],
-          [2, 'RTRIM'],
-        ]);
+        return QueryResult(
+          columns: const ['seq', 'name'],
+          rows: const [
+            [0, 'BINARY'],
+            [1, 'NOCASE'],
+            [2, 'RTRIM'],
+          ],
+        );
       case 'function_list':
         {
           final names = <String>{
             ...kScalarFunctions.keys,
             ...kAggregateFunctions,
-          }.toList()
-            ..sort();
-          return QueryResult(columns: const [
-            'name'
-          ], rows: [
-            for (final n in names) [n.toLowerCase()]
-          ]);
+          }.toList()..sort();
+          return QueryResult(
+            columns: const ['name'],
+            rows: [
+              for (final n in names) [n.toLowerCase()],
+            ],
+          );
         }
       case 'module_list':
-        return QueryResult(columns: const [
-          'name'
-        ], rows: const [
-          ['fts5'],
-          ['rtree'],
-          ['json_each'],
-          ['json_tree'],
-          ['generate_series'],
-        ]);
+        return QueryResult(
+          columns: const ['name'],
+          rows: const [
+            ['fts5'],
+            ['rtree'],
+            ['json_each'],
+            ['json_tree'],
+            ['generate_series'],
+          ],
+        );
       case 'pragma_list':
         {
           const names = <String>[
@@ -9651,11 +10069,12 @@ class Database {
             'wal_autocheckpoint',
             'wal_checkpoint',
           ];
-          return QueryResult(columns: const [
-            'name'
-          ], rows: [
-            for (final n in names) [n]
-          ]);
+          return QueryResult(
+            columns: const ['name'],
+            rows: [
+              for (final n in names) [n],
+            ],
+          );
         }
       case 'table_list':
         {
@@ -9667,8 +10086,9 @@ class Database {
             rows.add(['main', v, 'view', 0, 0, 0]);
           }
           return QueryResult(
-              columns: const ['schema', 'name', 'type', 'ncol', 'wr', 'strict'],
-              rows: rows);
+            columns: const ['schema', 'name', 'type', 'ncol', 'wr', 'strict'],
+            rows: rows,
+          );
         }
       case 'optimize':
         {
@@ -9688,18 +10108,19 @@ class Database {
           // most recent EXPLAIN so tools that toggle this pragma and
           // re-read the listing keep working.
           if (s.value != null) _pragmas[name] = s.value;
-          return QueryResult(columns: const [
-            'addr',
-            'opcode',
-            'p1',
-            'p2',
-            'p3',
-            'p4',
-            'p5',
-            'comment',
-          ], rows: [
-            for (final r in _lastBytecode) List<Object?>.from(r)
-          ]);
+          return QueryResult(
+            columns: const [
+              'addr',
+              'opcode',
+              'p1',
+              'p2',
+              'p3',
+              'p4',
+              'p5',
+              'comment',
+            ],
+            rows: [for (final r in _lastBytecode) List<Object?>.from(r)],
+          );
         }
       case 'shrink_memory':
       case 'incremental_vacuum':
@@ -9712,13 +10133,12 @@ class Database {
             // ignore: unawaited_futures
             checkpointSqlite();
           }
-          return QueryResult(columns: const [
-            'busy',
-            'log',
-            'checkpointed'
-          ], rows: const [
-            [0, 0, 0]
-          ]);
+          return QueryResult(
+            columns: const ['busy', 'log', 'checkpointed'],
+            rows: const [
+              [0, 0, 0],
+            ],
+          );
         }
       case 'wal2_checkpoint':
         {
@@ -9729,13 +10149,12 @@ class Database {
             // ignore: unawaited_futures
             checkpointSqlite();
           }
-          return QueryResult(columns: const [
-            'busy',
-            'log',
-            'checkpointed'
-          ], rows: const [
-            [0, 0, 0]
-          ]);
+          return QueryResult(
+            columns: const ['busy', 'log', 'checkpointed'],
+            rows: const [
+              [0, 0, 0],
+            ],
+          );
         }
       case 'max_trigger_depth':
         {
@@ -9743,11 +10162,12 @@ class Database {
             _pragmas[name] = s.value;
             return QueryResult.message('max_trigger_depth = ${s.value}');
           }
-          return QueryResult(columns: const [
-            'max_trigger_depth'
-          ], rows: [
-            [_pragmas[name] ?? 1000]
-          ]);
+          return QueryResult(
+            columns: const ['max_trigger_depth'],
+            rows: [
+              [_pragmas[name] ?? 1000],
+            ],
+          );
         }
     }
     // Recognised PRAGMA names with sensible default return values when no
@@ -9795,11 +10215,13 @@ class Database {
       'wal_checkpoint': 0,
     };
     final v = _pragmas.containsKey(name) ? _pragmas[name] : defaults[name];
-    return QueryResult(columns: [
-      name
-    ], rows: [
-      <Object?>[v]
-    ], affected: v == null ? 0 : 1);
+    return QueryResult(
+      columns: [name],
+      rows: [
+        <Object?>[v],
+      ],
+      affected: v == null ? 0 : 1,
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -9815,13 +10237,20 @@ class Database {
     if (s.timing == 'INSTEAD OF') {
       if (!_views.containsKey(s.table)) {
         throw StateError(
-            'INSTEAD OF trigger requires a view target: ${s.table}');
+          'INSTEAD OF trigger requires a view target: ${s.table}',
+        );
       }
     } else {
       _requireTable(s.table);
     }
-    _triggers[s.name] =
-        _TriggerSpec(s.name, s.timing, s.event, s.table, s.when, s.body);
+    _triggers[s.name] = _TriggerSpec(
+      s.name,
+      s.timing,
+      s.event,
+      s.table,
+      s.when,
+      s.body,
+    );
     return QueryResult.message('Trigger ${s.name} created');
   }
 
@@ -9837,7 +10266,10 @@ class Database {
   }
 
   Iterable<_TriggerSpec> _triggersFor(
-      String table, String event, String timing) sync* {
+    String table,
+    String event,
+    String timing,
+  ) sync* {
     for (final t in _triggers.values) {
       if (t.table == table && t.event == event && t.timing == timing) yield t;
     }
@@ -9864,8 +10296,13 @@ class Database {
         final idx = viewCols.indexOf(targetCols[i]);
         if (idx >= 0) newRow[idx] = r[i];
       }
-      _fireTriggers(s.table, 'INSERT', 'INSTEAD OF',
-          newRow: newRow, columnNames: viewCols);
+      _fireTriggers(
+        s.table,
+        'INSERT',
+        'INSTEAD OF',
+        newRow: newRow,
+        columnNames: viewCols,
+      );
       count++;
     }
     return QueryResult.message('$count row(s) inserted', affected: count);
@@ -9888,8 +10325,14 @@ class Database {
         final idx = viewCols.indexOf(col);
         if (idx >= 0) newRow[idx] = _evalScalar(expr, view2);
       });
-      _fireTriggers(s.table, 'UPDATE', 'INSTEAD OF',
-          oldRow: row, newRow: newRow, columnNames: viewCols);
+      _fireTriggers(
+        s.table,
+        'UPDATE',
+        'INSTEAD OF',
+        oldRow: row,
+        newRow: newRow,
+        columnNames: viewCols,
+      );
       count++;
     }
     return QueryResult.message('$count row(s) updated', affected: count);
@@ -9907,8 +10350,13 @@ class Database {
       if (s.where != null && !evalPredicate(_bindExpr(s.where!), view2)) {
         continue;
       }
-      _fireTriggers(s.table, 'DELETE', 'INSTEAD OF',
-          oldRow: row, columnNames: viewCols);
+      _fireTriggers(
+        s.table,
+        'DELETE',
+        'INSTEAD OF',
+        oldRow: row,
+        columnNames: viewCols,
+      );
       count++;
     }
     return QueryResult.message('$count row(s) deleted', affected: count);
@@ -9916,14 +10364,19 @@ class Database {
 
   /// Run all triggers matching ([table], [event], [timing]) once with the
   /// supplied NEW / OLD bindings. Either map may be null when not relevant.
-  void _fireTriggers(String table, String event, String timing,
-      {List<Object?>? newRow,
-      List<Object?>? oldRow,
-      Table? sourceTable,
-      List<String>? columnNames}) {
+  void _fireTriggers(
+    String table,
+    String event,
+    String timing, {
+    List<Object?>? newRow,
+    List<Object?>? oldRow,
+    Table? sourceTable,
+    List<String>? columnNames,
+  }) {
     final fired = _triggersFor(table, event, timing).toList();
     if (fired.isEmpty) return;
-    final names = columnNames ??
+    final names =
+        columnNames ??
         (sourceTable == null
             ? const <String>[]
             : sourceTable.columns.map((c) => c.name).toList());
@@ -9962,10 +10415,12 @@ class Database {
             case 'ROLLBACK':
               if (inTransaction) _rollback();
               throw StateError(
-                  'RAISE(ROLLBACK${e.message.isEmpty ? '' : ", '${e.message}'"})');
+                'RAISE(ROLLBACK${e.message.isEmpty ? '' : ", '${e.message}'"})',
+              );
             default: // ABORT / FAIL
               throw StateError(
-                  'RAISE(${e.action}${e.message.isEmpty ? '' : ", '${e.message}'"})');
+                'RAISE(${e.action}${e.message.isEmpty ? '' : ", '${e.message}'"})',
+              );
           }
         }
       }
@@ -9980,7 +10435,7 @@ class Database {
   // ---------------------------------------------------------------------------
   QueryResult _savepoint(SavepointStmt s) {
     final tablesSnap = {
-      for (final e in _tables.entries) e.key: e.value.clone()
+      for (final e in _tables.entries) e.key: e.value.clone(),
     };
     final viewsSnap = Map<String, SelectStmt>.from(_views);
     _savepoints.add(_Savepoint(s.name, tablesSnap, viewsSnap));
@@ -10085,17 +10540,21 @@ class Database {
       try {
         final stmt = Parser.fromString(ts.sql!).parseStatement();
         if (stmt is! CreateTableStmt) continue;
-        tbl = Table(stmt.name, stmt.columns,
-            constraints: stmt.constraints,
-            strict: stmt.strict,
-            withoutRowid: stmt.withoutRowid);
+        tbl = Table(
+          stmt.name,
+          stmt.columns,
+          constraints: stmt.constraints,
+          strict: stmt.strict,
+          withoutRowid: stmt.withoutRowid,
+        );
       } catch (_) {
         continue;
       }
       // Restore rows, applying the WITHOUT ROWID column-order remap.
       final isWor = fmt.isWithoutRowid(ts.name);
-      final pkIdx = tbl.columns
-          .indexWhere((c) => c.primaryKey && c.type == DataType.integer);
+      final pkIdx = tbl.columns.indexWhere(
+        (c) => c.primaryKey && c.type == DataType.integer,
+      );
       List<int>? onDiskToDeclared;
       if (isWor) {
         final pkCols = <int>[];
@@ -10106,8 +10565,9 @@ class Database {
           for (final con in tbl.constraints) {
             if (con is PrimaryKeyConstraint) {
               for (final n in con.columns) {
-                final idx = tbl.columns
-                    .indexWhere((c) => c.name.toLowerCase() == n.toLowerCase());
+                final idx = tbl.columns.indexWhere(
+                  (c) => c.name.toLowerCase() == n.toLowerCase(),
+                );
                 if (idx >= 0) pkCols.add(idx);
               }
               break;
@@ -10180,8 +10640,9 @@ class Database {
   /// readers of [destPath] either see the previous file or the new
   /// complete file, never a partial write.
   Future<void> backup(String destPath, {int pageSize = 4096}) async {
-    final bytes =
-        await _lock.write(() async => _buildSqliteBytes(pageSize: pageSize));
+    final bytes = await _lock.write(
+      () async => _buildSqliteBytes(pageSize: pageSize),
+    );
     await _atomicWriteBytes(destPath, bytes);
   }
 
@@ -10204,7 +10665,8 @@ class Database {
     required int rowid,
     bool writable = false,
   }) {
-    final t = _tables[table] ??
+    final t =
+        _tables[table] ??
         _tables[table.toLowerCase()] ??
         _tables[table.toUpperCase()];
     if (t == null) {
@@ -10214,7 +10676,8 @@ class Database {
     final col = t.columns[colIdx];
     if (col.type != DataType.blob && col.type != DataType.any) {
       throw ArgumentError(
-          'Column $table.$column is ${col.type.name}, not BLOB');
+        'Column $table.$column is ${col.type.name}, not BLOB',
+      );
     }
     int? pkIdx;
     for (var i = 0; i < t.columns.length; i++) {
@@ -10240,8 +10703,13 @@ class Database {
     if (row == null) {
       throw StateError('No row with rowid $rowid in $table');
     }
-    return BlobHandle.internal(row, colIdx,
-        tableName: table, columnName: column, writable: writable);
+    return BlobHandle.internal(
+      row,
+      colIdx,
+      tableName: table,
+      columnName: column,
+      writable: writable,
+    );
   }
 
   /// REINDEX: rebuild ordered index structures from the underlying rows.
@@ -10272,7 +10740,8 @@ class Database {
     if (tbl != null) {
       rebuildTable(tbl);
       return QueryResult.message(
-          'REINDEX rebuilt $rebuilt index(es) on $target');
+        'REINDEX rebuilt $rebuilt index(es) on $target',
+      );
     }
     // Try as an index name across all tables.
     for (final t in _tables.values) {
@@ -10313,9 +10782,7 @@ class Database {
         break;
       case 'rtree':
         // First arg is rowid name; remaining args are min/max numeric pairs.
-        cols = [
-          for (final a in s.args) ColumnDef(a, DataType.real),
-        ];
+        cols = [for (final a in s.args) ColumnDef(a, DataType.real)];
         if (cols.isEmpty) {
           throw FormatException('rtree requires at least one column');
         }
@@ -10330,7 +10797,8 @@ class Database {
       _rtreeTables.add(s.name.toLowerCase());
     }
     return QueryResult.message(
-        'Virtual table ${s.name} (USING $module) created');
+      'Virtual table ${s.name} (USING $module) created',
+    );
   }
 
   /// ANALYZE: populate (or refresh) a synthetic `sqlite_stat1` table with
@@ -10339,14 +10807,11 @@ class Database {
   QueryResult _analyze(AnalyzeStmt s) {
     final stat = _tables.putIfAbsent(
       'sqlite_stat1',
-      () => Table(
-        'sqlite_stat1',
-        const [
-          ColumnDef('tbl', DataType.text),
-          ColumnDef('idx', DataType.text),
-          ColumnDef('stat', DataType.text),
-        ],
-      ),
+      () => Table('sqlite_stat1', const [
+        ColumnDef('tbl', DataType.text),
+        ColumnDef('idx', DataType.text),
+        ColumnDef('stat', DataType.text),
+      ]),
     );
     Iterable<MapEntry<String, Table>> targets;
     if (s.target == null) {
@@ -10366,10 +10831,12 @@ class Database {
       // Identify the auto-created INTEGER-PRIMARY-KEY shadow index so we
       // can skip it: SQLite has no real on-disk index for that case.
       final pkIntCol = tbl.columns.firstWhere(
-          (c) => c.primaryKey && c.type == DataType.integer,
-          orElse: () => const ColumnDef('', DataType.any));
-      final pkShadowName =
-          pkIntCol.name.isEmpty ? null : '${e.key}__${pkIntCol.name}';
+        (c) => c.primaryKey && c.type == DataType.integer,
+        orElse: () => const ColumnDef('', DataType.any),
+      );
+      final pkShadowName = pkIntCol.name.isEmpty
+          ? null
+          : '${e.key}__${pkIntCol.name}';
 
       // Sample per-index distinct counts.
       final distinct = <String, int>{};
@@ -10378,8 +10845,9 @@ class Database {
         if (idxDef.name == pkShadowName) continue;
         final col = idxDef.column;
         final keys = <Object>{};
-        final colIdx = tbl.columns
-            .indexWhere((c) => c.name.toLowerCase() == col.toLowerCase());
+        final colIdx = tbl.columns.indexWhere(
+          (c) => c.name.toLowerCase() == col.toLowerCase(),
+        );
         if (colIdx < 0) continue;
         for (final r in tbl.rows) {
           final v = r[colIdx];
@@ -10414,7 +10882,9 @@ class Database {
       'views': {for (final e in _viewSql.entries) e.key: e.value},
     };
     await _atomicWriteBytes(
-        path!, Uint8List.fromList(utf8.encode(jsonEncode(out))));
+      path!,
+      Uint8List.fromList(utf8.encode(jsonEncode(out))),
+    );
   }
 
   /// Crash-safe write: writes to `<dest>.tmp`, fsyncs the temp file's
@@ -10441,7 +10911,9 @@ class Database {
       if (await destFile.exists()) {
         try {
           await destFile.delete();
-        } catch (_) {/* best-effort */}
+        } catch (_) {
+          /* best-effort */
+        }
       }
     }
     await File(tmp).rename(dest);
@@ -10463,7 +10935,9 @@ class Database {
       if (destFile.existsSync()) {
         try {
           destFile.deleteSync();
-        } catch (_) {/* best-effort */}
+        } catch (_) {
+          /* best-effort */
+        }
       }
     }
     File(tmp).renameSync(dest);
@@ -10474,16 +10948,14 @@ class Database {
   /// write that never made it to the rename step — discard it.
   Future<void> _reapStaleTempFiles() async {
     if (path == null) return;
-    for (final p in [
-      '$path.tmp',
-      '${path!}-wal.tmp',
-      '${path!}-wal2.tmp',
-    ]) {
+    for (final p in ['$path.tmp', '${path!}-wal.tmp', '${path!}-wal2.tmp']) {
       final f = File(p);
       if (await f.exists()) {
         try {
           await f.delete();
-        } catch (_) {/* best-effort */}
+        } catch (_) {
+          /* best-effort */
+        }
       }
     }
   }
@@ -10505,7 +10977,8 @@ class Database {
     final walPath = '${path!}-wal';
     final wal2Path = '${path!}-wal2';
     final ps = _sqlitePageSize;
-    final canDiff = baseline != null &&
+    final canDiff =
+        baseline != null &&
         baseline.length % ps == 0 &&
         current.length % ps == 0 &&
         current.length >= baseline.length;
@@ -10565,7 +11038,9 @@ class Database {
       // Persist which slot is live so that a fresh open knows which
       // companion to overlay (mtime resolution can be too coarse).
       await _atomicWriteBytes(
-          '${path!}-wal2.meta', Uint8List.fromList(utf8.encode('$liveSlot')));
+        '${path!}-wal2.meta',
+        Uint8List.fromList(utf8.encode('$liveSlot')),
+      );
     } else {
       await _atomicWriteBytes(walPath, wal);
     }
@@ -10610,7 +11085,9 @@ class Database {
         final p = live == 1 ? '$mainPath-wal' : '$mainPath-wal2';
         final f = File(p);
         if (await f.exists()) return f.readAsBytes();
-      } catch (_) {/* fall through to mtime-based pick */}
+      } catch (_) {
+        /* fall through to mtime-based pick */
+      }
     }
     final candidates = <File>[];
     for (final p in ['$mainPath-wal', '$mainPath-wal2']) {
@@ -10618,8 +11095,9 @@ class Database {
       if (await f.exists()) candidates.add(f);
     }
     if (candidates.isEmpty) return null;
-    candidates
-        .sort((a, b) => b.statSync().modified.compareTo(a.statSync().modified));
+    candidates.sort(
+      (a, b) => b.statSync().modified.compareTo(a.statSync().modified),
+    );
     return candidates.first.readAsBytes();
   }
 
@@ -10633,7 +11111,9 @@ class Database {
         final p = live == 1 ? '$mainPath-wal' : '$mainPath-wal2';
         final f = File(p);
         if (f.existsSync()) return f.readAsBytesSync();
-      } catch (_) {/* fall through */}
+      } catch (_) {
+        /* fall through */
+      }
     }
     final candidates = <File>[];
     for (final p in ['$mainPath-wal', '$mainPath-wal2']) {
@@ -10641,8 +11121,9 @@ class Database {
       if (f.existsSync()) candidates.add(f);
     }
     if (candidates.isEmpty) return null;
-    candidates
-        .sort((a, b) => b.statSync().modified.compareTo(a.statSync().modified));
+    candidates.sort(
+      (a, b) => b.statSync().modified.compareTo(a.statSync().modified),
+    );
     return candidates.first.readAsBytesSync();
   }
 
@@ -10738,17 +11219,24 @@ class Database {
   /// Columns whose declared type is `BLOB` keep their bytes; everything
   /// else is stored using SQLite's natural serial types (INT / REAL / TEXT
   /// / NULL). Booleans are stored as 0/1 integers.
-  Future<void> exportSqlite(String path,
-      {int pageSize = 4096, bool includeIndexes = true}) async {
-    final bytes =
-        _buildSqliteBytes(pageSize: pageSize, includeIndexes: includeIndexes);
+  Future<void> exportSqlite(
+    String path, {
+    int pageSize = 4096,
+    bool includeIndexes = true,
+  }) async {
+    final bytes = _buildSqliteBytes(
+      pageSize: pageSize,
+      includeIndexes: includeIndexes,
+    );
     await _atomicWriteBytes(path, bytes);
   }
 
   /// Build the SQLite-format byte image for the current in-memory state.
   /// Pure: no I/O. See [exportSqlite] for the disk-writing wrapper.
-  Uint8List _buildSqliteBytes(
-      {int pageSize = 4096, bool includeIndexes = true}) {
+  Uint8List _buildSqliteBytes({
+    int pageSize = 4096,
+    bool includeIndexes = true,
+  }) {
     final tables = <SqliteWriteTable>[];
     final indexes = <SqliteWriteIndex>[];
     for (final entry in _tables.entries) {
@@ -10765,18 +11253,21 @@ class Database {
         final pkOrder = _withoutRowidColumnOrder(t);
         if (pkOrder == null) {
           throw StateError(
-              'Cannot export WITHOUT ROWID table ${t.name}: no PRIMARY KEY');
+            'Cannot export WITHOUT ROWID table ${t.name}: no PRIMARY KEY',
+          );
         }
         final reorderedRows = <List<Object?>>[
           for (final r in t.rows)
-            [for (final ci in pkOrder) _toSqliteValue(r[ci])]
+            [for (final ci in pkOrder) _toSqliteValue(r[ci])],
         ];
-        tables.add(SqliteWriteTable(
-          name: name,
-          createSql: _renderCreateTable(t),
-          rows: reorderedRows,
-          withoutRowid: true,
-        ));
+        tables.add(
+          SqliteWriteTable(
+            name: name,
+            createSql: _renderCreateTable(t),
+            rows: reorderedRows,
+            withoutRowid: true,
+          ),
+        );
         if (!includeIndexes) continue;
         // Secondary indexes on a WITHOUT ROWID table: each entry is
         // (indexed-col values..., PK-col values...). Per SQLite, PK
@@ -10786,8 +11277,9 @@ class Database {
         final pkCols = pkOrder; // already PK-first
         final pkColCount = _pkColumnCount(t);
         final pkColIdxs = pkCols.take(pkColCount).toList();
-        final pkColNamesLower =
-            pkColIdxs.map((i) => t.columns[i].name.toLowerCase()).toSet();
+        final pkColNamesLower = pkColIdxs
+            .map((i) => t.columns[i].name.toLowerCase())
+            .toSet();
         for (final ix in t.indexDefs.values) {
           // Expression-index branch (WITHOUT ROWID): single-key entry is
           // [exprValue, ...PK columns].
@@ -10802,15 +11294,19 @@ class Database {
                 for (final ci in pkColIdxs) _toSqliteValue(r[ci]),
               ]);
             }
-            final whereTail =
-                ix.whereSql == null ? '' : ' WHERE ${ix.whereSql}';
-            indexes.add(SqliteWriteIndex(
-              name: ix.name,
-              tableName: name,
-              createSql: 'CREATE ${ix.unique ? "UNIQUE " : ""}INDEX ${ix.name} '
-                  'ON $name(${ix.exprSql})$whereTail',
-              entries: entries,
-            ));
+            final whereTail = ix.whereSql == null
+                ? ''
+                : ' WHERE ${ix.whereSql}';
+            indexes.add(
+              SqliteWriteIndex(
+                name: ix.name,
+                tableName: name,
+                createSql:
+                    'CREATE ${ix.unique ? "UNIQUE " : ""}INDEX ${ix.name} '
+                    'ON $name(${ix.exprSql})$whereTail',
+                entries: entries,
+              ),
+            );
             continue;
           }
           // Resolve indexed columns to row indices.
@@ -10818,8 +11314,9 @@ class Database {
           final keyNamesLower = <String>{};
           var ok = true;
           for (final cn in ix.columns) {
-            final i = t.columns
-                .indexWhere((c) => c.name.toLowerCase() == cn.toLowerCase());
+            final i = t.columns.indexWhere(
+              (c) => c.name.toLowerCase() == cn.toLowerCase(),
+            );
             if (i < 0) {
               ok = false;
               break;
@@ -10836,7 +11333,7 @@ class Database {
           // Append PK columns NOT already in the index key.
           final trailingPkIdxs = [
             for (final pi in pkColIdxs)
-              if (!keyNamesLower.contains(t.columns[pi].name.toLowerCase())) pi
+              if (!keyNamesLower.contains(t.columns[pi].name.toLowerCase())) pi,
           ];
           final partialPred = _compilePartialPredicate(ix.whereSql);
           final entries = <List<Object?>>[];
@@ -10849,13 +11346,16 @@ class Database {
           }
           final colList = _renderIndexColumnList(ix);
           final whereTail = ix.whereSql == null ? '' : ' WHERE ${ix.whereSql}';
-          indexes.add(SqliteWriteIndex(
-            name: ix.name,
-            tableName: name,
-            createSql: 'CREATE ${ix.unique ? "UNIQUE " : ""}INDEX ${ix.name} '
-                'ON $name($colList)$whereTail',
-            entries: entries,
-          ));
+          indexes.add(
+            SqliteWriteIndex(
+              name: ix.name,
+              tableName: name,
+              createSql:
+                  'CREATE ${ix.unique ? "UNIQUE " : ""}INDEX ${ix.name} '
+                  'ON $name($colList)$whereTail',
+              entries: entries,
+            ),
+          );
         }
         continue;
       }
@@ -10863,8 +11363,9 @@ class Database {
       // column value MUST be stored as the rowid (and as NULL in the
       // record) or the engine reads rowid back as the id and disagrees
       // with the stored value, breaking integrity.
-      final pkIdx = t.columns
-          .indexWhere((c) => c.primaryKey && c.type == DataType.integer);
+      final pkIdx = t.columns.indexWhere(
+        (c) => c.primaryKey && c.type == DataType.integer,
+      );
       List<int>? finalRowids;
       if (pkIdx >= 0 &&
           t.rows.every((r) => r[pkIdx] is int && (r[pkIdx] as int) > 0)) {
@@ -10876,20 +11377,22 @@ class Database {
           for (final r in t.rows)
             [
               for (var i = 0; i < r.length; i++)
-                if (i == pkIdx) null else _toSqliteValue(r[i])
-            ]
+                if (i == pkIdx) null else _toSqliteValue(r[i]),
+            ],
         ];
       } else {
         exportRows = [
-          for (final r in t.rows) [for (final v in r) _toSqliteValue(v)]
+          for (final r in t.rows) [for (final v in r) _toSqliteValue(v)],
         ];
       }
-      tables.add(SqliteWriteTable(
-        name: name,
-        createSql: _renderCreateTable(t),
-        rows: exportRows,
-        rowids: finalRowids,
-      ));
+      tables.add(
+        SqliteWriteTable(
+          name: name,
+          createSql: _renderCreateTable(t),
+          rows: exportRows,
+          rowids: finalRowids,
+        ),
+      );
       if (!includeIndexes) continue;
       for (final ix in t.indexDefs.values) {
         // Expression-index branch: evaluate the expression per row and
@@ -10905,13 +11408,16 @@ class Database {
             entries.add([_toSqliteValue(exprFn(t, row)), rowid]);
           }
           final whereTail = ix.whereSql == null ? '' : ' WHERE ${ix.whereSql}';
-          indexes.add(SqliteWriteIndex(
-            name: ix.name,
-            tableName: name,
-            createSql: 'CREATE ${ix.unique ? "UNIQUE " : ""}INDEX ${ix.name} '
-                'ON $name(${ix.exprSql})$whereTail',
-            entries: entries,
-          ));
+          indexes.add(
+            SqliteWriteIndex(
+              name: ix.name,
+              tableName: name,
+              createSql:
+                  'CREATE ${ix.unique ? "UNIQUE " : ""}INDEX ${ix.name} '
+                  'ON $name(${ix.exprSql})$whereTail',
+              entries: entries,
+            ),
+          );
           continue;
         }
         // Skip the auto-created INTEGER-PRIMARY-KEY shadow index: SQLite
@@ -10927,8 +11433,9 @@ class Database {
         final colIdxs = <int>[];
         var ok = true;
         for (final cn in ix.columns) {
-          final i = t.columns
-              .indexWhere((c) => c.name.toLowerCase() == cn.toLowerCase());
+          final i = t.columns.indexWhere(
+            (c) => c.name.toLowerCase() == cn.toLowerCase(),
+          );
           if (i < 0) {
             ok = false;
             break;
@@ -10949,13 +11456,16 @@ class Database {
         }
         final colList = _renderIndexColumnList(ix);
         final whereTail = ix.whereSql == null ? '' : ' WHERE ${ix.whereSql}';
-        indexes.add(SqliteWriteIndex(
-          name: ix.name,
-          tableName: name,
-          createSql: 'CREATE ${ix.unique ? "UNIQUE " : ""}INDEX ${ix.name} '
-              'ON $name($colList)$whereTail',
-          entries: entries,
-        ));
+        indexes.add(
+          SqliteWriteIndex(
+            name: ix.name,
+            tableName: name,
+            createSql:
+                'CREATE ${ix.unique ? "UNIQUE " : ""}INDEX ${ix.name} '
+                'ON $name($colList)$whereTail',
+            entries: entries,
+          ),
+        );
       }
     }
     // Synthesize SQLite's `sqlite_sequence` table from per-table autoInc
@@ -10980,11 +11490,13 @@ class Database {
       if (seq > 0) seqRows.add([entry.key, seq]);
     }
     if (seqRows.isNotEmpty) {
-      tables.add(SqliteWriteTable(
-        name: 'sqlite_sequence',
-        createSql: 'CREATE TABLE sqlite_sequence(name,seq)',
-        rows: seqRows,
-      ));
+      tables.add(
+        SqliteWriteTable(
+          name: 'sqlite_sequence',
+          createSql: 'CREATE TABLE sqlite_sequence(name,seq)',
+          rows: seqRows,
+        ),
+      );
     }
     final bytes = writeSqliteFile(tables, pageSize: pageSize, indexes: indexes);
     return bytes;
@@ -11038,8 +11550,9 @@ class Database {
         continue;
       }
       tablesLoaded++;
-      final pkIdx = t.columns
-          .indexWhere((c) => c.primaryKey && c.type == DataType.integer);
+      final pkIdx = t.columns.indexWhere(
+        (c) => c.primaryKey && c.type == DataType.integer,
+      );
       // For WITHOUT ROWID tables, SQLite physically stores PK columns
       // first in the record, then the remaining columns in declared
       // order. Build a mapping from on-disk position back to declared
@@ -11056,8 +11569,9 @@ class Database {
           for (final con in t.constraints) {
             if (con is PrimaryKeyConstraint) {
               for (final n in con.columns) {
-                final idx = t.columns
-                    .indexWhere((c) => c.name.toLowerCase() == n.toLowerCase());
+                final idx = t.columns.indexWhere(
+                  (c) => c.name.toLowerCase() == n.toLowerCase(),
+                );
                 if (idx >= 0) pkCols.add(idx);
               }
               break;
@@ -11136,14 +11650,11 @@ class Database {
     // Restore ANALYZE planner stats from sqlite_stat1, if present.
     final hasStat = tableSchemas.any((s) => s.name == 'sqlite_stat1');
     if (hasStat) {
-      final stat = Table(
-        'sqlite_stat1',
-        const [
-          ColumnDef('tbl', DataType.text),
-          ColumnDef('idx', DataType.text),
-          ColumnDef('stat', DataType.text),
-        ],
-      );
+      final stat = Table('sqlite_stat1', const [
+        ColumnDef('tbl', DataType.text),
+        ColumnDef('idx', DataType.text),
+        ColumnDef('stat', DataType.text),
+      ]);
       try {
         for (final row in f.readTable('sqlite_stat1')) {
           final vals = List<Object?>.from(row.values);
@@ -11194,13 +11705,17 @@ class Database {
         final def = tbl.indexDefs[idxName];
         if (def == null) continue;
         final distinct = (n / avg).ceil();
-        final ts =
-            _stats.putIfAbsent(tname, () => _TableStats(n, <String, int>{}));
+        final ts = _stats.putIfAbsent(
+          tname,
+          () => _TableStats(n, <String, int>{}),
+        );
         ts.distinctByColumn[def.column.toLowerCase()] = distinct;
       }
     }
-    final msg = StringBuffer('Loaded $tablesLoaded table(s), '
-        '$rowsLoaded row(s), $indexesLoaded index(es) from $path');
+    final msg = StringBuffer(
+      'Loaded $tablesLoaded table(s), '
+      '$rowsLoaded row(s), $indexesLoaded index(es) from $path',
+    );
     if (skipped.isNotEmpty) {
       msg.write(' (skipped: ${skipped.join(", ")})');
     }
@@ -11276,7 +11791,8 @@ class Database {
   /// owning table (for column-name resolution) and a row, and returns true
   /// when the row should be included in the index.
   bool Function(Table, List<Object?>)? _compilePartialPredicate(
-      String? whereSql) {
+    String? whereSql,
+  ) {
     if (whereSql == null) return null;
     final stmt =
         Parser.fromString('SELECT $whereSql').parseStatement() as SelectStmt;
@@ -11289,7 +11805,8 @@ class Database {
   /// Returns the raw evaluated value, which the exporter writes as the
   /// index key (subject to [_toSqliteValue] coercion at the call site).
   Object? Function(Table, List<Object?>) _compileIndexExpression(
-      String exprSql) {
+    String exprSql,
+  ) {
     final stmt =
         Parser.fromString('SELECT $exprSql').parseStatement() as SelectStmt;
     final expr = stmt.projection.first.expr!;
@@ -11326,8 +11843,9 @@ class Database {
       for (final c in t.constraints) {
         if (c is PrimaryKeyConstraint) {
           for (final cn in c.columns) {
-            final i = t.columns
-                .indexWhere((cd) => cd.name.toLowerCase() == cn.toLowerCase());
+            final i = t.columns.indexWhere(
+              (cd) => cd.name.toLowerCase() == cn.toLowerCase(),
+            );
             if (i >= 0) pkIdxs.add(i);
           }
           break;
@@ -11492,7 +12010,11 @@ class Database {
   }
 
   void _recordChange(
-      Table t, String op, List<Object?>? oldRow, List<Object?>? newRow) {
+    Table t,
+    String op,
+    List<Object?>? oldRow,
+    List<Object?>? newRow,
+  ) {
     if (_sessions.isEmpty) return;
     final cols = [for (final c in t.columns) c.name];
     final pk = _pkColumnsOf(t);
@@ -11523,7 +12045,8 @@ class Database {
     var applied = 0;
     return _lock.write(() async {
       for (final c in changes) {
-        final t = _tables[c.table] ??
+        final t =
+            _tables[c.table] ??
             _tables[c.table.toLowerCase()] ??
             _tables[c.table.toUpperCase()];
         if (t == null) {
@@ -11554,8 +12077,9 @@ class Database {
             for (var ri = 0; ri < t.rows.length; ri++) {
               var match = true;
               for (var k = 0; k < c.columns.length; k++) {
-                final ti = colIdxIn(
-                    [for (final col in t.columns) col.name], c.columns[k]);
+                final ti = colIdxIn([
+                  for (final col in t.columns) col.name,
+                ], c.columns[k]);
                 if (ti == null) {
                   match = false;
                   break;
@@ -11571,7 +12095,7 @@ class Database {
           }
           // Locate by primary-key columns.
           final pkIdxRecorded = [
-            for (final p in c.pkColumns) colIdxIn(c.columns, p)
+            for (final p in c.pkColumns) colIdxIn(c.columns, p),
           ];
           if (pkIdxRecorded.contains(null)) return null;
           final pkIdxTable = [for (final p in c.pkColumns) t.columnIndex(p)];
@@ -11711,7 +12235,13 @@ class _TriggerSpec {
   final Expr? when;
   final List<Statement> body;
   _TriggerSpec(
-      this.name, this.timing, this.event, this.table, this.when, this.body);
+    this.name,
+    this.timing,
+    this.event,
+    this.table,
+    this.when,
+    this.body,
+  );
 }
 
 class _Savepoint {
@@ -11787,12 +12317,12 @@ class _IndexPlan {
     required this.column,
     required Object equalityKey,
     required this.estHits,
-  })  : equalityKeys = [equalityKey],
-        prefixKey = null,
-        lo = null,
-        hi = null,
-        loInclusive = false,
-        hiInclusive = false;
+  }) : equalityKeys = [equalityKey],
+       prefixKey = null,
+       lo = null,
+       hi = null,
+       loInclusive = false,
+       hiInclusive = false;
 
   _IndexPlan.equalityList({
     required this.table,
@@ -11800,11 +12330,11 @@ class _IndexPlan {
     required this.column,
     required this.equalityKeys,
     required this.estHits,
-  })  : prefixKey = null,
-        lo = null,
-        hi = null,
-        loInclusive = false,
-        hiInclusive = false;
+  }) : prefixKey = null,
+       lo = null,
+       hi = null,
+       loInclusive = false,
+       hiInclusive = false;
 
   _IndexPlan.range({
     required this.table,
@@ -11815,8 +12345,8 @@ class _IndexPlan {
     required this.loInclusive,
     required this.hiInclusive,
     required this.estHits,
-  })  : equalityKeys = null,
-        prefixKey = null;
+  }) : equalityKeys = null,
+       prefixKey = null;
 
   _IndexPlan.prefix({
     required this.table,
@@ -11824,11 +12354,11 @@ class _IndexPlan {
     required this.column,
     required this.prefixKey,
     required this.estHits,
-  })  : equalityKeys = null,
-        lo = null,
-        hi = null,
-        loInclusive = false,
-        hiInclusive = false;
+  }) : equalityKeys = null,
+       lo = null,
+       hi = null,
+       loInclusive = false,
+       hiInclusive = false;
 
   /// Hybrid plan: equality prefix over the leading K of N indexed
   /// columns, then a range constraint on column K+1.

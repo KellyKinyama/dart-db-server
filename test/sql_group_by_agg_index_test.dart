@@ -24,11 +24,11 @@ void main() {
       final r =
           await db.execute('SELECT v, SUM(v) FROM t GROUP BY v ORDER BY v');
       expect(r.rows, [
-        [1, 1],   // 1*1
-        [2, 4],   // 2*2
-        [3, 9],   // 3*3
-        [4, 4],   // 4*1
-        [5, 10],  // 5*2
+        [1, 1], // 1*1
+        [2, 4], // 2*2
+        [3, 9], // 3*3
+        [4, 4], // 4*1
+        [5, 10], // 5*2
       ]);
     } finally {
       await db.close();
@@ -55,20 +55,19 @@ void main() {
   test('GROUP BY v with TOTAL(v) — REAL', () async {
     final db = await seed();
     try {
-      final r = await db
-          .execute('SELECT v, TOTAL(v) FROM t GROUP BY v ORDER BY v');
+      final r =
+          await db.execute('SELECT v, TOTAL(v) FROM t GROUP BY v ORDER BY v');
       final expectedTotals = [1.0, 4.0, 9.0, 4.0, 10.0];
       for (var i = 0; i < expectedTotals.length; i++) {
-        expect((r.rows[i][1] as num).toDouble(),
-            closeTo(expectedTotals[i], 1e-9));
+        expect(
+            (r.rows[i][1] as num).toDouble(), closeTo(expectedTotals[i], 1e-9));
       }
     } finally {
       await db.close();
     }
   });
 
-  test('GROUP BY v combo: COUNT(*), MIN(v), SUM(v) all in one row',
-      () async {
+  test('GROUP BY v combo: COUNT(*), MIN(v), SUM(v) all in one row', () async {
     final db = await seed();
     try {
       final r = await db.execute(
@@ -116,12 +115,12 @@ void main() {
         [1, 20],
         [2, 30],
       ]) {
-        await db.execute(
-            'INSERT INTO t VALUES (${id++}, ${pair[0]}, ${pair[1]})');
+        await db
+            .execute('INSERT INTO t VALUES (${id++}, ${pair[0]}, ${pair[1]})');
       }
       // Generic path must still return correct sum across rows in group.
-      final r = await db
-          .execute('SELECT v, SUM(w) FROM t GROUP BY v ORDER BY v');
+      final r =
+          await db.execute('SELECT v, SUM(w) FROM t GROUP BY v ORDER BY v');
       expect(r.rows, [
         [1, 30],
         [2, 30],

@@ -15,8 +15,7 @@ void main() {
     await db.execute('CREATE INDEX i_v ON t(v)');
     var id = 1;
     for (final v in [1, null, 2, null, 3, null, 4, 5]) {
-      await db.execute(
-          'INSERT INTO t VALUES (${id++}, ${v ?? 'NULL'})');
+      await db.execute('INSERT INTO t VALUES (${id++}, ${v ?? 'NULL'})');
     }
     return db;
   }
@@ -44,8 +43,7 @@ void main() {
   test('TOTAL(v) WHERE v IS NOT NULL', () async {
     final db = await seed();
     try {
-      final r = await db.execute(
-          'SELECT TOTAL(v) FROM t WHERE v IS NOT NULL');
+      final r = await db.execute('SELECT TOTAL(v) FROM t WHERE v IS NOT NULL');
       expect((r.rows.first.first as num).toDouble(), closeTo(15.0, 1e-9));
     } finally {
       await db.close();
@@ -59,8 +57,7 @@ void main() {
       expect(r1.rows.first.first, 1);
       final r2 = await db.execute('SELECT MAX(v) FROM t WHERE v IS NOT NULL');
       expect(r2.rows.first.first, 5);
-      final r3 =
-          await db.execute('SELECT COUNT(v) FROM t WHERE v IS NOT NULL');
+      final r3 = await db.execute('SELECT COUNT(v) FROM t WHERE v IS NOT NULL');
       expect(r3.rows.first.first, 5);
     } finally {
       await db.close();
@@ -97,7 +94,8 @@ void main() {
     }
   });
 
-  test('IS NOT NULL on different column → not handled by fast path '
+  test(
+      'IS NOT NULL on different column → not handled by fast path '
       '(falls through, still correct)', () async {
     final db = await Database.open();
     try {

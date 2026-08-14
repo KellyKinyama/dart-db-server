@@ -14,8 +14,7 @@ void main() {
     await db.execute('CREATE INDEX i_v ON t(v)');
     var id = 1;
     for (final v in [1, null, 2, 3, null, 4, 5, 6, 7, 8, 9, 10]) {
-      await db.execute(
-          'INSERT INTO t VALUES (${id++}, ${v ?? 'NULL'})');
+      await db.execute('INSERT INTO t VALUES (${id++}, ${v ?? 'NULL'})');
     }
     return db;
   }
@@ -26,7 +25,11 @@ void main() {
       final r = await db
           .execute('SELECT v FROM t WHERE v BETWEEN 3 AND 7 ORDER BY v');
       expect(r.rows, [
-        [3], [4], [5], [6], [7],
+        [3],
+        [4],
+        [5],
+        [6],
+        [7],
       ]);
     } finally {
       await db.close();
@@ -39,7 +42,11 @@ void main() {
       final r = await db
           .execute('SELECT v FROM t WHERE v >= 4 AND v <= 8 ORDER BY v DESC');
       expect(r.rows, [
-        [8], [7], [6], [5], [4],
+        [8],
+        [7],
+        [6],
+        [5],
+        [4],
       ]);
     } finally {
       await db.close();
@@ -53,7 +60,8 @@ void main() {
       await db.execute('INSERT INTO t VALUES (99, 5)');
       final r = await db.execute('SELECT v FROM t WHERE v = 5');
       expect(r.rows, [
-        [5], [5],
+        [5],
+        [5],
       ]);
     } finally {
       await db.close();
@@ -65,7 +73,9 @@ void main() {
     try {
       final r = await db.execute('SELECT v FROM t WHERE v IN (7, 3, 5)');
       expect(r.rows, [
-        [3], [5], [7],
+        [3],
+        [5],
+        [7],
       ]);
     } finally {
       await db.close();
@@ -81,10 +91,11 @@ void main() {
       for (final v in [1, 2, 2, 3, 3, 3, 4]) {
         await db.execute('INSERT INTO t VALUES (${id++}, $v)');
       }
-      final r = await db
-          .execute('SELECT DISTINCT v FROM t WHERE v BETWEEN 2 AND 3');
+      final r =
+          await db.execute('SELECT DISTINCT v FROM t WHERE v BETWEEN 2 AND 3');
       expect(r.rows, [
-        [2], [3],
+        [2],
+        [3],
       ]);
     } finally {
       await db.close();
@@ -104,10 +115,10 @@ void main() {
   test('covering scan with WHERE col IS NOT NULL', () async {
     final db = await seed();
     try {
-      final r = await db.execute(
-          'SELECT v FROM t WHERE v IS NOT NULL ORDER BY v');
-      expect(r.rows.map((r) => r.first).toList(),
-          [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+      final r =
+          await db.execute('SELECT v FROM t WHERE v IS NOT NULL ORDER BY v');
+      expect(
+          r.rows.map((r) => r.first).toList(), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     } finally {
       await db.close();
     }
@@ -119,15 +130,16 @@ void main() {
       final r = await db.execute(
           'SELECT v FROM t WHERE v BETWEEN 3 AND 9 ORDER BY v LIMIT 3 OFFSET 2');
       expect(r.rows, [
-        [5], [6], [7],
+        [5],
+        [6],
+        [7],
       ]);
     } finally {
       await db.close();
     }
   });
 
-  test('covering scan WHERE on different col bails to generic scan',
-      () async {
+  test('covering scan WHERE on different col bails to generic scan', () async {
     final db = await Database.open();
     try {
       await db.execute(
@@ -139,12 +151,13 @@ void main() {
         [2, 200],
         [3, 100],
       ]) {
-        await db.execute(
-            'INSERT INTO t VALUES (${id++}, ${pair[0]}, ${pair[1]})');
+        await db
+            .execute('INSERT INTO t VALUES (${id++}, ${pair[0]}, ${pair[1]})');
       }
       final r = await db.execute('SELECT v FROM t WHERE w = 100 ORDER BY v');
       expect(r.rows, [
-        [1], [3],
+        [1],
+        [3],
       ]);
     } finally {
       await db.close();

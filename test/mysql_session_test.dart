@@ -11,7 +11,8 @@ void main() {
     setUp(() async {
       db = await Database.open(null);
       await db.execute(
-          'CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL)');
+        'CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL)',
+      );
     });
 
     test('SELECT @@version returns the server version literal', () async {

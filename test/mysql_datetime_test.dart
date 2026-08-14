@@ -19,7 +19,8 @@ void main() {
         )
       ''');
       await db.execute(
-          "INSERT INTO events VALUES (1, '2024-06-15', '2024-06-15 10:30:00', '2024-06-15 10:30:00', '10:30:00', 2024)");
+        "INSERT INTO events VALUES (1, '2024-06-15', '2024-06-15 10:30:00', '2024-06-15 10:30:00', '10:30:00', 2024)",
+      );
       final r = await db.execute('SELECT d, dt, ts, t, y FROM events');
       expect(r.rows.single, [
         '2024-06-15',
@@ -37,8 +38,7 @@ void main() {
     setUp(() async {
       db = await Database.open(null);
       await db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, ts TEXT)');
-      await db
-          .execute("INSERT INTO t VALUES (1, '2024-06-15 14:25:36')");
+      await db.execute("INSERT INTO t VALUES (1, '2024-06-15 14:25:36')");
     });
 
     test('NOW / CURDATE / CURTIME return strings', () async {
@@ -51,26 +51,30 @@ void main() {
     });
 
     test('YEAR / MONTH / DAY extract components', () async {
-      final r = await db
-          .execute('SELECT YEAR(ts), MONTH(ts), DAY(ts) FROM t WHERE id=1');
+      final r = await db.execute(
+        'SELECT YEAR(ts), MONTH(ts), DAY(ts) FROM t WHERE id=1',
+      );
       expect(r.rows.single, [2024, 6, 15]);
     });
 
     test('HOUR / MINUTE / SECOND extract components', () async {
       final r = await db.execute(
-          'SELECT HOUR(ts), MINUTE(ts), SECOND(ts) FROM t WHERE id=1');
+        'SELECT HOUR(ts), MINUTE(ts), SECOND(ts) FROM t WHERE id=1',
+      );
       expect(r.rows.single, [14, 25, 36]);
     });
 
     test('DAYNAME and MONTHNAME', () async {
-      final r =
-          await db.execute('SELECT DAYNAME(ts), MONTHNAME(ts) FROM t WHERE id=1');
+      final r = await db.execute(
+        'SELECT DAYNAME(ts), MONTHNAME(ts) FROM t WHERE id=1',
+      );
       expect(r.rows.single, ['Saturday', 'June']);
     });
 
     test('DAYOFWEEK / DAYOFYEAR / WEEKDAY', () async {
       final r = await db.execute(
-          'SELECT DAYOFWEEK(ts), DAYOFYEAR(ts), WEEKDAY(ts) FROM t WHERE id=1');
+        'SELECT DAYOFWEEK(ts), DAYOFYEAR(ts), WEEKDAY(ts) FROM t WHERE id=1',
+      );
       // 2024-06-15 = Saturday. MySQL DAYOFWEEK: 1=Sun..7=Sat -> 7.
       // DAYOFYEAR: 167 (leap year). WEEKDAY: 0=Mon..6=Sun -> 5 (Sat).
       expect(r.rows.single, [7, 167, 5]);
@@ -78,7 +82,8 @@ void main() {
 
     test('UNIX_TIMESTAMP and FROM_UNIXTIME roundtrip', () async {
       final r = await db.execute(
-          "SELECT UNIX_TIMESTAMP('2024-06-15 14:25:36'), FROM_UNIXTIME(1718461536)");
+        "SELECT UNIX_TIMESTAMP('2024-06-15 14:25:36'), FROM_UNIXTIME(1718461536)",
+      );
       expect(r.rows.single[0], 1718461536);
       expect(r.rows.single[1], '2024-06-15 14:25:36');
     });
@@ -89,26 +94,28 @@ void main() {
     });
 
     test('DATEDIFF returns integer days', () async {
-      final r =
-          await db.execute("SELECT DATEDIFF('2024-06-15', '2024-06-10')");
+      final r = await db.execute("SELECT DATEDIFF('2024-06-15', '2024-06-10')");
       expect(r.rows.single.single, 5);
     });
 
     test('DATE_FORMAT MySQL specifiers', () async {
       final r = await db.execute(
-          "SELECT DATE_FORMAT('2024-06-15 14:25:36', '%Y-%m-%d %H:%i:%s')");
+        "SELECT DATE_FORMAT('2024-06-15 14:25:36', '%Y-%m-%d %H:%i:%s')",
+      );
       expect(r.rows.single.single, '2024-06-15 14:25:36');
     });
 
     test('DATE_FORMAT with month/day names', () async {
       final r = await db.execute(
-          "SELECT DATE_FORMAT('2024-06-15', '%W, %M %e, %Y')");
+        "SELECT DATE_FORMAT('2024-06-15', '%W, %M %e, %Y')",
+      );
       expect(r.rows.single.single, 'Saturday, June 15, 2024');
     });
 
     test('DATE_FORMAT with 12-hour clock + AM/PM', () async {
       final r = await db.execute(
-          "SELECT DATE_FORMAT('2024-06-15 14:25:36', '%h:%i %p')");
+        "SELECT DATE_FORMAT('2024-06-15 14:25:36', '%h:%i %p')",
+      );
       expect(r.rows.single.single, '02:25 PM');
     });
   });

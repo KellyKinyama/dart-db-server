@@ -104,8 +104,7 @@ void main() {
       () async {
     final db = await Database.open();
     try {
-      await db.execute(
-          'CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)');
+      await db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)');
       // No index on v.
       var id = 1;
       for (final v in [1, 2, 2, 3, 3, 3]) {
@@ -120,8 +119,7 @@ void main() {
     }
   });
 
-  test('COUNT(*) WHERE col != literal stays correct via fallback',
-      () async {
+  test('COUNT(*) WHERE col != literal stays correct via fallback', () async {
     final db = await Database.open();
     try {
       await db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER)');

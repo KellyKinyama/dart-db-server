@@ -10,13 +10,15 @@ void main() {
     setUp(() async {
       db = await Database.open(null);
       await db.execute(
-          'CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, hits INTEGER)');
+        'CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, hits INTEGER)',
+      );
       await db.execute("INSERT INTO t VALUES (1, 'alice', 1)");
     });
 
     test('inserts a new row when no key conflict', () async {
       await db.execute(
-          "INSERT INTO t VALUES (2, 'bob', 5) ON DUPLICATE KEY UPDATE hits = hits + 1");
+        "INSERT INTO t VALUES (2, 'bob', 5) ON DUPLICATE KEY UPDATE hits = hits + 1",
+      );
       final r = await db.execute('SELECT id, name, hits FROM t ORDER BY id');
       expect(r.rows, [
         [1, 'alice', 1],
@@ -26,21 +28,24 @@ void main() {
 
     test('updates the existing row on PK collision', () async {
       await db.execute(
-          "INSERT INTO t VALUES (1, 'alice', 99) ON DUPLICATE KEY UPDATE hits = hits + 1");
+        "INSERT INTO t VALUES (1, 'alice', 99) ON DUPLICATE KEY UPDATE hits = hits + 1",
+      );
       final r = await db.execute('SELECT id, name, hits FROM t WHERE id = 1');
       expect(r.rows.single, [1, 'alice', 2]);
     });
 
     test('VALUES(col) references the would-be-inserted row', () async {
       await db.execute(
-          "INSERT INTO t VALUES (1, 'ALICE', 7) ON DUPLICATE KEY UPDATE name = VALUES(name), hits = hits + VALUES(hits)");
+        "INSERT INTO t VALUES (1, 'ALICE', 7) ON DUPLICATE KEY UPDATE name = VALUES(name), hits = hits + VALUES(hits)",
+      );
       final r = await db.execute('SELECT id, name, hits FROM t WHERE id = 1');
       expect(r.rows.single, [1, 'ALICE', 8]);
     });
 
     test('multiple assignments', () async {
       await db.execute(
-          "INSERT INTO t VALUES (1, 'a2', 10) ON DUPLICATE KEY UPDATE name = VALUES(name), hits = VALUES(hits)");
+        "INSERT INTO t VALUES (1, 'a2', 10) ON DUPLICATE KEY UPDATE name = VALUES(name), hits = VALUES(hits)",
+      );
       final r = await db.execute('SELECT id, name, hits FROM t WHERE id = 1');
       expect(r.rows.single, [1, 'a2', 10]);
     });

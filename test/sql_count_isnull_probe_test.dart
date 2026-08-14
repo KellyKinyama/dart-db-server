@@ -37,8 +37,7 @@ void main() {
         await db.execute('INSERT INTO t VALUES (${id++}, '
             '${v ?? 'NULL'})');
       }
-      final r =
-          await db.execute('SELECT COUNT(*) FROM t WHERE k IS NOT NULL');
+      final r = await db.execute('SELECT COUNT(*) FROM t WHERE k IS NOT NULL');
       expect(r.rows, [
         [3],
       ]);
@@ -77,8 +76,7 @@ void main() {
       expect(r.rows, [
         [4],
       ]);
-      final r2 =
-          await db.execute('SELECT COUNT(*) FROM t WHERE k IS NOT NULL');
+      final r2 = await db.execute('SELECT COUNT(*) FROM t WHERE k IS NOT NULL');
       expect(r2.rows, [
         [0],
       ]);
@@ -87,12 +85,10 @@ void main() {
     }
   });
 
-  test('IS NULL on non-indexed col falls through to generic path',
-      () async {
+  test('IS NULL on non-indexed col falls through to generic path', () async {
     final db = await Database.open();
     try {
-      await db.execute(
-          'CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)');
+      await db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)');
       var id = 1;
       for (final v in [1, null, 2, null]) {
         await db.execute('INSERT INTO t VALUES (${id++}, '

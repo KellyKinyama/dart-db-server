@@ -34,8 +34,8 @@ void main() {
       for (var i = 1; i <= 100; i++) {
         await db.execute('INSERT INTO t VALUES ($i, $i)');
       }
-      final r = await db
-          .execute('SELECT COUNT(*) FROM t WHERE k >= 30 AND k <= 40');
+      final r =
+          await db.execute('SELECT COUNT(*) FROM t WHERE k >= 30 AND k <= 40');
       expect(r.rows, [
         [11],
       ]);

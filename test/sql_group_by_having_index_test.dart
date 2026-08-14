@@ -21,9 +21,9 @@ void main() {
   test('HAVING COUNT(*) > 1', () async {
     final db = await seed();
     try {
-      final r = await db.execute(
-          'SELECT v, COUNT(*) FROM t GROUP BY v HAVING COUNT(*) > 1 '
-          'ORDER BY v');
+      final r = await db
+          .execute('SELECT v, COUNT(*) FROM t GROUP BY v HAVING COUNT(*) > 1 '
+              'ORDER BY v');
       expect(r.rows, [
         [2, 2],
         [3, 3],
@@ -37,9 +37,9 @@ void main() {
   test('HAVING COUNT(*) = 1', () async {
     final db = await seed();
     try {
-      final r = await db.execute(
-          'SELECT v, COUNT(*) FROM t GROUP BY v HAVING COUNT(*) = 1 '
-          'ORDER BY v');
+      final r = await db
+          .execute('SELECT v, COUNT(*) FROM t GROUP BY v HAVING COUNT(*) = 1 '
+              'ORDER BY v');
       expect(r.rows, [
         [1, 1],
         [4, 1],
@@ -83,9 +83,9 @@ void main() {
   test('HAVING v IN (1, 3, 5)', () async {
     final db = await seed();
     try {
-      final r = await db.execute(
-          'SELECT v, COUNT(*) FROM t GROUP BY v HAVING v IN (1, 3, 5) '
-          'ORDER BY v');
+      final r = await db
+          .execute('SELECT v, COUNT(*) FROM t GROUP BY v HAVING v IN (1, 3, 5) '
+              'ORDER BY v');
       expect(r.rows, [
         [1, 1],
         [3, 3],
@@ -99,8 +99,7 @@ void main() {
   test('HAVING COUNT(*) >= 2 AND v < 5', () async {
     final db = await seed();
     try {
-      final r = await db.execute(
-          'SELECT v, COUNT(*) FROM t GROUP BY v '
+      final r = await db.execute('SELECT v, COUNT(*) FROM t GROUP BY v '
           'HAVING COUNT(*) >= 2 AND v < 5 ORDER BY v');
       expect(r.rows, [
         [2, 2],
@@ -114,9 +113,9 @@ void main() {
   test('WHERE + HAVING composes', () async {
     final db = await seed();
     try {
-      final r = await db.execute(
-          'SELECT v, COUNT(*) FROM t WHERE v >= 2 GROUP BY v '
-          'HAVING COUNT(*) > 1 ORDER BY v DESC');
+      final r =
+          await db.execute('SELECT v, COUNT(*) FROM t WHERE v >= 2 GROUP BY v '
+              'HAVING COUNT(*) > 1 ORDER BY v DESC');
       expect(r.rows, [
         [5, 2],
         [3, 3],
@@ -145,9 +144,9 @@ void main() {
     // still produce the correct answer.
     final db = await seed();
     try {
-      final r = await db.execute(
-          'SELECT v, SUM(v) FROM t GROUP BY v HAVING SUM(v) >= 9 '
-          'ORDER BY v');
+      final r = await db
+          .execute('SELECT v, SUM(v) FROM t GROUP BY v HAVING SUM(v) >= 9 '
+              'ORDER BY v');
       expect(r.rows, [
         [3, 9],
         [5, 10],

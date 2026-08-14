@@ -60,8 +60,8 @@ void main() {
   test('TOTAL(DISTINCT v) WHERE v IS NOT NULL → all unique', () async {
     final db = await seed();
     try {
-      final r = await db.execute(
-          'SELECT TOTAL(DISTINCT v) FROM t WHERE v IS NOT NULL');
+      final r = await db
+          .execute('SELECT TOTAL(DISTINCT v) FROM t WHERE v IS NOT NULL');
       // 1+2+3+4+5+6+7 = 28
       expect((r.rows.first.first as num).toDouble(), closeTo(28.0, 1e-9));
     } finally {
@@ -86,8 +86,7 @@ void main() {
   test('SUM(DISTINCT v) WHERE v = lit — single key', () async {
     final db = await seed();
     try {
-      final r = await db
-          .execute('SELECT SUM(DISTINCT v) FROM t WHERE v = 3');
+      final r = await db.execute('SELECT SUM(DISTINCT v) FROM t WHERE v = 3');
       expect(r.rows, [
         [3],
       ]);
@@ -110,15 +109,16 @@ void main() {
   test('TOTAL(DISTINCT v) WHERE no match → 0.0', () async {
     final db = await seed();
     try {
-      final r = await db
-          .execute('SELECT TOTAL(DISTINCT v) FROM t WHERE v BETWEEN 100 AND 200');
+      final r = await db.execute(
+          'SELECT TOTAL(DISTINCT v) FROM t WHERE v BETWEEN 100 AND 200');
       expect((r.rows.first.first as num).toDouble(), closeTo(0.0, 1e-9));
     } finally {
       await db.close();
     }
   });
 
-  test('MIN(DISTINCT v) WHERE — bails (DISTINCT not supported for MIN); '
+  test(
+      'MIN(DISTINCT v) WHERE — bails (DISTINCT not supported for MIN); '
       'generic path still correct', () async {
     final db = await seed();
     try {

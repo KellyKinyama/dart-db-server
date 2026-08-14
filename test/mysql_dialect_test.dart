@@ -16,12 +16,13 @@ void main() {
 
     test('backtick-quoted identifiers in DDL and DML', () async {
       await db.execute(
-          'CREATE TABLE `users` (`id` INTEGER PRIMARY KEY, `full name` TEXT)');
+        'CREATE TABLE `users` (`id` INTEGER PRIMARY KEY, `full name` TEXT)',
+      );
       await db.execute("INSERT INTO `users` VALUES (1, 'Alice')");
       final r = await db.execute('SELECT `id`, `full name` FROM `users`');
       expect(r.columns, ['id', 'full name']);
       expect(r.rows, [
-        [1, 'Alice']
+        [1, 'Alice'],
       ]);
     });
 
@@ -47,8 +48,7 @@ void main() {
       for (var i = 1; i <= 5; i++) {
         await db.execute('INSERT INTO n VALUES ($i)');
       }
-      final r =
-          await db.execute('SELECT x FROM n ORDER BY x LIMIT 1, 2');
+      final r = await db.execute('SELECT x FROM n ORDER BY x LIMIT 1, 2');
       expect(r.rows, [
         [2],
         [3],
@@ -57,7 +57,8 @@ void main() {
 
     test('LIMIT offset, count on VALUES', () async {
       final r = await db.execute(
-          'VALUES (1),(2),(3),(4) ORDER BY 1 LIMIT 1, 2');
+        'VALUES (1),(2),(3),(4) ORDER BY 1 LIMIT 1, 2',
+      );
       expect(r.rows.length, 2);
       expect(r.rows[0][0], 2);
       expect(r.rows[1][0], 3);

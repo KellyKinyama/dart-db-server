@@ -43,8 +43,7 @@ void main() {
       await db.execute('CREATE INDEX i_v ON t(v)');
       var id = 1;
       for (final v in [4, null, 6, null, 10]) {
-        await db.execute(
-            'INSERT INTO t VALUES (${id++}, ${v ?? 'NULL'})');
+        await db.execute('INSERT INTO t VALUES (${id++}, ${v ?? 'NULL'})');
       }
       final r = await db.execute('SELECT TOTAL(v) FROM t');
       expect((r.rows.first.first as num).toDouble(), closeTo(20.0, 1e-9));
@@ -76,12 +75,10 @@ void main() {
     }
   });
 
-  test('TOTAL on non-indexed col falls through to generic aggregate',
-      () async {
+  test('TOTAL on non-indexed col falls through to generic aggregate', () async {
     final db = await Database.open();
     try {
-      await db.execute(
-          'CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)');
+      await db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)');
       // No index on v.
       for (var i = 1; i <= 4; i++) {
         await db.execute('INSERT INTO t VALUES ($i, $i)');
@@ -97,8 +94,7 @@ void main() {
       () async {
     final db = await Database.open();
     try {
-      await db.execute(
-          'CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)');
+      await db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)');
       final r = await db.execute('SELECT TOTAL(v) FROM t');
       expect((r.rows.first.first as num).toDouble(), closeTo(0.0, 1e-9));
     } finally {

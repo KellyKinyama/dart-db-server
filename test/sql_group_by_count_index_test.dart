@@ -58,21 +58,28 @@ void main() {
     try {
       final r = await db.execute('SELECT COUNT(*) FROM t GROUP BY v');
       expect(r.rows, [
-        [1], [2], [3], [1], [2],
+        [1],
+        [2],
+        [3],
+        [1],
+        [2],
       ]);
     } finally {
       await db.close();
     }
   });
 
-  test('GROUP BY with COUNT(v) (same col) is equivalent to COUNT(*)',
-      () async {
+  test('GROUP BY with COUNT(v) (same col) is equivalent to COUNT(*)', () async {
     final db = await seed();
     try {
       final r =
           await db.execute('SELECT v, COUNT(v) FROM t GROUP BY v ORDER BY v');
       expect(r.rows, [
-        [1, 1], [2, 2], [3, 3], [4, 1], [5, 2],
+        [1, 1],
+        [2, 2],
+        [3, 3],
+        [4, 1],
+        [5, 2],
       ]);
     } finally {
       await db.close();
@@ -87,11 +94,10 @@ void main() {
       await db.execute('CREATE INDEX i_v ON t(v)');
       var id = 1;
       for (final v in [1, null, 1, 2, null]) {
-        await db.execute(
-            'INSERT INTO t VALUES (${id++}, ${v ?? 'NULL'})');
+        await db.execute('INSERT INTO t VALUES (${id++}, ${v ?? 'NULL'})');
       }
-      final r = await db
-          .execute('SELECT v, COUNT(*) FROM t GROUP BY v ORDER BY v');
+      final r =
+          await db.execute('SELECT v, COUNT(*) FROM t GROUP BY v ORDER BY v');
       // Generic path emits a NULL group with count=2.
       expect(r.rows.length, 3);
       // SQLite groups NULLs together.
@@ -108,7 +114,9 @@ void main() {
       final r = await db.execute(
           'SELECT v, COUNT(*) FROM t WHERE v >= 3 GROUP BY v ORDER BY v');
       expect(r.rows, [
-        [3, 3], [4, 1], [5, 2],
+        [3, 3],
+        [4, 1],
+        [5, 2],
       ]);
     } finally {
       await db.close();
@@ -138,10 +146,12 @@ void main() {
       for (final v in [1, 2, 2, 3]) {
         await db.execute('INSERT INTO t VALUES (${id++}, $v)');
       }
-      final r = await db
-          .execute('SELECT v, COUNT(*) FROM t GROUP BY v ORDER BY v');
+      final r =
+          await db.execute('SELECT v, COUNT(*) FROM t GROUP BY v ORDER BY v');
       expect(r.rows, [
-        [1, 1], [2, 2], [3, 1],
+        [1, 1],
+        [2, 2],
+        [3, 1],
       ]);
     } finally {
       await db.close();

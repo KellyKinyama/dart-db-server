@@ -35,8 +35,8 @@ void main() {
       for (var i = 1; i <= 7; i++) {
         await db.execute('INSERT INTO t VALUES ($i, ${i * 3})');
       }
-      final r = await db.execute(
-          'SELECT MIN(v) AS lo, MAX(v) AS hi, COUNT(*) AS n FROM t');
+      final r = await db
+          .execute('SELECT MIN(v) AS lo, MAX(v) AS hi, COUNT(*) AS n FROM t');
       expect(r.columns, ['lo', 'hi', 'n']);
       expect(r.rows, [
         [3, 21, 7],
