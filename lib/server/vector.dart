@@ -132,7 +132,7 @@ enum VectorMetric {
   /// therefore keeps the k LARGEST scores here.
   innerProduct,
 
-  /// Cosine distance = 1 − (a·b)/(‖a‖·‖b‖). Range [0, 2].
+  /// Cosine distance = 1 − (a·b)/(‖a‖·‖b‖). Range `[0, 2]`.
   cosine,
 }
 
@@ -367,7 +367,7 @@ double vecNorm(Vector v) {
   return math.sqrt(acc);
 }
 
-/// Cosine similarity in [-1, 1]. Returns 0 when either vector is the
+/// Cosine similarity in `[-1, 1]`. Returns 0 when either vector is the
 /// zero vector (mirroring FAISS's behavior of treating undefined
 /// directions as maximally dissimilar-ish).
 double vecCosineSimilarity(Vector a, Vector b) {
@@ -378,7 +378,7 @@ double vecCosineSimilarity(Vector a, Vector b) {
   return vecInnerProduct(a, b) / (na * nb);
 }
 
-/// Cosine distance = 1 − cosine similarity, in [0, 2].
+/// Cosine distance = 1 − cosine similarity, in `[0, 2]`.
 double vecCosineDistance(Vector a, Vector b) => 1.0 - vecCosineSimilarity(a, b);
 
 /// Return a new L2-normalized copy of [v]. A zero vector is returned
@@ -674,12 +674,12 @@ class FlatIndex {
 /// at the price of small recall loss controlled by [efSearch].
 ///
 /// Parameters mirror FAISS `IndexHNSWFlat`:
-///   * [M] — max neighbors per node above layer 0 (layer 0 gets `2*M`).
+///   * [m] — max neighbors per node above layer 0 (layer 0 gets `2*m`).
 ///     Larger = better recall / more memory. Typical: 8–48.
 ///   * [efConstruction] — build-time beam width. Larger = better graph,
 ///     slower add. Typical: 40–200.
 ///   * [efSearch] — query-time beam width. Larger = better recall,
-///     slower search. Tunable per-search via [search]'s `ef` argument.
+///     slower search. Tunable per-search via `search`'s `ef` argument.
 ///
 /// Metric semantics: [VectorMetric.l2] and [VectorMetric.l2sq] both use
 /// squared L2 internally for ranking; the visible distance is sqrt'd

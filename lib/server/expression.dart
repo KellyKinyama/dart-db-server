@@ -690,9 +690,9 @@ class WindowFrame {
   });
 }
 
-/// OVER([PARTITION BY ...] [ORDER BY ...] [frame]) specification attached
+/// `OVER (PARTITION BY ... ORDER BY ... frame)` specification attached
 /// to a `FunctionCallExpr` to make it a window function. Either an
-/// inline spec or a [name] referencing a named window in the SELECT.
+/// inline spec or a `baseName` referencing a named window in the SELECT.
 class WindowSpec {
   final List<Expr> partitionBy;
   final List<WindowOrderItem> orderBy;
@@ -2127,7 +2127,7 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
 /// Hook installed by the engine: given a table and column name, return
 /// the corpus-aware FTS5 index, or null when no active database is in
 /// scope. Wired up by `Database.executeStmt` so that scalar functions
-/// can reach back into the database without [expression.dart] importing
+/// can reach back into the database without `expression.dart` importing
 /// it (which would create a cycle).
 Fts5Index? Function(String table, String column)? fts5CorpusLookup;
 

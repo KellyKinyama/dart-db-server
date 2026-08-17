@@ -8,7 +8,7 @@
 ///
 /// ## File layout
 ///
-/// The data file is an integer multiple of [pageSize] bytes long. Page
+/// The data file is an integer multiple of `pageSize` bytes long. Page
 /// numbers are 0-indexed; page `n` lives at byte offset `n * pageSize`.
 /// There is no in-file header — higher layers (heap, btree) own their
 /// own metadata pages.
@@ -18,7 +18,7 @@
 /// On the first dirty write of a transaction we open a sibling
 /// `<path>.journal` file and copy the *original* bytes of every page we
 /// are about to modify into it, fsyncing the journal before touching
-/// the data file. [commit] then writes the dirty pages into the data
+/// the data file. `commit` then writes the dirty pages into the data
 /// file, fsyncs it, and finally deletes the journal. The journal's
 /// presence on disk therefore means "the last transaction did not
 /// finish" — [PagedFile.open] replays it page-by-page to restore the

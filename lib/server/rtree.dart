@@ -53,7 +53,7 @@ class BBox {
     return a;
   }
 
-  /// Returns true when [this] and [other] share at least one point
+  /// Returns true when this box and [other] share at least one point
   /// (closed-interval intersection).
   bool intersects(BBox other) {
     assert(other.dims == dims);

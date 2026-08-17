@@ -25,6 +25,8 @@ jobs:
         run: dart format --output=none --set-exit-if-changed .
       - name: Analyze project source
         run: dart analyze --fatal-infos
+      - name: Verify dartdoc references
+        run: dart doc --dry-run
       - name: Run tests
         run: dart test --reporter compact
 

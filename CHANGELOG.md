@@ -1,3 +1,16 @@
+## 0.1.4
+
+- Docs-only release. Fix all 13 unresolved-symbol warnings that
+  `dart doc` emitted on the previous versions:
+  - `vector.dart`: `[M]` → `[m]`, `[0, 2]` / `[-1, 1]` backticked.
+  - `expression.dart`: `WindowSpec` doc + `fts5CorpusLookup` doc.
+  - `paged_file.dart`: library-level `[pageSize]` / `[commit]` refs
+    backticked (they were member refs at library scope).
+  - `paged_table.dart`: `[columnName]` → `columnName`, `[database.dart]`
+    backticked.
+  - `rtree.dart`: `[this]` in `BBox.intersects` doc → prose.
+- `dart doc --dry-run` now reports **0 warnings**.
+
 ## 0.1.3
 
 - **New: `vec_search_join_filtered` TVF.**

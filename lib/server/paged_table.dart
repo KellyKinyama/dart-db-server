@@ -8,7 +8,7 @@
 /// by the configured `cacheCapacity`.
 ///
 /// **This API is intentionally separate from the SQL executor.** The
-/// in-memory `Database` / `Table` classes in [database.dart] are
+/// in-memory `Database` / `Table` classes in `database.dart` are
 /// untouched; this is a parallel storage layer that callers can use
 /// directly when they need true out-of-core behaviour. A future
 /// refactor may wire it behind `CREATE TABLE … USING paged(…)`.
@@ -642,10 +642,10 @@ class PagedTable implements TableBackend {
   // Secondary indexes (equality lookup)
   // ---------------------------------------------------------------------------
 
-  /// Build a new secondary index [name] over column [columnName]. Walks
+  /// Build a new secondary index [name] over column `columnName`. Walks
   /// every existing row, populates the index, commits everything, and
   /// rewrites `meta.json` so the index survives reopen. Throws when
-  /// [name] is already taken or [columnName] is unknown.
+  /// [name] is already taken or `columnName` is unknown.
   ///
   /// Index names must match `^[A-Za-z0-9_]+$` so they can become a
   /// safe filename suffix (`<base>.idx_<name>`).
