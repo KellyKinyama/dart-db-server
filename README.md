@@ -4,6 +4,26 @@ A small SQLite-style SQL database server written in pure Dart. In-memory
 storage with JSON file persistence, TCP server with a JSON line protocol,
 and an interactive REPL.
 
+> **What ships in the box**
+>
+> - Full SQL surface (DDL, DML, joins, CTEs, window functions, transactions).
+> - Three storage backends: in-memory (JSON), out-of-core paged, SQLite
+>   on-disk format.
+> - **Vector database** — six index kinds (Flat / HNSW / IVFFlat / LSH / PQ
+>   / IVFPQ), four metrics (l2 / l2sq / inner_product / cosine),
+>   payload-filter pruning, range search, hybrid vector + BM25 retrieval.
+> - **FTS5-lite** full-text search with BM25.
+> - TCP server + JSON line protocol.
+> - **MySQL wire compatibility** — ORMs like `mysql_client` connect
+>   unchanged.
+
+## Install
+
+```yaml
+dependencies:
+  dart_db_server: ^0.1.0
+```
+
 ## Run
 
 ```powershell
@@ -70,6 +90,102 @@ print(r.rows); // [[1, Alice]]
 > **Note on persistence:** tables (rows + schema + indexes + AUTOINCREMENT
 > counters) round-trip through JSON. Views are best-effort and may not
 > survive process restart in the current build.
+
+## Vector database
+
+`dart_db_server` ships a full vector-search engine wired into the SQL
+surface. Six index kinds are available (`flat`, `hnsw`, `ivf`, `lsh`,
+`pq`, `ivfpq`) with four metrics (`l2`, `l2sq`, `inner_product`,
+`cosine`).
+
+**Declare an index inline on the column:**
+
+```sql
+CREATE TABLE products (
+  id INTEGER PRIMARY KEY,
+  tenant INTEGER,
+  kind TEXT,
+  description TEXT,
+  embedding BLOB VECTOR(
+    dim=384,
+    kind=hnsw,
+    metric=cosine,
+    m=16, ef_construction=64,
+    filter_cols='tenant,kind'
+  )
+);
+```
+
+`filter_cols` opts into **payload-filter pruning**: the engine maintains
+an inverse index (`col=value → row-position set`) and intersects
+candidate rows in O(1) **before** touching the vector index. On a query
+like `WHERE tenant = 3 AND kind = 'wearables' ORDER BY VEC_COSINE(...)
+LIMIT 10`, this is often 10-100× faster than a plain over-fetch.
+
+**k-NN via the planner fast path** — plain SQL, no TVF needed:
+
+```sql
+SELECT id, title
+FROM products
+WHERE tenant = 3 AND kind = 'wearables'
+ORDER BY VEC_COSINE(embedding, VEC('[0.1, 0.4, ...]'))
+LIMIT 10;
+```
+
+`EXPLAIN QUERY PLAN` shows the plan chose the built index:
+```
+SEARCH products USING VECTOR INDEX (hnsw) WITH FILTER
+```
+
+**k-NN via a table-valued function** — composable with joins and CTEs:
+
+```sql
+SELECT p.id, p.title, s.distance
+FROM vec_search('products', 'embedding',
+                VEC('[0.1, 0.4, ...]'), 10) AS s
+JOIN products p ON p.id = s.rowid
+ORDER BY s.distance;
+```
+
+**Filtered / range / hybrid / batch retrieval** — all available as TVFs:
+
+| TVF                              | Purpose                                       |
+| -------------------------------- | --------------------------------------------- |
+| `vec_search`                     | Single-query k-NN                             |
+| `vec_search_batch`               | Multi-query k-NN                              |
+| `vec_search_filtered`            | k-NN with `filter_json` payload intersection  |
+| `vec_search_filtered_batch`      | Batch variant of the above                    |
+| `vec_range_search`               | All rows within a distance threshold          |
+| `vec_range_search_batch`         | Batch variant of the above                    |
+| `vec_hybrid_search`              | Fuse vector distance + BM25 via RRF           |
+| `vec_hybrid_search_batch`        | Batch variant of the above                    |
+| `vec_search_join`                | Row-to-row k-NN join between two tables       |
+| `vec_batch_insert`               | Bulk insert (id, vec) pairs from JSON         |
+| `vec_import_csv`                 | Bulk insert (id, vec) pairs from a CSV file   |
+
+**Admin PRAGMAs:**
+
+```sql
+PRAGMA vector_index_list;              -- what's registered
+PRAGMA vector_index_stats('t.col');    -- kind, n, live, tombstones, bytes
+PRAGMA vector_verify('t.col');         -- consistency check vs t.rows
+PRAGMA vector_verify_all;              -- verify every binding
+PRAGMA vector_analyze('t.col');        -- top-k recall via random probes
+PRAGMA vector_index_rebuild('t.col');  -- drop + reprime
+PRAGMA vector_index_rebuild_all;       -- rebuild everything
+PRAGMA vector_index_warm('t.col');     -- targeted async warm (paged)
+PRAGMA vector_index_warm_all;          -- warm every binding
+PRAGMA fts5_warm('t.col');             -- warm FTS5 corpus (paged)
+```
+
+For an end-to-end walkthrough — seed, k-NN, filtered k-NN, range,
+hybrid, batch, EXPLAIN, and PRAGMAs — see
+[`example/vector_semantic_search.dart`](example/vector_semantic_search.dart).
+Run it with:
+
+```powershell
+dart run example/vector_semantic_search.dart
+```
 
 ## Wire protocol
 

@@ -1,9 +1,0 @@
-﻿00:00 +0: loading test/mysql_multi_statement_test.dart
-00:00 +0: MySqlServer multi-statement COM_QUERY SELECT; INSERT; SELECT chains 3 results with proper status flags
-[mysql] listening on 127.0.0.1:57658 (mysql wire)
-[mysql] conn 1 login user=root db= plugin=mysql_native_password
-00:00 +1: MySqlServer multi-statement COM_QUERY without CLIENT_MULTI_STATEMENTS, only the first stmt is executed
-[mysql] listening on 127.0.0.1:57660 (mysql wire)
-[mysql] conn 1 login user=root db= plugin=mysql_native_password
-[mysql] conn 2 login user=root db= plugin=mysql_native_password
-00:00 +2: All tests passed!

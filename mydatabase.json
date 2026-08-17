@@ -1,1 +1,0 @@
-{"users":{"columns":[{"name":"id","type":"int"},{"name":"name","type":"string"},{"name":"age","type":"int"}],"rows":[[1,"Alice",31]]}}

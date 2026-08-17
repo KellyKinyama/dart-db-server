@@ -6,3 +6,7 @@
 memory/
 memory.lock
 
+# Local test / dev artifacts (never commit)
+*.log
+mydatabase.json
+

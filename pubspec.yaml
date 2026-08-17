@@ -1,7 +1,23 @@
 name: dart_db_server
-description: A sample command-line application.
-version: 1.0.0
-# repository: https://github.com/my_org/my_repo
+description: >
+  A pure-Dart SQL database (SQLite-inspired) with a built-in vector search
+  engine, FTS5-lite full-text search, and hybrid retrieval — plus a TCP
+  server and MySQL-wire compatibility layer.
+version: 0.1.0
+homepage: https://github.com/KellyKinyama/dart-db-server
+repository: https://github.com/KellyKinyama/dart-db-server
+issue_tracker: https://github.com/KellyKinyama/dart-db-server/issues
+topics:
+  - database
+  - sql
+  - vector-search
+  - embeddings
+  - full-text-search
+
+# Test-only cert/key used by TLS handshake tests; not a real credential.
+false_secrets:
+  - /test/fixtures/mysql_test_key.pem
+  - /test/fixtures/mysql_test_cert.pem
 
 environment:
   sdk: ^3.6.2
