@@ -1386,6 +1386,52 @@ class Database {
     );
   }
 
+  /// V47: `PRAGMA vector_index_rebuild('tbl.col')` — drop the built
+  /// index (any tombstones, incremental deltas, and payload buckets)
+  /// and force a from-scratch rebuild on the next query. Useful after
+  /// heavy UPDATE/DELETE churn on a paged binding, or when a user
+  /// suspects drift and wants a clean baseline. Paged bindings still
+  /// need warmVectorIndexes() to actually rebuild; the pragma just
+  /// invalidates.
+  QueryResult _vectorIndexRebuild(String target) {
+    final dot = target.indexOf('.');
+    if (dot < 0) {
+      throw StateError(
+        'PRAGMA vector_index_rebuild target must be "tbl.col", got '
+        '"$target"',
+      );
+    }
+    final tableName = target.substring(0, dot);
+    final colName = target.substring(dot + 1);
+    final key = '${tableName.toLowerCase()}:${colName.toLowerCase()}';
+    final binding = _vectorIndexes[key];
+    if (binding == null) {
+      throw StateError(
+        'PRAGMA vector_index_rebuild: no vector index on '
+        '$tableName.$colName',
+      );
+    }
+    binding.index = null;
+    binding.builtRowCount = 0;
+    binding.refreshPositions.clear();
+    binding.pendingPagedInserts.clear();
+    binding.pendingPagedRefreshes.clear();
+    binding.pendingPagedDeletes.clear();
+    binding.payloadIndex.clear();
+    binding.payloadIndexDirty = false;
+    if (_isPaged(tableName)) {
+      return QueryResult.message(
+        'vector_index_rebuild: $tableName.$colName invalidated; '
+        'call warmVectorIndexes() to rebuild',
+      );
+    }
+    // In-memory: prime the rebuild synchronously.
+    _vectorIndexFor(tableName, colName);
+    return QueryResult.message(
+      'vector_index_rebuild: $tableName.$colName rebuilt',
+    );
+  }
+
   /// V21 incremental-maintenance-aware invalidation.
   ///
   /// * Plain `INSERT` (mode `normal`) leaves the built index intact —
@@ -13769,6 +13815,7 @@ class Database {
       'foreign_key_list',
       'vector_index_stats',
       'vector_analyze',
+      'vector_index_rebuild',
     };
     if (s.value != null && !introspectionWithArg.contains(name)) {
       _pragmas[name] = s.value;
@@ -14002,6 +14049,7 @@ class Database {
             'vector_index_list',
             'vector_index_stats',
             'vector_analyze',
+            'vector_index_rebuild',
           ];
           return QueryResult(
             columns: const ['name'],
@@ -14107,6 +14155,15 @@ class Database {
             );
           }
           return _vectorAnalyze(target);
+        }
+      case 'vector_index_rebuild':
+        {
+          if (target == null) {
+            throw StateError(
+              "PRAGMA vector_index_rebuild requires a 'tbl.col' target.",
+            );
+          }
+          return _vectorIndexRebuild(target);
         }
       case 'optimize':
         {
