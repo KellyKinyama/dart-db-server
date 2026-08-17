@@ -40,8 +40,8 @@ void main() {
       for (var i = 0; i < 40; i++) {
         await db.execute('INSERT INTO t VALUES ($i, ${i % 8}, ${i % 5})');
       }
-      final r = await db.execute(
-          'SELECT id FROM t WHERE a = 3 AND b = 2 ORDER BY id');
+      final r = await db
+          .execute('SELECT id FROM t WHERE a = 3 AND b = 2 ORDER BY id');
       // Manual filter check: i % 8 == 3 AND i % 5 == 2 for i in [0,40).
       final expected = <List<Object?>>[
         for (var i = 0; i < 40; i++)
@@ -64,8 +64,7 @@ void main() {
       // probes on code despite ordering.
       await db.execute('CREATE UNIQUE INDEX u_code ON t(code)');
       for (var i = 0; i < 20; i++) {
-        await db
-            .execute("INSERT INTO t VALUES ($i, 'c-$i', ${i % 4})");
+        await db.execute("INSERT INTO t VALUES ($i, 'c-$i', ${i % 4})");
       }
       // We can't directly see the chosen index, but the data must
       // round-trip exactly the same.

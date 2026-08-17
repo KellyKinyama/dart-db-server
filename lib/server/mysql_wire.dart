@@ -252,8 +252,7 @@ class _Conn {
   bool _looksLikeSslRequest(Uint8List payload) {
     if (server.tlsContext == null) return false;
     if (payload.length != 32) return false;
-    final caps =
-        payload[0] |
+    final caps = payload[0] |
         (payload[1] << 8) |
         (payload[2] << 16) |
         (payload[3] << 24);
@@ -300,8 +299,7 @@ class _Conn {
     b.u32(threadId);
     b.bytes(_scramble.sublist(0, 8));
     b.u8(0); // filler
-    final caps =
-        _Cap.longPassword |
+    final caps = _Cap.longPassword |
         _Cap.foundRows |
         _Cap.longFlag |
         _Cap.connectWithDb |
@@ -480,8 +478,7 @@ class _Conn {
         return;
       case _Cmd.stmtClose:
         if (payload.length >= 5) {
-          final id =
-              payload[1] |
+          final id = payload[1] |
               (payload[2] << 8) |
               (payload[3] << 16) |
               (payload[4] << 24);
@@ -605,8 +602,8 @@ class _Conn {
             : _FieldType.varString;
         final unsigned =
             prep.paramUnsigned != null && i < prep.paramUnsigned!.length
-            ? prep.paramUnsigned![i]
-            : false;
+                ? prep.paramUnsigned![i]
+                : false;
         positional.add(_readBinaryValue(r, type, unsigned: unsigned));
       }
     }
@@ -1017,8 +1014,7 @@ class _PacketReader {
   }
 
   int u32() {
-    final v =
-        _buf[_pos] |
+    final v = _buf[_pos] |
         (_buf[_pos + 1] << 8) |
         (_buf[_pos + 2] << 16) |
         (_buf[_pos + 3] << 24);

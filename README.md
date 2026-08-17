@@ -1,5 +1,10 @@
 # dart-db-server
 
+[![pub package](https://img.shields.io/pub/v/dart_db_server.svg)](https://pub.dev/packages/dart_db_server)
+[![pub points](https://img.shields.io/pub/points/dart_db_server)](https://pub.dev/packages/dart_db_server/score)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![CI](https://github.com/KellyKinyama/dart-db-server/actions/workflows/ci.yml/badge.svg)](https://github.com/KellyKinyama/dart-db-server/actions/workflows/ci.yml)
+
 A small SQLite-style SQL database server written in pure Dart. In-memory
 storage with JSON file persistence, TCP server with a JSON line protocol,
 and an interactive REPL.

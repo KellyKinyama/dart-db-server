@@ -32,8 +32,7 @@ void main() {
     }
   });
 
-  test('composite index: half-open range (only upper) still works',
-      () async {
+  test('composite index: half-open range (only upper) still works', () async {
     final db = await Database.open();
     try {
       await db.execute(
@@ -42,8 +41,8 @@ void main() {
       for (var i = 0; i < 30; i++) {
         await db.execute('INSERT INTO t VALUES ($i, ${i % 3}, $i)');
       }
-      final r = await db.execute(
-          'SELECT id FROM t WHERE a = 0 AND b < 15 ORDER BY id');
+      final r = await db
+          .execute('SELECT id FROM t WHERE a = 0 AND b < 15 ORDER BY id');
       final expected = <List<Object?>>[
         for (var i = 0; i < 30; i++)
           if (i % 3 == 0 && i < 15) [i],

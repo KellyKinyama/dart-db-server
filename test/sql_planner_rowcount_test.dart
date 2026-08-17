@@ -23,8 +23,7 @@ void main() {
     }
   });
 
-  test('ANALYZE primes plannerRowCountEstimate from sqlite_stat1',
-      () async {
+  test('ANALYZE primes plannerRowCountEstimate from sqlite_stat1', () async {
     final db = await Database.open();
     try {
       await db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER)');
@@ -45,8 +44,7 @@ void main() {
     }
   });
 
-  test('FROM-order vs ANALYZE: reordered query yields same rows',
-      () async {
+  test('FROM-order vs ANALYZE: reordered query yields same rows', () async {
     final db = await Database.open();
     try {
       await db.execute('CREATE TABLE big (id INTEGER, k INTEGER)');

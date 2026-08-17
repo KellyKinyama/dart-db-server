@@ -199,8 +199,7 @@ class _Reader {
     var bytes = _buf.toBytes();
     var consumed = 0;
     while (bytes.length - consumed >= 4) {
-      final len =
-          bytes[consumed] |
+      final len = bytes[consumed] |
           (bytes[consumed + 1] << 8) |
           (bytes[consumed + 2] << 16);
       final seq = bytes[consumed + 3];

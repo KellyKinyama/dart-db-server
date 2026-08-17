@@ -103,8 +103,8 @@ void main() {
         }
       }
       // Mixed direction can't be served by a single forward/reverse walk.
-      final r = await db.execute(
-          'SELECT a, b FROM t WHERE a >= 0 ORDER BY a ASC, b DESC');
+      final r = await db
+          .execute('SELECT a, b FROM t WHERE a >= 0 ORDER BY a ASC, b DESC');
       expect(db.lastPlanSortSkipped, isFalse);
       // Spot-check correctness:
       expect(r.rows.first, [0, 2]);

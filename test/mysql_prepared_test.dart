@@ -46,8 +46,7 @@ void main() {
       w.send(_stmtPrepare('INSERT INTO t VALUES (?, ?)'), seq: 0);
       final ok = await r.next();
       expect(ok.payload[0], 0x00);
-      final stmtId =
-          ok.payload[1] |
+      final stmtId = ok.payload[1] |
           (ok.payload[2] << 8) |
           (ok.payload[3] << 16) |
           (ok.payload[4] << 24);
@@ -81,8 +80,7 @@ void main() {
       () async {
         w.send(_stmtPrepare('SELECT id, name FROM t WHERE id = ?'), seq: 0);
         final ok = await r.next();
-        final stmtId =
-            ok.payload[1] |
+        final stmtId = ok.payload[1] |
             (ok.payload[2] << 8) |
             (ok.payload[3] << 16) |
             (ok.payload[4] << 24);
@@ -125,8 +123,7 @@ void main() {
     test('CLOSE then EXECUTE on stale id returns ERR', () async {
       w.send(_stmtPrepare('SELECT 1'), seq: 0);
       final ok = await r.next();
-      final stmtId =
-          ok.payload[1] |
+      final stmtId = ok.payload[1] |
           (ok.payload[2] << 8) |
           (ok.payload[3] << 16) |
           (ok.payload[4] << 24);

@@ -18,6 +18,7 @@
 /// real system you would swap them for embeddings from a model like
 /// `text-embedding-3-small` (dim=1536), Cohere Embed (dim=1024), or a
 /// local ONNX / GGUF encoder.
+library;
 
 import 'dart:io';
 

@@ -63,8 +63,8 @@ void main() {
       }
       // Mixed columns → not eligible for OR-to-IN. Result must still
       // be correct (the executor falls back to a full scan).
-      final r = await db.execute(
-          'SELECT id FROM t WHERE a = 3 OR b = 95 ORDER BY id');
+      final r = await db
+          .execute('SELECT id FROM t WHERE a = 3 OR b = 95 ORDER BY id');
       expect(r.rows, [
         [3],
         [5],
@@ -108,9 +108,9 @@ void main() {
       for (var i = 1; i <= 100; i++) {
         await db.execute("INSERT INTO t VALUES ($i, 'k$i')");
       }
-      final r = await db.execute(
-          "SELECT id FROM t WHERE k = 'k5' OR k = 'k50' OR k = 'k95' "
-          "ORDER BY id");
+      final r = await db
+          .execute("SELECT id FROM t WHERE k = 'k5' OR k = 'k50' OR k = 'k95' "
+              "ORDER BY id");
       expect(r.rows, [
         [5],
         [50],

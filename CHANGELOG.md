@@ -1,3 +1,14 @@
+## 0.1.2
+
+- `dart format` sweep across the whole tree so pub.dev's format check
+  passes cleanly (18 files reformatted, no code changes).
+- Fix a `dangling_library_doc_comments` info in the example script by
+  adding an explicit `library;` directive.
+- Add pub.dev + CI + license badges to the README.
+- GitHub Actions workflow: `dart format`, `dart analyze --fatal-infos`,
+  and `dart test` on every push / PR (Dart stable + beta), plus a
+  `dart pub publish --dry-run` job.
+
 ## 0.1.1
 
 - Docs-only release. Adds a `doc/` folder with real-world vector-database

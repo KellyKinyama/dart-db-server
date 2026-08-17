@@ -45,8 +45,7 @@ void main() {
         final plan = ref.select(
             "EXPLAIN QUERY PLAN SELECT v FROM t WHERE a = 2 AND b = 15");
         expect(plan.toString().toLowerCase(), contains('ix_ab'));
-        final r = ref.select(
-            'SELECT a, b, v FROM t ORDER BY a, b');
+        final r = ref.select('SELECT a, b, v FROM t ORDER BY a, b');
         expect(r.map((row) => row.values).toList(), [
           [1, 10, 'x'],
           [1, 20, 'y'],
@@ -79,8 +78,7 @@ void main() {
       }
       final ref = sq.sqlite3.open(f.path);
       try {
-        expect(ref.select('PRAGMA integrity_check').single.values.single,
-            'ok');
+        expect(ref.select('PRAGMA integrity_check').single.values.single, 'ok');
         // Verify the unique constraint actually fires through the file.
         expect(
           () => ref.execute("INSERT INTO t VALUES ('x', 1)"),
@@ -126,9 +124,9 @@ void main() {
         try {
           final ic = ref.select('PRAGMA integrity_check');
           expect(ic.single.values.single, 'ok');
-          final defs = ref.select(
-              "SELECT sql FROM sqlite_schema WHERE type='index' "
-              "AND name='ix_abc'");
+          final defs =
+              ref.select("SELECT sql FROM sqlite_schema WHERE type='index' "
+                  "AND name='ix_abc'");
           expect(defs.single.values.single.toString().toLowerCase(),
               contains('a, b, c'));
         } finally {
@@ -149,8 +147,7 @@ void main() {
         await db.execute('CREATE TABLE big(g INT, n INT, label TEXT)');
         await db.execute('CREATE INDEX ix_gn ON big(g, n)');
         for (var i = 0; i < 1500; i++) {
-          await db.execute(
-              "INSERT INTO big VALUES (${i % 7}, $i, 'r$i')");
+          await db.execute("INSERT INTO big VALUES (${i % 7}, $i, 'r$i')");
         }
         await db.exportSqlite(f.path);
       } finally {
@@ -158,10 +155,12 @@ void main() {
       }
       final ref = sq.sqlite3.open(f.path);
       try {
-        expect(ref.select('PRAGMA integrity_check').single.values.single,
-            'ok');
-        final c = ref.select(
-            'SELECT count(*) FROM big WHERE g = 3').single.values.single;
+        expect(ref.select('PRAGMA integrity_check').single.values.single, 'ok');
+        final c = ref
+            .select('SELECT count(*) FROM big WHERE g = 3')
+            .single
+            .values
+            .single;
         expect(c, greaterThan(0));
       } finally {
         ref.dispose();

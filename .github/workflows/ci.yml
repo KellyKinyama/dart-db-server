@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  test:
+    name: Analyze + test (Dart ${{ matrix.sdk }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk: [stable, beta]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: ${{ matrix.sdk }}
+      - name: Install dependencies
+        run: dart pub get
+      - name: Verify formatting
+        run: dart format --output=none --set-exit-if-changed .
+      - name: Analyze project source
+        run: dart analyze --fatal-infos
+      - name: Run tests
+        run: dart test --reporter compact
+
+  publish-dry-run:
+    name: pub.dev dry-run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+      - run: dart pub get
+      - run: dart pub publish --dry-run

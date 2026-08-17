@@ -19,8 +19,8 @@ void main() {
       for (final v in [50, 10, 30, 5, 90, 20, 40, 60, 70, 80]) {
         await db.execute('INSERT INTO t VALUES (${id++}, $v)');
       }
-      final r = await db.execute(
-          'SELECT v FROM t WHERE v >= 1 ORDER BY v LIMIT 3');
+      final r =
+          await db.execute('SELECT v FROM t WHERE v >= 1 ORDER BY v LIMIT 3');
       expect(r.rows.map((row) => row[0]).toList(), [5, 10, 20]);
       expect(db.lastPlanSortSkipped, isTrue);
       expect(db.lastPlanLimitPushed, isTrue);
@@ -38,8 +38,8 @@ void main() {
       for (final v in [50, 10, 30, 5, 90, 20, 40, 60, 70, 80]) {
         await db.execute('INSERT INTO t VALUES (${id++}, $v)');
       }
-      final r = await db.execute(
-          'SELECT v FROM t WHERE v >= 1 ORDER BY v DESC LIMIT 3');
+      final r = await db
+          .execute('SELECT v FROM t WHERE v >= 1 ORDER BY v DESC LIMIT 3');
       expect(r.rows.map((row) => row[0]).toList(), [90, 80, 70]);
       expect(db.lastPlanSortSkipped, isTrue);
       expect(db.lastPlanLimitPushed, isTrue);
@@ -57,8 +57,8 @@ void main() {
       for (final v in [50, 10, 30, 5, 90, 20, 40, 60, 70, 80]) {
         await db.execute('INSERT INTO t VALUES (${id++}, $v)');
       }
-      final r = await db.execute(
-          'SELECT v FROM t WHERE v >= 1 ORDER BY v LIMIT 3 OFFSET 4');
+      final r = await db
+          .execute('SELECT v FROM t WHERE v >= 1 ORDER BY v LIMIT 3 OFFSET 4');
       expect(r.rows.map((row) => row[0]).toList(), [40, 50, 60]);
       expect(db.lastPlanLimitPushed, isTrue);
     } finally {
@@ -66,8 +66,7 @@ void main() {
     }
   });
 
-  test('LIMIT pushdown skipped when ORDER BY not satisfied by index',
-      () async {
+  test('LIMIT pushdown skipped when ORDER BY not satisfied by index', () async {
     final db = await Database.open();
     try {
       await db.execute(
@@ -77,8 +76,8 @@ void main() {
         await db.execute('INSERT INTO t VALUES (${i + 1}, ${i % 3}, ${9 - i})');
       }
       // Index is on a, ORDER BY is on b → no pushdown.
-      final r = await db.execute(
-          'SELECT b FROM t WHERE a = 1 ORDER BY b LIMIT 2');
+      final r =
+          await db.execute('SELECT b FROM t WHERE a = 1 ORDER BY b LIMIT 2');
       expect(r.rows.length, 2);
       expect(db.lastPlanLimitPushed, isFalse);
     } finally {
@@ -95,8 +94,8 @@ void main() {
       for (final v in [1, 1, 2, 2, 3, 3, 4]) {
         await db.execute('INSERT INTO t VALUES (${id++}, $v)');
       }
-      final r = await db.execute(
-          'SELECT DISTINCT v FROM t WHERE v >= 1 ORDER BY v LIMIT 2');
+      final r = await db
+          .execute('SELECT DISTINCT v FROM t WHERE v >= 1 ORDER BY v LIMIT 2');
       expect(r.rows.map((row) => row[0]).toList(), [1, 2]);
       expect(db.lastPlanLimitPushed, isFalse);
     } finally {
@@ -114,9 +113,9 @@ void main() {
         await db.execute('INSERT INTO t VALUES (${id++}, $v)');
       }
       // ROW_NUMBER over the whole partition needs every row first.
-      final r = await db.execute(
-          'SELECT v, ROW_NUMBER() OVER (ORDER BY v) AS rn '
-          'FROM t WHERE v >= 1 ORDER BY v LIMIT 2');
+      final r =
+          await db.execute('SELECT v, ROW_NUMBER() OVER (ORDER BY v) AS rn '
+              'FROM t WHERE v >= 1 ORDER BY v LIMIT 2');
       expect(r.rows, [
         [10, 1],
         [20, 2],

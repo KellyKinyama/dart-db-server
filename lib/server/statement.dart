@@ -99,10 +99,9 @@ class CreateIndexStmt extends Statement {
     this.exprSql,
     List<String>? columns,
     List<String>? collations,
-  }) : columns = columns ?? [column],
-       collations =
-           collations ??
-           List<String>.filled((columns ?? [column]).length, 'BINARY');
+  })  : columns = columns ?? [column],
+        collations = collations ??
+            List<String>.filled((columns ?? [column]).length, 'BINARY');
 }
 
 class DropIndexStmt extends Statement {
@@ -201,8 +200,12 @@ class InsertStmt extends Statement {
 class IndexHint {
   final String? indexName;
   final bool notIndexed;
-  const IndexHint.byName(String name) : indexName = name, notIndexed = false;
-  const IndexHint.notIndexed() : indexName = null, notIndexed = true;
+  const IndexHint.byName(String name)
+      : indexName = name,
+        notIndexed = false;
+  const IndexHint.notIndexed()
+      : indexName = null,
+        notIndexed = true;
 }
 
 class JoinClause {
@@ -323,17 +326,20 @@ class SelectItem {
   final String? starTable; // for `t.*`
   final Expr? expr;
   final String? alias;
-  SelectItem.star({this.starTable}) : isStar = true, expr = null, alias = null;
+  SelectItem.star({this.starTable})
+      : isStar = true,
+        expr = null,
+        alias = null;
   SelectItem.expr(Expr this.expr, {this.alias})
-    : isStar = false,
-      starTable = null;
+      : isStar = false,
+        starTable = null;
 }
 
 class OrderByItem {
   final Expr expr;
   final bool descending;
   final bool?
-  nullsFirst; // null => default (NULLS FIRST for ASC, LAST for DESC)
+      nullsFirst; // null => default (NULLS FIRST for ASC, LAST for DESC)
   OrderByItem(this.expr, {this.descending = false, this.nullsFirst});
 }
 

@@ -49,8 +49,7 @@ void main() {
         expect(caps & 0x0800, isNot(0));
 
         // Send a 32-byte SSLRequest with CLIENT_SSL bit set, seq=1.
-        const clientCaps =
-            0x00000200 | // PROTOCOL_41
+        const clientCaps = 0x00000200 | // PROTOCOL_41
             0x00000800 | // SSL
             0x00008000 | // SECURE_CONNECTION
             0x00080000 | // PLUGIN_AUTH

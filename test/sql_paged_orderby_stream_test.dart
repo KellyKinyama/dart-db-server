@@ -57,8 +57,8 @@ void main() {
       for (var i = 1; i <= 50; i++) {
         await db.execute('INSERT INTO t VALUES ($i, ${i * 100})');
       }
-      final r = await db.execute(
-          'SELECT id FROM t ORDER BY id LIMIT 4 OFFSET 10');
+      final r =
+          await db.execute('SELECT id FROM t ORDER BY id LIMIT 4 OFFSET 10');
       expect(r.rows, [
         [11],
         [12],
@@ -78,8 +78,7 @@ void main() {
       for (var i = 1; i <= 20; i++) {
         await db.execute('INSERT INTO t VALUES ($i, $i)');
       }
-      final r = await db.execute(
-          'SELECT id FROM t ORDER BY id DESC LIMIT 3');
+      final r = await db.execute('SELECT id FROM t ORDER BY id DESC LIMIT 3');
       expect(r.rows, [
         [20],
         [19],

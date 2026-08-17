@@ -28,8 +28,9 @@ void main() {
         await db.execute("INSERT INTO users VALUES (1, 'alice', 9.5), "
             "(2, 'bob', 7.25), (3, 'carol', NULL)");
         final out = _tmp('users');
-        addTearDown(
-            () async { if (await out.exists()) await out.delete(); });
+        addTearDown(() async {
+          if (await out.exists()) await out.delete();
+        });
         await db.exportSqlite(out.path);
         final ref = sq.sqlite3.open(out.path);
         try {
@@ -61,8 +62,9 @@ void main() {
         await db
             .execute('INSERT INTO t2 VALUES (10, 1.5), (20, 2.5), (30, 3.5)');
         final out = _tmp('multi');
-        addTearDown(
-            () async { if (await out.exists()) await out.delete(); });
+        addTearDown(() async {
+          if (await out.exists()) await out.delete();
+        });
         await db.exportSqlite(out.path);
         final ref = sq.sqlite3.open(out.path);
         try {
@@ -111,8 +113,9 @@ void main() {
           Uint8List.fromList([0x99, 0x88])
         ]);
         final out = _tmp('blob');
-        addTearDown(
-            () async { if (await out.exists()) await out.delete(); });
+        addTearDown(() async {
+          if (await out.exists()) await out.delete();
+        });
         await db.exportSqlite(out.path);
         final ref = sq.sqlite3.open(out.path);
         try {
@@ -142,8 +145,9 @@ void main() {
           await stmt.execute(positional: [i + 1, i * 2]);
         }
         final out = _tmp('many');
-        addTearDown(
-            () async { if (await out.exists()) await out.delete(); });
+        addTearDown(() async {
+          if (await out.exists()) await out.delete();
+        });
         await db.exportSqlite(out.path);
         final ref = sq.sqlite3.open(out.path);
         try {
@@ -170,8 +174,9 @@ void main() {
         await src.execute('CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT)');
         await src.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')");
         final out = _tmp('rt');
-        addTearDown(
-            () async { if (await out.exists()) await out.delete(); });
+        addTearDown(() async {
+          if (await out.exists()) await out.delete();
+        });
         await src.exportSqlite(out.path);
         final dst = await Database.open();
         try {
@@ -195,7 +200,9 @@ void main() {
       final skip = sqliteSkipReason();
       if (skip != null) return;
       final f = _tmp('foreign');
-      addTearDown(() async { if (await f.exists()) await f.delete(); });
+      addTearDown(() async {
+        if (await f.exists()) await f.delete();
+      });
       final ref = sq.sqlite3.open(f.path);
       try {
         ref.execute('CREATE TABLE foo(id INTEGER PRIMARY KEY, label TEXT)');

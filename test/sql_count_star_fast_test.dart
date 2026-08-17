@@ -71,8 +71,7 @@ void main() {
     }
   });
 
-  test('COUNT(*) with non-indexed WHERE still returns correct count',
-      () async {
+  test('COUNT(*) with non-indexed WHERE still returns correct count', () async {
     final db = await Database.open();
     try {
       await db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)');
