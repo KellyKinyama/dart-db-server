@@ -331,9 +331,9 @@ class Parser {
   /// (which becomes SQL NULL).
   Object? _mysqlSystemVar(String name) {
     final n = name.toLowerCase().replaceFirst(
-      RegExp(r'^(global|session)\.'),
-      '',
-    );
+          RegExp(r'^(global|session)\.'),
+          '',
+        );
     switch (n) {
       case 'version':
       case 'version_comment':
@@ -714,6 +714,7 @@ class Parser {
     ForeignKeyRef? references;
     String? generatedSql;
     bool generatedStored = false;
+    Map<String, String>? vectorSpec;
     while (true) {
       if (_matchKw('PRIMARY')) {
         _expectKw('KEY');
@@ -824,6 +825,22 @@ class Parser {
         }
         continue;
       }
+      if (_check(TokType.ident) && _peek().upper == 'VECTOR') {
+        _advance();
+        _expect(TokType.punct, '(');
+        vectorSpec = <String, String>{};
+        while (!_check(TokType.punct, ')')) {
+          final key = _expectIdent().text.toLowerCase();
+          _expect(TokType.op, '=');
+          final valTok = _advance();
+          vectorSpec[key] = valTok.text.replaceAll("'", '');
+          if (_check(TokType.punct, ',')) {
+            _advance();
+          }
+        }
+        _expect(TokType.punct, ')');
+        continue;
+      }
       break;
     }
     return ColumnDef(
@@ -839,6 +856,7 @@ class Parser {
       references: references,
       generatedExprSql: generatedSql,
       generatedStored: generatedStored,
+      vectorSpec: vectorSpec,
     );
   }
 
@@ -1256,9 +1274,8 @@ class Parser {
         isStarArg: e.isStarArg,
         distinct: e.distinct,
         window: e.window,
-        filterExpr: e.filterExpr == null
-            ? null
-            : _rewriteValuesRefs(e.filterExpr!),
+        filterExpr:
+            e.filterExpr == null ? null : _rewriteValuesRefs(e.filterExpr!),
         aggOrderBy: e.aggOrderBy,
       );
     }

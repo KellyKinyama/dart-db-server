@@ -177,6 +177,11 @@ class ColumnDef {
   final String? generatedExprSql;
   final bool generatedStored;
 
+  /// V30: `VECTOR(dim=384, kind=hnsw, metric=cosine, ...)` inline spec.
+  /// Consumed by CREATE TABLE to auto-register a vector index on this
+  /// column. Map keys are lowercased attribute names.
+  final Map<String, String>? vectorSpec;
+
   const ColumnDef(
     this.name,
     this.type, {
@@ -190,41 +195,44 @@ class ColumnDef {
     this.references,
     this.generatedExprSql,
     this.generatedStored = false,
+    this.vectorSpec,
   });
 
   Map<String, Object?> toJson() => {
-    'name': name,
-    'type': type.name,
-    if (primaryKey) 'primaryKey': true,
-    if (notNull) 'notNull': true,
-    if (unique) 'unique': true,
-    if (autoIncrement) 'autoIncrement': true,
-    if (defaultValue != null) 'default': defaultValue,
-    if (defaultExprSql != null) 'defaultExpr': defaultExprSql,
-    if (checkExprSql != null) 'check': checkExprSql,
-    if (references != null) 'references': references!.toJson(),
-    if (generatedExprSql != null) 'generated': generatedExprSql,
-    if (generatedStored) 'generatedStored': true,
-  };
+        'name': name,
+        'type': type.name,
+        if (primaryKey) 'primaryKey': true,
+        if (notNull) 'notNull': true,
+        if (unique) 'unique': true,
+        if (autoIncrement) 'autoIncrement': true,
+        if (defaultValue != null) 'default': defaultValue,
+        if (defaultExprSql != null) 'defaultExpr': defaultExprSql,
+        if (checkExprSql != null) 'check': checkExprSql,
+        if (references != null) 'references': references!.toJson(),
+        if (generatedExprSql != null) 'generated': generatedExprSql,
+        if (generatedStored) 'generatedStored': true,
+        if (vectorSpec != null) 'vectorSpec': vectorSpec,
+      };
 
   factory ColumnDef.fromJson(Map<String, Object?> j) => ColumnDef(
-    j['name'] as String,
-    DataType.values.byName(j['type'] as String),
-    primaryKey: j['primaryKey'] == true,
-    notNull: j['notNull'] == true,
-    unique: j['unique'] == true,
-    autoIncrement: j['autoIncrement'] == true,
-    defaultValue: j['default'],
-    defaultExprSql: j['defaultExpr'] as String?,
-    checkExprSql: j['check'] as String?,
-    references: j['references'] == null
-        ? null
-        : ForeignKeyRef.fromJson(
-            (j['references'] as Map).cast<String, Object?>(),
-          ),
-    generatedExprSql: j['generated'] as String?,
-    generatedStored: j['generatedStored'] == true,
-  );
+        j['name'] as String,
+        DataType.values.byName(j['type'] as String),
+        primaryKey: j['primaryKey'] == true,
+        notNull: j['notNull'] == true,
+        unique: j['unique'] == true,
+        autoIncrement: j['autoIncrement'] == true,
+        defaultValue: j['default'],
+        defaultExprSql: j['defaultExpr'] as String?,
+        checkExprSql: j['check'] as String?,
+        references: j['references'] == null
+            ? null
+            : ForeignKeyRef.fromJson(
+                (j['references'] as Map).cast<String, Object?>(),
+              ),
+        generatedExprSql: j['generated'] as String?,
+        generatedStored: j['generatedStored'] == true,
+        vectorSpec: (j['vectorSpec'] as Map?)?.cast<String, String>(),
+      );
 }
 
 /// Foreign key reference target.
@@ -241,18 +249,18 @@ class ForeignKeyRef {
   });
 
   Map<String, Object?> toJson() => {
-    'table': table,
-    if (column != null) 'column': column,
-    if (onDelete != 'NO ACTION') 'onDelete': onDelete,
-    if (onUpdate != 'NO ACTION') 'onUpdate': onUpdate,
-  };
+        'table': table,
+        if (column != null) 'column': column,
+        if (onDelete != 'NO ACTION') 'onDelete': onDelete,
+        if (onUpdate != 'NO ACTION') 'onUpdate': onUpdate,
+      };
 
   factory ForeignKeyRef.fromJson(Map<String, Object?> j) => ForeignKeyRef(
-    j['table'] as String,
-    column: j['column'] as String?,
-    onDelete: (j['onDelete'] as String?) ?? 'NO ACTION',
-    onUpdate: (j['onUpdate'] as String?) ?? 'NO ACTION',
-  );
+        j['table'] as String,
+        column: j['column'] as String?,
+        onDelete: (j['onDelete'] as String?) ?? 'NO ACTION',
+        onUpdate: (j['onUpdate'] as String?) ?? 'NO ACTION',
+      );
 }
 
 /// Table-level constraint (composite PK, multi-column UNIQUE, table CHECK,
@@ -308,10 +316,10 @@ class ForeignKeyConstraint extends TableConstraint {
   ForeignKeyConstraint(this.columns, this.references);
   @override
   Map<String, Object?> toJson() => {
-    'kind': 'fk',
-    'columns': columns,
-    'references': references.toJson(),
-  };
+        'kind': 'fk',
+        'columns': columns,
+        'references': references.toJson(),
+      };
 }
 
 /// Coerce a raw value (from parser literal or client JSON) into the storage

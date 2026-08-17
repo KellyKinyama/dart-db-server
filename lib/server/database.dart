@@ -25,6 +25,7 @@ import 'statement.dart';
 import 'table.dart';
 import 'paged_table.dart';
 import 'table_backend.dart';
+import 'vector.dart';
 
 /// Outcome of an [AuthorizerCallback] invocation. Mirrors the
 /// SQLITE_OK / SQLITE_DENY / SQLITE_IGNORE constants of the C API.
@@ -33,8 +34,49 @@ enum AuthorizerResult { allow, deny, ignore }
 /// Authorizer callback. Invoked by [Database.executeStmt] for every
 /// dispatched statement; the second argument is the primary table the
 /// statement targets (or null when there is none, e.g. PRAGMA).
-typedef AuthorizerCallback =
-    AuthorizerResult Function(Statement action, String? tableName);
+typedef AuthorizerCallback = AuthorizerResult Function(
+    Statement action, String? tableName);
+
+/// Runtime binding for a registered vector index — the spec plus the
+/// built index instance (or null while stale / not yet built).
+class _VectorIndexBinding {
+  final VectorIndexSpec spec;
+  // FlatIndex | HnswIndex | IvfFlatIndex, or null if invalidated /
+  // never built. The planner rebuilds lazily on next use.
+  Object? index;
+
+  /// Size of `t.rows` at the time [index] was last built or last
+  /// incrementally updated. Used by V21 incremental maintenance to
+  /// append rows added since then, avoiding a full rebuild for
+  /// insert-only workloads.
+  int builtRowCount = 0;
+
+  /// V23 incremental UPDATE: row positions whose vector column has been
+  /// mutated since the last query. On next `_vectorIndexFor` call, each
+  /// position is `removeId`'d then re-added from the current row.
+  /// HNSW (tombstone-based delete) skips this and full-invalidates
+  /// instead to avoid graph bloat.
+  final Set<int> refreshPositions = <int>{};
+
+  /// V29 paged incremental: PKs whose row was inserted, updated, or
+  /// deleted since the last delta drain. Applied at query time before
+  /// serving the built paged index.
+  final List<(Object, Vector)> pendingPagedInserts = <(Object, Vector)>[];
+  final List<(Object, Vector)> pendingPagedRefreshes = <(Object, Vector)>[];
+  final Set<Object> pendingPagedDeletes = <Object>{};
+
+  /// V36/V40 payload-filter index: `col_lower -> value -> Set<id>`.
+  /// The id is a row position for in-memory bindings and a primary-key
+  /// value for paged bindings — the search paths that consume the set
+  /// know which convention their binding uses.
+  /// Rebuilt on any UPDATE that touches a tracked column (via
+  /// [payloadIndexDirty] flag).
+  final Map<String, Map<Object?, Set<Object>>> payloadIndex =
+      <String, Map<Object?, Set<Object>>>{};
+  bool payloadIndexDirty = false;
+
+  _VectorIndexBinding(this.spec);
+}
 
 class Database {
   final Map<String, Table> _tables = <String, Table>{};
@@ -246,6 +288,13 @@ class Database {
   /// mutated.
   final Map<String, Fts5Index> _fts5IndexCache = <String, Fts5Index>{};
 
+  /// V44: parallel array of primary keys for paged-table FTS5 caches,
+  /// same key convention as [_fts5IndexCache]. Position `i` in the
+  /// list corresponds to `docId=i` in the cached `Fts5Index`. Only
+  /// populated by [warmFts5]; in-memory tables use row-position ids
+  /// directly and don't need this.
+  final Map<String, List<Object>> _pagedFts5Pks = <String, List<Object>>{};
+
   /// Stack of [Database] instances currently mid-`executeStmt`. The
   /// FTS5 ranking scalar functions (`BM25_CORPUS`) consult
   /// [Database.current] to discover the active corpus.
@@ -287,6 +336,34 @@ class Database {
   void _invalidateFts5(String tableName) {
     final prefix = '${tableName.toLowerCase()}:';
     _fts5IndexCache.removeWhere((k, _) => k.startsWith(prefix));
+    _pagedFts5Pks.removeWhere((k, _) => k.startsWith(prefix));
+  }
+
+  /// V44: build (or rebuild) the FTS5 corpus for a paged table so
+  /// hybrid search TVFs can use it. In-memory tables don't need this
+  /// — `fts5IndexFor` lazily builds their corpus on demand. Paged
+  /// corpuses persist in the [_fts5IndexCache] until the next
+  /// mutation of [tableName] invalidates them.
+  Future<void> warmFts5(String tableName, String columnName) async {
+    final pt = _pagedTable(tableName);
+    if (pt == null) {
+      // In-memory: just prime the lazy cache.
+      fts5IndexFor(tableName, columnName);
+      return;
+    }
+    final key = '${tableName.toLowerCase()}:${columnName.toLowerCase()}';
+    final pkName = pt.primaryKey.name;
+    final docs = <String>[];
+    final pks = <Object>[];
+    await for (final row in pt.scan()) {
+      final pk = row[pkName];
+      if (pk == null) continue;
+      final txt = row[columnName] ?? row[columnName.toLowerCase()];
+      docs.add(txt?.toString() ?? '');
+      pks.add(pk);
+    }
+    _fts5IndexCache[key] = Fts5Index.build(docs);
+    _pagedFts5Pks[key] = pks;
   }
 
   /// Names (lowercased) of tables created via `CREATE VIRTUAL TABLE ... USING rtree`
@@ -331,6 +408,1071 @@ class Database {
     _rtreeIndexCache.remove(tableName.toLowerCase());
   }
 
+  /// Registered vector indexes, keyed by lowercased `'table:column'`.
+  /// Populated by [createVectorIndex]; the underlying [FlatIndex] /
+  /// [HnswIndex] / [IvfFlatIndex] instance is built lazily on first
+  /// query use and dropped on any mutation of the target table (the
+  /// next query rebuilds it).
+  final Map<String, _VectorIndexBinding> _vectorIndexes =
+      <String, _VectorIndexBinding>{};
+
+  /// For vector indexes created via `CREATE VIRTUAL TABLE ... USING
+  /// vector_index(...)`, maps the lowercased vtab name to the
+  /// `'table:column'` binding key so `DROP TABLE <vtab>` can cascade
+  /// through to [dropVectorIndex].
+  final Map<String, String> _vectorVtabToKey = <String, String>{};
+
+  /// Snapshot of every registered vector index. Mutating the returned
+  /// list has no effect on the database.
+  List<VectorIndexSpec> get vectorIndexes =>
+      [for (final b in _vectorIndexes.values) b.spec];
+
+  /// Register a vector index on `spec.table.spec.column`. The index is
+  /// built the first time a query uses it and automatically rebuilt
+  /// after any mutation of the target table.
+  ///
+  /// Throws [StateError] if the target table or column doesn't exist,
+  /// or if an index is already registered on that column.
+  void createVectorIndex(VectorIndexSpec spec) {
+    final key = '${spec.table.toLowerCase()}:${spec.column.toLowerCase()}';
+    if (_vectorIndexes.containsKey(key)) {
+      throw StateError(
+        'vector index already registered on ${spec.table}.${spec.column}',
+      );
+    }
+    // Paged tables use PK-keyed rowids and must be warmed via
+    // `warmVectorIndexes()` before queries can use the index — the
+    // planner's sync fast path can't drive an async `pt.scan()`.
+    final pt = _pagedTable(spec.table);
+    if (pt != null) {
+      final col = pt.columns.firstWhere(
+        (c) => c.name.toLowerCase() == spec.column.toLowerCase(),
+        orElse: () => throw StateError(
+          'createVectorIndex: no such column: ${spec.table}.${spec.column}',
+        ),
+      );
+      // Just check the column exists; register the binding.
+      // ignore: unused_local_variable
+      final _ = col;
+      _vectorIndexes[key] = _VectorIndexBinding(spec);
+      return;
+    }
+    final t = _tables[spec.table];
+    if (t == null) {
+      throw StateError('createVectorIndex: no such table: ${spec.table}');
+    }
+    final colIdx = t.columns.indexWhere(
+      (c) => c.name.toLowerCase() == spec.column.toLowerCase(),
+    );
+    if (colIdx < 0) {
+      throw StateError(
+        'createVectorIndex: no such column: ${spec.table}.${spec.column}',
+      );
+    }
+    _vectorIndexes[key] = _VectorIndexBinding(spec);
+  }
+
+  /// Remove the vector index on `table.column`, if any. Returns true
+  /// when a binding was actually dropped.
+  bool dropVectorIndex(String table, String column) {
+    final key = '${table.toLowerCase()}:${column.toLowerCase()}';
+    return _vectorIndexes.remove(key) != null;
+  }
+
+  /// Build every registered vector index that hasn't been warmed yet
+  /// and, if a persistence path is configured, flush the built state
+  /// to disk. Callers typically invoke this after bulk-loading rows
+  /// so the built graph / centroids survive a subsequent reopen.
+  ///
+  /// Paged tables are warmed here too (via async `pt.scan()`), which
+  /// is the only way to build indexes on the paged backend — the sync
+  /// SELECT executor can't drive the scan itself.
+  Future<void> warmVectorIndexes() async {
+    for (final e in _vectorIndexes.entries) {
+      if (e.value.index != null) continue;
+      final spec = e.value.spec;
+      final pt = _pagedTable(spec.table);
+      if (pt != null) {
+        await _buildPagedVectorIndex(e.value, pt);
+      } else {
+        _vectorIndexFor(spec.table, spec.column);
+      }
+    }
+    if (path != null && _vectorIndexes.isNotEmpty) {
+      await _persist();
+    }
+  }
+
+  /// Build a vector index over a paged table by streaming its rows.
+  /// Uses the table's PK as the index id (paged tables always have a
+  /// PK). Same kind-dispatch as `_vectorIndexFor`.
+  Future<void> _buildPagedVectorIndex(
+    _VectorIndexBinding binding,
+    PagedTable pt,
+  ) async {
+    final spec = binding.spec;
+    final colName = spec.column.toLowerCase();
+    final pkName = pt.primaryKey.name;
+    // First pass: materialize (pk, Vector) pairs. Also lets IVF/PQ/
+    // IvfPq train on the full set before adding.
+    final entries = <(Object, Vector)>[];
+    // V40: seed the payload index for paged bindings from the same
+    // scan pass so we don't need a second async iteration.
+    binding.payloadIndex.clear();
+    binding.payloadIndexDirty = false;
+    final filterColsLower = <String>[
+      for (final c in spec.filterColumns) c.toLowerCase(),
+    ];
+    for (final col in filterColsLower) {
+      binding.payloadIndex[col] = <Object?, Set<Object>>{};
+    }
+    await for (final row in pt.scan()) {
+      final raw = row[colName] ?? row[spec.column];
+      if (raw == null) continue;
+      Vector v;
+      try {
+        v = coerceVector(raw)!;
+      } catch (_) {
+        continue;
+      }
+      if (v.dim != spec.dim) continue;
+      final pk = row[pkName];
+      if (pk == null) continue;
+      entries.add((pk, v));
+      for (var i = 0; i < filterColsLower.length; i++) {
+        final lower = filterColsLower[i];
+        final original = spec.filterColumns[i];
+        final val = row[lower] ?? row[original];
+        binding.payloadIndex[lower]!.putIfAbsent(val, () => <Object>{}).add(pk);
+      }
+    }
+
+    late Object built;
+    switch (spec.kind) {
+      case VectorIndexKind.flat:
+        final idx = FlatIndex(spec.dim, defaultMetric: spec.metric);
+        for (final (id, v) in entries) {
+          idx.add(id, v);
+        }
+        built = idx;
+        break;
+      case VectorIndexKind.hnsw:
+        final idx = HnswIndex(
+          spec.dim,
+          m: spec.m,
+          efConstruction: spec.efConstruction,
+          efSearch: spec.efSearch,
+          defaultMetric: spec.metric,
+          seed: spec.seed,
+        );
+        for (final (id, v) in entries) {
+          idx.add(id, v);
+        }
+        built = idx;
+        break;
+      case VectorIndexKind.ivf:
+        final effNlist = spec.nlist > 0 ? spec.nlist : math.max(1, 4);
+        if (entries.length < effNlist) {
+          final idx = FlatIndex(spec.dim, defaultMetric: spec.metric);
+          for (final (id, v) in entries) {
+            idx.add(id, v);
+          }
+          built = idx;
+          break;
+        }
+        final idx = IvfFlatIndex(
+          spec.dim,
+          nlist: effNlist,
+          nprobe: spec.nprobe,
+          defaultMetric: spec.metric,
+          seed: spec.seed,
+        );
+        idx.train([for (final (_, v) in entries) v]);
+        for (final (id, v) in entries) {
+          idx.add(id, v);
+        }
+        built = idx;
+        break;
+      case VectorIndexKind.lsh:
+        final idx = LshIndex(spec.dim, nbits: spec.nbits, seed: spec.seed);
+        for (final (id, v) in entries) {
+          idx.add(id, _maybeNormalizeForSpec(v, spec));
+        }
+        built = idx;
+        break;
+      case VectorIndexKind.pq:
+        if (entries.length < 256 || spec.dim % spec.m != 0) {
+          final idx = FlatIndex(spec.dim, defaultMetric: spec.metric);
+          for (final (id, v) in entries) {
+            idx.add(id, v);
+          }
+          built = idx;
+          break;
+        }
+        final idx = PqIndex(spec.dim, m: spec.m, seed: spec.seed);
+        final normEntries = [
+          for (final (id, v) in entries) (id, _maybeNormalizeForSpec(v, spec))
+        ];
+        idx.train([for (final (_, v) in normEntries) v]);
+        for (final (id, v) in normEntries) {
+          idx.add(id, v);
+        }
+        built = idx;
+        break;
+      case VectorIndexKind.ivfPq:
+        final effNlist = spec.nlist > 0 ? spec.nlist : math.max(1, 4);
+        if (entries.length < 256 ||
+            entries.length < effNlist ||
+            spec.dim % spec.m != 0) {
+          final idx = FlatIndex(spec.dim, defaultMetric: spec.metric);
+          for (final (id, v) in entries) {
+            idx.add(id, v);
+          }
+          built = idx;
+          break;
+        }
+        final idx = IvfPqIndex(
+          spec.dim,
+          nlist: effNlist,
+          m: spec.m,
+          nprobe: spec.nprobe,
+          seed: spec.seed,
+        );
+        final normEntries2 = [
+          for (final (id, v) in entries) (id, _maybeNormalizeForSpec(v, spec))
+        ];
+        idx.train([for (final (_, v) in normEntries2) v]);
+        for (final (id, v) in normEntries2) {
+          idx.add(id, v);
+        }
+        built = idx;
+        break;
+    }
+    binding.index = built;
+    binding.builtRowCount = 0; // N/A for paged; deltas ignored
+    // V29: a from-scratch paged build supersedes any pending deltas.
+    binding.pendingPagedInserts.clear();
+    binding.pendingPagedRefreshes.clear();
+    binding.pendingPagedDeletes.clear();
+  }
+
+  /// Return the built vector index for `(table, column)`, building it
+  /// on demand from the current row set. Returns null when no binding
+  /// is registered.
+  Object? _vectorIndexFor(String table, String column) {
+    final key = '${table.toLowerCase()}:${column.toLowerCase()}';
+    final binding = _vectorIndexes[key];
+    if (binding == null) return null;
+    // Fast path: index is already built. V21 catches up any rows
+    // appended to the table since the last build without a full
+    // rebuild. V24 may null out `binding.index` here when HNSW
+    // tombstones exceed threshold — fall through to the from-scratch
+    // build path in that case.
+    if (binding.index != null) {
+      _applyPendingInsertsToBuiltIndex(binding);
+      if (binding.payloadIndexDirty) _rebuildPayloadIndex(binding);
+      if (binding.index != null) return binding.index;
+    }
+    // Paged tables must be built through `warmVectorIndexes()` — no
+    // auto-build here because the sync executor path can't drive
+    // `pt.scan()`. Return null so the planner falls back to the
+    // generic executor.
+    if (_isPaged(binding.spec.table)) return null;
+
+    final t = _tables[binding.spec.table];
+    if (t == null) return null;
+    final colIdx = t.columns.indexWhere(
+      (c) => c.name.toLowerCase() == binding.spec.column.toLowerCase(),
+    );
+    if (colIdx < 0) return null;
+
+    final spec = binding.spec;
+    // Materialize (rowIndex, Vector) pairs, skipping NULL / non-BLOB.
+    final entries = <(int, Vector)>[];
+    for (var i = 0; i < t.rows.length; i++) {
+      final raw = t.rows[i][colIdx];
+      if (raw == null) continue;
+      Vector v;
+      try {
+        v = coerceVector(raw)!;
+      } catch (_) {
+        continue; // malformed row → skip, don't fail the whole build
+      }
+      if (v.dim != spec.dim) continue;
+      entries.add((i, v));
+    }
+
+    late Object built;
+    switch (spec.kind) {
+      case VectorIndexKind.flat:
+        final idx = FlatIndex(spec.dim, defaultMetric: spec.metric);
+        for (final (rowid, v) in entries) {
+          idx.add(rowid, v);
+        }
+        built = idx;
+        break;
+      case VectorIndexKind.hnsw:
+        final idx = HnswIndex(
+          spec.dim,
+          m: spec.m,
+          efConstruction: spec.efConstruction,
+          efSearch: spec.efSearch,
+          defaultMetric: spec.metric,
+          seed: spec.seed,
+        );
+        for (final (rowid, v) in entries) {
+          idx.add(rowid, v);
+        }
+        built = idx;
+        break;
+      case VectorIndexKind.ivf:
+        final effNlist = spec.nlist > 0 ? spec.nlist : math.max(1, 4);
+        // Guard: IVF needs at least nlist training points. On tiny
+        // tables, silently fall back to Flat rather than crashing.
+        if (entries.length < effNlist) {
+          final idx = FlatIndex(spec.dim, defaultMetric: spec.metric);
+          for (final (rowid, v) in entries) {
+            idx.add(rowid, v);
+          }
+          built = idx;
+          break;
+        }
+        final idx = IvfFlatIndex(
+          spec.dim,
+          nlist: effNlist,
+          nprobe: spec.nprobe,
+          defaultMetric: spec.metric,
+          seed: spec.seed,
+        );
+        idx.train([for (final (_, v) in entries) v]);
+        for (final (rowid, v) in entries) {
+          idx.add(rowid, v);
+        }
+        built = idx;
+        break;
+      case VectorIndexKind.lsh:
+        final idx = LshIndex(
+          spec.dim,
+          nbits: spec.nbits,
+          seed: spec.seed,
+        );
+        for (final (rowid, v) in entries) {
+          idx.add(rowid, _maybeNormalizeForSpec(v, spec));
+        }
+        built = idx;
+        break;
+      case VectorIndexKind.pq:
+        // PQ requires dim % m == 0 and at least a few hundred training
+        // samples per subspace to produce useful codebooks. On tiny
+        // tables silently fall back to Flat rather than build nonsense.
+        if (entries.length < 256 || spec.dim % spec.m != 0) {
+          final idx = FlatIndex(spec.dim, defaultMetric: spec.metric);
+          for (final (rowid, v) in entries) {
+            idx.add(rowid, v);
+          }
+          built = idx;
+          break;
+        }
+        final idx = PqIndex(spec.dim, m: spec.m, seed: spec.seed);
+        final normEntries = [
+          for (final (rowid, v) in entries)
+            (rowid, _maybeNormalizeForSpec(v, spec))
+        ];
+        idx.train([for (final (_, v) in normEntries) v]);
+        for (final (rowid, v) in normEntries) {
+          idx.add(rowid, v);
+        }
+        built = idx;
+        break;
+      case VectorIndexKind.ivfPq:
+        // IVF-PQ needs enough training samples for BOTH k-means passes;
+        // fall back to Flat when either isn't satisfiable.
+        final effNlist = spec.nlist > 0 ? spec.nlist : math.max(1, 4);
+        if (entries.length < 256 ||
+            entries.length < effNlist ||
+            spec.dim % spec.m != 0) {
+          final idx = FlatIndex(spec.dim, defaultMetric: spec.metric);
+          for (final (rowid, v) in entries) {
+            idx.add(rowid, v);
+          }
+          built = idx;
+          break;
+        }
+        final idx = IvfPqIndex(
+          spec.dim,
+          nlist: effNlist,
+          m: spec.m,
+          nprobe: spec.nprobe,
+          seed: spec.seed,
+        );
+        final normEntries = [
+          for (final (rowid, v) in entries)
+            (rowid, _maybeNormalizeForSpec(v, spec))
+        ];
+        idx.train([for (final (_, v) in normEntries) v]);
+        for (final (rowid, v) in normEntries) {
+          idx.add(rowid, v);
+        }
+        built = idx;
+        break;
+    }
+    binding.index = built;
+    binding.builtRowCount = t.rows.length;
+    _rebuildPayloadIndex(binding);
+    return built;
+  }
+
+  /// V21 incremental append. When rows have been added to the source
+  /// table since the last full build, decode + `add(pos, v)` them to
+  /// the existing index instead of rebuilding from scratch.
+  ///
+  /// Requires an index that supports one-at-a-time `add(id, Vector)`,
+  /// which all our current kinds do. IVF/PQ/IvfPq must already be
+  /// trained; when they're not, we return silently and defer to the
+  /// full-rebuild path (the caller shouldn't have gotten here anyway
+  /// because a not-trained index is null).
+  void _applyPendingInsertsToBuiltIndex(_VectorIndexBinding binding) {
+    final t = _tables[binding.spec.table];
+    if (t == null) return;
+    final colIdx = t.columns.indexWhere(
+      (c) => c.name.toLowerCase() == binding.spec.column.toLowerCase(),
+    );
+    if (colIdx < 0) return;
+    final spec = binding.spec;
+    final idx = binding.index;
+    if (idx == null) return;
+
+    // V23/V24: process UPDATE deltas first — remove then re-add each
+    // affected row at its (stable) position. HNSW uses tombstone
+    // removal, which bloats the graph; a threshold-based rebuild
+    // downstream keeps the graph from growing without bound.
+    if (binding.refreshPositions.isNotEmpty) {
+      for (final pos in binding.refreshPositions) {
+        if (pos < 0 || pos >= t.rows.length) continue;
+        final raw = t.rows[pos][colIdx];
+        if (idx is FlatIndex) {
+          idx.removeId(pos);
+        } else if (idx is HnswIndex) {
+          idx.removeId(pos);
+        } else if (idx is IvfFlatIndex) {
+          idx.removeId(pos);
+        } else if (idx is LshIndex) {
+          idx.removeId(pos);
+        } else if (idx is PqIndex) {
+          idx.removeId(pos);
+        } else if (idx is IvfPqIndex) {
+          idx.removeId(pos);
+        }
+        if (raw == null) continue;
+        Vector v;
+        try {
+          v = coerceVector(raw)!;
+        } catch (_) {
+          continue;
+        }
+        if (v.dim != spec.dim) continue;
+        if (idx is FlatIndex) {
+          idx.add(pos, v);
+        } else if (idx is HnswIndex) {
+          idx.add(pos, v);
+        } else if (idx is IvfFlatIndex) {
+          if (idx.isTrained) idx.add(pos, v);
+        } else if (idx is LshIndex) {
+          idx.add(pos, _maybeNormalizeForSpec(v, spec));
+        } else if (idx is PqIndex) {
+          if (idx.isTrained) idx.add(pos, _maybeNormalizeForSpec(v, spec));
+        } else if (idx is IvfPqIndex) {
+          if (idx.isTrained) idx.add(pos, _maybeNormalizeForSpec(v, spec));
+        }
+      }
+      binding.refreshPositions.clear();
+      // V24: after HNSW tombstone accumulation, force a rebuild on the
+      // next query when more than 30% of the graph is dead. 32-node
+      // minimum avoids thrashing tiny indexes.
+      if (idx is HnswIndex && idx.length >= 32 && idx.tombstoneRatio > 0.3) {
+        binding.index = null;
+        binding.builtRowCount = 0;
+      }
+    }
+
+    if (t.rows.length <= binding.builtRowCount) return;
+
+    for (var i = binding.builtRowCount; i < t.rows.length; i++) {
+      final raw = t.rows[i][colIdx];
+      if (raw == null) continue;
+      Vector v;
+      try {
+        v = coerceVector(raw)!;
+      } catch (_) {
+        continue;
+      }
+      if (v.dim != spec.dim) continue;
+      if (idx is FlatIndex) {
+        idx.add(i, v);
+      } else if (idx is HnswIndex) {
+        idx.add(i, v);
+      } else if (idx is IvfFlatIndex) {
+        if (!idx.isTrained) continue;
+        idx.add(i, v);
+      } else if (idx is LshIndex) {
+        idx.add(i, _maybeNormalizeForSpec(v, spec));
+      } else if (idx is PqIndex) {
+        if (!idx.isTrained) continue;
+        idx.add(i, _maybeNormalizeForSpec(v, spec));
+      } else if (idx is IvfPqIndex) {
+        if (!idx.isTrained) continue;
+        idx.add(i, _maybeNormalizeForSpec(v, spec));
+      }
+      _extendPayloadIndex(binding, i);
+    }
+    binding.builtRowCount = t.rows.length;
+  }
+
+  /// V23 UPDATE-loop hook: record a row position as needing a vector
+  /// re-add on next query. Called from the in-memory UPDATE executor
+  /// after `s.assignments.forEach` mutates the row.
+  void _captureVectorRowUpdate(String tableName, int position) {
+    final prefix = '${tableName.toLowerCase()}:';
+    for (final e in _vectorIndexes.entries) {
+      if (!e.key.startsWith(prefix)) continue;
+      e.value.refreshPositions.add(position);
+    }
+  }
+
+  /// V29 paged INSERT hook: capture (pk, vec) so the built paged index
+  /// can incrementally append at next query.
+  void _capturePagedInsert(String tableName, Map<String, Object?> row) {
+    final prefix = '${tableName.toLowerCase()}:';
+    for (final e in _vectorIndexes.entries) {
+      if (!e.key.startsWith(prefix)) continue;
+      final spec = e.value.spec;
+      final pk = row[_pagedPkName(tableName)];
+      if (pk == null) continue;
+      final raw = row[spec.column] ?? row[spec.column.toLowerCase()];
+      if (raw == null) {
+        // Even without a vector, add PK to payload index buckets so
+        // filter queries can enumerate NULL-vector rows.
+        _updatePagedPayloadForRow(e.value, pk, row);
+        continue;
+      }
+      Vector v;
+      try {
+        v = coerceVector(raw)!;
+      } catch (_) {
+        continue;
+      }
+      if (v.dim != spec.dim) continue;
+      e.value.pendingPagedInserts.add((pk, v));
+      _updatePagedPayloadForRow(e.value, pk, row);
+    }
+  }
+
+  /// V29 paged UPDATE hook: capture the new (pk, vec) for delta replay.
+  /// The old PK (before UPDATE renamed it) is captured separately as a
+  /// delete when different from the new PK.
+  void _capturePagedUpdate(
+    String tableName,
+    Object oldPk,
+    Object newPk,
+    Map<String, Object?> newRow,
+  ) {
+    final prefix = '${tableName.toLowerCase()}:';
+    for (final e in _vectorIndexes.entries) {
+      if (!e.key.startsWith(prefix)) continue;
+      final spec = e.value.spec;
+      if (oldPk != newPk) {
+        e.value.pendingPagedDeletes.add(oldPk);
+        _removePagedPayloadForPk(e.value, oldPk);
+      }
+      final raw = newRow[spec.column] ?? newRow[spec.column.toLowerCase()];
+      if (raw == null) {
+        // Row still exists but vector column is now NULL — treat as
+        // delete on this binding.
+        e.value.pendingPagedDeletes.add(newPk);
+        _removePagedPayloadForPk(e.value, newPk);
+        continue;
+      }
+      Vector v;
+      try {
+        v = coerceVector(raw)!;
+      } catch (_) {
+        continue;
+      }
+      if (v.dim != spec.dim) continue;
+      e.value.pendingPagedRefreshes.add((newPk, v));
+      // Filter columns may have changed → refresh payload buckets.
+      _removePagedPayloadForPk(e.value, newPk);
+      _updatePagedPayloadForRow(e.value, newPk, newRow);
+    }
+  }
+
+  /// V29 paged DELETE hook: capture the pk for removal.
+  void _capturePagedDelete(String tableName, Object pk) {
+    final prefix = '${tableName.toLowerCase()}:';
+    for (final e in _vectorIndexes.entries) {
+      if (!e.key.startsWith(prefix)) continue;
+      e.value.pendingPagedDeletes.add(pk);
+      _removePagedPayloadForPk(e.value, pk);
+    }
+  }
+
+  /// V40: add [pk] to the payload buckets for every declared filter
+  /// column, reading the new value from [row].
+  void _updatePagedPayloadForRow(
+    _VectorIndexBinding binding,
+    Object pk,
+    Map<String, Object?> row,
+  ) {
+    if (binding.spec.filterColumns.isEmpty) return;
+    for (final col in binding.spec.filterColumns) {
+      final lower = col.toLowerCase();
+      final buckets = binding.payloadIndex[lower] ??
+          (binding.payloadIndex[lower] = <Object?, Set<Object>>{});
+      final val = row[lower] ?? row[col];
+      buckets.putIfAbsent(val, () => <Object>{}).add(pk);
+    }
+  }
+
+  /// V40: remove [pk] from every payload bucket. O(distinct_values)
+  /// per filter column; acceptable because filter columns are chosen
+  /// deliberately for low-to-mid cardinality (tenant, kind, …).
+  void _removePagedPayloadForPk(_VectorIndexBinding binding, Object pk) {
+    if (binding.payloadIndex.isEmpty) return;
+    for (final buckets in binding.payloadIndex.values) {
+      for (final set in buckets.values) {
+        set.remove(pk);
+      }
+    }
+  }
+
+  String? _pagedPkName(String tableName) {
+    final pt = _pagedTable(tableName);
+    if (pt == null) return null;
+    return pt.primaryKey.name;
+  }
+
+  /// V29 apply captured deltas to a built paged binding's index.
+  /// Called just before serving reads. HNSW's tombstone counter still
+  /// triggers a rebuild threshold via the caller.
+  void _applyPendingPagedDeltas(_VectorIndexBinding binding) {
+    final idx = binding.index;
+    if (idx == null) return;
+    final spec = binding.spec;
+
+    void removeFromIdx(Object pk) {
+      if (idx is FlatIndex) {
+        idx.removeId(pk);
+      } else if (idx is HnswIndex) {
+        idx.removeId(pk);
+      } else if (idx is IvfFlatIndex) {
+        idx.removeId(pk);
+      } else if (idx is LshIndex) {
+        idx.removeId(pk);
+      } else if (idx is PqIndex) {
+        idx.removeId(pk);
+      } else if (idx is IvfPqIndex) {
+        idx.removeId(pk);
+      }
+    }
+
+    void addToIdx(Object pk, Vector v) {
+      final norm = _maybeNormalizeForSpec(v, spec);
+      if (idx is FlatIndex) {
+        idx.add(pk, v);
+      } else if (idx is HnswIndex) {
+        idx.add(pk, v);
+      } else if (idx is IvfFlatIndex) {
+        if (idx.isTrained) idx.add(pk, v);
+      } else if (idx is LshIndex) {
+        idx.add(pk, norm);
+      } else if (idx is PqIndex) {
+        if (idx.isTrained) idx.add(pk, norm);
+      } else if (idx is IvfPqIndex) {
+        if (idx.isTrained) idx.add(pk, norm);
+      }
+    }
+
+    for (final pk in binding.pendingPagedDeletes) {
+      removeFromIdx(pk);
+    }
+    binding.pendingPagedDeletes.clear();
+
+    for (final (pk, v) in binding.pendingPagedRefreshes) {
+      removeFromIdx(pk);
+      addToIdx(pk, v);
+    }
+    binding.pendingPagedRefreshes.clear();
+
+    for (final (pk, v) in binding.pendingPagedInserts) {
+      addToIdx(pk, v);
+    }
+    binding.pendingPagedInserts.clear();
+
+    // V24-style HNSW rebuild threshold applies here too.
+    if (idx is HnswIndex && idx.length >= 32 && idx.tombstoneRatio > 0.3) {
+      binding.index = null;
+      binding.builtRowCount = 0;
+    }
+  }
+
+  /// V25: LSH/PQ/IvfPq internally rank by squared-L2, so cosine metric
+  /// is emulated by normalizing vectors on ingest and query. On the
+  /// unit sphere, argmin L2² = argmax cosine similarity.
+  static Vector _maybeNormalizeForSpec(Vector v, VectorIndexSpec spec) {
+    if (spec.metric != VectorMetric.cosine) return v;
+    switch (spec.kind) {
+      case VectorIndexKind.lsh:
+      case VectorIndexKind.pq:
+      case VectorIndexKind.ivfPq:
+        return vecNormalize(v);
+      default:
+        return v;
+    }
+  }
+
+  /// V28: number of entries currently held by a built vector index,
+  /// dispatched across the six kinds. Zero for a not-yet-built binding.
+  static int _vectorIndexLength(Object? idx) {
+    if (idx is FlatIndex) return idx.length;
+    if (idx is HnswIndex) return idx.length;
+    if (idx is IvfFlatIndex) return idx.length;
+    if (idx is LshIndex) return idx.length;
+    if (idx is PqIndex) return idx.length;
+    if (idx is IvfPqIndex) return idx.length;
+    return 0;
+  }
+
+  /// V36: rebuild [_VectorIndexBinding.payloadIndex] from scratch by
+  /// scanning `t.rows`. Called after any UPDATE touching a tracked
+  /// column (via the [payloadIndexDirty] flag) and on initial build.
+  /// No-op when the binding declares no filter columns or the table
+  /// is paged.
+  void _rebuildPayloadIndex(_VectorIndexBinding binding) {
+    binding.payloadIndex.clear();
+    binding.payloadIndexDirty = false;
+    final spec = binding.spec;
+    if (spec.filterColumns.isEmpty) return;
+    final t = _tables[spec.table];
+    if (t == null) return;
+    final colIdxs = <String, int>{};
+    for (final col in spec.filterColumns) {
+      final idx = t.columns.indexWhere(
+        (c) => c.name.toLowerCase() == col.toLowerCase(),
+      );
+      if (idx < 0) continue;
+      colIdxs[col.toLowerCase()] = idx;
+      binding.payloadIndex[col.toLowerCase()] = <Object?, Set<Object>>{};
+    }
+    for (var ri = 0; ri < t.rows.length; ri++) {
+      final row = t.rows[ri];
+      for (final e in colIdxs.entries) {
+        final v = row[e.value];
+        binding.payloadIndex[e.key]!.putIfAbsent(v, () => <Object>{}).add(ri);
+      }
+    }
+  }
+
+  /// V36: append a single row's payload attributes to the index
+  /// without a full rebuild. Called from V21's incremental append
+  /// path.
+  void _extendPayloadIndex(_VectorIndexBinding binding, int rowPos) {
+    if (binding.spec.filterColumns.isEmpty) return;
+    if (binding.payloadIndex.isEmpty) return;
+    final t = _tables[binding.spec.table];
+    if (t == null || rowPos >= t.rows.length) return;
+    final row = t.rows[rowPos];
+    for (final col in binding.spec.filterColumns) {
+      final colIdxLower = col.toLowerCase();
+      final buckets = binding.payloadIndex[colIdxLower];
+      if (buckets == null) continue;
+      final colIdx = t.columns.indexWhere(
+        (c) => c.name.toLowerCase() == colIdxLower,
+      );
+      if (colIdx < 0) continue;
+      buckets.putIfAbsent(row[colIdx], () => <Object>{}).add(rowPos);
+    }
+  }
+
+  /// V36: walk [where] as a conjunction of `col = literal` equalities,
+  /// intersecting the corresponding payload sets. Returns null when
+  /// any conjunct is NOT a `filter_column = literal` equality — the
+  /// caller then falls back to over-fetch + eval. An empty result set
+  /// (no conjuncts matched or no rows) still returns null so the
+  /// generic executor answers the query.
+  Set<Object>? _extractPayloadFilterSet(
+    Expr where,
+    _VectorIndexBinding binding,
+  ) {
+    if (binding.spec.filterColumns.isEmpty) return null;
+    if (binding.payloadIndex.isEmpty) return null;
+    final lowerCols = <String>{
+      for (final c in binding.spec.filterColumns) c.toLowerCase(),
+    };
+
+    // Recursively collect equalities. Any non-equality-non-AND term
+    // means we can't use the payload index and must fall back.
+    final terms = <(String, Object?)>[];
+    bool ok = true;
+    void walk(Expr e) {
+      if (!ok) return;
+      if (e is BinaryExpr) {
+        final op = e.op;
+        if (op.toUpperCase() == 'AND') {
+          walk(e.left);
+          walk(e.right);
+          return;
+        }
+        if (op == '=' || op.toUpperCase() == 'IS') {
+          Expr colSide = e.left;
+          Expr litSide = e.right;
+          if (colSide is! ColumnExpr && litSide is ColumnExpr) {
+            colSide = e.right;
+            litSide = e.left;
+          }
+          if (colSide is ColumnExpr && litSide is LiteralExpr) {
+            final colName = colSide.name.toLowerCase();
+            if (!lowerCols.contains(colName)) {
+              ok = false;
+              return;
+            }
+            terms.add((colName, litSide.value));
+            return;
+          }
+        }
+      }
+      ok = false;
+    }
+
+    walk(where);
+    if (!ok || terms.isEmpty) return null;
+
+    Set<Object>? acc;
+    for (final (col, val) in terms) {
+      final buckets = binding.payloadIndex[col];
+      if (buckets == null) return null;
+      final set = buckets[val] ?? const <Object>{};
+      if (acc == null) {
+        acc = Set<Object>.from(set);
+      } else {
+        acc = acc.intersection(set);
+      }
+      if (acc.isEmpty) break;
+    }
+    return acc;
+  }
+
+  /// V33: `PRAGMA vector_analyze('tbl.col[:k[:sample_size]]')` samples
+  /// `sample_size` random rows as queries, computes brute-force top-K
+  /// vs the binding's top-K, and reports mean recall@K. In-memory
+  /// tables only. Requires the binding to be built (call
+  /// `warmVectorIndexes` first).
+  QueryResult _vectorAnalyze(String target) {
+    final parts = target.split(':');
+    final tblCol = parts[0];
+    final k = parts.length > 1 ? int.tryParse(parts[1]) ?? 10 : 10;
+    final sampleSize = parts.length > 2 ? int.tryParse(parts[2]) ?? 32 : 32;
+
+    final dot = tblCol.indexOf('.');
+    if (dot < 0) {
+      throw StateError(
+        'PRAGMA vector_analyze target must be "tbl.col", got "$tblCol"',
+      );
+    }
+    final tableName = tblCol.substring(0, dot);
+    final colName = tblCol.substring(dot + 1);
+    final key = '${tableName.toLowerCase()}:${colName.toLowerCase()}';
+    final binding = _vectorIndexes[key];
+    if (binding == null) {
+      throw StateError(
+        'PRAGMA vector_analyze: no vector index on $tableName.$colName',
+      );
+    }
+    if (_isPaged(tableName)) {
+      throw StateError(
+        'PRAGMA vector_analyze: paged tables not supported',
+      );
+    }
+    final t = _tables[tableName];
+    if (t == null) {
+      throw StateError(
+        'PRAGMA vector_analyze: table $tableName not found',
+      );
+    }
+    final colIdx = t.columns.indexWhere(
+      (c) => c.name.toLowerCase() == colName.toLowerCase(),
+    );
+    if (colIdx < 0) {
+      throw StateError(
+        'PRAGMA vector_analyze: column $colName not found in $tableName',
+      );
+    }
+
+    // Materialise ALL row vectors so we can build a brute-force
+    // FlatIndex and pick random query rows.
+    final vectors = <(int, Vector)>[];
+    for (var i = 0; i < t.rows.length; i++) {
+      final raw = t.rows[i][colIdx];
+      if (raw == null) continue;
+      Vector v;
+      try {
+        v = coerceVector(raw)!;
+      } catch (_) {
+        continue;
+      }
+      if (v.dim != binding.spec.dim) continue;
+      vectors.add((i, v));
+    }
+    if (vectors.length < k) {
+      throw StateError(
+        'PRAGMA vector_analyze: table has ${vectors.length} valid '
+        'rows, needs at least k=$k',
+      );
+    }
+
+    final brute =
+        FlatIndex(binding.spec.dim, defaultMetric: binding.spec.metric);
+    for (final (id, v) in vectors) {
+      brute.add(id, v);
+    }
+
+    final idx = _vectorIndexFor(tableName, colName);
+    if (idx == null) {
+      throw StateError(
+        'PRAGMA vector_analyze: binding index not built; call '
+        'warmVectorIndexes() first',
+      );
+    }
+
+    final rng = math.Random(0xa17a);
+    final effSample = math.min(sampleSize, vectors.length);
+    var totalRecall = 0.0;
+
+    for (var s = 0; s < effSample; s++) {
+      final pick = vectors[rng.nextInt(vectors.length)].$2;
+      final bruteHits = brute
+          .search(pick, k, metric: binding.spec.metric)
+          .map((h) => h.id)
+          .toSet();
+
+      List<VectorSearchHit> idxHits;
+      final effQ = _maybeNormalizeForSpec(pick, binding.spec);
+      if (idx is FlatIndex) {
+        idxHits = idx.search(pick, k, metric: binding.spec.metric);
+      } else if (idx is HnswIndex) {
+        idxHits = idx.search(pick, k, metric: binding.spec.metric);
+      } else if (idx is IvfFlatIndex) {
+        idxHits = idx.search(pick, k, metric: binding.spec.metric);
+      } else if (idx is LshIndex) {
+        idxHits = idx.search(effQ, k);
+      } else if (idx is PqIndex) {
+        idxHits = idx.search(effQ, k);
+      } else if (idx is IvfPqIndex) {
+        idxHits = idx.search(effQ, k);
+      } else {
+        idxHits = const [];
+      }
+
+      final idxIds = idxHits.map((h) => h.id).toSet();
+      final overlap = bruteHits.intersection(idxIds).length;
+      totalRecall += overlap / k;
+    }
+
+    final meanRecall = effSample == 0 ? 0.0 : totalRecall / effSample;
+    return QueryResult(
+      columns: const ['tbl', 'col', 'k', 'sample_size', 'mean_recall'],
+      rows: [
+        [tableName, colName, k, effSample, meanRecall],
+      ],
+    );
+  }
+
+  /// V21 incremental-maintenance-aware invalidation.
+  ///
+  /// * Plain `INSERT` (mode `normal`) leaves the built index intact —
+  ///   new rows are appended to the built index at the next query
+  ///   through `_vectorIndexFor`'s catch-up loop (positions are stable
+  ///   because rows are appended, not inserted mid-list).
+  /// * `UPDATE` invalidates only when the SET clause touches a
+  ///   vector-indexed column — non-vector-column updates don't move
+  ///   the underlying embedding so the index stays valid.
+  /// * `INSERT OR REPLACE|IGNORE`, `DELETE`, and anything else fall
+  ///   back to a full invalidation.
+  void _invalidateVectorIndexes(Statement stmt, String tableName) {
+    final prefix = '${tableName.toLowerCase()}:';
+    final touched = <String>[
+      for (final k in _vectorIndexes.keys)
+        if (k.startsWith(prefix)) k,
+    ];
+    if (touched.isEmpty) return;
+
+    // Paged tables: V29 supports incremental append (INSERT), UPDATE
+    // (removeId + add via delta capture), and DELETE (removeId). Other
+    // statements (DDL, TRUNCATE, INSERT OR REPLACE/IGNORE) still force
+    // a full re-warm.
+    if (_isPaged(tableName)) {
+      final incremental =
+          stmt is InsertStmt && stmt.mode == InsertMode.normal ||
+              stmt is UpdateStmt ||
+              stmt is DeleteStmt;
+      if (!incremental) {
+        for (final key in touched) {
+          final b = _vectorIndexes[key]!;
+          b.index = null;
+          b.builtRowCount = 0;
+          b.refreshPositions.clear();
+          b.pendingPagedInserts.clear();
+          b.pendingPagedRefreshes.clear();
+          b.pendingPagedDeletes.clear();
+        }
+      }
+      return;
+    }
+
+    // Plain INSERT: leave index alone; catch-up path picks up new rows.
+    if (stmt is InsertStmt && stmt.mode == InsertMode.normal) return;
+
+    // UPDATE: invalidate only if a vector-indexed column is on the
+    // left side of any SET assignment.
+    if (stmt is UpdateStmt) {
+      final touchedCols = {
+        for (final k in stmt.assignments.keys) k.toLowerCase(),
+      };
+      for (final key in touched) {
+        final b = _vectorIndexes[key]!;
+        // V36: mark payload index dirty on any UPDATE that touches a
+        // declared filter column.
+        for (final col in b.spec.filterColumns) {
+          if (touchedCols.contains(col.toLowerCase())) {
+            b.payloadIndexDirty = true;
+            break;
+          }
+        }
+        final col = key.substring(prefix.length);
+        if (!touchedCols.contains(col)) {
+          // Update didn't touch this binding's column; the position-
+          // capture side channel would have collected unrelated
+          // positions — discard them.
+          b.refreshPositions.clear();
+          continue;
+        }
+        // V24: all index kinds keep `refreshPositions` for query-time
+        // replay. HNSW uses tombstone+re-add; a periodic full rebuild
+        // triggers in `_applyPendingInsertsToBuiltIndex` when the
+        // tombstone ratio exceeds 50%.
+      }
+      return;
+    }
+
+    // Everything else (DELETE, INSERT OR REPLACE/IGNORE, TRUNCATE,
+    // ALTER, DROP, ...): full invalidation.
+    for (final key in touched) {
+      final b = _vectorIndexes[key]!;
+      b.index = null;
+      b.builtRowCount = 0;
+      b.refreshPositions.clear();
+    }
+  }
+
   /// Cached, parsed partial-index `WHERE` predicate AST per index name.
   /// Built lazily on first planner access and cleared when a partial
   /// index is created or dropped.
@@ -343,12 +1485,10 @@ class Database {
   void _refreshPartialIndexes(Table t) {
     for (final def in t.indexDefs.values) {
       if (def.whereSql == null && def.exprSql == null) continue;
-      final pred = def.whereSql == null
-          ? null
-          : _compilePartialPredicate(def.whereSql);
-      final exprFn = def.exprSql == null
-          ? null
-          : _compileIndexExpression(def.exprSql!);
+      final pred =
+          def.whereSql == null ? null : _compilePartialPredicate(def.whereSql);
+      final exprFn =
+          def.exprSql == null ? null : _compileIndexExpression(def.exprSql!);
       final tree = t.indexes[def.name];
       if (tree == null) continue;
       tree.clear();
@@ -389,9 +1529,8 @@ class Database {
   bool _partialIndexUsable(IndexDef def) {
     if (def.whereSql == null) return true;
     final ast = _partialIndexAstCache.putIfAbsent(def.name, () {
-      final stmt =
-          Parser.fromString('SELECT ${def.whereSql}').parseStatement()
-              as SelectStmt;
+      final stmt = Parser.fromString('SELECT ${def.whereSql}').parseStatement()
+          as SelectStmt;
       return stmt.projection.first.expr!;
     });
     for (final c in _currentScanConjuncts) {
@@ -578,6 +1717,30 @@ class Database {
   /// `<path>.lock` sidecar will keep readers/writers blocked until the
   /// process exits.
   Future<void> close() async {
+    // Flush built vector-index state so the next open can skip the
+    // (potentially expensive) rebuild of HNSW graphs / IVF centroids.
+    if (path != null) {
+      var anyBuilt = false;
+      for (final b in _vectorIndexes.values) {
+        if (b.index != null) {
+          anyBuilt = true;
+          break;
+        }
+      }
+      if (anyBuilt) {
+        try {
+          await _persist();
+        } catch (_) {
+          // Best-effort; a failed flush must not block close.
+        }
+      }
+    }
+    // V37: drain any queued unawaited persist calls (e.g. from
+    // vec_batch_insert / vec_import_csv TVFs) before releasing the
+    // file lock so a reopen observes the latest committed state.
+    try {
+      await _persistChain;
+    } catch (_) {}
     // Flush + close every paged table first; their journals must be
     // gone before we drop the file lock so a subsequent open sees a
     // clean state.
@@ -646,8 +1809,7 @@ class Database {
   Future<QueryResult> executeStmt(Statement stmt) async {
     // Statements that span a transaction boundary always need exclusive
     // access; otherwise SELECT-ish statements take the shared arm.
-    final wantsWrite =
-        inTransaction ||
+    final wantsWrite = inTransaction ||
         _isMutation(stmt) ||
         stmt is BeginStmt ||
         stmt is CommitStmt ||
@@ -738,6 +1900,7 @@ class Database {
         if (tname != null) {
           _invalidateFts5(tname);
           _invalidateRtree(tname);
+          _invalidateVectorIndexes(stmt, tname);
           final t = _tables[tname];
           if (t != null) _refreshPartialIndexes(t);
         }
@@ -761,22 +1924,24 @@ class Database {
   /// writer arm of [rwLock] until the snapshot is committed/rolled back.
   /// Any mutation inside the snapshot is rejected.
   Future<QueryResult> beginSnapshot() => _lock.write(() async {
-    if (inTransaction) {
-      throw StateError('Already in a transaction');
-    }
-    // Stash the live state; install a deep-cloned view as _tables
-    // so all read paths transparently see the snapshot.
-    _liveTables = Map<String, Table>.from(_tables);
-    _liveViews = Map<String, SelectStmt>.from(_views);
-    final cloned = {for (final e in _tables.entries) e.key: e.value.clone()};
-    _snapshot = Map<String, Table>.from(cloned);
-    _viewSnapshot = Map<String, SelectStmt>.from(_views);
-    _tables
-      ..clear()
-      ..addAll(cloned);
-    _readOnlySnapshot = true;
-    return QueryResult.message('Snapshot transaction started');
-  });
+        if (inTransaction) {
+          throw StateError('Already in a transaction');
+        }
+        // Stash the live state; install a deep-cloned view as _tables
+        // so all read paths transparently see the snapshot.
+        _liveTables = Map<String, Table>.from(_tables);
+        _liveViews = Map<String, SelectStmt>.from(_views);
+        final cloned = {
+          for (final e in _tables.entries) e.key: e.value.clone()
+        };
+        _snapshot = Map<String, Table>.from(cloned);
+        _viewSnapshot = Map<String, SelectStmt>.from(_views);
+        _tables
+          ..clear()
+          ..addAll(cloned);
+        _readOnlySnapshot = true;
+        return QueryResult.message('Snapshot transaction started');
+      });
 
   /// Snapshot-read primitive: clones the current table set and runs
   /// [body] against the clone. Multiple [snapshotRead] calls can
@@ -1404,6 +2569,13 @@ class Database {
     );
     pt.tableName = s.name;
     _pagedTables[s.name] = pt;
+    // V30/V38: register any inline VECTOR(...) column bindings so the
+    // paged binding uses the declared filter_cols etc.
+    for (final c in s.columns) {
+      if (c.vectorSpec != null) {
+        _registerInlineVectorSpec(s.name, c.name, c.vectorSpec!);
+      }
+    }
     return QueryResult.message('paged table ${s.name} created');
   }
 
@@ -2107,6 +3279,7 @@ class Database {
         case InsertMode.normal:
           await pt.insert(map);
           affected++;
+          _capturePagedInsert(s.table, map);
           if (returningExprs.isNotEmpty) {
             returnedRows.add([for (final e in returningExprs) e.eval(map)]);
           }
@@ -2219,12 +3392,10 @@ class Database {
       for (final row in rows) {
         final keyVals = <Object?>[for (final ge in groupExprs) ge.eval(row)];
         final keyStr = jsonEncode(keyVals);
-        groups
-            .putIfAbsent(keyStr, () {
-              groupOrder.add(keyStr);
-              return <Map<String, Object?>>[];
-            })
-            .add(row);
+        groups.putIfAbsent(keyStr, () {
+          groupOrder.add(keyStr);
+          return <Map<String, Object?>>[];
+        }).add(row);
       }
     }
 
@@ -2263,14 +3434,11 @@ class Database {
     ];
 
     // Build per-group output rows, applying HAVING.
-    final survivors =
-        <
-          ({
-            List<Object?> outRow,
-            List<Map<String, Object?>> grp,
-            Map<String, Object?> sample,
-          })
-        >[];
+    final survivors = <({
+      List<Object?> outRow,
+      List<Map<String, Object?>> grp,
+      Map<String, Object?> sample,
+    })>[];
     final having = s.having;
     for (final keyStr in groupOrder) {
       final grp = groups[keyStr]!;
@@ -2374,8 +3542,7 @@ class Database {
       return found;
     }
 
-    final hasAggregates =
-        s.groupBy.isNotEmpty ||
+    final hasAggregates = s.groupBy.isNotEmpty ||
         s.having != null ||
         s.projection.any((p) => p.expr != null && isAggregate(p.expr)) ||
         s.orderBy.any((o) => isAggregate(o.expr));
@@ -2528,8 +3695,7 @@ class Database {
     // upper/lower bound, or no predicate at all (full PK scan). When
     // the residual would route through a *secondary index*, the
     // stream emits in index order, not PK order — keep buffering.
-    final streamIsPkOrdered =
-        range.eq != null ||
+    final streamIsPkOrdered = range.eq != null ||
         range.lower != null ||
         range.upper != null ||
         range.residual == null ||
@@ -2741,6 +3907,7 @@ class Database {
       for (final p in plan) {
         if (_compareLiteral(p.oldPk, p.newPk) == 0) {
           await pt.update(p.oldPk, p.row);
+          _capturePagedUpdate(s.table, p.oldPk, p.newPk, p.row);
         }
       }
       // Phase 2: delete every row whose PK is moving away.
@@ -2751,6 +3918,7 @@ class Database {
       // above these inserts are guaranteed not to conflict.
       for (final p in moving) {
         await pt.insert(p.row);
+        _capturePagedUpdate(s.table, p.oldPk, p.newPk, p.row);
       }
       affected = plan.length;
       if (returningExprs.isNotEmpty) {
@@ -2770,6 +3938,7 @@ class Database {
         });
         await pt.update(pkVal, updated);
         affected++;
+        _capturePagedUpdate(s.table, pkVal, pkVal, updated);
         if (returningExprs.isNotEmpty) {
           returnedRows.add([for (final e in returningExprs) e.eval(updated)]);
         }
@@ -2840,6 +4009,7 @@ class Database {
       if (pk == null) continue;
       if (await pt.delete(pk)) {
         affected++;
+        _capturePagedDelete(s.table, pk);
         if (returningExprs.isNotEmpty) {
           returnedRows.add([for (final e in returningExprs) e.eval(row)]);
         }
@@ -2886,7 +4056,83 @@ class Database {
         t.createIndex(IndexDef('${s.name}__${c.name}', c.name, unique: true));
       }
     }
+    // V30: register inline VECTOR(...) column bindings.
+    for (final c in s.columns) {
+      if (c.vectorSpec != null) {
+        _registerInlineVectorSpec(s.name, c.name, c.vectorSpec!);
+      }
+    }
     return QueryResult.message('Table ${s.name} created');
+  }
+
+  /// V30: convert a `VECTOR(dim=..., kind=..., metric=...)` map into a
+  /// [VectorIndexSpec] and register it. Unknown keys are ignored so
+  /// forward-compat additions don't break existing DDL.
+  void _registerInlineVectorSpec(
+    String table,
+    String column,
+    Map<String, String> attrs,
+  ) {
+    int? asInt(String k) {
+      final v = attrs[k];
+      if (v == null) return null;
+      return int.tryParse(v);
+    }
+
+    final dim = asInt('dim') ?? asInt('dimension');
+    if (dim == null || dim <= 0) {
+      throw StateError(
+        'VECTOR($column): missing required attribute `dim`',
+      );
+    }
+    final kindStr = (attrs['kind'] ?? 'flat').toLowerCase();
+    final metricStr = (attrs['metric'] ?? 'l2sq').toLowerCase();
+    final kind = VectorIndexKind.values.firstWhere(
+      (k) =>
+          k.name.toLowerCase() == kindStr ||
+          (kindStr == 'ivfpq' && k == VectorIndexKind.ivfPq) ||
+          (kindStr == 'ivf_pq' && k == VectorIndexKind.ivfPq),
+      orElse: () => VectorIndexKind.flat,
+    );
+    final metric = VectorMetric.values.firstWhere(
+      (m) =>
+          m.name.toLowerCase() == metricStr ||
+          (metricStr == 'ip' && m == VectorMetric.innerProduct) ||
+          (metricStr == 'dot' && m == VectorMetric.innerProduct) ||
+          (metricStr == 'inner_product' && m == VectorMetric.innerProduct),
+      orElse: () => VectorMetric.l2sq,
+    );
+    createVectorIndex(
+      VectorIndexSpec(
+        table: table,
+        column: column,
+        dim: dim,
+        kind: kind,
+        metric: metric,
+        m: asInt('m') ?? 16,
+        efConstruction: asInt('ef_construction') ?? 40,
+        efSearch: asInt('ef_search') ?? 16,
+        nlist: asInt('nlist') ?? 0,
+        nprobe: asInt('nprobe') ?? 1,
+        nbits: asInt('nbits') ?? 64,
+        rescoreFactor: asInt('rescore_factor') ?? 1,
+        seed: asInt('seed') ?? 1234,
+        filterColumns: _parseFilterCols(attrs['filter_cols']),
+      ),
+    );
+  }
+
+  /// V38: split a `filter_cols='col1,col2'` attribute value into a
+  /// column-name list. Accepts comma-, semicolon-, or pipe-separated
+  /// values so it works with SQL parsers that may treat comma as a
+  /// clause terminator. Trims whitespace; empty input → empty list.
+  static List<String> _parseFilterCols(String? raw) {
+    if (raw == null || raw.isEmpty) return const <String>[];
+    return raw
+        .split(RegExp(r'[,;|]'))
+        .map((s) => s.trim())
+        .where((s) => s.isNotEmpty)
+        .toList(growable: false);
   }
 
   QueryResult _dropTable(DropTableStmt s) {
@@ -2908,6 +4154,12 @@ class Database {
       }
     }
     _tables.remove(s.name);
+    // Cascade: if this was a vector_index vtab, drop the underlying
+    // binding too so the planner stops routing through it.
+    final vkey = _vectorVtabToKey.remove(s.name.toLowerCase());
+    if (vkey != null) {
+      _vectorIndexes.remove(vkey);
+    }
     return QueryResult.message('Table ${s.name} dropped');
   }
 
@@ -3206,6 +4458,7 @@ class Database {
       }
       _evaluateGenerated(t, row);
       _enforceChecks(t, row);
+      _enforceVectorDims(t, row);
       _enforceForeignKeysOnInsert(t, row);
       _fireTriggers(t.name, 'INSERT', 'BEFORE', newRow: row, sourceTable: t);
 
@@ -3477,8 +4730,7 @@ class Database {
       // INDEXED BY: resolve a candidate rowId set up-front. NOT INDEXED
       // and the absence of any hint both fall through to a full scan.
       final hintedRows = _resolveHintedRowIds(t, s.where, s.indexedBy);
-      final rowOrder =
-          hintedRows ??
+      final rowOrder = hintedRows ??
           List<int>.generate(t.rows.length, (i) => i, growable: false);
       final lim = s.limit == null
           ? -1
@@ -3538,8 +4790,13 @@ class Database {
             strict: t.strict,
           );
         });
+        // V23: capture position so the vector-index invalidation hook
+        // can replay a targeted remove+add instead of dropping the
+        // entire index.
+        _captureVectorRowUpdate(t.name, ri);
         _evaluateGenerated(t, row);
         _enforceChecks(t, row);
+        _enforceVectorDims(t, row);
         _enforceForeignKeysOnInsert(t, row);
         _cascadeOnUpdate(t, old, row);
         _fireTriggers(
@@ -3718,6 +4975,41 @@ class Database {
     _runChecks(t, row);
   }
 
+  /// V35: enforce vector-column dim at write time. Any registered
+  /// vector index on `t` whose column is being written must receive a
+  /// blob of the correct dim; NULL is allowed (row won't be indexed).
+  /// Throws with a specific message so ETL surfaces the row that
+  /// failed rather than silently skipping it later at query time.
+  void _enforceVectorDims(Table t, List<Object?> row) {
+    final prefix = '${t.name.toLowerCase()}:';
+    for (final entry in _vectorIndexes.entries) {
+      if (!entry.key.startsWith(prefix)) continue;
+      final spec = entry.value.spec;
+      final colIdx = t.columns.indexWhere(
+        (c) => c.name.toLowerCase() == spec.column.toLowerCase(),
+      );
+      if (colIdx < 0) continue;
+      final raw = row[colIdx];
+      if (raw == null) continue;
+      Vector? v;
+      try {
+        v = coerceVector(raw);
+      } catch (e) {
+        throw StateError(
+          'VECTOR(${spec.column}): value is not a valid vector blob '
+          '(${e.toString()})',
+        );
+      }
+      if (v == null) continue;
+      if (v.dim != spec.dim) {
+        throw StateError(
+          'VECTOR(${spec.column}): expected dim=${spec.dim}, '
+          'got dim=${v.dim}',
+        );
+      }
+    }
+  }
+
   /// Apply all column- and table-level CHECK constraints to [row]
   /// immediately and throw on the first failure.
   void _runChecks(Table t, List<Object?> row) {
@@ -3804,9 +5096,8 @@ class Database {
         final parentCols = fk.references.column != null
             ? [fk.references.column!]
             : _primaryKeyColumns(parent);
-        final parentValues = parentCols
-            .map((c) => parentRow[parent.columnIndex(c)])
-            .toList();
+        final parentValues =
+            parentCols.map((c) => parentRow[parent.columnIndex(c)]).toList();
         // Find matching child rows.
         final matchingChildren = <int>[];
         for (var i = 0; i < child.rows.length; i++) {
@@ -3876,9 +5167,8 @@ class Database {
     for (final child in _tables.values) {
       for (final fk in _foreignKeysOf(child)) {
         if (fk.references.table != parent.name) continue;
-        final parentCols = fk.references.column != null
-            ? [fk.references.column!]
-            : pkCols;
+        final parentCols =
+            fk.references.column != null ? [fk.references.column!] : pkCols;
         if (parentCols.length != fk.columns.length) continue;
         for (var ri = 0; ri < child.rows.length; ri++) {
           final cr = child.rows[ri];
@@ -4161,8 +5451,8 @@ class Database {
     final anchorRes = _selectTopLevel(anchor);
     final cols =
         (columnNames != null && columnNames.length == anchorRes.columns.length)
-        ? List<String>.from(columnNames)
-        : anchorRes.columns;
+            ? List<String>.from(columnNames)
+            : anchorRes.columns;
     final all = <List<Object?>>[...anchorRes.rows];
     final seen = <String>{for (final r in all) jsonEncode(r)};
     var queue = <List<Object?>>[...anchorRes.rows];
@@ -4425,6 +5715,20 @@ class Database {
     final dcm = _tryDistinctCompositeFast(s);
     if (dcm != null) return dcm;
 
+    // Phase V4: `SELECT ... FROM t ORDER BY vec_metric(col, const)
+    // [ASC|DESC] LIMIT k` where a vector index is registered on
+    // `t.col`. Routes through the built FlatIndex / HnswIndex /
+    // IvfFlatIndex instead of scanning + sorting every row.
+    final vkn = _tryVectorKnnFast(s, outer);
+    if (vkn != null) return vkn;
+
+    // Phase V18: `SELECT ... FROM t WHERE VEC_L2|L2SQ(col, const) <op>
+    // threshold [AND …]` — range search on a registered vector index.
+    // Retrieves candidates in ranked order and stops once distance
+    // exceeds the threshold. No LIMIT required.
+    final vrn = _tryVectorRangeFast(s, outer);
+    if (vrn != null) return vrn;
+
     final reordered = _reorderInnerJoins(s);
     final fromRows =
         _planScan(reordered, outer) ?? _resolveFromRows(reordered, outer);
@@ -4440,8 +5744,7 @@ class Database {
     }
 
     // Detect aggregates anywhere in projection or HAVING.
-    final hasAggregates =
-        s.groupBy.isNotEmpty ||
+    final hasAggregates = s.groupBy.isNotEmpty ||
         _containsAggregate(s.having) ||
         s.projection.any((p) => p.expr != null && _containsAggregate(p.expr));
 
@@ -4933,7 +6236,7 @@ class Database {
   /// the bound is inclusive. Returns null on any other shape or NULL
   /// literal.
   ({String col, Object value, bool isLower, bool inclusive})?
-  _extractRangeBound(BinaryExpr e) {
+      _extractRangeBound(BinaryExpr e) {
     var op = e.op;
     ColumnExpr? col;
     LiteralExpr? lit;
@@ -5404,8 +6707,7 @@ class Database {
         value = cnt == 0 ? 0.0 : sumAcc.toDouble();
     }
 
-    final col =
-        p.alias ??
+    final col = p.alias ??
         '${name.toLowerCase()}(${isDistinct ? "DISTINCT " : ""}${arg.name})';
     var rows = <List<Object?>>[
       [value],
@@ -5553,9 +6855,8 @@ class Database {
               (where.right is ColumnExpr && where.left is LiteralExpr))) {
         final col =
             (where.left is ColumnExpr ? where.left : where.right) as ColumnExpr;
-        final lit =
-            (where.left is LiteralExpr ? where.left : where.right)
-                as LiteralExpr;
+        final lit = (where.left is LiteralExpr ? where.left : where.right)
+            as LiteralExpr;
         if (col.name.toLowerCase() != geNameLower) return null;
         if (lit.value == null) {
           whereEmpty = true;
@@ -5890,6 +7191,605 @@ class Database {
     return null;
   }
 
+  /// Phase V4: `SELECT ... FROM t [WHERE …] ORDER BY vec_metric(col, q)
+  /// [ASC|DESC] LIMIT k` served by a registered vector index on
+  /// `(t, col)`. `q` must be constant (no column references); k must be
+  /// a positive int literal.
+  ///
+  /// When `WHERE` is present (Phase V11), we over-fetch the top
+  /// `4*k` (and, if needed, `16*k`) candidates from the index, then
+  /// evaluate `WHERE` per candidate row and keep the survivors until we
+  /// have `k` matches. If the filter is more selective than that,
+  /// return null so the generic executor can do a full scan.
+  ///
+  /// Recognised metrics and their required direction (smaller / larger
+  /// is closer):
+  ///   * `VEC_L2` / `VEC_L2SQ` / `VEC_DISTANCE_L2` — ASC
+  ///   * `VEC_COSINE` / `VEC_DISTANCE_COSINE`     — ASC
+  ///   * `VEC_IP` / `VEC_DOT`                     — DESC
+  ///
+  /// Returns null on any shape mismatch so the generic planner keeps
+  /// semantics (in particular, if no vector index is registered on the
+  /// column the query still runs — just via full-scan + sort).
+  QueryResult? _tryVectorKnnFast(
+    SelectStmt s,
+    Map<String, Object?> outer,
+  ) {
+    if (s.fromTable == null) return null;
+    if (s.joins.isNotEmpty) return null;
+    if (s.fromSubquery != null || s.fromFunction != null) return null;
+    // Paged tables live outside `_tables`; row-projection would need
+    // an async fetch. Punt to the generic executor (which handles
+    // paged sources via its own async streaming path).
+    if (_isPaged(s.fromTable)) return null;
+    if (s.groupBy.isNotEmpty || s.having != null) return null;
+    if (s.setOp != null) return null;
+    if (s.distinct) return null;
+    if (s.orderBy.length != 1) return null;
+    if (s.limit == null || s.limit! <= 0) return null;
+    if ((s.offset ?? 0) != 0) return null;
+
+    final ob = s.orderBy.first;
+    final e = ob.expr;
+    if (e is! FunctionCallExpr) return null;
+    if (e.window != null || e.filterExpr != null || e.distinct) return null;
+    if (e.args.length != 2) return null;
+
+    final fname = e.name.toUpperCase();
+    late VectorMetric requiredMetric;
+    late bool wantDesc;
+    switch (fname) {
+      case 'VEC_L2':
+      case 'VEC_DISTANCE_L2':
+        requiredMetric = VectorMetric.l2;
+        wantDesc = false;
+        break;
+      case 'VEC_L2SQ':
+        requiredMetric = VectorMetric.l2sq;
+        wantDesc = false;
+        break;
+      case 'VEC_COSINE':
+      case 'VEC_DISTANCE_COSINE':
+        requiredMetric = VectorMetric.cosine;
+        wantDesc = false;
+        break;
+      case 'VEC_IP':
+      case 'VEC_DOT':
+        requiredMetric = VectorMetric.innerProduct;
+        wantDesc = true;
+        break;
+      default:
+        return null;
+    }
+    if (ob.descending != wantDesc) return null;
+
+    // arg[0] must be a bare column ref on the source table; arg[1]
+    // must be column-free (so it evaluates in the empty context).
+    final colArg = e.args[0];
+    if (colArg is! ColumnExpr) return null;
+    final qArg = e.args[1];
+    if (_exprReferencesColumn(qArg)) return null;
+
+    // Resolve binding and metric.
+    final t = _tables[s.fromTable!];
+    if (t == null) return null;
+    final key = '${s.fromTable!.toLowerCase()}:${colArg.name.toLowerCase()}';
+    final binding = _vectorIndexes[key];
+    if (binding == null) return null;
+    // LSH always ranks in Hamming space, so its stored `metric` is
+    // semantically L2-adjacent. Accept it for L2 / L2SQ queries always
+    // (approx). V25: also accept COSINE queries when the binding was
+    // built as cosine — vectors were L2-normalized on ingest so
+    // squared-L2 preserves cosine ordering.
+    // PQ / IvfPq: same semantics.
+    final isLsh = binding.spec.kind == VectorIndexKind.lsh;
+    final isPq = binding.spec.kind == VectorIndexKind.pq;
+    final isIvfPq = binding.spec.kind == VectorIndexKind.ivfPq;
+    if (isLsh || isPq || isIvfPq) {
+      final okL2 = requiredMetric == VectorMetric.l2 ||
+          requiredMetric == VectorMetric.l2sq;
+      final okCos = requiredMetric == VectorMetric.cosine &&
+          binding.spec.metric == VectorMetric.cosine;
+      if (!okL2 && !okCos) return null;
+    } else if (binding.spec.metric != requiredMetric) {
+      // Metric mismatch — the built index ranks under a different
+      // metric, so falling back to a full scan is safer than
+      // returning re-scored partial results.
+      return null;
+    }
+
+    // Evaluate the query vector once.
+    Object? qRaw;
+    try {
+      qRaw = qArg.eval(outer);
+    } catch (_) {
+      return null;
+    }
+    Vector? query;
+    try {
+      query = coerceVector(qRaw);
+    } catch (_) {
+      return null;
+    }
+    if (query == null || query.dim != binding.spec.dim) return null;
+
+    final idx = _vectorIndexFor(s.fromTable!, colArg.name);
+    if (idx == null) return null;
+
+    // V25: LSH/PQ/IvfPq cosine bindings expect unit-norm queries.
+    final Vector effectiveQuery = _maybeNormalizeForSpec(query, binding.spec);
+
+    // V31: expand IVF/IvfPq nprobe when a WHERE filter is present so
+    // filter attrition doesn't starve the k-hit budget. Bounded by
+    // nlist.
+    final expandedNprobe = s.where == null
+        ? null
+        : math.min(binding.spec.nlist,
+            math.max(binding.spec.nprobe * 4, binding.spec.nprobe + 4));
+
+    // Helper — runs the underlying index search with a given k.
+    List<VectorSearchHit> runSearch(int wantK) {
+      if (idx is FlatIndex) {
+        return idx.search(query!, wantK, metric: requiredMetric);
+      } else if (idx is HnswIndex) {
+        return idx.search(query!, wantK, metric: requiredMetric);
+      } else if (idx is IvfFlatIndex) {
+        return idx.search(query!, wantK,
+            metric: requiredMetric, nprobe: expandedNprobe);
+      } else if (idx is LshIndex) {
+        return idx.search(effectiveQuery, wantK);
+      } else if (idx is PqIndex) {
+        return idx.search(effectiveQuery, wantK);
+      } else if (idx is IvfPqIndex) {
+        return idx.search(effectiveQuery, wantK, nprobe: expandedNprobe);
+      }
+      return const [];
+    }
+
+    // Materialize the projected row for a hit; returns null when the
+    // WHERE clause filters it out. Any eval error bails the fast path.
+    // We use a mutable outer flag to signal that.
+    var bailed = false;
+    List<Object?>? projectHit(VectorSearchHit hit) {
+      final rowIdx = hit.id;
+      if (rowIdx is! int || rowIdx < 0 || rowIdx >= t.rows.length) return null;
+      final row = t.rows[rowIdx];
+      final rowMap = t.rowToMap(row, alias: s.fromAlias);
+      if (s.where != null) {
+        Object? w;
+        try {
+          w = s.where!.eval(rowMap);
+        } catch (_) {
+          bailed = true;
+          return null;
+        }
+        if (w != true) return null;
+      }
+      final out = <Object?>[];
+      for (final p in s.projection) {
+        if (p.isStar) {
+          for (final c in t.columns) {
+            out.add(rowMap[c.name]);
+          }
+        } else {
+          out.add(p.expr!.eval(rowMap));
+        }
+      }
+      return out;
+    }
+
+    final targetK = s.limit!;
+    final rescoreFactor = math.max(1, binding.spec.rescoreFactor);
+    final rescore = rescoreFactor > 1;
+
+    // Locate the embedding column so rescoring can decode the row's
+    // uncompressed blob for exact distance recomputation.
+    final embColIdx = t.columns.indexWhere(
+      (c) => c.name.toLowerCase() == colArg.name.toLowerCase(),
+    );
+    if (rescore && embColIdx < 0) return null;
+
+    /// Recompute the exact metric distance between `query` and the
+    /// stored embedding of [row]. Returns infinity on decode errors so
+    /// bad rows sink to the bottom of the ranking.
+    double exactDist(List<Object?> row) {
+      final raw = row[embColIdx];
+      if (raw == null) return double.infinity;
+      Vector rowVec;
+      try {
+        rowVec = coerceVector(raw)!;
+      } catch (_) {
+        return double.infinity;
+      }
+      switch (requiredMetric) {
+        case VectorMetric.l2:
+          return vecL2(query!, rowVec);
+        case VectorMetric.l2sq:
+          return vecL2Sq(query!, rowVec);
+        case VectorMetric.innerProduct:
+          return vecInnerProduct(query!, rowVec);
+        case VectorMetric.cosine:
+          return vecCosineDistance(query!, rowVec);
+      }
+    }
+
+    // For rescoring we collect (rowIdx, proj, exactDist) tuples;
+    // otherwise we accumulate projections in hit order.
+    final rescored = <({int rowIdx, List<Object?> proj, double exactDist})>[];
+    final outRows = <List<Object?>>[];
+
+    if (s.where == null) {
+      // No filter. When rescoring, fetch targetK * rescoreFactor
+      // candidates from the index and re-rank exactly.
+      final wantK = rescore ? targetK * rescoreFactor : targetK;
+      final hits = runSearch(wantK);
+      for (final hit in hits) {
+        final proj = projectHit(hit);
+        if (bailed) return null;
+        if (proj == null) continue;
+        if (rescore) {
+          final rid = hit.id as int;
+          rescored.add(
+            (rowIdx: rid, proj: proj, exactDist: exactDist(t.rows[rid])),
+          );
+        } else {
+          outRows.add(proj);
+        }
+      }
+    } else {
+      // Filtered — over-fetch and post-filter. Budget also accounts
+      // for the rescore factor so we don't run short of candidates.
+      final tableSize = t.rows.length;
+      // If the table itself is smaller than targetK, the fast path
+      // can never satisfy the LIMIT — hand off to the generic
+      // executor.
+      if (tableSize < targetK) return null;
+
+      // V36: payload-index-driven pre-filter. When every conjunct of
+      // WHERE is an equality on a declared filter column, intersect
+      // the row-position sets and use them as the candidate universe.
+      final payloadSet = _extractPayloadFilterSet(s.where!, binding);
+      final usePayload = payloadSet != null;
+      if (usePayload && payloadSet.length < targetK) return null;
+      final rfPad = rescoreFactor;
+      final budgets = [
+        math.min(math.max(targetK * 4, targetK * rfPad), tableSize),
+        math.min(math.max(targetK * 16, targetK * rfPad), tableSize),
+      ];
+      final seenIds = <int>{};
+      for (final budget in budgets) {
+        final hits = runSearch(budget);
+        for (final hit in hits) {
+          final rid = hit.id;
+          if (rid is! int || !seenIds.add(rid)) continue;
+          if (usePayload && !payloadSet.contains(rid)) continue;
+          final proj = projectHit(hit);
+          if (bailed) return null;
+          if (proj == null) continue;
+          if (rescore) {
+            rescored.add((
+              rowIdx: rid,
+              proj: proj,
+              exactDist: exactDist(t.rows[rid]),
+            ));
+          } else {
+            outRows.add(proj);
+            if (outRows.length >= targetK) break;
+          }
+        }
+        if ((rescore ? rescored.length : outRows.length) >= targetK) break;
+        // If we've already exhausted the whole table, no point growing.
+        if (budget >= tableSize) break;
+      }
+      // Not enough survivors — hand off to the generic executor so it
+      // can do a full scan + sort + filter and give the right answer.
+      final have = rescore ? rescored.length : outRows.length;
+      if (have < targetK) return null;
+    }
+
+    if (rescore) {
+      // Sort by exact distance. Smaller-is-better for L2/COSINE;
+      // larger-is-better for inner-product.
+      final ascending = requiredMetric != VectorMetric.innerProduct;
+      rescored.sort((a, b) => ascending
+          ? a.exactDist.compareTo(b.exactDist)
+          : b.exactDist.compareTo(a.exactDist));
+      final take = math.min(targetK, rescored.length);
+      for (var i = 0; i < take; i++) {
+        outRows.add(rescored[i].proj);
+      }
+    }
+
+    final usedPayload =
+        s.where != null && _extractPayloadFilterSet(s.where!, binding) != null;
+    _planTrace = [
+      'SEARCH ${t.name} USING VECTOR INDEX (${binding.spec.kind.name})'
+          '${s.where != null ? (usedPayload ? " WITH PAYLOAD FILTER" : " WITH FILTER") : ""}'
+          '${rescore ? " WITH RESCORE" : ""}',
+    ];
+    _planSortSkipped = true;
+    _planLimitPushed = true;
+
+    // Column labels.
+    final outCols = <String>[];
+    for (final p in s.projection) {
+      if (p.isStar) {
+        for (final c in t.columns) {
+          outCols.add(c.name);
+        }
+      } else {
+        outCols.add(p.alias ?? _exprLabel(p.expr!));
+      }
+    }
+
+    return QueryResult(
+      columns: outCols,
+      rows: outRows,
+      affected: outRows.length,
+    );
+  }
+
+  /// Returns true if [e] transitively contains a [ColumnExpr]. Used by
+  /// the vector-KNN fast path to check that the query-vector argument
+  /// is a compile-time constant (or bindable from `outer`).
+  bool _exprReferencesColumn(Expr e) {
+    if (e is ColumnExpr) return true;
+    if (e is UnaryExpr) return _exprReferencesColumn(e.operand);
+    if (e is BinaryExpr) {
+      return _exprReferencesColumn(e.left) || _exprReferencesColumn(e.right);
+    }
+    if (e is FunctionCallExpr) {
+      for (final a in e.args) {
+        if (_exprReferencesColumn(a)) return true;
+      }
+    }
+    if (e is BetweenExpr) {
+      return _exprReferencesColumn(e.value) ||
+          _exprReferencesColumn(e.low) ||
+          _exprReferencesColumn(e.high);
+    }
+    return false;
+  }
+
+  /// Phase V18: range search on a registered vector index.
+  ///
+  /// Recognises `SELECT ... FROM t WHERE VEC_L2|L2SQ(col, const) op
+  /// threshold [AND remainder]` where `op` is `<` or `<=`. No
+  /// LIMIT/ORDER BY required — returns every matching row.
+  ///
+  /// Retrieves candidates from the index in ranked order with a
+  /// progressive doubling schedule (32, 128, 512, …, tableSize) and
+  /// stops when the ranked distance passes the threshold. The
+  /// remainder of the WHERE clause is evaluated per candidate row.
+  QueryResult? _tryVectorRangeFast(
+    SelectStmt s,
+    Map<String, Object?> outer,
+  ) {
+    if (s.fromTable == null) return null;
+    if (s.joins.isNotEmpty) return null;
+    if (s.fromSubquery != null || s.fromFunction != null) return null;
+    if (_isPaged(s.fromTable)) return null;
+    if (s.groupBy.isNotEmpty || s.having != null) return null;
+    if (s.setOp != null) return null;
+    if (s.distinct) return null;
+    if (s.orderBy.isNotEmpty) return null; // KNN fast path handles ORDER BY
+    if (s.limit != null) return null; // ditto — KNN fast path
+    if ((s.offset ?? 0) != 0) return null;
+    if (s.where == null) return null;
+
+    // Split the top-level AND-chain into conjuncts and find the
+    // vector-distance predicate. Only the first match is treated as
+    // the range operator; other distance predicates fall through to
+    // the generic executor.
+    final conjuncts = <Expr>[];
+    void split(Expr e) {
+      if (e is BinaryExpr && e.op == 'AND') {
+        split(e.left);
+        split(e.right);
+      } else {
+        conjuncts.add(e);
+      }
+    }
+
+    split(s.where!);
+
+    int? distIdx;
+    ColumnExpr? colArg;
+    Expr? qArg;
+    late VectorMetric requiredMetric;
+    late bool inclusive; // < vs <=
+    double? threshold;
+    for (var i = 0; i < conjuncts.length; i++) {
+      final c = conjuncts[i];
+      if (c is! BinaryExpr) continue;
+      if (c.op != '<' && c.op != '<=') continue;
+      // shape: VEC_L2(col, const) <op> literalNumber
+      final left = c.left;
+      final right = c.right;
+      if (left is! FunctionCallExpr) continue;
+      if (left.args.length != 2) continue;
+      final fname = left.name.toUpperCase();
+      VectorMetric? m;
+      switch (fname) {
+        case 'VEC_L2':
+        case 'VEC_DISTANCE_L2':
+          m = VectorMetric.l2;
+          break;
+        case 'VEC_L2SQ':
+          m = VectorMetric.l2sq;
+          break;
+      }
+      if (m == null) continue;
+      final leftCol = left.args[0];
+      if (leftCol is! ColumnExpr) continue;
+      final leftQ = left.args[1];
+      if (_exprReferencesColumn(leftQ)) continue;
+      double? th;
+      try {
+        final v = right.eval(outer);
+        if (v is num) th = v.toDouble();
+      } catch (_) {}
+      if (th == null) continue;
+      distIdx = i;
+      colArg = leftCol;
+      qArg = leftQ;
+      requiredMetric = m;
+      inclusive = c.op == '<=';
+      threshold = th;
+      break;
+    }
+    if (distIdx == null) return null;
+
+    // Resolve binding.
+    final t = _tables[s.fromTable!];
+    if (t == null) return null;
+    final key = '${s.fromTable!.toLowerCase()}:${colArg!.name.toLowerCase()}';
+    final binding = _vectorIndexes[key];
+    if (binding == null) return null;
+    // Only exact-L2 indexes (Flat/HNSW/IVF-Flat) can honour "all
+    // within threshold" tightly. LSH/PQ/IvfPq rank in approximate
+    // spaces so their monotone-in-distance stopping criterion doesn't
+    // hold — fall through to the generic executor.
+    final kind = binding.spec.kind;
+    final approx = kind == VectorIndexKind.lsh ||
+        kind == VectorIndexKind.pq ||
+        kind == VectorIndexKind.ivfPq;
+    if (approx) return null;
+    if (binding.spec.metric != requiredMetric) return null;
+
+    Object? qRaw;
+    try {
+      qRaw = qArg!.eval(outer);
+    } catch (_) {
+      return null;
+    }
+    Vector? query;
+    try {
+      query = coerceVector(qRaw);
+    } catch (_) {
+      return null;
+    }
+    if (query == null || query.dim != binding.spec.dim) return null;
+
+    final idx = _vectorIndexFor(s.fromTable!, colArg.name);
+    if (idx == null) return null;
+
+    final tableSize = t.rows.length;
+    if (tableSize == 0) {
+      return QueryResult(columns: const [], rows: const [], affected: 0);
+    }
+
+    // Progressive doubling until we find a hit at or above threshold
+    // or exhaust the table.
+    var wantK = 32;
+    List<VectorSearchHit> hits = const [];
+    while (true) {
+      final effK = wantK > tableSize ? tableSize : wantK;
+      if (idx is FlatIndex) {
+        hits = idx.search(query, effK, metric: requiredMetric);
+      } else if (idx is HnswIndex) {
+        hits = idx.search(query, effK, metric: requiredMetric);
+      } else if (idx is IvfFlatIndex) {
+        hits = idx.search(query, effK, metric: requiredMetric);
+      } else {
+        return null;
+      }
+      if (effK >= tableSize) break;
+      if (hits.isEmpty) break;
+      final last = hits.last.distance;
+      final passesThreshold =
+          inclusive ? last <= threshold! : last < threshold!;
+      if (!passesThreshold) break;
+      wantK *= 4;
+    }
+
+    // Materialise remaining WHERE conjuncts (skip the distance one).
+    final remainder = <Expr>[
+      for (var i = 0; i < conjuncts.length; i++)
+        if (i != distIdx) conjuncts[i],
+    ];
+
+    // V45: fuse V36 payload-filter pruning with V18 range. Fold the
+    // remainder into an AND-chain and try to intersect it via the
+    // payload buckets; on success we skip per-hit remainder eval.
+    Set<Object>? payloadSet;
+    if (remainder.isNotEmpty && binding.spec.filterColumns.isNotEmpty) {
+      Expr foldAnd(List<Expr> xs) {
+        var acc = xs.first;
+        for (var i = 1; i < xs.length; i++) {
+          acc = BinaryExpr('AND', acc, xs[i]);
+        }
+        return acc;
+      }
+
+      payloadSet = _extractPayloadFilterSet(foldAnd(remainder), binding);
+      if (payloadSet != null && payloadSet.isEmpty) {
+        return QueryResult(columns: const [], rows: const [], affected: 0);
+      }
+    }
+
+    // Build output columns.
+    final outCols = <String>[];
+    for (final p in s.projection) {
+      if (p.isStar) {
+        for (final c in t.columns) {
+          outCols.add(c.name);
+        }
+      } else {
+        outCols.add(p.alias ?? _exprLabel(p.expr!));
+      }
+    }
+    final outRows = <List<Object?>>[];
+    for (final h in hits) {
+      final passes =
+          inclusive ? h.distance <= threshold! : h.distance < threshold!;
+      if (!passes) break; // ranked, no more will pass
+      final rowIdx = h.id;
+      if (rowIdx is! int || rowIdx < 0 || rowIdx >= t.rows.length) continue;
+      // V45 fast-filter: skip everything not in the payload set.
+      if (payloadSet != null && !payloadSet.contains(rowIdx)) continue;
+      final row = t.rows[rowIdx];
+      final rowMap = t.rowToMap(row, alias: s.fromAlias);
+      var keep = true;
+      if (payloadSet == null) {
+        for (final rc in remainder) {
+          Object? v;
+          try {
+            v = rc.eval(rowMap);
+          } catch (_) {
+            return null;
+          }
+          if (v != true) {
+            keep = false;
+            break;
+          }
+        }
+      }
+      if (!keep) continue;
+      final out = <Object?>[];
+      for (final p in s.projection) {
+        if (p.isStar) {
+          for (final c in t.columns) {
+            out.add(rowMap[c.name]);
+          }
+        } else {
+          out.add(p.expr!.eval(rowMap));
+        }
+      }
+      outRows.add(out);
+    }
+    _planTrace = [
+      'SEARCH ${t.name} USING VECTOR INDEX (${binding.spec.kind.name}) '
+          'RANGE'
+          '${payloadSet != null ? " WITH PAYLOAD FILTER" : ""}',
+    ];
+    return QueryResult(
+      columns: outCols,
+      rows: outRows,
+      affected: outRows.length,
+    );
+  }
+
   /// Phase 3.8: `SELECT DISTINCT c1, c2[, ...] FROM t
   /// [ORDER BY c1[, c2[, ...]]] [LIMIT/OFFSET]` answered from a
   /// composite index whose leading columns match the projection in
@@ -5985,9 +7885,8 @@ class Database {
       return true;
     }
 
-    Iterable<Object> keysIter = descending
-        ? indexMap.keys.toList().reversed
-        : indexMap.keys;
+    Iterable<Object> keysIter =
+        descending ? indexMap.keys.toList().reversed : indexMap.keys;
     for (final raw in keysIter) {
       final tuple = <Object?>[];
       if (isComposite) {
@@ -6034,8 +7933,7 @@ class Database {
       default:
         value = null;
     }
-    final col =
-        p.alias ??
+    final col = p.alias ??
         '${name.toLowerCase()}(${distinct ? "DISTINCT " : ""}$argName)';
     return QueryResult(
       columns: [col],
@@ -6436,9 +8334,8 @@ class Database {
           if (pos > latest) latest = pos;
         }
         if (order[latest] != id) continue;
-        mergedOn = mergedOn == null
-            ? p.expr
-            : BinaryExpr('AND', mergedOn, p.expr);
+        mergedOn =
+            mergedOn == null ? p.expr : BinaryExpr('AND', mergedOn, p.expr);
       }
       newJoins.add(JoinClause('INNER', slot.tableName, slot.alias, mergedOn));
     }
@@ -6612,9 +8509,8 @@ class Database {
       // If no plan can use the named index, raise like SQLite does.
       if (hint != null && hint.indexName != null) {
         final wanted = hint.indexName!.toLowerCase();
-        final usable = candidates
-            .where((p) => p.index.toLowerCase() == wanted)
-            .toList();
+        final usable =
+            candidates.where((p) => p.index.toLowerCase() == wanted).toList();
         if (usable.isEmpty) {
           throw FormatException(
             'no query solution for INDEXED BY ${hint.indexName} on ${t.name}',
@@ -6702,9 +8598,8 @@ class Database {
       }
       candidates.addAll(_classifyMultiColumnPlans(t, conjuncts));
       candidates.addAll(_classifyExpressionIndexPlans(t, conjuncts));
-      final usable = candidates
-          .where((p) => p.index.toLowerCase() == wanted)
-          .toList();
+      final usable =
+          candidates.where((p) => p.index.toLowerCase() == wanted).toList();
       if (usable.isEmpty) {
         throw FormatException(
           'no query solution for INDEXED BY ${hint.indexName} on ${t.name}',
@@ -7026,9 +8921,8 @@ class Database {
       if (def.exprSql == null) continue;
       if (!_partialIndexUsable(def)) continue;
       final ast = _exprIndexAstCache.putIfAbsent(def.name, () {
-        final stmt =
-            Parser.fromString('SELECT ${def.exprSql}').parseStatement()
-                as SelectStmt;
+        final stmt = Parser.fromString('SELECT ${def.exprSql}').parseStatement()
+            as SelectStmt;
         return stmt.projection.first.expr!;
       });
       for (final c in conjuncts) {
@@ -7197,8 +9091,7 @@ class Database {
       // lower-cased keys; the pattern's case would have to be normalised
       // first, but since LIKE is already case-sensitive here a NOCASE
       // index can never be used safely for LIKE prefix.
-      final isNocase =
-          idx.collations.isNotEmpty &&
+      final isNocase = idx.collations.isNotEmpty &&
           idx.collations[0].toUpperCase() == 'NOCASE';
       if (isNocase) return null;
       final pat = _evalConst(conjunct.right);
@@ -7263,12 +9156,12 @@ class Database {
   Object? _evalConst(Expr e) => e.eval(const {});
 
   String _flipComparison(String op) => switch (op) {
-    '<' => '>',
-    '<=' => '>=',
-    '>' => '<',
-    '>=' => '<=',
-    _ => op,
-  };
+        '<' => '>',
+        '<=' => '>=',
+        '>' => '<',
+        '>=' => '<=',
+        _ => op,
+      };
 
   IndexDef? _findIndexForColumn(Table t, String column) {
     final lc = column.toLowerCase();
@@ -7560,8 +9453,7 @@ class Database {
       // tuple of those right-side keys and probe per left row instead of
       // doing a full nested loop.
       final rightAlias = (j.alias ?? j.table)?.toLowerCase();
-      final hashPlan =
-          (j.type == 'INNER' || j.type == 'LEFT') &&
+      final hashPlan = (j.type == 'INNER' || j.type == 'LEFT') &&
               boundOn != null &&
               rightAlias != null
           ? _tryEquiHashPlan(boundOn, rightAlias)
@@ -8051,6 +9943,36 @@ class Database {
       case 'GENERATE_SERIES':
         rows = _generateSeriesRows(args);
         break;
+      case 'VEC_SEARCH':
+        rows = _vecSearchRows(args);
+        break;
+      case 'VEC_RANGE_SEARCH':
+        rows = _vecRangeSearchRows(args);
+        break;
+      case 'VEC_SEARCH_FILTERED':
+        rows = _vecSearchFilteredRows(args);
+        break;
+      case 'VEC_SEARCH_FILTERED_BATCH':
+        rows = _vecSearchFilteredBatchRows(args);
+        break;
+      case 'VEC_HYBRID_SEARCH':
+        rows = _vecHybridSearchRows(args);
+        break;
+      case 'VEC_HYBRID_SEARCH_BATCH':
+        rows = _vecHybridSearchBatchRows(args);
+        break;
+      case 'VEC_SEARCH_BATCH':
+        rows = _vecSearchBatchRows(args);
+        break;
+      case 'VEC_SEARCH_JOIN':
+        rows = _vecSearchJoinRows(args);
+        break;
+      case 'VEC_BATCH_INSERT':
+        rows = _vecBatchInsertRows(args);
+        break;
+      case 'VEC_IMPORT_CSV':
+        rows = _vecImportCsvRows(args);
+        break;
       default:
         if (upper.startsWith('PRAGMA_')) {
           rows = _pragmaTableFunctionRows(upper, args);
@@ -8086,6 +10008,1893 @@ class Database {
     ];
   }
 
+  /// Implementation of `vec_search(table, column, query, k[, metric])` —
+  /// explicit vector k-NN table-valued function.
+  ///
+  /// Returns rows `{rowid: int, distance: double}` sorted best-first
+  /// according to the registered index's metric (or L2 if none is
+  /// registered). When no index is registered, a temporary [FlatIndex]
+  /// is built on the fly from the current row set.
+  ///
+  /// Ideal for JOIN composition:
+  ///
+  /// ```sql
+  /// SELECT d.id, d.title, v.distance
+  /// FROM   vec_search('docs', 'embedding', VEC('[…]'), 10) v
+  /// JOIN   docs d ON d.rowid = v.rowid;
+  /// ```
+  ///
+  /// The optional 5th arg overrides the metric: `l2|l2sq|ip|cosine`.
+  List<Map<String, Object?>> _vecSearchRows(List<Object?> args) {
+    if (args.length < 4) {
+      throw StateError(
+        'vec_search: expected (table, column, query, k[, metric])',
+      );
+    }
+    final tableName = args[0]?.toString();
+    final colName = args[1]?.toString();
+    final k = args[3] == null ? 0 : (args[3] as num).toInt();
+    if (tableName == null || colName == null || k <= 0) return const [];
+
+    Vector? query;
+    try {
+      query = coerceVector(args[2]);
+    } catch (_) {
+      return const [];
+    }
+    if (query == null) return const [];
+
+    // Metric selection: registered spec's metric wins by default; the
+    // optional 5th arg overrides.
+    final key = '${tableName.toLowerCase()}:${colName.toLowerCase()}';
+    final binding = _vectorIndexes[key];
+    VectorMetric metric = binding?.spec.metric ?? VectorMetric.l2sq;
+    if (args.length >= 5 && args[4] != null) {
+      try {
+        metric = _parseVectorMetric(args[4].toString());
+      } catch (_) {
+        return const [];
+      }
+    }
+
+    // Locate table + column. Support both the in-memory and paged
+    // backends: paged tables store PKs as index ids (populated during
+    // `warmVectorIndexes`), so we can serve `vec_search` without hitting
+    // the paged storage at query time.
+    final pt = _pagedTable(tableName);
+    if (pt != null) {
+      if (binding == null || query.dim != binding.spec.dim) return const [];
+      // V29: drain any captured INSERT/UPDATE/DELETE deltas before
+      // reading.
+      _applyPendingPagedDeltas(binding);
+      final idx = binding.index;
+      if (idx == null) return const [];
+      final colOk = pt.columns.any(
+        (c) => c.name.toLowerCase() == colName.toLowerCase(),
+      );
+      if (!colOk) return const [];
+      final effQ = _maybeNormalizeForSpec(query, binding.spec);
+      List<VectorSearchHit> hits;
+      if (idx is FlatIndex) {
+        hits = idx.search(query, k, metric: metric);
+      } else if (idx is HnswIndex) {
+        hits = idx.search(query, k, metric: metric);
+      } else if (idx is IvfFlatIndex) {
+        hits = idx.search(query, k, metric: metric);
+      } else if (idx is LshIndex) {
+        hits = idx.search(effQ, k);
+      } else if (idx is PqIndex) {
+        hits = idx.search(effQ, k);
+      } else if (idx is IvfPqIndex) {
+        hits = idx.search(effQ, k);
+      } else {
+        return const [];
+      }
+      return [
+        for (final h in hits) {'rowid': h.id, 'distance': h.distance},
+      ];
+    }
+    final t = _tables[tableName];
+    if (t == null) return const [];
+    final colIdx = t.columns.indexWhere(
+      (c) => c.name.toLowerCase() == colName.toLowerCase(),
+    );
+    if (colIdx < 0) return const [];
+    // Locate PK column so `rowid` maps to the source table's PK when
+    // one exists; otherwise fall back to row position.
+    final pkColIdx = t.columns.indexWhere((c) => c.primaryKey);
+
+    // Prefer the registered index; otherwise build an ad-hoc FlatIndex
+    // over the current rows.
+    List<VectorSearchHit> hits;
+    if (binding != null && query.dim == binding.spec.dim) {
+      final idx = _vectorIndexFor(tableName, colName);
+      final effQ = _maybeNormalizeForSpec(query, binding.spec);
+      if (idx is FlatIndex) {
+        hits = idx.search(query, k, metric: metric);
+      } else if (idx is HnswIndex) {
+        hits = idx.search(query, k, metric: metric);
+      } else if (idx is IvfFlatIndex) {
+        hits = idx.search(query, k, metric: metric);
+      } else if (idx is LshIndex) {
+        hits = idx.search(effQ, k);
+      } else if (idx is PqIndex) {
+        hits = idx.search(effQ, k);
+      } else if (idx is IvfPqIndex) {
+        hits = idx.search(effQ, k);
+      } else {
+        hits = const [];
+      }
+    } else {
+      final flat = FlatIndex(query.dim, defaultMetric: metric);
+      for (var i = 0; i < t.rows.length; i++) {
+        final raw = t.rows[i][colIdx];
+        if (raw == null) continue;
+        Vector v;
+        try {
+          v = coerceVector(raw)!;
+        } catch (_) {
+          continue;
+        }
+        if (v.dim != query.dim) continue;
+        flat.add(i, v);
+      }
+      hits = flat.search(query, k, metric: metric);
+    }
+
+    return [
+      for (final h in hits)
+        if (h.id is int && (h.id as int) >= 0 && (h.id as int) < t.rows.length)
+          {
+            'rowid':
+                pkColIdx >= 0 ? t.rows[h.id as int][pkColIdx] : (h.id as int),
+            'distance': h.distance,
+          },
+    ];
+  }
+
+  /// V46: `vec_range_search(table, column, query, threshold[, metric
+  /// [, filter_json]])` — range analogue of `vec_search`. Returns
+  /// every row whose vector distance to [query] is `<= threshold`,
+  /// sorted best-first. Uses V18's progressive-doubling stopping
+  /// criterion internally so LSH/PQ/IvfPq bindings are rejected
+  /// (their metrics aren't monotone-terminating).
+  ///
+  /// Optional `filter_json` intersects with V36 payload buckets
+  /// before scoring — same shape as V39.
+  ///
+  /// Returns `{rowid, distance}` sorted by distance ascending.
+  /// Supports both in-memory and paged tables.
+  List<Map<String, Object?>> _vecRangeSearchRows(List<Object?> args) {
+    if (args.length < 4) {
+      throw StateError(
+        'vec_range_search: expected '
+        '(table, column, query, threshold[, metric[, filter_json]])',
+      );
+    }
+    final tableName = args[0]?.toString();
+    final colName = args[1]?.toString();
+    if (tableName == null || colName == null) return const [];
+
+    Vector? query;
+    try {
+      query = coerceVector(args[2]);
+    } catch (_) {
+      return const [];
+    }
+    if (query == null) return const [];
+
+    final threshold = args[3];
+    if (threshold is! num) return const [];
+    final thr = threshold.toDouble();
+    if (thr < 0) return const [];
+
+    final key = '${tableName.toLowerCase()}:${colName.toLowerCase()}';
+    final binding = _vectorIndexes[key];
+    if (binding == null) return const [];
+    if (query.dim != binding.spec.dim) return const [];
+
+    final kind = binding.spec.kind;
+    if (kind == VectorIndexKind.lsh ||
+        kind == VectorIndexKind.pq ||
+        kind == VectorIndexKind.ivfPq) {
+      // Non-monotone metrics — reject the range API entirely.
+      return const [];
+    }
+
+    VectorMetric metric = binding.spec.metric;
+    if (args.length >= 5 && args[4] != null) {
+      try {
+        metric = _parseVectorMetric(args[4].toString());
+      } catch (_) {
+        return const [];
+      }
+    }
+
+    // Optional payload-filter intersection.
+    Set<Object>? allowed;
+    if (args.length >= 6 && args[5] != null) {
+      final filterJson = args[5].toString();
+      if (filterJson.isNotEmpty) {
+        try {
+          final decoded = jsonDecode(filterJson);
+          if (decoded is Map && decoded.isNotEmpty) {
+            final filterMap = decoded.cast<String, Object?>();
+            final declared = {
+              for (final c in binding.spec.filterColumns) c.toLowerCase(),
+            };
+            for (final entry in filterMap.entries) {
+              if (!declared.contains(entry.key.toLowerCase())) return const [];
+              final buckets = binding.payloadIndex[entry.key.toLowerCase()];
+              if (buckets == null) return const [];
+              final set = buckets[entry.value] ?? const <Object>{};
+              allowed = allowed == null
+                  ? Set<Object>.from(set)
+                  : allowed.intersection(set);
+              if (allowed.isEmpty) return const [];
+            }
+          }
+        } catch (_) {
+          // Malformed filter — bail rather than silently ignore.
+          return const [];
+        }
+      }
+    }
+
+    // Paged branch — hit.id is the PK; no row-position remap needed.
+    if (_isPaged(tableName)) {
+      final pt = _pagedTable(tableName);
+      if (pt == null) return const [];
+      _applyPendingPagedDeltas(binding);
+      final idx = binding.index;
+      if (idx == null) return const [];
+      return _rangeSearchPass(
+        idx: idx,
+        query: query,
+        threshold: thr,
+        metric: metric,
+        // Paged tables can be very large; use the paged length hint
+        // to grow the search budget.
+        approxSize: pt.length,
+        remap: (id) => id,
+        allowed: allowed,
+      );
+    }
+
+    // In-memory branch — remap positions to PKs on output.
+    final t = _tables[tableName];
+    if (t == null) return const [];
+    final idx = _vectorIndexFor(tableName, colName);
+    if (idx == null) return const [];
+    final pkColIdx = t.columns.indexWhere((c) => c.primaryKey);
+    return _rangeSearchPass(
+      idx: idx,
+      query: query,
+      threshold: thr,
+      metric: metric,
+      approxSize: t.rows.length,
+      remap: (id) {
+        if (id is! int || id < 0 || id >= t.rows.length) return null;
+        return pkColIdx >= 0 ? t.rows[id][pkColIdx] : id;
+      },
+      allowed: allowed,
+    );
+  }
+
+  /// V46 helper: progressive-doubling range search with optional
+  /// payload filter. Same stopping criterion as V18's fast path.
+  List<Map<String, Object?>> _rangeSearchPass({
+    required Object idx,
+    required Vector query,
+    required double threshold,
+    required VectorMetric metric,
+    required int approxSize,
+    required Object? Function(Object?) remap,
+    required Set<Object>? allowed,
+  }) {
+    if (approxSize == 0) return const [];
+    var wantK = 32;
+    List<VectorSearchHit> hits = const [];
+    while (true) {
+      final effK = wantK > approxSize ? approxSize : wantK;
+      if (idx is FlatIndex) {
+        hits = idx.search(query, effK, metric: metric);
+      } else if (idx is HnswIndex) {
+        hits = idx.search(query, effK, metric: metric);
+      } else if (idx is IvfFlatIndex) {
+        hits = idx.search(query, effK, metric: metric);
+      } else {
+        return const [];
+      }
+      if (effK >= approxSize) break;
+      if (hits.isEmpty) break;
+      if (hits.last.distance > threshold) break;
+      wantK *= 4;
+    }
+    final out = <Map<String, Object?>>[];
+    for (final h in hits) {
+      if (h.distance > threshold) break;
+      if (allowed != null && h.id != null && !allowed.contains(h.id)) continue;
+      final rid = remap(h.id);
+      if (rid == null) continue;
+      out.add({'rowid': rid, 'distance': h.distance});
+    }
+    return out;
+  }
+
+  /// V39: `vec_search_filtered(table, column, query, k, filter_json
+  /// [, metric])` — like `vec_search` but pre-intersects a payload
+  /// filter map with the KNN candidate list. Requires the binding to
+  /// declare `filterColumns`; every filter key must be in that list.
+  /// In-memory tables only (paged payload index is future work).
+  ///
+  /// `filter_json` example: `'{"tenant": 3, "kind": 1}'`. Values are
+  /// treated as equality literals matching the binding's payload map.
+  /// Returns `{rowid, distance}` sorted best-first — same shape as
+  /// `vec_search`.
+  List<Map<String, Object?>> _vecSearchFilteredRows(List<Object?> args) {
+    if (args.length < 5) {
+      throw StateError(
+        'vec_search_filtered: expected '
+        '(table, column, query, k, filter_json[, metric])',
+      );
+    }
+    final tableName = args[0]?.toString();
+    final colName = args[1]?.toString();
+    final k = args[3] == null ? 0 : (args[3] as num).toInt();
+    if (tableName == null || colName == null || k <= 0) return const [];
+
+    Vector? query;
+    try {
+      query = coerceVector(args[2]);
+    } catch (_) {
+      return const [];
+    }
+    if (query == null) return const [];
+
+    final filterJson = args[4]?.toString();
+    if (filterJson == null) return const [];
+    Map<String, Object?> filterMap;
+    try {
+      final decoded = jsonDecode(filterJson);
+      if (decoded is! Map) return const [];
+      filterMap = decoded.cast<String, Object?>();
+    } catch (_) {
+      return const [];
+    }
+    if (filterMap.isEmpty) {
+      // Empty filter → identical semantics to vec_search.
+      return _vecSearchRows(
+          args.take(4).toList() + (args.length >= 6 ? [args[5]] : <Object?>[]));
+    }
+
+    final key = '${tableName.toLowerCase()}:${colName.toLowerCase()}';
+    final binding = _vectorIndexes[key];
+    if (binding == null) return const [];
+    if (binding.spec.filterColumns.isEmpty) return const [];
+    if (query.dim != binding.spec.dim) return const [];
+
+    // Metric override.
+    VectorMetric metric = binding.spec.metric;
+    if (args.length >= 6 && args[5] != null) {
+      try {
+        metric = _parseVectorMetric(args[5].toString());
+      } catch (_) {
+        return const [];
+      }
+    }
+
+    // Every filter key must be in filterColumns.
+    final declared = {
+      for (final c in binding.spec.filterColumns) c.toLowerCase(),
+    };
+    for (final k in filterMap.keys) {
+      if (!declared.contains(k.toLowerCase())) return const [];
+    }
+
+    // V40 paged path: binding.index is only reachable via
+    // `warmVectorIndexes` (paged bindings are built async). Payload
+    // index was already populated during the warm.
+    if (_isPaged(tableName)) {
+      final pt = _pagedTable(tableName);
+      if (pt == null) return const [];
+      // V29 delta drain — ensure INSERT/UPDATE/DELETE captures are
+      // baked before we read either the vector index or the payload
+      // index.
+      _applyPendingPagedDeltas(binding);
+      final idx = binding.index;
+      if (idx == null) return const [];
+      Set<Object>? allowed;
+      for (final entry in filterMap.entries) {
+        final buckets = binding.payloadIndex[entry.key.toLowerCase()];
+        if (buckets == null) return const [];
+        final set = buckets[entry.value] ?? const <Object>{};
+        allowed =
+            allowed == null ? Set<Object>.from(set) : allowed.intersection(set);
+        if (allowed.isEmpty) return const [];
+      }
+      if (allowed == null || allowed.isEmpty) return const [];
+
+      final effQ = _maybeNormalizeForSpec(query, binding.spec);
+      List<VectorSearchHit> runSearch(int wantK) {
+        if (idx is FlatIndex) {
+          return idx.search(query!, wantK, metric: metric);
+        } else if (idx is HnswIndex) {
+          return idx.search(query!, wantK, metric: metric);
+        } else if (idx is IvfFlatIndex) {
+          return idx.search(query!, wantK, metric: metric);
+        } else if (idx is LshIndex) {
+          return idx.search(effQ, wantK);
+        } else if (idx is PqIndex) {
+          return idx.search(effQ, wantK);
+        } else if (idx is IvfPqIndex) {
+          return idx.search(effQ, wantK);
+        }
+        return const [];
+      }
+
+      final approxSize = allowed.length;
+      final wantBudgets = <int>[
+        math.max(k * 4, 16),
+        math.max(k * 16, 64),
+        math.max(approxSize, k),
+      ];
+      final seenPks = <Object>{};
+      final results = <Map<String, Object?>>[];
+      for (final budget in wantBudgets) {
+        final hits = runSearch(budget);
+        for (final hit in hits) {
+          final id = hit.id;
+          if (id == null || !seenPks.add(id)) continue;
+          if (!allowed.contains(id)) continue;
+          results.add({'rowid': id, 'distance': hit.distance});
+          if (results.length >= k) break;
+        }
+        if (results.length >= k) break;
+      }
+      return results;
+    }
+
+    final t = _tables[tableName];
+    if (t == null) return const [];
+
+    // Force build / refresh of the payload index (in-memory).
+    final idx = _vectorIndexFor(tableName, colName);
+    if (idx == null) return const [];
+
+    // Intersect the payload sets.
+    Set<Object>? allowed;
+    for (final entry in filterMap.entries) {
+      final buckets = binding.payloadIndex[entry.key.toLowerCase()];
+      if (buckets == null) return const [];
+      final set = buckets[entry.value] ?? const <Object>{};
+      allowed =
+          allowed == null ? Set<Object>.from(set) : allowed.intersection(set);
+      if (allowed.isEmpty) return const [];
+    }
+    if (allowed == null || allowed.isEmpty) return const [];
+
+    // Over-fetch modestly and post-filter against `allowed`.
+    final tableSize = t.rows.length;
+    final wantBudgets = <int>[
+      math.min(math.max(k * 4, 16), tableSize),
+      math.min(math.max(k * 16, 64), tableSize),
+    ];
+    final effQ = _maybeNormalizeForSpec(query, binding.spec);
+
+    List<VectorSearchHit> runSearch(int wantK) {
+      if (idx is FlatIndex) {
+        return idx.search(query!, wantK, metric: metric);
+      } else if (idx is HnswIndex) {
+        return idx.search(query!, wantK, metric: metric);
+      } else if (idx is IvfFlatIndex) {
+        return idx.search(query!, wantK, metric: metric);
+      } else if (idx is LshIndex) {
+        return idx.search(effQ, wantK);
+      } else if (idx is PqIndex) {
+        return idx.search(effQ, wantK);
+      } else if (idx is IvfPqIndex) {
+        return idx.search(effQ, wantK);
+      }
+      return const [];
+    }
+
+    final pkColIdx = t.columns.indexWhere((c) => c.primaryKey);
+    final seen = <int>{};
+    final results = <Map<String, Object?>>[];
+    for (final budget in wantBudgets) {
+      final hits = runSearch(budget);
+      for (final hit in hits) {
+        final rid = hit.id;
+        if (rid is! int || !seen.add(rid)) continue;
+        if (!allowed.contains(rid)) continue;
+        if (rid < 0 || rid >= t.rows.length) continue;
+        results.add({
+          'rowid': pkColIdx >= 0 ? t.rows[rid][pkColIdx] : rid,
+          'distance': hit.distance,
+        });
+        if (results.length >= k) break;
+      }
+      if (results.length >= k) break;
+      if (budget >= tableSize) break;
+    }
+    return results;
+  }
+
+  /// V43: `vec_search_filtered_batch(table, column, queries_json, k,
+  /// filter_json[, metric])` — batch companion to V39.
+  ///
+  /// `queries_json` is a JSON array of vectors (`'[[1,2,3],[4,5,6]]'`).
+  /// `filter_json` is a single payload filter applied to every query;
+  /// the intersected `allowed` set is computed once and reused,
+  /// avoiding N repeated intersections.
+  ///
+  /// Returns rows `{query_idx, rowid, distance}` grouped by
+  /// `(query_idx ASC, distance BEST-FIRST)`. Malformed / dim-mismatched
+  /// entries are silently skipped but preserve their input position in
+  /// `query_idx`, matching V15 `vec_search_batch` semantics.
+  ///
+  /// Supports both in-memory and paged bindings (like V40).
+  List<Map<String, Object?>> _vecSearchFilteredBatchRows(List<Object?> args) {
+    if (args.length < 5) {
+      throw StateError(
+        'vec_search_filtered_batch: expected '
+        '(table, column, queries_json, k, filter_json[, metric])',
+      );
+    }
+    final tableName = args[0]?.toString();
+    final colName = args[1]?.toString();
+    final k = args[3] == null ? 0 : (args[3] as num).toInt();
+    final filterJson = args[4]?.toString();
+    if (tableName == null || colName == null || filterJson == null || k <= 0) {
+      return const [];
+    }
+
+    final key = '${tableName.toLowerCase()}:${colName.toLowerCase()}';
+    final binding = _vectorIndexes[key];
+    if (binding == null) return const [];
+    if (binding.spec.filterColumns.isEmpty) return const [];
+
+    // Metric override.
+    VectorMetric metric = binding.spec.metric;
+    if (args.length >= 6 && args[5] != null) {
+      try {
+        metric = _parseVectorMetric(args[5].toString());
+      } catch (_) {
+        return const [];
+      }
+    }
+
+    // Parse queries — preserve input position for `query_idx`.
+    List<({int idx, Vector vec})> queries;
+    try {
+      final raw = args[2];
+      queries = <({int idx, Vector vec})>[];
+      List<dynamic> decoded;
+      if (raw is String) {
+        final tmp = jsonDecode(raw);
+        if (tmp is! List) return const [];
+        decoded = tmp;
+      } else if (raw is List) {
+        decoded = raw;
+      } else {
+        return const [];
+      }
+      for (var i = 0; i < decoded.length; i++) {
+        final entry = decoded[i];
+        if (entry is! List) continue;
+        try {
+          final v = Vector.fromList(entry.cast<num>());
+          if (v.dim != binding.spec.dim) continue;
+          queries.add((idx: i, vec: v));
+        } catch (_) {
+          continue;
+        }
+      }
+    } catch (_) {
+      return const [];
+    }
+    if (queries.isEmpty) return const [];
+
+    // Parse and validate the filter once.
+    Map<String, Object?> filterMap;
+    try {
+      final decoded = jsonDecode(filterJson);
+      if (decoded is! Map) return const [];
+      filterMap = decoded.cast<String, Object?>();
+    } catch (_) {
+      return const [];
+    }
+    if (filterMap.isEmpty) return const [];
+    final declared = {
+      for (final c in binding.spec.filterColumns) c.toLowerCase(),
+    };
+    for (final fk in filterMap.keys) {
+      if (!declared.contains(fk.toLowerCase())) return const [];
+    }
+
+    // In-memory vs paged branches share the fusion loop but differ on
+    // rowid handling (position vs PK).
+    final paged = _isPaged(tableName);
+    if (paged) {
+      final pt = _pagedTable(tableName);
+      if (pt == null) return const [];
+      _applyPendingPagedDeltas(binding);
+      final idx = binding.index;
+      if (idx == null) return const [];
+
+      // Intersect payload sets ONCE.
+      Set<Object>? allowed;
+      for (final entry in filterMap.entries) {
+        final buckets = binding.payloadIndex[entry.key.toLowerCase()];
+        if (buckets == null) return const [];
+        final set = buckets[entry.value] ?? const <Object>{};
+        allowed =
+            allowed == null ? Set<Object>.from(set) : allowed.intersection(set);
+        if (allowed.isEmpty) return const [];
+      }
+      if (allowed == null || allowed.isEmpty) return const [];
+
+      final approxSize = allowed.length;
+      final wantBudgets = <int>[
+        math.max(k * 4, 16),
+        math.max(k * 16, 64),
+        math.max(approxSize, k),
+      ];
+
+      final out = <Map<String, Object?>>[];
+      for (final q in queries) {
+        final effQ = _maybeNormalizeForSpec(q.vec, binding.spec);
+        List<VectorSearchHit> runSearch(int wantK) {
+          if (idx is FlatIndex) return idx.search(q.vec, wantK, metric: metric);
+          if (idx is HnswIndex) return idx.search(q.vec, wantK, metric: metric);
+          if (idx is IvfFlatIndex) {
+            return idx.search(q.vec, wantK, metric: metric);
+          }
+          if (idx is LshIndex) return idx.search(effQ, wantK);
+          if (idx is PqIndex) return idx.search(effQ, wantK);
+          if (idx is IvfPqIndex) return idx.search(effQ, wantK);
+          return const [];
+        }
+
+        final seen = <Object>{};
+        final results = <Map<String, Object?>>[];
+        for (final budget in wantBudgets) {
+          final hits = runSearch(budget);
+          for (final hit in hits) {
+            final id = hit.id;
+            if (id == null || !seen.add(id)) continue;
+            if (!allowed.contains(id)) continue;
+            results.add({
+              'query_idx': q.idx,
+              'rowid': id,
+              'distance': hit.distance,
+            });
+            if (results.length >= k) break;
+          }
+          if (results.length >= k) break;
+        }
+        out.addAll(results);
+      }
+      return out;
+    }
+
+    // In-memory branch.
+    final t = _tables[tableName];
+    if (t == null) return const [];
+    final sharedIdx = _vectorIndexFor(tableName, colName);
+    if (sharedIdx == null) return const [];
+
+    Set<Object>? allowed;
+    for (final entry in filterMap.entries) {
+      final buckets = binding.payloadIndex[entry.key.toLowerCase()];
+      if (buckets == null) return const [];
+      final set = buckets[entry.value] ?? const <Object>{};
+      allowed =
+          allowed == null ? Set<Object>.from(set) : allowed.intersection(set);
+      if (allowed.isEmpty) return const [];
+    }
+    if (allowed == null || allowed.isEmpty) return const [];
+
+    final tableSize = t.rows.length;
+    final wantBudgets = <int>[
+      math.min(math.max(k * 4, 16), tableSize),
+      math.min(math.max(k * 16, 64), tableSize),
+    ];
+    final pkColIdx = t.columns.indexWhere((c) => c.primaryKey);
+
+    final out = <Map<String, Object?>>[];
+    for (final q in queries) {
+      final effQ = _maybeNormalizeForSpec(q.vec, binding.spec);
+      List<VectorSearchHit> runSearch(int wantK) {
+        if (sharedIdx is FlatIndex) {
+          return sharedIdx.search(q.vec, wantK, metric: metric);
+        }
+        if (sharedIdx is HnswIndex) {
+          return sharedIdx.search(q.vec, wantK, metric: metric);
+        }
+        if (sharedIdx is IvfFlatIndex) {
+          return sharedIdx.search(q.vec, wantK, metric: metric);
+        }
+        if (sharedIdx is LshIndex) return sharedIdx.search(effQ, wantK);
+        if (sharedIdx is PqIndex) return sharedIdx.search(effQ, wantK);
+        if (sharedIdx is IvfPqIndex) return sharedIdx.search(effQ, wantK);
+        return const [];
+      }
+
+      final seen = <int>{};
+      final results = <Map<String, Object?>>[];
+      for (final budget in wantBudgets) {
+        final hits = runSearch(budget);
+        for (final hit in hits) {
+          final rid = hit.id;
+          if (rid is! int || !seen.add(rid)) continue;
+          if (!allowed.contains(rid)) continue;
+          if (rid < 0 || rid >= t.rows.length) continue;
+          results.add({
+            'query_idx': q.idx,
+            'rowid': pkColIdx >= 0 ? t.rows[rid][pkColIdx] : rid,
+            'distance': hit.distance,
+          });
+          if (results.length >= k) break;
+        }
+        if (results.length >= k) break;
+        if (budget >= tableSize) break;
+      }
+      out.addAll(results);
+    }
+    return out;
+  }
+
+  /// V41: `vec_hybrid_search(table, vec_col, text_col, query_vec,
+  /// query_text, k[, rrf_k[, filter_json]])` — fused vector+FTS5
+  /// retrieval via Reciprocal Rank Fusion.
+  ///
+  /// * Vector side runs a top-`fetch` KNN via the registered binding
+  ///   (or an ad-hoc FlatIndex).
+  /// * Text side computes BM25 for every row and takes the top-`fetch`.
+  /// * Each candidate rowid gets `1/(rrf_k + rank_vec) + 1/(rrf_k +
+  ///   rank_text)`; ranks are 1-based, missing side contributes 0.
+  /// * `filter_json` (optional) intersects allowed rowids via the V36
+  ///   payload index before scoring — filter-first, then fuse.
+  ///
+  /// Returns rows `{rowid, distance, bm25, rrf_score}` sorted by
+  /// `rrf_score` descending. In-memory tables only.
+  List<Map<String, Object?>> _vecHybridSearchRows(List<Object?> args) {
+    if (args.length < 6) {
+      throw StateError(
+        'vec_hybrid_search: expected '
+        '(table, vec_col, text_col, query_vec, query_text, k'
+        '[, rrf_k[, filter_json]])',
+      );
+    }
+    final tableName = args[0]?.toString();
+    final vecCol = args[1]?.toString();
+    final textCol = args[2]?.toString();
+    final queryText = args[4]?.toString();
+    final k = args[5] == null ? 0 : (args[5] as num).toInt();
+    if (tableName == null ||
+        vecCol == null ||
+        textCol == null ||
+        queryText == null ||
+        k <= 0) {
+      return const [];
+    }
+
+    Vector? query;
+    try {
+      query = coerceVector(args[3]);
+    } catch (_) {
+      return const [];
+    }
+    if (query == null) return const [];
+
+    final rrfK =
+        args.length >= 7 && args[6] != null ? (args[6] as num).toInt() : 60;
+    final filterJson = args.length >= 8 ? args[7]?.toString() : null;
+
+    final key = '${tableName.toLowerCase()}:${vecCol.toLowerCase()}';
+    final binding = _vectorIndexes[key];
+    if (binding == null) return const [];
+    if (query.dim != binding.spec.dim) return const [];
+
+    if (_isPaged(tableName)) {
+      return _vecHybridSearchRowsPaged(
+        binding: binding,
+        tableName: tableName,
+        textCol: textCol,
+        query: query,
+        queryText: queryText,
+        k: k,
+        rrfK: rrfK,
+        filterJson: filterJson,
+      );
+    }
+    final t = _tables[tableName];
+    if (t == null) return const [];
+    final textColIdx = t.columns.indexWhere(
+      (c) => c.name.toLowerCase() == textCol.toLowerCase(),
+    );
+    if (textColIdx < 0) return const [];
+
+    // Optional payload filter → intersected `allowed` set.
+    Set<int>? allowed;
+    if (filterJson != null && filterJson.isNotEmpty) {
+      try {
+        final decoded = jsonDecode(filterJson);
+        if (decoded is Map && decoded.isNotEmpty) {
+          final filterMap = decoded.cast<String, Object?>();
+          final declared = {
+            for (final c in binding.spec.filterColumns) c.toLowerCase(),
+          };
+          for (final entry in filterMap.entries) {
+            if (!declared.contains(entry.key.toLowerCase())) return const [];
+            final buckets = binding.payloadIndex[entry.key.toLowerCase()];
+            if (buckets == null) return const [];
+            final set = <int>{
+              for (final id in buckets[entry.value] ?? const <Object>{})
+                if (id is int) id,
+            };
+            allowed = allowed == null ? set : allowed.intersection(set);
+            if (allowed.isEmpty) return const [];
+          }
+        }
+      } catch (_) {
+        // Malformed filter — treat as no filter.
+      }
+    }
+
+    final idx = _vectorIndexFor(tableName, vecCol);
+    if (idx == null) return const [];
+
+    // Fetch pool — over-request from each side to give the fusion
+    // room to reorder.
+    final fetch = math.max(k * 4, 32);
+
+    // --- Vector side ------------------------------------------------------
+    final effQ = _maybeNormalizeForSpec(query, binding.spec);
+    List<VectorSearchHit> vecHits;
+    if (idx is FlatIndex) {
+      vecHits = idx.search(query, fetch, metric: binding.spec.metric);
+    } else if (idx is HnswIndex) {
+      vecHits = idx.search(query, fetch, metric: binding.spec.metric);
+    } else if (idx is IvfFlatIndex) {
+      vecHits = idx.search(query, fetch, metric: binding.spec.metric);
+    } else if (idx is LshIndex) {
+      vecHits = idx.search(effQ, fetch);
+    } else if (idx is PqIndex) {
+      vecHits = idx.search(effQ, fetch);
+    } else if (idx is IvfPqIndex) {
+      vecHits = idx.search(effQ, fetch);
+    } else {
+      vecHits = const [];
+    }
+    final vecRank = <int, int>{}; // rowid → 1-based rank
+    final vecDist = <int, double>{};
+    var rank = 0;
+    for (final h in vecHits) {
+      final rid = h.id;
+      if (rid is! int) continue;
+      if (allowed != null && !allowed.contains(rid)) continue;
+      rank++;
+      vecRank[rid] = rank;
+      vecDist[rid] = h.distance;
+    }
+
+    // --- Text side --------------------------------------------------------
+    final fts = fts5IndexFor(tableName, textCol);
+    final textScored = <(int, double)>[];
+    for (var i = 0; i < t.rows.length; i++) {
+      if (allowed != null && !allowed.contains(i)) continue;
+      final score = fts.bm25(i, queryText);
+      if (score > 0) textScored.add((i, score));
+    }
+    textScored.sort((a, b) => b.$2.compareTo(a.$2));
+    final textRank = <int, int>{};
+    final textScore = <int, double>{};
+    for (var i = 0; i < math.min(fetch, textScored.length); i++) {
+      final (rid, score) = textScored[i];
+      textRank[rid] = i + 1;
+      textScore[rid] = score;
+    }
+
+    if (vecRank.isEmpty && textRank.isEmpty) return const [];
+
+    // --- Fuse -------------------------------------------------------------
+    final union = <int>{...vecRank.keys, ...textRank.keys};
+    final scored = <(int, double, double, double)>[];
+    for (final rid in union) {
+      final vr = vecRank[rid];
+      final tr = textRank[rid];
+      final rrf = (vr == null ? 0.0 : 1.0 / (rrfK + vr)) +
+          (tr == null ? 0.0 : 1.0 / (rrfK + tr));
+      scored.add((rid, vecDist[rid] ?? double.nan, textScore[rid] ?? 0.0, rrf));
+    }
+    scored.sort((a, b) => b.$4.compareTo(a.$4));
+    final take = math.min(k, scored.length);
+    final pkColIdx = t.columns.indexWhere((c) => c.primaryKey);
+    return [
+      for (var i = 0; i < take; i++)
+        {
+          'rowid':
+              pkColIdx >= 0 ? t.rows[scored[i].$1][pkColIdx] : scored[i].$1,
+          'distance': scored[i].$2,
+          'bm25': scored[i].$3,
+          'rrf_score': scored[i].$4,
+        },
+    ];
+  }
+
+  /// V44: paged-table hybrid search. FTS5 corpus must have been
+  /// warmed via [warmFts5] first; the cached [_pagedFts5Pks] list
+  /// gives us a stable `docId → pk` mapping so `fts.bm25(docId, q)`
+  /// still works.
+  List<Map<String, Object?>> _vecHybridSearchRowsPaged({
+    required _VectorIndexBinding binding,
+    required String tableName,
+    required String textCol,
+    required Vector query,
+    required String queryText,
+    required int k,
+    required int rrfK,
+    required String? filterJson,
+  }) {
+    final ftsKey = '${tableName.toLowerCase()}:${textCol.toLowerCase()}';
+    final fts = _fts5IndexCache[ftsKey];
+    final pks = _pagedFts5Pks[ftsKey];
+    if (fts == null || pks == null) {
+      throw StateError(
+        'vec_hybrid_search: paged FTS5 corpus for '
+        '$tableName.$textCol not warmed — call db.warmFts5(...) first',
+      );
+    }
+
+    // Drain V29 paged deltas + payload filter intersection.
+    _applyPendingPagedDeltas(binding);
+    final idx = binding.index;
+    if (idx == null) return const [];
+
+    Set<Object>? allowed;
+    if (filterJson != null && filterJson.isNotEmpty) {
+      try {
+        final decoded = jsonDecode(filterJson);
+        if (decoded is Map && decoded.isNotEmpty) {
+          final filterMap = decoded.cast<String, Object?>();
+          final declared = {
+            for (final c in binding.spec.filterColumns) c.toLowerCase(),
+          };
+          for (final entry in filterMap.entries) {
+            if (!declared.contains(entry.key.toLowerCase())) return const [];
+            final buckets = binding.payloadIndex[entry.key.toLowerCase()];
+            if (buckets == null) return const [];
+            final set = buckets[entry.value] ?? const <Object>{};
+            allowed = allowed == null
+                ? Set<Object>.from(set)
+                : allowed.intersection(set);
+            if (allowed.isEmpty) return const [];
+          }
+        }
+      } catch (_) {}
+    }
+
+    final fetch = math.max(k * 4, 32);
+    final effQ = _maybeNormalizeForSpec(query, binding.spec);
+    List<VectorSearchHit> vecHits;
+    if (idx is FlatIndex) {
+      vecHits = idx.search(query, fetch, metric: binding.spec.metric);
+    } else if (idx is HnswIndex) {
+      vecHits = idx.search(query, fetch, metric: binding.spec.metric);
+    } else if (idx is IvfFlatIndex) {
+      vecHits = idx.search(query, fetch, metric: binding.spec.metric);
+    } else if (idx is LshIndex) {
+      vecHits = idx.search(effQ, fetch);
+    } else if (idx is PqIndex) {
+      vecHits = idx.search(effQ, fetch);
+    } else if (idx is IvfPqIndex) {
+      vecHits = idx.search(effQ, fetch);
+    } else {
+      vecHits = const [];
+    }
+    final vecRank = <Object, int>{};
+    final vecDist = <Object, double>{};
+    var rank = 0;
+    for (final h in vecHits) {
+      final id = h.id;
+      if (id == null) continue;
+      if (allowed != null && !allowed.contains(id)) continue;
+      rank++;
+      vecRank[id] = rank;
+      vecDist[id] = h.distance;
+    }
+
+    // Text side — iterate paged pks, compute bm25 for each.
+    final textScored = <(Object, double)>[];
+    for (var i = 0; i < pks.length; i++) {
+      final pk = pks[i];
+      if (allowed != null && !allowed.contains(pk)) continue;
+      final score = fts.bm25(i, queryText);
+      if (score > 0) textScored.add((pk, score));
+    }
+    textScored.sort((a, b) => b.$2.compareTo(a.$2));
+    final textRank = <Object, int>{};
+    final textScore = <Object, double>{};
+    for (var i = 0; i < math.min(fetch, textScored.length); i++) {
+      final (pk, score) = textScored[i];
+      textRank[pk] = i + 1;
+      textScore[pk] = score;
+    }
+
+    if (vecRank.isEmpty && textRank.isEmpty) return const [];
+
+    final union = <Object>{...vecRank.keys, ...textRank.keys};
+    final scored = <(Object, double, double, double)>[];
+    for (final id in union) {
+      final vr = vecRank[id];
+      final tr = textRank[id];
+      final rrf = (vr == null ? 0.0 : 1.0 / (rrfK + vr)) +
+          (tr == null ? 0.0 : 1.0 / (rrfK + tr));
+      scored.add((id, vecDist[id] ?? double.nan, textScore[id] ?? 0.0, rrf));
+    }
+    scored.sort((a, b) => b.$4.compareTo(a.$4));
+    final take = math.min(k, scored.length);
+    return [
+      for (var i = 0; i < take; i++)
+        {
+          'rowid': scored[i].$1,
+          'distance': scored[i].$2,
+          'bm25': scored[i].$3,
+          'rrf_score': scored[i].$4,
+        },
+    ];
+  }
+
+  /// V44: paged batch companion to `_vecHybridSearchRowsPaged`.
+  /// Amortises FTS5 corpus + payload set across every query. Requires
+  /// the FTS5 corpus warmed via [warmFts5] first.
+  List<Map<String, Object?>> _vecHybridSearchBatchRowsPaged({
+    required _VectorIndexBinding binding,
+    required String tableName,
+    required String textCol,
+    required List<({int idx, Vector vec, String text})> queries,
+    required int k,
+    required int rrfK,
+    required String? filterJson,
+  }) {
+    final ftsKey = '${tableName.toLowerCase()}:${textCol.toLowerCase()}';
+    final fts = _fts5IndexCache[ftsKey];
+    final pks = _pagedFts5Pks[ftsKey];
+    if (fts == null || pks == null) {
+      throw StateError(
+        'vec_hybrid_search_batch: paged FTS5 corpus for '
+        '$tableName.$textCol not warmed — call db.warmFts5(...) first',
+      );
+    }
+
+    _applyPendingPagedDeltas(binding);
+    final idx = binding.index;
+    if (idx == null) return const [];
+
+    Set<Object>? allowed;
+    if (filterJson != null && filterJson.isNotEmpty) {
+      try {
+        final decoded = jsonDecode(filterJson);
+        if (decoded is Map && decoded.isNotEmpty) {
+          final filterMap = decoded.cast<String, Object?>();
+          final declared = {
+            for (final c in binding.spec.filterColumns) c.toLowerCase(),
+          };
+          for (final entry in filterMap.entries) {
+            if (!declared.contains(entry.key.toLowerCase())) return const [];
+            final buckets = binding.payloadIndex[entry.key.toLowerCase()];
+            if (buckets == null) return const [];
+            final set = buckets[entry.value] ?? const <Object>{};
+            allowed = allowed == null
+                ? Set<Object>.from(set)
+                : allowed.intersection(set);
+            if (allowed.isEmpty) return const [];
+          }
+        }
+      } catch (_) {}
+    }
+
+    final fetch = math.max(k * 4, 32);
+    final out = <Map<String, Object?>>[];
+    for (final q in queries) {
+      final effQ = _maybeNormalizeForSpec(q.vec, binding.spec);
+      List<VectorSearchHit> vecHits;
+      if (idx is FlatIndex) {
+        vecHits = idx.search(q.vec, fetch, metric: binding.spec.metric);
+      } else if (idx is HnswIndex) {
+        vecHits = idx.search(q.vec, fetch, metric: binding.spec.metric);
+      } else if (idx is IvfFlatIndex) {
+        vecHits = idx.search(q.vec, fetch, metric: binding.spec.metric);
+      } else if (idx is LshIndex) {
+        vecHits = idx.search(effQ, fetch);
+      } else if (idx is PqIndex) {
+        vecHits = idx.search(effQ, fetch);
+      } else if (idx is IvfPqIndex) {
+        vecHits = idx.search(effQ, fetch);
+      } else {
+        vecHits = const [];
+      }
+      final vecRank = <Object, int>{};
+      final vecDist = <Object, double>{};
+      var rank = 0;
+      for (final h in vecHits) {
+        final id = h.id;
+        if (id == null) continue;
+        if (allowed != null && !allowed.contains(id)) continue;
+        rank++;
+        vecRank[id] = rank;
+        vecDist[id] = h.distance;
+      }
+
+      final textScored = <(Object, double)>[];
+      for (var i = 0; i < pks.length; i++) {
+        final pk = pks[i];
+        if (allowed != null && !allowed.contains(pk)) continue;
+        final score = fts.bm25(i, q.text);
+        if (score > 0) textScored.add((pk, score));
+      }
+      textScored.sort((a, b) => b.$2.compareTo(a.$2));
+      final textRank = <Object, int>{};
+      final textScore = <Object, double>{};
+      for (var i = 0; i < math.min(fetch, textScored.length); i++) {
+        final (pk, score) = textScored[i];
+        textRank[pk] = i + 1;
+        textScore[pk] = score;
+      }
+
+      if (vecRank.isEmpty && textRank.isEmpty) continue;
+
+      final union = <Object>{...vecRank.keys, ...textRank.keys};
+      final scored = <(Object, double, double, double)>[];
+      for (final id in union) {
+        final vr = vecRank[id];
+        final tr = textRank[id];
+        final rrf = (vr == null ? 0.0 : 1.0 / (rrfK + vr)) +
+            (tr == null ? 0.0 : 1.0 / (rrfK + tr));
+        scored.add((id, vecDist[id] ?? double.nan, textScore[id] ?? 0.0, rrf));
+      }
+      scored.sort((a, b) => b.$4.compareTo(a.$4));
+      final take = math.min(k, scored.length);
+      for (var i = 0; i < take; i++) {
+        out.add({
+          'query_idx': q.idx,
+          'rowid': scored[i].$1,
+          'distance': scored[i].$2,
+          'bm25': scored[i].$3,
+          'rrf_score': scored[i].$4,
+        });
+      }
+    }
+    return out;
+  }
+
+  /// V42: `vec_hybrid_search_batch(table, vec_col, text_col,
+  /// queries_json, k[, rrf_k[, filter_json]])` — batch companion to
+  /// V41. `queries_json` is a JSON array of `{vec: [...], text: "..."}`
+  /// objects. FTS5 index and (if any) payload filter are computed
+  /// once and reused across every query — the win vs calling
+  /// `vec_hybrid_search` per query.
+  ///
+  /// Returns rows `{query_idx, rowid, distance, bm25, rrf_score}`
+  /// ordered by `(query_idx ASC, rrf_score DESC)`.
+  List<Map<String, Object?>> _vecHybridSearchBatchRows(List<Object?> args) {
+    if (args.length < 5) {
+      throw StateError(
+        'vec_hybrid_search_batch: expected '
+        '(table, vec_col, text_col, queries_json, k'
+        '[, rrf_k[, filter_json]])',
+      );
+    }
+    final tableName = args[0]?.toString();
+    final vecCol = args[1]?.toString();
+    final textCol = args[2]?.toString();
+    final queriesJson = args[3]?.toString();
+    final k = args[4] == null ? 0 : (args[4] as num).toInt();
+    if (tableName == null ||
+        vecCol == null ||
+        textCol == null ||
+        queriesJson == null ||
+        k <= 0) {
+      return const [];
+    }
+
+    final rrfK =
+        args.length >= 6 && args[5] != null ? (args[5] as num).toInt() : 60;
+    final filterJson = args.length >= 7 ? args[6]?.toString() : null;
+
+    final key = '${tableName.toLowerCase()}:${vecCol.toLowerCase()}';
+    final binding = _vectorIndexes[key];
+    if (binding == null) return const [];
+
+    // Parse queries. Position in the input array is preserved as the
+    // returned `query_idx` — malformed entries are skipped but still
+    // occupy their slot for numbering purposes (matches V15's
+    // `vec_search_batch` semantics).
+    List<({int idx, Vector vec, String text})> queries;
+    try {
+      final decoded = jsonDecode(queriesJson);
+      if (decoded is! List) return const [];
+      queries = <({int idx, Vector vec, String text})>[];
+      for (var i = 0; i < decoded.length; i++) {
+        final entry = decoded[i];
+        if (entry is! Map) continue;
+        final vecRaw = entry['vec'];
+        final textRaw = entry['text'];
+        if (vecRaw is! List || textRaw is! String) continue;
+        final vec = Vector.fromList(vecRaw.cast<num>());
+        if (vec.dim != binding.spec.dim) continue;
+        queries.add((idx: i, vec: vec, text: textRaw));
+      }
+    } catch (_) {
+      return const [];
+    }
+    if (queries.isEmpty) return const [];
+
+    if (_isPaged(tableName)) {
+      return _vecHybridSearchBatchRowsPaged(
+        binding: binding,
+        tableName: tableName,
+        textCol: textCol,
+        queries: queries,
+        k: k,
+        rrfK: rrfK,
+        filterJson: filterJson,
+      );
+    }
+    final t = _tables[tableName];
+    if (t == null) return const [];
+    final textColIdx = t.columns.indexWhere(
+      (c) => c.name.toLowerCase() == textCol.toLowerCase(),
+    );
+    if (textColIdx < 0) return const [];
+
+    // Payload filter → intersected `allowed` (computed once).
+    Set<int>? allowed;
+    if (filterJson != null && filterJson.isNotEmpty) {
+      try {
+        final decoded = jsonDecode(filterJson);
+        if (decoded is Map && decoded.isNotEmpty) {
+          final filterMap = decoded.cast<String, Object?>();
+          final declared = {
+            for (final c in binding.spec.filterColumns) c.toLowerCase(),
+          };
+          for (final entry in filterMap.entries) {
+            if (!declared.contains(entry.key.toLowerCase())) return const [];
+            final buckets = binding.payloadIndex[entry.key.toLowerCase()];
+            if (buckets == null) return const [];
+            final set = <int>{
+              for (final id in buckets[entry.value] ?? const <Object>{})
+                if (id is int) id,
+            };
+            allowed = allowed == null ? set : allowed.intersection(set);
+            if (allowed.isEmpty) return const [];
+          }
+        }
+      } catch (_) {
+        // Malformed filter — treat as no filter.
+      }
+    }
+
+    // Build once: vector index + FTS5 corpus + PK column resolution.
+    final idx = _vectorIndexFor(tableName, vecCol);
+    if (idx == null) return const [];
+    final fts = fts5IndexFor(tableName, textCol);
+    final pkColIdx = t.columns.indexWhere((c) => c.primaryKey);
+    final fetch = math.max(k * 4, 32);
+
+    final out = <Map<String, Object?>>[];
+    for (var qi = 0; qi < queries.length; qi++) {
+      final q = queries[qi];
+      if (q.vec.dim != binding.spec.dim) continue;
+      // Vector side.
+      final effQ = _maybeNormalizeForSpec(q.vec, binding.spec);
+      List<VectorSearchHit> vecHits;
+      if (idx is FlatIndex) {
+        vecHits = idx.search(q.vec, fetch, metric: binding.spec.metric);
+      } else if (idx is HnswIndex) {
+        vecHits = idx.search(q.vec, fetch, metric: binding.spec.metric);
+      } else if (idx is IvfFlatIndex) {
+        vecHits = idx.search(q.vec, fetch, metric: binding.spec.metric);
+      } else if (idx is LshIndex) {
+        vecHits = idx.search(effQ, fetch);
+      } else if (idx is PqIndex) {
+        vecHits = idx.search(effQ, fetch);
+      } else if (idx is IvfPqIndex) {
+        vecHits = idx.search(effQ, fetch);
+      } else {
+        vecHits = const [];
+      }
+      final vecRank = <int, int>{};
+      final vecDist = <int, double>{};
+      var rank = 0;
+      for (final h in vecHits) {
+        final rid = h.id;
+        if (rid is! int) continue;
+        if (allowed != null && !allowed.contains(rid)) continue;
+        rank++;
+        vecRank[rid] = rank;
+        vecDist[rid] = h.distance;
+      }
+
+      // Text side.
+      final textScored = <(int, double)>[];
+      for (var i = 0; i < t.rows.length; i++) {
+        if (allowed != null && !allowed.contains(i)) continue;
+        final score = fts.bm25(i, q.text);
+        if (score > 0) textScored.add((i, score));
+      }
+      textScored.sort((a, b) => b.$2.compareTo(a.$2));
+      final textRank = <int, int>{};
+      final textScore = <int, double>{};
+      for (var i = 0; i < math.min(fetch, textScored.length); i++) {
+        final (rid, score) = textScored[i];
+        textRank[rid] = i + 1;
+        textScore[rid] = score;
+      }
+
+      if (vecRank.isEmpty && textRank.isEmpty) continue;
+
+      // Fuse.
+      final union = <int>{...vecRank.keys, ...textRank.keys};
+      final scored = <(int, double, double, double)>[];
+      for (final rid in union) {
+        final vr = vecRank[rid];
+        final tr = textRank[rid];
+        final rrf = (vr == null ? 0.0 : 1.0 / (rrfK + vr)) +
+            (tr == null ? 0.0 : 1.0 / (rrfK + tr));
+        scored
+            .add((rid, vecDist[rid] ?? double.nan, textScore[rid] ?? 0.0, rrf));
+      }
+      scored.sort((a, b) => b.$4.compareTo(a.$4));
+      final take = math.min(k, scored.length);
+      for (var i = 0; i < take; i++) {
+        out.add({
+          'query_idx': q.idx,
+          'rowid':
+              pkColIdx >= 0 ? t.rows[scored[i].$1][pkColIdx] : scored[i].$1,
+          'distance': scored[i].$2,
+          'bm25': scored[i].$3,
+          'rrf_score': scored[i].$4,
+        });
+      }
+    }
+    return out;
+  }
+
+  /// k[, metric])` — multi-query k-NN table-valued function.
+  ///
+  /// [queries_json] is a JSON array of vectors:
+  /// `'[[1,2,3], [4,5,6], [7,8,9]]'`. A single flat literal
+  /// `'[1,2,3]'` is also accepted and treated as one query.
+  ///
+  /// Returns rows `{query_idx: int, rowid, distance: double}`, ordered
+  /// by `(query_idx ASC, distance BEST-FIRST)`. Query rows with dim
+  /// mismatch to the target column are skipped (empty per-query
+  /// result), preserving `query_idx` numbering.
+  ///
+  /// Reuses the registered index (if any) or builds a single ad-hoc
+  /// [FlatIndex] once and probes it N times — the key performance win
+  /// vs calling `vec_search` per query.
+  List<Map<String, Object?>> _vecSearchBatchRows(List<Object?> args) {
+    if (args.length < 4) {
+      throw StateError(
+        'vec_search_batch: expected (table, column, queries, k[, metric])',
+      );
+    }
+    final tableName = args[0]?.toString();
+    final colName = args[1]?.toString();
+    final k = args[3] == null ? 0 : (args[3] as num).toInt();
+    if (tableName == null || colName == null || k <= 0) return const [];
+
+    List<Vector> queries;
+    try {
+      final raw = args[2];
+      if (raw is String) {
+        queries = parseVectorBatchText(raw);
+      } else if (raw is List) {
+        queries = [
+          for (final e in raw)
+            if (e is List)
+              Vector.fromList(e.cast<num>())
+            else
+              throw const FormatException('non-list batch entry'),
+        ];
+      } else {
+        throw const FormatException('queries must be text or list');
+      }
+    } catch (_) {
+      return const [];
+    }
+    if (queries.isEmpty) return const [];
+
+    final t = _tables[tableName];
+    if (t == null) return const [];
+    final colIdx = t.columns.indexWhere(
+      (c) => c.name.toLowerCase() == colName.toLowerCase(),
+    );
+    if (colIdx < 0) return const [];
+    final pkColIdx = t.columns.indexWhere((c) => c.primaryKey);
+
+    // Metric resolution — same as vec_search.
+    final key = '${tableName.toLowerCase()}:${colName.toLowerCase()}';
+    final binding = _vectorIndexes[key];
+    VectorMetric metric = binding?.spec.metric ?? VectorMetric.l2sq;
+    if (args.length >= 5 && args[4] != null) {
+      try {
+        metric = _parseVectorMetric(args[4].toString());
+      } catch (_) {
+        return const [];
+      }
+    }
+
+    // Build once, probe N times.
+    Object? sharedIndex;
+    if (binding != null) {
+      sharedIndex = _vectorIndexFor(tableName, colName);
+    }
+    FlatIndex? adhoc;
+    int? adhocDim;
+    if (sharedIndex == null) {
+      // Ad-hoc FlatIndex over current rows — built to match the first
+      // valid query's dim so we don't waste work on empty batches.
+      final firstValid = queries.firstWhere(
+        (q) => q.dim > 0,
+        orElse: () => queries.first,
+      );
+      adhocDim = firstValid.dim;
+      adhoc = FlatIndex(adhocDim, defaultMetric: metric);
+      for (var i = 0; i < t.rows.length; i++) {
+        final raw = t.rows[i][colIdx];
+        if (raw == null) continue;
+        Vector v;
+        try {
+          v = coerceVector(raw)!;
+        } catch (_) {
+          continue;
+        }
+        if (v.dim != adhocDim) continue;
+        adhoc.add(i, v);
+      }
+    }
+
+    final out = <Map<String, Object?>>[];
+    for (var qi = 0; qi < queries.length; qi++) {
+      final query = queries[qi];
+      List<VectorSearchHit> hits;
+      if (sharedIndex != null) {
+        if (binding != null && query.dim != binding.spec.dim) {
+          continue; // skip this query, keep numbering
+        }
+        final effQ = binding != null
+            ? _maybeNormalizeForSpec(query, binding.spec)
+            : query;
+        if (sharedIndex is FlatIndex) {
+          hits = sharedIndex.search(query, k, metric: metric);
+        } else if (sharedIndex is HnswIndex) {
+          hits = sharedIndex.search(query, k, metric: metric);
+        } else if (sharedIndex is IvfFlatIndex) {
+          hits = sharedIndex.search(query, k, metric: metric);
+        } else if (sharedIndex is LshIndex) {
+          hits = sharedIndex.search(effQ, k);
+        } else if (sharedIndex is PqIndex) {
+          hits = sharedIndex.search(effQ, k);
+        } else if (sharedIndex is IvfPqIndex) {
+          hits = sharedIndex.search(effQ, k);
+        } else {
+          hits = const [];
+        }
+      } else {
+        if (query.dim != adhocDim) continue;
+        hits = adhoc!.search(query, k, metric: metric);
+      }
+      for (final h in hits) {
+        if (h.id is! int) continue;
+        final rid = h.id as int;
+        if (rid < 0 || rid >= t.rows.length) continue;
+        out.add({
+          'query_idx': qi,
+          'rowid': pkColIdx >= 0 ? t.rows[rid][pkColIdx] : rid,
+          'distance': h.distance,
+        });
+      }
+    }
+    return out;
+  }
+
+  /// Implementation of `vec_search_join(target_table, target_column,
+  /// query_table, query_column, k[, metric])` — table-to-table k-NN.
+  ///
+  /// Each row of `query_table.query_column` is treated as a query
+  /// vector and searched against `target_table.target_column`. Returns
+  /// rows `{query_rowid, rowid, distance}` where `query_rowid` is the
+  /// query table's PK (or row position) and `rowid` is the target
+  /// table's PK. Results are ordered by `(query_rowid, distance)`.
+  ///
+  /// Shares the target index (registered or ad-hoc FlatIndex) across
+  /// every query — same amortization as `vec_search_batch`. Malformed
+  /// or dim-mismatched query rows contribute zero output rows without
+  /// affecting the other queries.
+  List<Map<String, Object?>> _vecSearchJoinRows(List<Object?> args) {
+    if (args.length < 5) {
+      throw StateError(
+        'vec_search_join: expected (target_table, target_column, '
+        'query_table, query_column, k[, metric])',
+      );
+    }
+    final targetTable = args[0]?.toString();
+    final targetCol = args[1]?.toString();
+    final queryTable = args[2]?.toString();
+    final queryCol = args[3]?.toString();
+    final k = args[4] == null ? 0 : (args[4] as num).toInt();
+    if (targetTable == null ||
+        targetCol == null ||
+        queryTable == null ||
+        queryCol == null ||
+        k <= 0) {
+      return const [];
+    }
+
+    // Resolve both tables and their column indices.
+    final tTarget = _tables[targetTable];
+    final tQuery = _tables[queryTable];
+    if (tTarget == null || tQuery == null) return const [];
+    final targetColIdx = tTarget.columns.indexWhere(
+      (c) => c.name.toLowerCase() == targetCol.toLowerCase(),
+    );
+    final queryColIdx = tQuery.columns.indexWhere(
+      (c) => c.name.toLowerCase() == queryCol.toLowerCase(),
+    );
+    if (targetColIdx < 0 || queryColIdx < 0) return const [];
+    final targetPkIdx = tTarget.columns.indexWhere((c) => c.primaryKey);
+    final queryPkIdx = tQuery.columns.indexWhere((c) => c.primaryKey);
+
+    // Metric selection — registered binding or explicit override.
+    final key = '${targetTable.toLowerCase()}:${targetCol.toLowerCase()}';
+    final binding = _vectorIndexes[key];
+    VectorMetric metric = binding?.spec.metric ?? VectorMetric.l2sq;
+    if (args.length >= 6 && args[5] != null) {
+      try {
+        metric = _parseVectorMetric(args[5].toString());
+      } catch (_) {
+        return const [];
+      }
+    }
+
+    // Build shared target index — registered if available, else
+    // ad-hoc FlatIndex over the first-valid-dim of the query column.
+    Object? sharedIndex;
+    if (binding != null) {
+      sharedIndex = _vectorIndexFor(targetTable, targetCol);
+    }
+    FlatIndex? adhoc;
+    int? sharedDim;
+    if (sharedIndex == null) {
+      // Discover the dim by peeking the first non-null query row.
+      for (final row in tQuery.rows) {
+        final raw = row[queryColIdx];
+        if (raw == null) continue;
+        try {
+          sharedDim = coerceVector(raw)!.dim;
+          break;
+        } catch (_) {}
+      }
+      if (sharedDim == null) return const [];
+      adhoc = FlatIndex(sharedDim, defaultMetric: metric);
+      for (var i = 0; i < tTarget.rows.length; i++) {
+        final raw = tTarget.rows[i][targetColIdx];
+        if (raw == null) continue;
+        Vector v;
+        try {
+          v = coerceVector(raw)!;
+        } catch (_) {
+          continue;
+        }
+        if (v.dim != sharedDim) continue;
+        adhoc.add(i, v);
+      }
+    } else {
+      sharedDim = binding?.spec.dim;
+    }
+
+    final out = <Map<String, Object?>>[];
+    for (var qi = 0; qi < tQuery.rows.length; qi++) {
+      final row = tQuery.rows[qi];
+      final raw = row[queryColIdx];
+      if (raw == null) continue;
+      Vector query;
+      try {
+        query = coerceVector(raw)!;
+      } catch (_) {
+        continue;
+      }
+      if (sharedDim != null && query.dim != sharedDim) continue;
+
+      List<VectorSearchHit> hits;
+      final effQ =
+          binding != null ? _maybeNormalizeForSpec(query, binding.spec) : query;
+      if (sharedIndex is FlatIndex) {
+        hits = sharedIndex.search(query, k, metric: metric);
+      } else if (sharedIndex is HnswIndex) {
+        hits = sharedIndex.search(query, k, metric: metric);
+      } else if (sharedIndex is IvfFlatIndex) {
+        hits = sharedIndex.search(query, k, metric: metric);
+      } else if (sharedIndex is LshIndex) {
+        hits = sharedIndex.search(effQ, k);
+      } else if (sharedIndex is PqIndex) {
+        hits = sharedIndex.search(effQ, k);
+      } else if (sharedIndex is IvfPqIndex) {
+        hits = sharedIndex.search(effQ, k);
+      } else if (adhoc != null) {
+        hits = adhoc.search(query, k, metric: metric);
+      } else {
+        hits = const [];
+      }
+
+      final queryRowid = queryPkIdx >= 0 ? row[queryPkIdx] : qi;
+      for (final h in hits) {
+        if (h.id is! int) continue;
+        final rid = h.id as int;
+        if (rid < 0 || rid >= tTarget.rows.length) continue;
+        out.add({
+          'query_rowid': queryRowid,
+          'rowid': targetPkIdx >= 0 ? tTarget.rows[rid][targetPkIdx] : rid,
+          'distance': h.distance,
+        });
+      }
+    }
+    return out;
+  }
+
+  /// V27: bulk-append `{id, vec}` pairs from a JSON batch into a
+  /// table with a vector column. Meant for ETL from external
+  /// embedders — parses one JSON blob and appends rows in a single
+  /// pass, driving the V21 incremental-append path (built vector
+  /// index survives, catches up at next query).
+  ///
+  /// Signature: `vec_batch_insert(table, id_column, vec_column, json)`.
+  /// JSON forms accepted:
+  ///   * `[{"id": 1, "vec": [1, 2, 3]}, ...]`  (also `embedding` /
+  ///     `vector` keys)
+  ///   * `[[1, [1, 2, 3]], [2, [4, 5, 6]], ...]` (positional).
+  /// Returns one row `{inserted: N}`.
+  List<Map<String, Object?>> _vecBatchInsertRows(List<Object?> args) {
+    if (args.length < 4) {
+      throw StateError(
+        'vec_batch_insert: expected (table, id_column, vec_column, json)',
+      );
+    }
+    final tableName = args[0]?.toString();
+    final idColName = args[1]?.toString();
+    final vecColName = args[2]?.toString();
+    final jsonText = args[3]?.toString();
+    if (tableName == null ||
+        idColName == null ||
+        vecColName == null ||
+        jsonText == null) {
+      return [
+        {'inserted': 0}
+      ];
+    }
+    final t = _tables[tableName];
+    if (t == null) {
+      throw StateError('vec_batch_insert: unknown table $tableName');
+    }
+    final idColIdx = t.columns.indexWhere(
+      (c) => c.name.toLowerCase() == idColName.toLowerCase(),
+    );
+    final vecColIdx = t.columns.indexWhere(
+      (c) => c.name.toLowerCase() == vecColName.toLowerCase(),
+    );
+    if (idColIdx < 0) {
+      throw StateError(
+        'vec_batch_insert: id column $idColName not found in $tableName',
+      );
+    }
+    if (vecColIdx < 0) {
+      throw StateError(
+        'vec_batch_insert: vec column $vecColName not found in $tableName',
+      );
+    }
+
+    Object? decoded;
+    try {
+      decoded = jsonDecode(jsonText);
+    } catch (_) {
+      throw StateError('vec_batch_insert: malformed JSON batch');
+    }
+    if (decoded is! List) {
+      return [
+        {'inserted': 0}
+      ];
+    }
+
+    // Enforce dim if a vector index is registered on the column.
+    final bindingKey = '${tableName.toLowerCase()}:${vecColName.toLowerCase()}';
+    final binding = _vectorIndexes[bindingKey];
+    final expectedDim = binding?.spec.dim;
+
+    var inserted = 0;
+    for (final entry in decoded) {
+      Object? id;
+      List<Object?>? vecRaw;
+      if (entry is Map) {
+        id = entry['id'];
+        final v = entry['vec'] ?? entry['embedding'] ?? entry['vector'];
+        if (v is List) vecRaw = v;
+      } else if (entry is List && entry.length == 2) {
+        id = entry[0];
+        final v = entry[1];
+        if (v is List) vecRaw = v;
+      }
+      if (vecRaw == null) continue;
+      final vecNums = <num>[];
+      var ok = true;
+      for (final e in vecRaw) {
+        if (e is num) {
+          vecNums.add(e);
+        } else {
+          ok = false;
+          break;
+        }
+      }
+      if (!ok) continue;
+      if (expectedDim != null && vecNums.length != expectedDim) continue;
+
+      // Build row with declared defaults applied first.
+      final row = List<Object?>.filled(t.columns.length, null, growable: true);
+      for (var i = 0; i < t.columns.length; i++) {
+        final c = t.columns[i];
+        if (c.defaultValue != null) {
+          row[i] = coerce(c.defaultValue, c.type);
+        } else if (c.defaultExprSql != null) {
+          row[i] = _evalDefaultExpr(t, c, row);
+        }
+      }
+      row[idColIdx] = id;
+      row[vecColIdx] = encodeVectorBlob(Vector.fromList(vecNums));
+      t.rows.add(row);
+      inserted++;
+    }
+    if (inserted > 0) {
+      _rebuildIndexes(t);
+      unawaited(_persist().catchError((_) {}));
+    }
+    return [
+      {'inserted': inserted}
+    ];
+  }
+
+  /// V34: bulk-load `(id, vec)` rows from a CSV file. One row per line;
+  /// each line is `<id>,<vec>` where `<vec>` is a JSON array like
+  /// `[1, 2, 3]` (may be enclosed in quotes to hide commas from the
+  /// outer CSV split). Skips a header line when `has_header` is truthy.
+  ///
+  /// Signature:
+  ///   `vec_import_csv(table, id_col, vec_col, path[, has_header])`
+  List<Map<String, Object?>> _vecImportCsvRows(List<Object?> args) {
+    if (args.length < 4) {
+      throw StateError(
+        'vec_import_csv: expected (table, id_col, vec_col, path[, has_header])',
+      );
+    }
+    final tableName = args[0]?.toString();
+    final idColName = args[1]?.toString();
+    final vecColName = args[2]?.toString();
+    final path = args[3]?.toString();
+    final hasHeader =
+        args.length >= 5 && args[4] != null && (args[4] as num).toInt() != 0;
+    if (tableName == null ||
+        idColName == null ||
+        vecColName == null ||
+        path == null) {
+      return [
+        {'inserted': 0}
+      ];
+    }
+    final t = _tables[tableName];
+    if (t == null) {
+      throw StateError('vec_import_csv: unknown table $tableName');
+    }
+    final idColIdx = t.columns.indexWhere(
+      (c) => c.name.toLowerCase() == idColName.toLowerCase(),
+    );
+    final vecColIdx = t.columns.indexWhere(
+      (c) => c.name.toLowerCase() == vecColName.toLowerCase(),
+    );
+    if (idColIdx < 0 || vecColIdx < 0) {
+      throw StateError(
+        'vec_import_csv: id or vec column not found in $tableName',
+      );
+    }
+    final file = File(path);
+    if (!file.existsSync()) {
+      throw StateError('vec_import_csv: file not found: $path');
+    }
+    final lines = file.readAsLinesSync();
+
+    final bindingKey = '${tableName.toLowerCase()}:${vecColName.toLowerCase()}';
+    final expectedDim = _vectorIndexes[bindingKey]?.spec.dim;
+
+    var inserted = 0;
+    var lineNo = 0;
+    for (final line in lines) {
+      lineNo++;
+      if (line.trim().isEmpty) continue;
+      if (hasHeader && lineNo == 1) continue;
+      // Split at the FIRST unquoted comma to keep the JSON array intact.
+      final splitIdx = _findFirstCommaOutsideBrackets(line);
+      if (splitIdx < 0) continue;
+      final idPart = line.substring(0, splitIdx).trim();
+      var vecPart = line.substring(splitIdx + 1).trim();
+      // Strip surrounding CSV quotes if present.
+      if (vecPart.startsWith('"') && vecPart.endsWith('"')) {
+        vecPart =
+            vecPart.substring(1, vecPart.length - 1).replaceAll('""', '"');
+      }
+      Object? id = int.tryParse(idPart) ?? double.tryParse(idPart) ?? idPart;
+      Object? decoded;
+      try {
+        decoded = jsonDecode(vecPart);
+      } catch (_) {
+        continue;
+      }
+      if (decoded is! List) continue;
+      final vecNums = <num>[];
+      var ok = true;
+      for (final e in decoded) {
+        if (e is num) {
+          vecNums.add(e);
+        } else {
+          ok = false;
+          break;
+        }
+      }
+      if (!ok) continue;
+      if (expectedDim != null && vecNums.length != expectedDim) continue;
+
+      final row = List<Object?>.filled(t.columns.length, null, growable: true);
+      for (var i = 0; i < t.columns.length; i++) {
+        final c = t.columns[i];
+        if (c.defaultValue != null) {
+          row[i] = coerce(c.defaultValue, c.type);
+        } else if (c.defaultExprSql != null) {
+          row[i] = _evalDefaultExpr(t, c, row);
+        }
+      }
+      row[idColIdx] = id;
+      row[vecColIdx] = encodeVectorBlob(Vector.fromList(vecNums));
+      t.rows.add(row);
+      inserted++;
+    }
+    if (inserted > 0) {
+      _rebuildIndexes(t);
+      unawaited(_persist().catchError((_) {}));
+    }
+    return [
+      {'inserted': inserted}
+    ];
+  }
+
+  /// Locate the first comma not enclosed in JSON `[...]` or `"..."`.
+  int _findFirstCommaOutsideBrackets(String s) {
+    var depth = 0;
+    var inQuote = false;
+    for (var i = 0; i < s.length; i++) {
+      final c = s[i];
+      if (c == '"') {
+        inQuote = !inQuote;
+      } else if (!inQuote) {
+        if (c == '[') depth++;
+        if (c == ']') depth--;
+        if (c == ',' && depth == 0) return i;
+      }
+    }
+    return -1;
+  }
+
   /// Implementation of `generate_series(start, stop[, step])` table-valued
   /// function. Yields one row per integer with column `value`. `step`
   /// defaults to 1; a negative step counts down. An empty/invalid range
@@ -8093,12 +11902,10 @@ class Database {
   List<Map<String, Object?>> _generateSeriesRows(List<Object?> args) {
     if (args.isEmpty || args[0] == null) return const [];
     final start = (args[0] as num).toInt();
-    final stop = args.length >= 2 && args[1] != null
-        ? (args[1] as num).toInt()
-        : start;
-    final step = args.length >= 3 && args[2] != null
-        ? (args[2] as num).toInt()
-        : 1;
+    final stop =
+        args.length >= 2 && args[1] != null ? (args[1] as num).toInt() : start;
+    final step =
+        args.length >= 3 && args[2] != null ? (args[2] as num).toInt() : 1;
     if (step == 0) return const [];
     final out = <Map<String, Object?>>[];
     if (step > 0) {
@@ -8141,12 +11948,10 @@ class Database {
     ) {
       final id = nextId++;
       final type = _jsonTypeName(value);
-      final atom = (value is num || value is bool || value is String)
-          ? value
-          : null;
-      final outVal = (value is List || value is Map)
-          ? jsonEncode(value)
-          : value;
+      final atom =
+          (value is num || value is bool || value is String) ? value : null;
+      final outVal =
+          (value is List || value is Map) ? jsonEncode(value) : value;
       out.add({
         'key': key,
         'value': outVal,
@@ -8462,9 +12267,8 @@ class Database {
       return null;
     }
     if (e is FunctionCallExpr) {
-      final args = e.args
-          .map((a) => _evalProjectedWithAggregates(a, grp, ctx))
-          .toList();
+      final args =
+          e.args.map((a) => _evalProjectedWithAggregates(a, grp, ctx)).toList();
       return FunctionCallExpr(
         e.name,
         args.map((v) => LiteralExpr(v) as Expr).toList(),
@@ -8802,6 +12606,44 @@ class Database {
           if (denom <= 0) return null;
           return sxy / denom;
         }
+      case 'VEC_SUM':
+      case 'VEC_AVG':
+        {
+          Float32List? acc;
+          var count = 0;
+          for (final v in _aggValues(e, grp)) {
+            if (v == null) continue;
+            Vector vec;
+            try {
+              vec = coerceVector(v)!;
+            } catch (_) {
+              throw StateError(
+                '${e.name} requires vector-coercible values, got ${v.runtimeType}',
+              );
+            }
+            if (acc == null) {
+              acc = Float32List.fromList(vec.values);
+            } else {
+              if (vec.dim != acc.length) {
+                throw StateError(
+                  '${e.name}: dim mismatch (${vec.dim} vs ${acc.length})',
+                );
+              }
+              for (var i = 0; i < acc.length; i++) {
+                acc[i] += vec.values[i];
+              }
+            }
+            count++;
+          }
+          if (acc == null || count == 0) return null;
+          if (e.name == 'VEC_AVG') {
+            final inv = 1.0 / count;
+            for (var i = 0; i < acc.length; i++) {
+              acc[i] *= inv;
+            }
+          }
+          return encodeVectorBlob(Vector(acc));
+        }
     }
     throw StateError('Unknown aggregate: ${e.name}');
   }
@@ -8974,9 +12816,8 @@ class Database {
               for (var i = k; i < ordered.length; i++) {
                 final v = ob.expr.eval(partRows[i]);
                 if (v is! num) break;
-                final inWindow = ob.descending
-                    ? v >= desired - 1e-12
-                    : v <= desired + 1e-12;
+                final inWindow =
+                    ob.descending ? v >= desired - 1e-12 : v <= desired + 1e-12;
                 if (inWindow) {
                   best = i;
                 } else {
@@ -8987,9 +12828,8 @@ class Database {
               for (var i = k; i >= 0; i--) {
                 final v = ob.expr.eval(partRows[i]);
                 if (v is! num) break;
-                final inWindow = ob.descending
-                    ? v <= desired + 1e-12
-                    : v >= desired - 1e-12;
+                final inWindow =
+                    ob.descending ? v <= desired + 1e-12 : v >= desired - 1e-12;
                 if (inWindow) {
                   best = i;
                 } else {
@@ -9162,9 +13002,8 @@ class Database {
             final offset = fn.args.length >= 2
                 ? (fn.args[1].eval(const {}) as num).toInt()
                 : 1;
-            final defaultVal = fn.args.length >= 3
-                ? fn.args[2].eval(const {})
-                : null;
+            final defaultVal =
+                fn.args.length >= 3 ? fn.args[2].eval(const {}) : null;
             for (var k = 0; k < ordered.length; k++) {
               final target = k + dir * offset;
               if (target < 0 || target >= ordered.length) {
@@ -9227,6 +13066,8 @@ class Database {
         case 'COVAR_POP':
         case 'COVAR_SAMP':
         case 'CORR':
+        case 'VEC_SUM':
+        case 'VEC_AVG':
           {
             for (var k = 0; k < ordered.length; k++) {
               final slice = frameRows(k);
@@ -9254,9 +13095,8 @@ class Database {
       throw StateError('Unknown window: ${spec.baseName}');
     }
     return WindowSpec(
-      partitionBy: spec.partitionBy.isNotEmpty
-          ? spec.partitionBy
-          : base.partitionBy,
+      partitionBy:
+          spec.partitionBy.isNotEmpty ? spec.partitionBy : base.partitionBy,
       orderBy: spec.orderBy.isNotEmpty ? spec.orderBy : base.orderBy,
       frame: spec.frame ?? base.frame,
     );
@@ -9364,9 +13204,8 @@ class Database {
         isStarArg: e.isStarArg,
         distinct: e.distinct,
         window: boundWindow,
-        filterExpr: e.filterExpr == null
-            ? null
-            : _bindExpr(e.filterExpr!, outerScope),
+        filterExpr:
+            e.filterExpr == null ? null : _bindExpr(e.filterExpr!, outerScope),
         aggOrderBy: e.aggOrderBy,
       );
     }
@@ -9401,9 +13240,8 @@ class Database {
         try {
           // Re-check synchronously; bypass the deferral path.
           for (final fk in _foreignKeysOf(t)) {
-            final values = fk.columns
-                .map((c) => d.row[t.columnIndex(c)])
-                .toList();
+            final values =
+                fk.columns.map((c) => d.row[t.columnIndex(c)]).toList();
             if (values.any((v) => v == null)) continue;
             final parent = _tables[fk.references.table];
             if (parent == null) {
@@ -9518,13 +13356,13 @@ class Database {
   // Introspection
   // ---------------------------------------------------------------------------
   QueryResult _showTables() => QueryResult(
-    columns: const ['name', 'kind'],
-    rows: [
-      ..._tables.keys.map((n) => <Object?>[n, 'TABLE']),
-      ..._views.keys.map((n) => <Object?>[n, 'VIEW']),
-    ],
-    affected: _tables.length + _views.length,
-  );
+        columns: const ['name', 'kind'],
+        rows: [
+          ..._tables.keys.map((n) => <Object?>[n, 'TABLE']),
+          ..._views.keys.map((n) => <Object?>[n, 'VIEW']),
+        ],
+        affected: _tables.length + _views.length,
+      );
 
   QueryResult _showDatabases() {
     final names = <String>['main'];
@@ -9537,23 +13375,21 @@ class Database {
 
   QueryResult _showCreateTable(String name) {
     final t = _requireTable(name);
-    final colDefs = t.columns
-        .map((c) {
-          final parts = <String>['`${c.name}`', dataTypeName(c.type)];
-          if (c.primaryKey) {
-            parts.add('PRIMARY KEY');
-            if (c.autoIncrement) parts.add('AUTOINCREMENT');
-          }
-          if (c.notNull) parts.add('NOT NULL');
-          if (c.unique && !c.primaryKey) parts.add('UNIQUE');
-          if (c.defaultValue != null) {
-            final v = c.defaultValue;
-            final lit = v is num ? v.toString() : "'$v'";
-            parts.add('DEFAULT $lit');
-          }
-          return '  ${parts.join(' ')}';
-        })
-        .join(',\n');
+    final colDefs = t.columns.map((c) {
+      final parts = <String>['`${c.name}`', dataTypeName(c.type)];
+      if (c.primaryKey) {
+        parts.add('PRIMARY KEY');
+        if (c.autoIncrement) parts.add('AUTOINCREMENT');
+      }
+      if (c.notNull) parts.add('NOT NULL');
+      if (c.unique && !c.primaryKey) parts.add('UNIQUE');
+      if (c.defaultValue != null) {
+        final v = c.defaultValue;
+        final lit = v is num ? v.toString() : "'$v'";
+        parts.add('DEFAULT $lit');
+      }
+      return '  ${parts.join(' ')}';
+    }).join(',\n');
     final ddl = 'CREATE TABLE `${t.name}` (\n$colDefs\n)';
     return QueryResult(
       columns: const ['Table', 'Create Table'],
@@ -9685,7 +13521,12 @@ class Database {
       final myId = nextId[0]++;
       final t = _tables[stmt.fromTable];
       String detail;
-      if (t == null) {
+      // V26: detect vector fast paths before falling into the generic
+      // index / scan detail.
+      final vec = _predictVectorPlanDetail(stmt);
+      if (vec != null) {
+        detail = vec;
+      } else if (t == null) {
         detail = 'SCAN ${stmt.fromTable}';
       } else if (stmt.where != null) {
         // Look for an index that covers any equality column in WHERE.
@@ -9719,6 +13560,93 @@ class Database {
     } else {
       out.add([nextId[0]++, parentId, 0, stmt.runtimeType.toString()]);
     }
+  }
+
+  /// V26: predict, without executing, whether [stmt] would be served by
+  /// a vector fast path and return the EXPLAIN detail string to emit.
+  /// Returns null when no vector fast path applies.
+  String? _predictVectorPlanDetail(SelectStmt stmt) {
+    if (stmt.fromTable == null) return null;
+    final tableLower = stmt.fromTable!.toLowerCase();
+
+    bool isVecFn(String name) {
+      const vecFns = {
+        'VEC_L2',
+        'VEC_L2SQ',
+        'VEC_IP',
+        'VEC_DOT',
+        'VEC_COSINE',
+        'VEC_DISTANCE_COSINE',
+      };
+      return vecFns.contains(name.toUpperCase());
+    }
+
+    _VectorIndexBinding? lookupBinding(String colName) {
+      final key = '$tableLower:${colName.toLowerCase()}';
+      return _vectorIndexes[key];
+    }
+
+    // V4 KNN shape: ORDER BY VEC_*(col, const) [ASC|DESC] LIMIT k.
+    if (stmt.limit != null &&
+        stmt.orderBy.length == 1 &&
+        stmt.groupBy.isEmpty &&
+        stmt.having == null) {
+      final ob = stmt.orderBy.single;
+      final e = ob.expr;
+      if (e is FunctionCallExpr && isVecFn(e.name) && e.args.length == 2) {
+        final col = e.args[0];
+        if (col is ColumnExpr) {
+          final b = lookupBinding(col.name);
+          if (b != null) {
+            final extras = <String>[];
+            if (stmt.where != null) extras.add('WITH FILTER');
+            if (b.spec.rescoreFactor > 1) extras.add('WITH RESCORE');
+            final suffix = extras.isEmpty ? '' : ' ${extras.join(' ')}';
+            return 'SEARCH ${stmt.fromTable} USING VECTOR INDEX '
+                '(${b.spec.kind.name})$suffix';
+          }
+        }
+      }
+    }
+
+    // V18 range shape: WHERE VEC_L2|L2SQ(col, const) op threshold ...
+    if (stmt.orderBy.isEmpty &&
+        stmt.limit == null &&
+        stmt.groupBy.isEmpty &&
+        stmt.where != null) {
+      FunctionCallExpr? findVecPred(Expr w) {
+        if (w is BinaryExpr) {
+          final op = w.op;
+          if (op == '<' || op == '<=') {
+            if (w.left is FunctionCallExpr) {
+              final f = w.left as FunctionCallExpr;
+              final u = f.name.toUpperCase();
+              if ((u == 'VEC_L2' || u == 'VEC_L2SQ') && f.args.length == 2) {
+                return f;
+              }
+            }
+          } else if (op.toUpperCase() == 'AND') {
+            return findVecPred(w.left) ?? findVecPred(w.right);
+          }
+        }
+        return null;
+      }
+
+      final f = findVecPred(stmt.where!);
+      if (f != null && f.args[0] is ColumnExpr) {
+        final col = f.args[0] as ColumnExpr;
+        final b = lookupBinding(col.name);
+        if (b != null &&
+            (b.spec.kind == VectorIndexKind.flat ||
+                b.spec.kind == VectorIndexKind.hnsw ||
+                b.spec.kind == VectorIndexKind.ivf)) {
+          return 'SEARCH ${stmt.fromTable} USING VECTOR INDEX '
+              '(${b.spec.kind.name}) RANGE';
+        }
+      }
+    }
+
+    return null;
   }
 
   /// Best-effort: pick an index whose first column appears in an equality
@@ -9839,6 +13767,8 @@ class Database {
       'index_info',
       'index_xinfo',
       'foreign_key_list',
+      'vector_index_stats',
+      'vector_analyze',
     };
     if (s.value != null && !introspectionWithArg.contains(name)) {
       _pragmas[name] = s.value;
@@ -9994,7 +13924,8 @@ class Database {
           final names = <String>{
             ...kScalarFunctions.keys,
             ...kAggregateFunctions,
-          }.toList()..sort();
+          }.toList()
+            ..sort();
           return QueryResult(
             columns: const ['name'],
             rows: [
@@ -10068,6 +13999,9 @@ class Database {
             'user_version',
             'wal_autocheckpoint',
             'wal_checkpoint',
+            'vector_index_list',
+            'vector_index_stats',
+            'vector_analyze',
           ];
           return QueryResult(
             columns: const ['name'],
@@ -10089,6 +14023,90 @@ class Database {
             columns: const ['schema', 'name', 'type', 'ncol', 'wr', 'strict'],
             rows: rows,
           );
+        }
+      case 'vector_index_list':
+        {
+          final rows = <List<Object?>>[];
+          for (final entry in _vectorIndexes.entries) {
+            final b = entry.value;
+            final spec = b.spec;
+            rows.add([
+              spec.table,
+              spec.column,
+              spec.dim,
+              spec.kind.name,
+              spec.metric.name,
+              b.index == null ? 0 : 1,
+              _vectorIndexLength(b.index),
+            ]);
+          }
+          return QueryResult(
+            columns: const [
+              'tbl',
+              'col',
+              'dim',
+              'kind',
+              'metric',
+              'built',
+              'n',
+            ],
+            rows: rows,
+          );
+        }
+      case 'vector_index_stats':
+        {
+          final rows = <List<Object?>>[];
+          for (final entry in _vectorIndexes.entries) {
+            final b = entry.value;
+            final spec = b.spec;
+            final tblCol = '${spec.table}.${spec.column}';
+            if (target != null &&
+                target.toLowerCase() != tblCol.toLowerCase()) {
+              continue;
+            }
+            final n = _vectorIndexLength(b.index);
+            final tomb = b.index is HnswIndex
+                ? (b.index as HnswIndex).tombstoneCount
+                : 0;
+            final live =
+                b.index is HnswIndex ? (b.index as HnswIndex).liveCount : n;
+            final approxBytes = n * spec.dim * 4; // float32 payload
+            rows.add([
+              spec.table,
+              spec.column,
+              spec.kind.name,
+              spec.metric.name,
+              spec.dim,
+              n,
+              live,
+              tomb,
+              approxBytes,
+            ]);
+          }
+          return QueryResult(
+            columns: const [
+              'tbl',
+              'col',
+              'kind',
+              'metric',
+              'dim',
+              'n',
+              'live',
+              'tombstones',
+              'approx_bytes',
+            ],
+            rows: rows,
+          );
+        }
+      case 'vector_analyze':
+        {
+          if (target == null) {
+            throw StateError(
+              'PRAGMA vector_analyze requires a target like '
+              "'tbl.col' or 'tbl.col:k:sample_size'.",
+            );
+          }
+          return _vectorAnalyze(target);
         }
       case 'optimize':
         {
@@ -10375,8 +14393,7 @@ class Database {
   }) {
     final fired = _triggersFor(table, event, timing).toList();
     if (fired.isEmpty) return;
-    final names =
-        columnNames ??
+    final names = columnNames ??
         (sourceTable == null
             ? const <String>[]
             : sourceTable.columns.map((c) => c.name).toList());
@@ -10665,8 +14682,7 @@ class Database {
     required int rowid,
     bool writable = false,
   }) {
-    final t =
-        _tables[table] ??
+    final t = _tables[table] ??
         _tables[table.toLowerCase()] ??
         _tables[table.toUpperCase()];
     if (t == null) {
@@ -10789,6 +14805,8 @@ class Database {
         // Promote the first column to INTEGER PRIMARY KEY (the rowid).
         cols[0] = ColumnDef(cols[0].name, DataType.integer, primaryKey: true);
         break;
+      case 'vector_index':
+        return _createVectorIndexVtab(s);
       default:
         throw StateError('Unsupported virtual-table module: $module');
     }
@@ -10799,6 +14817,137 @@ class Database {
     return QueryResult.message(
       'Virtual table ${s.name} (USING $module) created',
     );
+  }
+
+  /// Handle `CREATE VIRTUAL TABLE <name> USING vector_index(k1=v1, ...)`.
+  ///
+  /// Required args: `table`, `column`, `dim`. Optional: `kind`
+  /// (`flat` | `hnsw` | `ivf`, default `flat`), `metric` (`l2` | `l2sq` |
+  /// `ip` | `inner_product` | `cosine`, default `l2sq`), plus algorithm
+  /// params (`m`, `ef_construction`, `ef_search`, `nlist`, `nprobe`,
+  /// `seed`).
+  ///
+  /// The vtab name is a bookkeeping handle for `DROP TABLE`; the actual
+  /// index binding lives in [_vectorIndexes] keyed by `table:column`.
+  QueryResult _createVectorIndexVtab(CreateVirtualTableStmt s) {
+    final kv = _parseKvArgs(s.args);
+    final targetTable = kv['table'];
+    final targetCol = kv['column'];
+    final dimStr = kv['dim'];
+    if (targetTable == null || targetCol == null || dimStr == null) {
+      throw FormatException(
+        'vector_index requires table=, column=, dim= args',
+      );
+    }
+    final dim = int.tryParse(dimStr);
+    if (dim == null || dim <= 0) {
+      throw FormatException('vector_index: dim must be a positive integer');
+    }
+    final kind = _parseVectorKind(kv['kind'] ?? 'flat');
+    final metric = _parseVectorMetric(kv['metric'] ?? 'l2sq');
+    int intArg(String name, int fallback) {
+      final v = kv[name];
+      if (v == null) return fallback;
+      final n = int.tryParse(v);
+      if (n == null) {
+        throw FormatException('vector_index: $name must be integer');
+      }
+      return n;
+    }
+
+    final spec = VectorIndexSpec(
+      table: targetTable,
+      column: targetCol,
+      dim: dim,
+      kind: kind,
+      metric: metric,
+      m: intArg('m', 16),
+      efConstruction: intArg('ef_construction', 40),
+      efSearch: intArg('ef_search', 16),
+      nlist: intArg('nlist', 0),
+      nprobe: intArg('nprobe', 1),
+      nbits: intArg('nbits', 64),
+      rescoreFactor: intArg('rescore_factor', 1),
+      seed: intArg('seed', 1234),
+      filterColumns: _parseFilterCols(kv['filter_cols']),
+    );
+
+    // Reuse the existing Dart API — this validates table/column and
+    // rejects duplicate bindings.
+    createVectorIndex(spec);
+
+    // Bookkeeping placeholder table so DROP TABLE works and the vtab
+    // shows up in `sqlite_master`. Users don't query it directly.
+    _tables[s.name] = Table(s.name, const [
+      ColumnDef('__vector_index_placeholder', DataType.blob),
+    ]);
+    _vectorVtabToKey[s.name.toLowerCase()] =
+        '${targetTable.toLowerCase()}:${targetCol.toLowerCase()}';
+
+    return QueryResult.message(
+      'Vector index ${s.name} on $targetTable.$targetCol '
+      '(dim=$dim, kind=${kind.name}, metric=${metric.name}) created',
+    );
+  }
+
+  /// Split `key=value` arg strings into a lowercased-keys map. Trailing
+  /// / leading whitespace and single/double quotes on values are
+  /// stripped. Args without an `=` are ignored (matches how `fts5`
+  /// treats bare arg words).
+  Map<String, String> _parseKvArgs(List<String> args) {
+    final out = <String, String>{};
+    for (final a in args) {
+      final eq = a.indexOf('=');
+      if (eq < 0) continue;
+      final k = a.substring(0, eq).trim().toLowerCase();
+      var v = a.substring(eq + 1).trim();
+      if (v.length >= 2 &&
+          ((v.startsWith("'") && v.endsWith("'")) ||
+              (v.startsWith('"') && v.endsWith('"')))) {
+        v = v.substring(1, v.length - 1);
+      }
+      out[k] = v;
+    }
+    return out;
+  }
+
+  VectorIndexKind _parseVectorKind(String s) {
+    switch (s.toLowerCase()) {
+      case 'flat':
+        return VectorIndexKind.flat;
+      case 'hnsw':
+        return VectorIndexKind.hnsw;
+      case 'ivf':
+      case 'ivf_flat':
+        return VectorIndexKind.ivf;
+      case 'lsh':
+        return VectorIndexKind.lsh;
+      case 'pq':
+        return VectorIndexKind.pq;
+      case 'ivfpq':
+      case 'ivf_pq':
+        return VectorIndexKind.ivfPq;
+      default:
+        throw FormatException('vector_index: unknown kind "$s"');
+    }
+  }
+
+  VectorMetric _parseVectorMetric(String s) {
+    switch (s.toLowerCase()) {
+      case 'l2':
+        return VectorMetric.l2;
+      case 'l2sq':
+      case 'l2_sq':
+        return VectorMetric.l2sq;
+      case 'ip':
+      case 'inner_product':
+      case 'dot':
+        return VectorMetric.innerProduct;
+      case 'cosine':
+        return VectorMetric.cosine;
+      default:
+        throw FormatException('vector_index: unknown metric "$s"');
+    }
   }
 
   /// ANALYZE: populate (or refresh) a synthetic `sqlite_stat1` table with
@@ -10834,9 +14983,8 @@ class Database {
         (c) => c.primaryKey && c.type == DataType.integer,
         orElse: () => const ColumnDef('', DataType.any),
       );
-      final pkShadowName = pkIntCol.name.isEmpty
-          ? null
-          : '${e.key}__${pkIntCol.name}';
+      final pkShadowName =
+          pkIntCol.name.isEmpty ? null : '${e.key}__${pkIntCol.name}';
 
       // Sample per-index distinct counts.
       final distinct = <String, int>{};
@@ -10870,21 +15018,203 @@ class Database {
   // ---------------------------------------------------------------------------
   // Persistence
   // ---------------------------------------------------------------------------
-  Future<void> _persist() async {
+  /// V37: serialise persist calls through a Future chain so overlapping
+  /// invocations (TVFs calling `_persist()` mid-SELECT vs
+  /// `warmVectorIndexes()` or `flush()` running from another await
+  /// point) don't race on the `.tmp` file underlying `_atomicWriteBytes`.
+  /// The chain never re-throws — each call awaits its own future
+  /// directly and any error from a prior call is swallowed here to
+  /// stop it from cascading into unrelated callers.
+  Future<void> _persistChain = Future.value();
+
+  Future<void> _persist() {
+    final next = _persistChain.then((_) => _persistLocked());
+    _persistChain = next.catchError((_) {});
+    return next;
+  }
+
+  Future<void> _persistLocked() async {
     if (path == null) return;
     if (_persistAsSqlite) {
       await _persistSqlite();
+      await _persistVectorIndexSidecar();
       return;
     }
     final out = <String, Object?>{
       '__schema__': 2,
       'tables': {for (final e in _tables.entries) e.key: e.value.toJson()},
       'views': {for (final e in _viewSql.entries) e.key: e.value},
+      if (_vectorIndexes.isNotEmpty)
+        'vector_indexes': [
+          for (final e in _vectorIndexes.entries)
+            _vectorIndexToJson(e.key, e.value),
+        ],
     };
     await _atomicWriteBytes(
       path!,
       Uint8List.fromList(utf8.encode(jsonEncode(out))),
     );
+  }
+
+  /// Sidecar for the SQLite-format backend: writes vector-index specs +
+  /// built state to `<path>.vec.json`. Cleaned up when the binding
+  /// registry is empty. No-op on the JSON backend, which already writes
+  /// vector indexes inline into the main file.
+  Future<void> _persistVectorIndexSidecar() async {
+    if (path == null) return;
+    final sidecarPath = '${path!}.vec.json';
+    final f = File(sidecarPath);
+    if (_vectorIndexes.isEmpty) {
+      if (await f.exists()) {
+        try {
+          await f.delete();
+        } catch (_) {}
+      }
+      return;
+    }
+    final out = <String, Object?>{
+      '__schema__': 1,
+      'vector_indexes': [
+        for (final e in _vectorIndexes.entries)
+          _vectorIndexToJson(e.key, e.value),
+      ],
+    };
+    await _atomicWriteBytes(
+      sidecarPath,
+      Uint8List.fromList(utf8.encode(jsonEncode(out))),
+    );
+  }
+
+  /// Load vector-index specs from `<path>.vec.json` if it exists. Used
+  /// by the SQLite-format load path to complete parity with the JSON
+  /// backend's inline `vector_indexes` block.
+  Future<void> _loadVectorIndexSidecar() async {
+    if (path == null) return;
+    final sidecarPath = '${path!}.vec.json';
+    final f = File(sidecarPath);
+    if (!await f.exists()) return;
+    try {
+      final text = await f.readAsString();
+      final data = jsonDecode(text);
+      if (data is! Map) return;
+      final vecs = (data['vector_indexes'] as List?)?.cast<Object?>();
+      if (vecs == null) return;
+      for (final v in vecs) {
+        if (v is! Map) continue;
+        try {
+          _vectorIndexFromJson(v.cast<String, Object?>());
+        } catch (_) {}
+      }
+    } catch (_) {
+      // Best-effort; a corrupt sidecar shouldn't block opening the DB.
+    }
+  }
+
+  /// Serialize one `_vectorIndexes` entry. Also stashes the associated
+  /// vtab name (if any) so `DROP TABLE <vtab>` still cascades after a
+  /// reopen.
+  Map<String, Object?> _vectorIndexToJson(
+    String bindingKey,
+    _VectorIndexBinding b,
+  ) {
+    // V29: fold any pending paged deltas into the built index before
+    // serialising so a close+reopen doesn't drop the mutations.
+    if (b.index != null &&
+        (b.pendingPagedInserts.isNotEmpty ||
+            b.pendingPagedRefreshes.isNotEmpty ||
+            b.pendingPagedDeletes.isNotEmpty)) {
+      _applyPendingPagedDeltas(b);
+    }
+    String? vtab;
+    for (final e in _vectorVtabToKey.entries) {
+      if (e.value == bindingKey) {
+        vtab = e.key;
+        break;
+      }
+    }
+    final spec = b.spec;
+    final built = b.index == null
+        ? null
+        : vectorIndexBuiltStateToJson(b.index!, seed: spec.seed);
+    return {
+      if (vtab != null) 'vtab': vtab,
+      'table': spec.table,
+      'column': spec.column,
+      'dim': spec.dim,
+      'kind': spec.kind.name,
+      'metric': spec.metric.name,
+      'm': spec.m,
+      'efConstruction': spec.efConstruction,
+      'efSearch': spec.efSearch,
+      'nlist': spec.nlist,
+      'nprobe': spec.nprobe,
+      'nbits': spec.nbits,
+      'rescoreFactor': spec.rescoreFactor,
+      'seed': spec.seed,
+      if (spec.filterColumns.isNotEmpty) 'filterColumns': spec.filterColumns,
+      if (built != null) 'built': built,
+      if (b.index != null) 'builtRowCount': b.builtRowCount,
+    };
+  }
+
+  /// Reverse of [_vectorIndexToJson]. Malformed entries throw so
+  /// [_load]'s caller can skip them.
+  void _vectorIndexFromJson(Map<String, Object?> j) {
+    final kindStr = j['kind'] as String? ?? 'flat';
+    final metricStr = j['metric'] as String? ?? 'l2sq';
+    final spec = VectorIndexSpec(
+      table: j['table'] as String,
+      column: j['column'] as String,
+      dim: (j['dim'] as num).toInt(),
+      kind: VectorIndexKind.values.firstWhere(
+        (k) => k.name == kindStr,
+        orElse: () => VectorIndexKind.flat,
+      ),
+      metric: VectorMetric.values.firstWhere(
+        (m) => m.name == metricStr,
+        orElse: () => VectorMetric.l2sq,
+      ),
+      m: (j['m'] as num?)?.toInt() ?? 16,
+      efConstruction: (j['efConstruction'] as num?)?.toInt() ?? 40,
+      efSearch: (j['efSearch'] as num?)?.toInt() ?? 16,
+      nlist: (j['nlist'] as num?)?.toInt() ?? 0,
+      nprobe: (j['nprobe'] as num?)?.toInt() ?? 1,
+      nbits: (j['nbits'] as num?)?.toInt() ?? 64,
+      rescoreFactor: (j['rescoreFactor'] as num?)?.toInt() ?? 1,
+      seed: (j['seed'] as num?)?.toInt() ?? 1234,
+      filterColumns:
+          (j['filterColumns'] as List?)?.cast<String>() ?? const <String>[],
+    );
+    final key = '${spec.table.toLowerCase()}:${spec.column.toLowerCase()}';
+    final binding = _VectorIndexBinding(spec);
+    // Restore built state if present. On any deserialization error,
+    // silently fall back to lazy rebuild on next query.
+    final built = j['built'];
+    if (built is Map) {
+      try {
+        binding.index =
+            vectorIndexBuiltStateFromJson(spec, built.cast<String, Object?>());
+      } catch (_) {
+        binding.index = null;
+      }
+    }
+    // Sync `builtRowCount` to the persisted value so V21's catch-up
+    // loop doesn't re-add the rows already baked into the deserialized
+    // index. Older persisted JSON without this field falls back to the
+    // index's own entry count.
+    if (binding.index != null) {
+      final persisted = (j['builtRowCount'] as num?)?.toInt();
+      binding.builtRowCount = persisted ?? _vectorIndexLength(binding.index);
+    }
+    _vectorIndexes[key] = binding;
+    // V36: mark payload index for lazy rebuild on next query.
+    if (spec.filterColumns.isNotEmpty) {
+      binding.payloadIndexDirty = true;
+    }
+    final vtab = j['vtab'] as String?;
+    if (vtab != null) {
+      _vectorVtabToKey[vtab.toLowerCase()] = key;
+    }
   }
 
   /// Crash-safe write: writes to `<dest>.tmp`, fsyncs the temp file's
@@ -10948,7 +15278,12 @@ class Database {
   /// write that never made it to the rename step — discard it.
   Future<void> _reapStaleTempFiles() async {
     if (path == null) return;
-    for (final p in ['$path.tmp', '${path!}-wal.tmp', '${path!}-wal2.tmp']) {
+    for (final p in [
+      '$path.tmp',
+      '${path!}-wal.tmp',
+      '${path!}-wal2.tmp',
+      '${path!}.vec.json.tmp',
+    ]) {
       final f = File(p);
       if (await f.exists()) {
         try {
@@ -10977,8 +15312,7 @@ class Database {
     final walPath = '${path!}-wal';
     final wal2Path = '${path!}-wal2';
     final ps = _sqlitePageSize;
-    final canDiff =
-        baseline != null &&
+    final canDiff = baseline != null &&
         baseline.length % ps == 0 &&
         current.length % ps == 0 &&
         current.length >= baseline.length;
@@ -11152,6 +15486,11 @@ class Database {
         }
         _sqliteBaselineBytes = Uint8List.fromList(raw);
         _persistAsSqlite = true;
+        // Restore vector-index bindings BEFORE `importSqlite` replays
+        // DDL/DML — otherwise each replayed mutation would trigger a
+        // `_persist()` that overwrites the sidecar with an empty
+        // `_vectorIndexes` map.
+        await _loadVectorIndexSidecar();
         await importSqlite(path!);
         // The reissued CREATE/INSERTs above will have produced one or
         // more incremental WAL writes against our baseline. Drop any
@@ -11190,6 +15529,17 @@ class Database {
             }
           } catch (_) {
             // Best-effort: skip views we can no longer parse.
+          }
+        }
+      }
+      final vecs = (data['vector_indexes'] as List?)?.cast<Object?>();
+      if (vecs != null) {
+        for (final v in vecs) {
+          if (v is! Map) continue;
+          try {
+            _vectorIndexFromJson(v.cast<String, Object?>());
+          } catch (_) {
+            // Best-effort: skip malformed entries.
           }
         }
       }
@@ -11277,9 +15627,8 @@ class Database {
         final pkCols = pkOrder; // already PK-first
         final pkColCount = _pkColumnCount(t);
         final pkColIdxs = pkCols.take(pkColCount).toList();
-        final pkColNamesLower = pkColIdxs
-            .map((i) => t.columns[i].name.toLowerCase())
-            .toSet();
+        final pkColNamesLower =
+            pkColIdxs.map((i) => t.columns[i].name.toLowerCase()).toSet();
         for (final ix in t.indexDefs.values) {
           // Expression-index branch (WITHOUT ROWID): single-key entry is
           // [exprValue, ...PK columns].
@@ -11294,9 +15643,8 @@ class Database {
                 for (final ci in pkColIdxs) _toSqliteValue(r[ci]),
               ]);
             }
-            final whereTail = ix.whereSql == null
-                ? ''
-                : ' WHERE ${ix.whereSql}';
+            final whereTail =
+                ix.whereSql == null ? '' : ' WHERE ${ix.whereSql}';
             indexes.add(
               SqliteWriteIndex(
                 name: ix.name,
@@ -11350,8 +15698,7 @@ class Database {
             SqliteWriteIndex(
               name: ix.name,
               tableName: name,
-              createSql:
-                  'CREATE ${ix.unique ? "UNIQUE " : ""}INDEX ${ix.name} '
+              createSql: 'CREATE ${ix.unique ? "UNIQUE " : ""}INDEX ${ix.name} '
                   'ON $name($colList)$whereTail',
               entries: entries,
             ),
@@ -11412,8 +15759,7 @@ class Database {
             SqliteWriteIndex(
               name: ix.name,
               tableName: name,
-              createSql:
-                  'CREATE ${ix.unique ? "UNIQUE " : ""}INDEX ${ix.name} '
+              createSql: 'CREATE ${ix.unique ? "UNIQUE " : ""}INDEX ${ix.name} '
                   'ON $name(${ix.exprSql})$whereTail',
               entries: entries,
             ),
@@ -11460,8 +15806,7 @@ class Database {
           SqliteWriteIndex(
             name: ix.name,
             tableName: name,
-            createSql:
-                'CREATE ${ix.unique ? "UNIQUE " : ""}INDEX ${ix.name} '
+            createSql: 'CREATE ${ix.unique ? "UNIQUE " : ""}INDEX ${ix.name} '
                 'ON $name($colList)$whereTail',
             entries: entries,
           ),
@@ -12045,8 +16390,7 @@ class Database {
     var applied = 0;
     return _lock.write(() async {
       for (final c in changes) {
-        final t =
-            _tables[c.table] ??
+        final t = _tables[c.table] ??
             _tables[c.table.toLowerCase()] ??
             _tables[c.table.toUpperCase()];
         if (t == null) {
@@ -12317,12 +16661,12 @@ class _IndexPlan {
     required this.column,
     required Object equalityKey,
     required this.estHits,
-  }) : equalityKeys = [equalityKey],
-       prefixKey = null,
-       lo = null,
-       hi = null,
-       loInclusive = false,
-       hiInclusive = false;
+  })  : equalityKeys = [equalityKey],
+        prefixKey = null,
+        lo = null,
+        hi = null,
+        loInclusive = false,
+        hiInclusive = false;
 
   _IndexPlan.equalityList({
     required this.table,
@@ -12330,11 +16674,11 @@ class _IndexPlan {
     required this.column,
     required this.equalityKeys,
     required this.estHits,
-  }) : prefixKey = null,
-       lo = null,
-       hi = null,
-       loInclusive = false,
-       hiInclusive = false;
+  })  : prefixKey = null,
+        lo = null,
+        hi = null,
+        loInclusive = false,
+        hiInclusive = false;
 
   _IndexPlan.range({
     required this.table,
@@ -12345,8 +16689,8 @@ class _IndexPlan {
     required this.loInclusive,
     required this.hiInclusive,
     required this.estHits,
-  }) : equalityKeys = null,
-       prefixKey = null;
+  })  : equalityKeys = null,
+        prefixKey = null;
 
   _IndexPlan.prefix({
     required this.table,
@@ -12354,11 +16698,11 @@ class _IndexPlan {
     required this.column,
     required this.prefixKey,
     required this.estHits,
-  }) : equalityKeys = null,
-       lo = null,
-       hi = null,
-       loInclusive = false,
-       hiInclusive = false;
+  })  : equalityKeys = null,
+        lo = null,
+        hi = null,
+        loInclusive = false,
+        hiInclusive = false;
 
   /// Hybrid plan: equality prefix over the leading K of N indexed
   /// columns, then a range constraint on column K+1.

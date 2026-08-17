@@ -7,6 +7,7 @@ import 'dart:typed_data';
 
 import 'fts5.dart';
 import 'schema.dart';
+import 'vector.dart';
 
 abstract class Expr {
   /// Evaluate this expression in the context of [row] (column name -> value).
@@ -40,10 +41,10 @@ class BindParamExpr extends Expr {
   final String spelling;
 
   BindParamExpr({this.index, this.name, required this.spelling})
-    : assert(
-        (index == null) != (name == null),
-        'Exactly one of index/name must be set',
-      );
+      : assert(
+          (index == null) != (name == null),
+          'Exactly one of index/name must be set',
+        );
 
   static final List<BindScope> scopeStack = <BindScope>[];
 
@@ -837,10 +838,10 @@ String _sqlitePrintf(String fmt, List<Object?> args) {
         body = v == null
             ? ''
             : (v is num
-                  ? String.fromCharCode(v.toInt())
-                  : v.toString().isEmpty
-                  ? ''
-                  : v.toString()[0]);
+                ? String.fromCharCode(v.toInt())
+                : v.toString().isEmpty
+                    ? ''
+                    : v.toString()[0]);
         break;
       case 's':
         final v = nextArg();
@@ -954,26 +955,26 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
   'UPPER': (a) => _propagateNull(a, () => a[0].toString().toUpperCase()),
   'LOWER': (a) => _propagateNull(a, () => a[0].toString().toLowerCase()),
   'LENGTH': (a) => _propagateNull(a, () {
-    final v = a[0]!;
-    // SQLite: LENGTH on a BLOB is the byte count, on TEXT the
-    // character count.
-    if (v is List<int>) return v.length;
-    return v.toString().length;
-  }),
+        final v = a[0]!;
+        // SQLite: LENGTH on a BLOB is the byte count, on TEXT the
+        // character count.
+        if (v is List<int>) return v.length;
+        return v.toString().length;
+      }),
   'CHAR_LENGTH': (a) => kScalarFunctions['LENGTH']!(a),
   'CHARACTER_LENGTH': (a) => kScalarFunctions['LENGTH']!(a),
   // OCTET_LENGTH: UTF-8 byte length for text, byte length for blobs.
   'OCTET_LENGTH': (a) => _propagateNull(a, () {
-    final v = a[0]!;
-    if (v is List<int>) return v.length;
-    return utf8.encode(v.toString()).length;
-  }),
+        final v = a[0]!;
+        if (v is List<int>) return v.length;
+        return utf8.encode(v.toString()).length;
+      }),
   // BIT_LENGTH: OCTET_LENGTH * 8.
   'BIT_LENGTH': (a) => _propagateNull(a, () {
-    final v = a[0]!;
-    if (v is List<int>) return v.length * 8;
-    return utf8.encode(v.toString()).length * 8;
-  }),
+        final v = a[0]!;
+        if (v is List<int>) return v.length * 8;
+        return utf8.encode(v.toString()).length * 8;
+      }),
   // LEAST(a, b, ...) -- smallest non-NULL value; returns NULL if all NULL.
   'LEAST': (a) {
     Object? best;
@@ -994,13 +995,13 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
   },
   'TRIM': (a) => _propagateNull(a, () => a[0].toString().trim()),
   'LTRIM': (a) => _propagateNull(
-    a,
-    () => a[0].toString().replaceFirst(RegExp(r'^\s+'), ''),
-  ),
+        a,
+        () => a[0].toString().replaceFirst(RegExp(r'^\s+'), ''),
+      ),
   'RTRIM': (a) => _propagateNull(
-    a,
-    () => a[0].toString().replaceFirst(RegExp(r'\s+$'), ''),
-  ),
+        a,
+        () => a[0].toString().replaceFirst(RegExp(r'\s+$'), ''),
+      ),
   'SUBSTR': (a) {
     if (a.isEmpty || a[0] == null) return null;
     final s = a[0].toString();
@@ -1021,18 +1022,18 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
   'SUBSTRING': (a) => kScalarFunctions['SUBSTR']!(a),
   // LEFT(s, n) -- first n characters.
   'LEFT': (a) => _propagateNull(a, () {
-    final s = a[0].toString();
-    final n = (a[1] as num).toInt();
-    if (n <= 0) return '';
-    return n >= s.length ? s : s.substring(0, n);
-  }),
+        final s = a[0].toString();
+        final n = (a[1] as num).toInt();
+        if (n <= 0) return '';
+        return n >= s.length ? s : s.substring(0, n);
+      }),
   // RIGHT(s, n) -- last n characters.
   'RIGHT': (a) => _propagateNull(a, () {
-    final s = a[0].toString();
-    final n = (a[1] as num).toInt();
-    if (n <= 0) return '';
-    return n >= s.length ? s : s.substring(s.length - n);
-  }),
+        final s = a[0].toString();
+        final n = (a[1] as num).toInt();
+        if (n <= 0) return '';
+        return n >= s.length ? s : s.substring(s.length - n);
+      }),
   // POSITION(needle IN haystack) is parsed as POSITION(needle, haystack)
   // here; returns 1-based index, 0 when not found, NULL on NULL input.
   'POSITION': (a) {
@@ -1052,64 +1053,63 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     final s = a[0].toString();
     final repl = a[1].toString();
     final start = (a[2] as num).toInt();
-    final length = a.length >= 4 && a[3] != null
-        ? (a[3] as num).toInt()
-        : repl.length;
+    final length =
+        a.length >= 4 && a[3] != null ? (a[3] as num).toInt() : repl.length;
     final idx = (start - 1).clamp(0, s.length);
     final endIdx = (idx + length).clamp(0, s.length);
     return s.substring(0, idx) + repl + s.substring(endIdx);
   },
   // REVERSE(s) -- reverses a string by Unicode code points.
   'REVERSE': (a) => _propagateNull(a, () {
-    final s = a[0].toString();
-    return String.fromCharCodes(s.runes.toList().reversed);
-  }),
+        final s = a[0].toString();
+        return String.fromCharCodes(s.runes.toList().reversed);
+      }),
   // REPEAT(s, n) -- string repetition; negative or zero count returns ''.
   'REPEAT': (a) => _propagateNull(a, () {
-    final s = a[0].toString();
-    final n = (a[1] as num).toInt();
-    if (n <= 0) return '';
-    return s * n;
-  }),
+        final s = a[0].toString();
+        final n = (a[1] as num).toInt();
+        if (n <= 0) return '';
+        return s * n;
+      }),
   // ASCII(s) -- code point of the first character. SQLite returns the
   // codepoint of the first UTF-8 byte in the input; we mirror Dart's
   // String.codeUnitAt(0) which is the UTF-16 code unit, equivalent for
   // ASCII inputs.
   'ASCII': (a) => _propagateNull(a, () {
-    final s = a[0].toString();
-    return s.isEmpty ? null : s.codeUnitAt(0);
-  }),
+        final s = a[0].toString();
+        return s.isEmpty ? null : s.codeUnitAt(0);
+      }),
   // CHR(n) -- single-character string from a Unicode codepoint.
   'CHR': (a) => _propagateNull(a, () {
-    return String.fromCharCode((a[0] as num).toInt());
-  }),
+        return String.fromCharCode((a[0] as num).toInt());
+      }),
   // SPACE(n) -- string of n spaces.
   'SPACE': (a) => _propagateNull(a, () {
-    final n = (a[0] as num).toInt();
-    return n <= 0 ? '' : ' ' * n;
-  }),
+        final n = (a[0] as num).toInt();
+        return n <= 0 ? '' : ' ' * n;
+      }),
   // INITCAP(s) -- title-case each whitespace-separated word.
   'INITCAP': (a) => _propagateNull(a, () {
-    final s = a[0].toString();
-    if (s.isEmpty) return s;
-    final out = StringBuffer();
-    var nextUpper = true;
-    for (var i = 0; i < s.length; i++) {
-      final c = s[i];
-      if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
-        out.write(c);
-        nextUpper = true;
-        continue;
-      }
-      out.write(nextUpper ? c.toUpperCase() : c.toLowerCase());
-      nextUpper = false;
-    }
-    return out.toString();
-  }),
+        final s = a[0].toString();
+        if (s.isEmpty) return s;
+        final out = StringBuffer();
+        var nextUpper = true;
+        for (var i = 0; i < s.length; i++) {
+          final c = s[i];
+          if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+            out.write(c);
+            nextUpper = true;
+            continue;
+          }
+          out.write(nextUpper ? c.toUpperCase() : c.toLowerCase());
+          nextUpper = false;
+        }
+        return out.toString();
+      }),
   'REPLACE': (a) => _propagateNull(
-    a,
-    () => a[0].toString().replaceAll(a[1].toString(), a[2].toString()),
-  ),
+        a,
+        () => a[0].toString().replaceAll(a[1].toString(), a[2].toString()),
+      ),
   'CONCAT': (a) => a.map((v) => v ?? '').join(),
   // CONCAT_WS(sep, args...) — joins non-NULL args with the given separator.
   // If sep is NULL, returns NULL (matches MySQL/PostgreSQL semantics).
@@ -1169,20 +1169,20 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
   'CEIL': (a) => _propagateNull(a, () => (a[0] as num).ceil()),
   'CEILING': (a) => _propagateNull(a, () => (a[0] as num).ceil()),
   'SQRT': (a) => _propagateNull(a, () {
-    final v = (a[0] as num).toDouble();
-    if (v < 0) return null;
-    return _sqrt(v);
-  }),
+        final v = (a[0] as num).toDouble();
+        if (v < 0) return null;
+        return _sqrt(v);
+      }),
   'POWER': (a) => _propagateNull(
-    a,
-    () => _intPow((a[0] as num).toDouble(), (a[1] as num).toDouble()),
-  ),
+        a,
+        () => _intPow((a[0] as num).toDouble(), (a[1] as num).toDouble()),
+      ),
   'POW': (a) => kScalarFunctions['POWER']!(a),
   'SIGN': (a) => _propagateNull(a, () {
-    final v = (a[0] as num).toDouble();
-    if (v == 0) return 0;
-    return v > 0 ? 1 : -1;
-  }),
+        final v = (a[0] as num).toDouble();
+        if (v == 0) return 0;
+        return v > 0 ? 1 : -1;
+      }),
   // SQLite 3.35+ math functions. All operate in double precision and
   // return NULL on NULL input. Domain errors (e.g. LN(0), SQRT(-1))
   // return NULL to match SQLite.
@@ -1197,31 +1197,31 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     final truthy = c is bool
         ? c
         : c is num
-        ? c != 0
-        : c != null;
+            ? c != 0
+            : c != null;
     return truthy ? a[1] : a[2];
   },
   'CBRT': (a) => _propagateNull(a, () {
-    final v = (a[0] as num).toDouble();
-    if (v < 0) return -math.pow(-v, 1 / 3).toDouble();
-    return math.pow(v, 1 / 3).toDouble();
-  }),
+        final v = (a[0] as num).toDouble();
+        if (v < 0) return -math.pow(-v, 1 / 3).toDouble();
+        return math.pow(v, 1 / 3).toDouble();
+      }),
   'EXP': (a) => _propagateNull(a, () => math.exp((a[0] as num).toDouble())),
   'LN': (a) => _propagateNull(a, () {
-    final v = (a[0] as num).toDouble();
-    if (v <= 0) return null;
-    return math.log(v);
-  }),
+        final v = (a[0] as num).toDouble();
+        if (v <= 0) return null;
+        return math.log(v);
+      }),
   'LOG10': (a) => _propagateNull(a, () {
-    final v = (a[0] as num).toDouble();
-    if (v <= 0) return null;
-    return math.log(v) / math.ln10;
-  }),
+        final v = (a[0] as num).toDouble();
+        if (v <= 0) return null;
+        return math.log(v) / math.ln10;
+      }),
   'LOG2': (a) => _propagateNull(a, () {
-    final v = (a[0] as num).toDouble();
-    if (v <= 0) return null;
-    return math.log(v) / math.ln2;
-  }),
+        final v = (a[0] as num).toDouble();
+        if (v <= 0) return null;
+        return math.log(v) / math.ln2;
+      }),
   // LOG(x) == LOG10(x); LOG(b, x) == log base b of x (SQLite semantics).
   'LOG': (a) {
     if (a.isEmpty || a[0] == null) return null;
@@ -1240,60 +1240,60 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
   'COS': (a) => _propagateNull(a, () => math.cos((a[0] as num).toDouble())),
   'TAN': (a) => _propagateNull(a, () => math.tan((a[0] as num).toDouble())),
   'COT': (a) => _propagateNull(a, () {
-    final t = math.tan((a[0] as num).toDouble());
-    if (t == 0) return null;
-    return 1.0 / t;
-  }),
+        final t = math.tan((a[0] as num).toDouble());
+        if (t == 0) return null;
+        return 1.0 / t;
+      }),
   'ACOT': (a) => _propagateNull(a, () {
-    final v = (a[0] as num).toDouble();
-    if (v == 0) return math.pi / 2;
-    return math.atan(1.0 / v);
-  }),
+        final v = (a[0] as num).toDouble();
+        if (v == 0) return math.pi / 2;
+        return math.atan(1.0 / v);
+      }),
   'ASIN': (a) => _propagateNull(a, () {
-    final v = (a[0] as num).toDouble();
-    if (v < -1 || v > 1) return null;
-    return math.asin(v);
-  }),
+        final v = (a[0] as num).toDouble();
+        if (v < -1 || v > 1) return null;
+        return math.asin(v);
+      }),
   'ACOS': (a) => _propagateNull(a, () {
-    final v = (a[0] as num).toDouble();
-    if (v < -1 || v > 1) return null;
-    return math.acos(v);
-  }),
+        final v = (a[0] as num).toDouble();
+        if (v < -1 || v > 1) return null;
+        return math.acos(v);
+      }),
   'ATAN': (a) => _propagateNull(a, () => math.atan((a[0] as num).toDouble())),
   'ATAN2': (a) => _propagateNull(
-    a,
-    () => math.atan2((a[0] as num).toDouble(), (a[1] as num).toDouble()),
-  ),
+        a,
+        () => math.atan2((a[0] as num).toDouble(), (a[1] as num).toDouble()),
+      ),
   'SINH': (a) => _propagateNull(a, () {
-    final x = (a[0] as num).toDouble();
-    return (math.exp(x) - math.exp(-x)) / 2;
-  }),
+        final x = (a[0] as num).toDouble();
+        return (math.exp(x) - math.exp(-x)) / 2;
+      }),
   'COSH': (a) => _propagateNull(a, () {
-    final x = (a[0] as num).toDouble();
-    return (math.exp(x) + math.exp(-x)) / 2;
-  }),
+        final x = (a[0] as num).toDouble();
+        return (math.exp(x) + math.exp(-x)) / 2;
+      }),
   'TANH': (a) => _propagateNull(a, () {
-    final x = (a[0] as num).toDouble();
-    if (x > 20) return 1.0;
-    if (x < -20) return -1.0;
-    final ep = math.exp(x);
-    final en = math.exp(-x);
-    return (ep - en) / (ep + en);
-  }),
+        final x = (a[0] as num).toDouble();
+        if (x > 20) return 1.0;
+        if (x < -20) return -1.0;
+        final ep = math.exp(x);
+        final en = math.exp(-x);
+        return (ep - en) / (ep + en);
+      }),
   'ASINH': (a) => _propagateNull(a, () {
-    final x = (a[0] as num).toDouble();
-    return math.log(x + math.sqrt(x * x + 1));
-  }),
+        final x = (a[0] as num).toDouble();
+        return math.log(x + math.sqrt(x * x + 1));
+      }),
   'ACOSH': (a) => _propagateNull(a, () {
-    final x = (a[0] as num).toDouble();
-    if (x < 1) return null;
-    return math.log(x + math.sqrt(x * x - 1));
-  }),
+        final x = (a[0] as num).toDouble();
+        if (x < 1) return null;
+        return math.log(x + math.sqrt(x * x - 1));
+      }),
   'ATANH': (a) => _propagateNull(a, () {
-    final x = (a[0] as num).toDouble();
-    if (x <= -1 || x >= 1) return null;
-    return 0.5 * math.log((1 + x) / (1 - x));
-  }),
+        final x = (a[0] as num).toDouble();
+        if (x <= -1 || x >= 1) return null;
+        return 0.5 * math.log((1 + x) / (1 - x));
+      }),
   'RADIANS': (a) =>
       _propagateNull(a, () => (a[0] as num).toDouble() * math.pi / 180),
   'DEGREES': (a) =>
@@ -1599,10 +1599,10 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
   },
   // ---- JSON1 (minimal) -----------------------------------------------------
   'JSON': (a) => _propagateNull(a, () {
-    // Validate + reformat (canonical JSON encoding).
-    final v = jsonDecode(a[0].toString());
-    return jsonEncode(v);
-  }),
+        // Validate + reformat (canonical JSON encoding).
+        final v = jsonDecode(a[0].toString());
+        return jsonEncode(v);
+      }),
   'JSON_VALID': (a) {
     if (a.isEmpty || a[0] == null) return 0;
     try {
@@ -1772,14 +1772,14 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
   'TOTAL_CHANGES': (a) => connStateLookup?.call('total_changes') ?? 0,
   // bit_count(x): population count (number of set bits in integer x).
   'BIT_COUNT': (a) => _propagateNull(a, () {
-    var v = (a[0] as num).toInt();
-    var c = 0;
-    while (v != 0) {
-      c += v & 1;
-      v = v >>> 1;
-    }
-    return c;
-  }),
+        var v = (a[0] as num).toInt();
+        var c = 0;
+        while (v != 0) {
+          c += v & 1;
+          v = v >>> 1;
+        }
+        return c;
+      }),
   // load_extension/sqlite_log: present for compatibility but no-op.
   'LOAD_EXTENSION': (a) => null,
   'SQLITE_LOG': (a) => null,
@@ -2000,6 +2000,129 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     return _resolveDateTime([a[0]]) == null
         ? null
         : _fmtDateTime(_resolveDateTime([a[0]])!, full: true);
+  },
+  // ---- Vector / embedding functions (FAISS-style) -----------------------
+  // Constructor: TEXT '[1,2,3]' or BLOB / List -> canonical vector BLOB.
+  'VEC': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final v = coerceVector(a[0]);
+    return v == null ? null : encodeVectorBlob(v);
+  },
+  'VEC_F32': (a) => kScalarFunctions['VEC']!(a),
+  // VEC_DIM(v) -> INTEGER dimension.
+  'VEC_DIM': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    return coerceVector(a[0])!.dim;
+  },
+  // V32 sqlite-vec compat: vec_length returns BYTES, not dimensions.
+  // Matches sqlite-vec: `vec_length(v) = dim * 4` for float32 vectors.
+  'VEC_LENGTH': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    return coerceVector(a[0])!.dim * 4;
+  },
+  // V32 sqlite-vec compat: vec_type always returns 'float32' — the
+  // only vector element type we support.
+  'VEC_TYPE': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    return 'float32';
+  },
+  // V32 sqlite-vec compat: vec_slice(v, start, end) returns a new
+  // vector containing elements [start, end). Negative or out-of-range
+  // indices are clamped.
+  'VEC_SLICE': (a) => _propagateNull(a, () {
+        final v = coerceVector(a[0])!;
+        final start = (a[1] as num).toInt().clamp(0, v.dim);
+        final end = (a[2] as num).toInt().clamp(start, v.dim);
+        return encodeVectorBlob(
+          Vector.fromList(v.values.sublist(start, end)),
+        );
+      }),
+  // VEC_TO_JSON(v) -> TEXT '[...]' for debug / export.
+  'VEC_TO_JSON': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    return coerceVector(a[0])!.toString();
+  },
+  // Distance metrics.
+  'VEC_L2SQ': (a) => _propagateNull(
+        a,
+        () => vecL2Sq(coerceVector(a[0])!, coerceVector(a[1])!),
+      ),
+  'VEC_L2': (a) => _propagateNull(
+        a,
+        () => vecL2(coerceVector(a[0])!, coerceVector(a[1])!),
+      ),
+  'VEC_DISTANCE_L2': (a) => kScalarFunctions['VEC_L2']!(a),
+  'VEC_IP': (a) => _propagateNull(
+        a,
+        () => vecInnerProduct(coerceVector(a[0])!, coerceVector(a[1])!),
+      ),
+  'VEC_DOT': (a) => kScalarFunctions['VEC_IP']!(a),
+  'VEC_COSINE': (a) => _propagateNull(
+        a,
+        () => vecCosineDistance(coerceVector(a[0])!, coerceVector(a[1])!),
+      ),
+  'VEC_DISTANCE_COSINE': (a) => kScalarFunctions['VEC_COSINE']!(a),
+  'VEC_COSINE_SIM': (a) => _propagateNull(
+        a,
+        () => vecCosineSimilarity(coerceVector(a[0])!, coerceVector(a[1])!),
+      ),
+  // Norm and normalization.
+  'VEC_NORM': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    return vecNorm(coerceVector(a[0])!);
+  },
+  'VEC_NORMALIZE': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    return encodeVectorBlob(vecNormalize(coerceVector(a[0])!));
+  },
+  // Element-wise arithmetic (useful for centroid math and tests).
+  'VEC_ADD': (a) => _propagateNull(
+        a,
+        () =>
+            encodeVectorBlob(vecAdd(coerceVector(a[0])!, coerceVector(a[1])!)),
+      ),
+  'VEC_SUB': (a) => _propagateNull(
+        a,
+        () =>
+            encodeVectorBlob(vecSub(coerceVector(a[0])!, coerceVector(a[1])!)),
+      ),
+  // ---- Hybrid retrieval / rank fusion ----------------------------------
+  // RRF_SCORE(rank[, k]) — one term of Reciprocal Rank Fusion. Returns
+  // `1 / (k + rank)` for a non-NULL rank, or 0 when the row didn't
+  // appear in the ranker's list. `k` defaults to 60 (the FAISS /
+  // Cormack & Buettcher canonical value).
+  'RRF_SCORE': (a) {
+    if (a.isEmpty || a[0] == null) return 0.0;
+    final rank = (a[0] as num).toDouble();
+    final k = a.length >= 2 && a[1] != null ? (a[1] as num).toDouble() : 60.0;
+    return 1.0 / (k + rank);
+  },
+  // RRF(rank1, rank2, ...) — sum of `1 / (60 + rank_i)` over non-NULL
+  // ranks. Missing / NULL ranks contribute 0. Convenience for the
+  // canonical two- or three-way fusion `RRF(fts_rank, vec_rank)`.
+  'RRF': (a) {
+    var s = 0.0;
+    for (final v in a) {
+      if (v == null) continue;
+      s += 1.0 / (60.0 + (v as num).toDouble());
+    }
+    return s;
+  },
+  // HYBRID_SCORE(vec_distance, fts_score, alpha) — convex-combination
+  // hybrid score. Higher = more relevant.
+  //   result = alpha * (1 / (1 + vec_distance)) + (1 - alpha) * fts_score
+  // Vector distance is converted to a similarity in [0, 1] via
+  // `1 / (1 + d)` (works for L2, L2SQ, and cosine distance). NULLs on
+  // either side contribute 0 for that term. `alpha` in [0, 1] controls
+  // the mix (0 = FTS only, 1 = vector only).
+  'HYBRID_SCORE': (a) {
+    if (a.length < 3) return null;
+    final vec = a[0];
+    final fts = a[1];
+    final alpha = a[2] == null ? 0.5 : (a[2] as num).toDouble();
+    final vecSim = vec == null ? 0.0 : 1.0 / (1.0 + (vec as num).toDouble());
+    final ftsScore = fts == null ? 0.0 : (fts as num).toDouble();
+    return alpha * vecSim + (1.0 - alpha) * ftsScore;
   },
 };
 
@@ -2369,13 +2492,11 @@ DateTime _fromJulianDay(double jd) {
   return DateTime.fromMillisecondsSinceEpoch(ms, isUtc: true);
 }
 
-String _fmtDate(DateTime d) =>
-    '${d.year.toString().padLeft(4, "0")}-'
+String _fmtDate(DateTime d) => '${d.year.toString().padLeft(4, "0")}-'
     '${d.month.toString().padLeft(2, "0")}-'
     '${d.day.toString().padLeft(2, "0")}';
 
-String _fmtTime(DateTime d) =>
-    '${d.hour.toString().padLeft(2, "0")}:'
+String _fmtTime(DateTime d) => '${d.hour.toString().padLeft(2, "0")}:'
     '${d.minute.toString().padLeft(2, "0")}:'
     '${d.second.toString().padLeft(2, "0")}';
 
@@ -2424,9 +2545,8 @@ String _strftime(String fmt, DateTime d) {
         {
           // ISO-ish week of year, week starting Monday, range 00-53.
           final start = DateTime.utc(d.year, 1, 1);
-          final firstMonday = start.weekday == DateTime.monday
-              ? 1
-              : (9 - start.weekday) % 7;
+          final firstMonday =
+              start.weekday == DateTime.monday ? 1 : (9 - start.weekday) % 7;
           final doy = _dayOfYear(d);
           final w = doy < firstMonday ? 0 : ((doy - firstMonday) ~/ 7) + 1;
           buf.write(w.toString().padLeft(2, '0'));
@@ -2701,6 +2821,10 @@ const Set<String> kAggregateFunctions = {
   'COVAR_POP',
   'COVAR_SAMP',
   'CORR',
+  // Vector aggregates — batch-oriented centroid / sum operations.
+  // See _aggregateValue in database.dart for implementation.
+  'VEC_AVG',
+  'VEC_SUM',
 };
 
 // ---- More JSON1 helpers ----------------------------------------------------
@@ -2820,9 +2944,8 @@ Object? jsonPathRemove(Object? root, String path) {
 /// RFC 7396 JSON Merge Patch (used by `json_patch`).
 Object? _rfc7396Merge(Object? target, Object? patch) {
   if (patch is! Map) return patch;
-  final out = target is Map
-      ? Map<String, Object?>.from(target)
-      : <String, Object?>{};
+  final out =
+      target is Map ? Map<String, Object?>.from(target) : <String, Object?>{};
   patch.forEach((k, v) {
     if (v == null) {
       out.remove(k);
