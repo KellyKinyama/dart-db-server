@@ -1233,9 +1233,8 @@ class Database {
       final buckets = binding.payloadIndex[lowerKey];
       if (buckets == null) return (null, true);
       final set = buckets[entry.value] ?? const <Object>{};
-      allowed = allowed == null
-          ? Set<Object>.from(set)
-          : allowed.intersection(set);
+      allowed =
+          allowed == null ? Set<Object>.from(set) : allowed.intersection(set);
       if (allowed.isEmpty) return (null, true);
     }
     return (allowed, false);
@@ -1257,12 +1256,42 @@ class Database {
       final buckets = binding.payloadIndex[entry.key.toLowerCase()];
       if (buckets == null) return null;
       final set = buckets[entry.value] ?? const <Object>{};
-      allowed = allowed == null
-          ? Set<Object>.from(set)
-          : allowed.intersection(set);
+      allowed =
+          allowed == null ? Set<Object>.from(set) : allowed.intersection(set);
       if (allowed.isEmpty) return null;
     }
     return allowed;
+  }
+
+  /// V54: drain any captured V29 paged INSERT/UPDATE/DELETE deltas into
+  /// the built index, then return the current [binding.index] (which
+  /// may still be `null` if the binding has not been warmed).
+  /// Every paged TVF branch runs this two-step dance before reading;
+  /// this helper gives it a name.
+  Object? _drainedPagedIndex(_VectorIndexBinding binding) {
+    _applyPendingPagedDeltas(binding);
+    return binding.index;
+  }
+
+  /// V54: fetch the paged FTS5 corpus + PK list for a `(tbl, col)` pair
+  /// or throw a StateError naming [tvfName]. Used by paged hybrid-
+  /// search variants that require `warmFts5(...)` to have been called
+  /// first.
+  ({Fts5Index fts, List<Object> pks}) _requirePagedFts5Corpus(
+    String tableName,
+    String textCol,
+    String tvfName,
+  ) {
+    final ftsKey = '${tableName.toLowerCase()}:${textCol.toLowerCase()}';
+    final fts = _fts5IndexCache[ftsKey];
+    final pks = _pagedFts5Pks[ftsKey];
+    if (fts == null || pks == null) {
+      throw StateError(
+        '$tvfName: paged FTS5 corpus for '
+        '$tableName.$textCol not warmed — call db.warmFts5(...) first',
+      );
+    }
+    return (fts: fts, pks: pks);
   }
 
   /// V36: rebuild [_VectorIndexBinding.payloadIndex] from scratch by
@@ -1493,8 +1522,7 @@ class Database {
   /// need warmVectorIndexes() to actually rebuild; the pragma just
   /// invalidates.
   QueryResult _vectorIndexRebuild(String target) {
-    final (tableName, colName) =
-        _parseTblCol(target, 'vector_index_rebuild');
+    final (tableName, colName) = _parseTblCol(target, 'vector_index_rebuild');
     final key = '${tableName.toLowerCase()}:${colName.toLowerCase()}';
     final binding = _vectorIndexes[key];
     if (binding == null) {
@@ -10330,10 +10358,7 @@ class Database {
     final pt = _pagedTable(tableName);
     if (pt != null) {
       if (binding == null || query.dim != binding.spec.dim) return const [];
-      // V29: drain any captured INSERT/UPDATE/DELETE deltas before
-      // reading.
-      _applyPendingPagedDeltas(binding);
-      final idx = binding.index;
+      final idx = _drainedPagedIndex(binding);
       if (idx == null) return const [];
       final colOk = pt.columns.any(
         (c) => c.name.toLowerCase() == colName.toLowerCase(),
@@ -10465,8 +10490,7 @@ class Database {
     if (_isPaged(tableName)) {
       final pt = _pagedTable(tableName);
       if (pt == null) return const [];
-      _applyPendingPagedDeltas(binding);
-      final idx = binding.index;
+      final idx = _drainedPagedIndex(binding);
       if (idx == null) return const [];
       return _rangeSearchPass(
         idx: idx,
@@ -10621,8 +10645,7 @@ class Database {
       // V29 delta drain — ensure INSERT/UPDATE/DELETE captures are
       // baked before we read either the vector index or the payload
       // index.
-      _applyPendingPagedDeltas(binding);
-      final idx = binding.index;
+      final idx = _drainedPagedIndex(binding);
       if (idx == null) return const [];
       final allowed = _intersectPayloadBuckets(filterMap, binding);
       if (allowed == null) return const [];
@@ -10795,8 +10818,7 @@ class Database {
     if (paged) {
       final pt = _pagedTable(tableName);
       if (pt == null) return const [];
-      _applyPendingPagedDeltas(binding);
-      final idx = binding.index;
+      final idx = _drainedPagedIndex(binding);
       if (idx == null) return const [];
 
       // Intersect payload sets ONCE.
@@ -10965,8 +10987,7 @@ class Database {
     if (textColIdx < 0) return const [];
 
     // Optional payload filter → intersected `allowed` set.
-    final (allowed, filterBail) =
-        _resolvePayloadFilter(filterJson, binding);
+    final (allowed, filterBail) = _resolvePayloadFilter(filterJson, binding);
     if (filterBail) return const [];
 
     final idx = _vectorIndexFor(tableName, vecCol);
@@ -11048,19 +11069,11 @@ class Database {
     required int rrfK,
     required String? filterJson,
   }) {
-    final ftsKey = '${tableName.toLowerCase()}:${textCol.toLowerCase()}';
-    final fts = _fts5IndexCache[ftsKey];
-    final pks = _pagedFts5Pks[ftsKey];
-    if (fts == null || pks == null) {
-      throw StateError(
-        'vec_hybrid_search: paged FTS5 corpus for '
-        '$tableName.$textCol not warmed — call db.warmFts5(...) first',
-      );
-    }
+    final (:fts, :pks) =
+        _requirePagedFts5Corpus(tableName, textCol, 'vec_hybrid_search');
 
     // Drain V29 paged deltas + payload filter intersection.
-    _applyPendingPagedDeltas(binding);
-    final idx = binding.index;
+    final idx = _drainedPagedIndex(binding);
     if (idx == null) return const [];
 
     Set<Object>? allowed;
@@ -11137,18 +11150,10 @@ class Database {
     required int rrfK,
     required String? filterJson,
   }) {
-    final ftsKey = '${tableName.toLowerCase()}:${textCol.toLowerCase()}';
-    final fts = _fts5IndexCache[ftsKey];
-    final pks = _pagedFts5Pks[ftsKey];
-    if (fts == null || pks == null) {
-      throw StateError(
-        'vec_hybrid_search_batch: paged FTS5 corpus for '
-        '$tableName.$textCol not warmed — call db.warmFts5(...) first',
-      );
-    }
+    final (:fts, :pks) = _requirePagedFts5Corpus(
+        tableName, textCol, 'vec_hybrid_search_batch');
 
-    _applyPendingPagedDeltas(binding);
-    final idx = binding.index;
+    final idx = _drainedPagedIndex(binding);
     if (idx == null) return const [];
 
     Set<Object>? allowed;
@@ -11297,8 +11302,7 @@ class Database {
     if (textColIdx < 0) return const [];
 
     // Payload filter → intersected `allowed` (computed once).
-    final (allowed, filterBail) =
-        _resolvePayloadFilter(filterJson, binding);
+    final (allowed, filterBail) = _resolvePayloadFilter(filterJson, binding);
     if (filterBail) return const [];
 
     // Build once: vector index + FTS5 corpus + PK column resolution.
