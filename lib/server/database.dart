@@ -1592,14 +1592,40 @@ class Database {
         'PRAGMA vector_verify: table $tableName not found',
       );
     }
-    final colIdx = t.columns.indexWhere(
-      (c) => c.name.toLowerCase() == colName.toLowerCase(),
-    );
-    if (colIdx < 0) {
+    final row = _verifyBindingRow(binding, tableName, colName, t, idx);
+    if (row == null) {
       throw StateError(
         'PRAGMA vector_verify: column $colName not found in $tableName',
       );
     }
+    return QueryResult(
+      columns: const [
+        'tbl',
+        'col',
+        'n_rows',
+        'n_index',
+        'missing_from_index',
+        'extra_in_index',
+        'dim_bad',
+      ],
+      rows: [row],
+    );
+  }
+
+  /// V50 + V56 helper: compute the verify-counter row for a single
+  /// built in-memory binding. Returns null when the column can't be
+  /// located on the table (caller decides whether to throw or skip).
+  List<Object?>? _verifyBindingRow(
+    _VectorIndexBinding binding,
+    String tableName,
+    String colName,
+    Table t,
+    Object idx,
+  ) {
+    final colIdx = t.columns.indexWhere(
+      (c) => c.name.toLowerCase() == colName.toLowerCase(),
+    );
+    if (colIdx < 0) return null;
 
     final indexIds = <int>{
       for (final pos in _vectorIndexIdsOf(idx))
@@ -1627,6 +1653,39 @@ class Database {
       if (!indexIds.contains(ri)) missing++;
     }
     final extra = indexIds.length - indexIds.intersection(expectedIds).length;
+    return [
+      tableName,
+      colName,
+      t.rows.length,
+      indexIds.length,
+      missing,
+      extra,
+      dimBad,
+    ];
+  }
+
+  /// V56a: `PRAGMA vector_verify_all` — run V50's verify across every
+  /// registered in-memory built binding. Paged bindings and unbuilt
+  /// bindings are silently skipped (paged would require pt.scan and
+  /// unbuilt has no index-side to compare against). Same column
+  /// schema as V50, one row per verifiable binding.
+  QueryResult _vectorVerifyAll() {
+    final rows = <List<Object?>>[];
+    for (final entry in _vectorIndexes.entries) {
+      final key = entry.key;
+      final binding = entry.value;
+      final sep = key.indexOf(':');
+      if (sep < 0) continue;
+      final tbl = key.substring(0, sep);
+      final col = key.substring(sep + 1);
+      if (_isPaged(tbl)) continue;
+      final idx = binding.index;
+      if (idx == null) continue;
+      final t = _tables[tbl];
+      if (t == null) continue;
+      final row = _verifyBindingRow(binding, tbl, col, t, idx);
+      if (row != null) rows.add(row);
+    }
     return QueryResult(
       columns: const [
         'tbl',
@@ -1637,17 +1696,42 @@ class Database {
         'extra_in_index',
         'dim_bad',
       ],
-      rows: [
-        [
-          tableName,
-          colName,
-          t.rows.length,
-          indexIds.length,
-          missing,
-          extra,
-          dimBad,
-        ],
-      ],
+      rows: rows,
+    );
+  }
+
+  /// V56b: `PRAGMA vector_index_rebuild_all` — apply V47's rebuild
+  /// action to every registered binding. In-memory bindings rebuild
+  /// synchronously; paged bindings are marked invalidated (caller
+  /// must then run warmVectorIndexes() to actually rebuild).
+  QueryResult _vectorIndexRebuildAll() {
+    var rebuilt = 0;
+    var invalidated = 0;
+    for (final entry in _vectorIndexes.entries) {
+      final key = entry.key;
+      final binding = entry.value;
+      final sep = key.indexOf(':');
+      if (sep < 0) continue;
+      final tbl = key.substring(0, sep);
+      final col = key.substring(sep + 1);
+      binding.index = null;
+      binding.builtRowCount = 0;
+      binding.refreshPositions.clear();
+      binding.pendingPagedInserts.clear();
+      binding.pendingPagedRefreshes.clear();
+      binding.pendingPagedDeletes.clear();
+      binding.payloadIndex.clear();
+      binding.payloadIndexDirty = false;
+      if (_isPaged(tbl)) {
+        invalidated++;
+      } else {
+        _vectorIndexFor(tbl, col);
+        rebuilt++;
+      }
+    }
+    return QueryResult.message(
+      'vector_index_rebuild_all: $rebuilt binding(s) rebuilt, '
+      '$invalidated paged binding(s) invalidated',
     );
   }
 
@@ -14140,9 +14224,11 @@ class Database {
             'vector_index_stats',
             'vector_analyze',
             'vector_index_rebuild',
+            'vector_index_rebuild_all',
             'vector_index_warm',
             'vector_index_warm_all',
             'vector_verify',
+            'vector_verify_all',
             'fts5_warm',
           ];
           return QueryResult(
@@ -14259,6 +14345,8 @@ class Database {
           }
           return _vectorIndexRebuild(target);
         }
+      case 'vector_index_rebuild_all':
+        return _vectorIndexRebuildAll();
       case 'vector_verify':
         {
           if (target == null) {
@@ -14268,6 +14356,8 @@ class Database {
           }
           return _vectorVerify(target);
         }
+      case 'vector_verify_all':
+        return _vectorVerifyAll();
       case 'optimize':
         {
           // SQLite normally inspects each table and may run ANALYZE on
