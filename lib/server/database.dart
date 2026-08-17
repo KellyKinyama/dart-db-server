@@ -2424,6 +2424,22 @@ class Database {
   Future<QueryResult?> _maybeRunAsyncPragma(Statement stmt) async {
     if (stmt is! PragmaStmt) return null;
     final name = stmt.name.toLowerCase();
+    if (name == 'vector_index_warm_all') {
+      var warmed = 0;
+      for (final key in _vectorIndexes.keys.toList()) {
+        final dot = key.indexOf(':');
+        if (dot < 0) continue;
+        final tbl = key.substring(0, dot);
+        final col = key.substring(dot + 1);
+        final before = _vectorIndexes[key]?.index;
+        await warmVectorIndex(tbl, col);
+        if (before == null && _vectorIndexes[key]?.index != null) warmed++;
+      }
+      return QueryResult.message(
+        'vector_index_warm_all: $warmed binding(s) warmed '
+        '(${_vectorIndexes.length} total)',
+      );
+    }
     if (name != 'fts5_warm' && name != 'vector_index_warm') return null;
     final target = stmt.value?.toString();
     if (target == null) {
@@ -10243,6 +10259,9 @@ class Database {
       case 'VEC_RANGE_SEARCH':
         rows = _vecRangeSearchRows(args);
         break;
+      case 'VEC_RANGE_SEARCH_BATCH':
+        rows = _vecRangeSearchBatchRows(args);
+        break;
       case 'VEC_SEARCH_FILTERED':
         rows = _vecSearchFilteredRows(args);
         break;
@@ -10562,6 +10581,134 @@ class Database {
       final rid = remap(h.id);
       if (rid == null) continue;
       out.add({'rowid': rid, 'distance': h.distance});
+    }
+    return out;
+  }
+
+  /// V55: `vec_range_search_batch(table, column, queries_json,
+  /// threshold[, metric[, filter_json]])` — batch companion to V46.
+  /// Runs [_rangeSearchPass] per query with a single up-front
+  /// resolution of the index, payload filter, and remap function.
+  /// Malformed / dim-mismatched query entries preserve `query_idx`
+  /// numbering (same shape as V43). Rejects LSH/PQ/IvfPq bindings —
+  /// their metrics don't monotone-terminate.
+  ///
+  /// Returns `{query_idx, rowid, distance}` grouped by `query_idx`
+  /// ASC then distance ASC per query.
+  List<Map<String, Object?>> _vecRangeSearchBatchRows(List<Object?> args) {
+    if (args.length < 4) {
+      throw StateError(
+        'vec_range_search_batch: expected '
+        '(table, column, queries_json, threshold[, metric[, filter_json]])',
+      );
+    }
+    final tableName = args[0]?.toString();
+    final colName = args[1]?.toString();
+    if (tableName == null || colName == null) return const [];
+
+    final threshold = args[3];
+    if (threshold is! num) return const [];
+    final thr = threshold.toDouble();
+    if (thr < 0) return const [];
+
+    final key = '${tableName.toLowerCase()}:${colName.toLowerCase()}';
+    final binding = _vectorIndexes[key];
+    if (binding == null) return const [];
+
+    final kind = binding.spec.kind;
+    if (kind == VectorIndexKind.lsh ||
+        kind == VectorIndexKind.pq ||
+        kind == VectorIndexKind.ivfPq) {
+      return const [];
+    }
+
+    VectorMetric metric = binding.spec.metric;
+    if (args.length >= 5 && args[4] != null) {
+      try {
+        metric = _parseVectorMetric(args[4].toString());
+      } catch (_) {
+        return const [];
+      }
+    }
+
+    // Parse queries — preserve input position for query_idx.
+    List<({int idx, Vector vec})> queries;
+    try {
+      final raw = args[2];
+      queries = <({int idx, Vector vec})>[];
+      List<dynamic> decoded;
+      if (raw is String) {
+        final tmp = jsonDecode(raw);
+        if (tmp is! List) return const [];
+        decoded = tmp;
+      } else if (raw is List) {
+        decoded = raw;
+      } else {
+        return const [];
+      }
+      for (var i = 0; i < decoded.length; i++) {
+        final entry = decoded[i];
+        if (entry is! List) continue;
+        try {
+          final v = Vector.fromList(entry.cast<num>());
+          if (v.dim != binding.spec.dim) continue;
+          queries.add((idx: i, vec: v));
+        } catch (_) {
+          continue;
+        }
+      }
+    } catch (_) {
+      return const [];
+    }
+    if (queries.isEmpty) return const [];
+
+    // Optional payload-filter — computed once, shared across queries.
+    Set<Object>? allowed;
+    if (args.length >= 6 && args[5] != null) {
+      final filterJson = args[5].toString();
+      final (a, bail) = _resolvePayloadFilter(filterJson, binding);
+      if (bail) return const [];
+      allowed = a;
+    }
+
+    // Resolve index + remap function once, then loop per query.
+    Object? idx;
+    int approxSize;
+    Object? Function(Object?) remap;
+    if (_isPaged(tableName)) {
+      final pt = _pagedTable(tableName);
+      if (pt == null) return const [];
+      idx = _drainedPagedIndex(binding);
+      if (idx == null) return const [];
+      approxSize = pt.length;
+      remap = (id) => id;
+    } else {
+      final t = _tables[tableName];
+      if (t == null) return const [];
+      idx = _vectorIndexFor(tableName, colName);
+      if (idx == null) return const [];
+      approxSize = t.rows.length;
+      final pkColIdx = t.columns.indexWhere((c) => c.primaryKey);
+      remap = (id) {
+        if (id is! int || id < 0 || id >= t.rows.length) return null;
+        return pkColIdx >= 0 ? t.rows[id][pkColIdx] : id;
+      };
+    }
+
+    final out = <Map<String, Object?>>[];
+    for (final q in queries) {
+      final rows = _rangeSearchPass(
+        idx: idx,
+        query: q.vec,
+        threshold: thr,
+        metric: metric,
+        approxSize: approxSize,
+        remap: remap,
+        allowed: allowed,
+      );
+      for (final r in rows) {
+        out.add({'query_idx': q.idx, ...r});
+      }
     }
     return out;
   }
@@ -11150,8 +11297,8 @@ class Database {
     required int rrfK,
     required String? filterJson,
   }) {
-    final (:fts, :pks) = _requirePagedFts5Corpus(
-        tableName, textCol, 'vec_hybrid_search_batch');
+    final (:fts, :pks) =
+        _requirePagedFts5Corpus(tableName, textCol, 'vec_hybrid_search_batch');
 
     final idx = _drainedPagedIndex(binding);
     if (idx == null) return const [];
@@ -13994,6 +14141,7 @@ class Database {
             'vector_analyze',
             'vector_index_rebuild',
             'vector_index_warm',
+            'vector_index_warm_all',
             'vector_verify',
             'fts5_warm',
           ];
