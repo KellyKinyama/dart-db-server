@@ -27,8 +27,8 @@ void main() {
           await db.execute("INSERT INTO docs VALUES ($i, VEC('[$i, 0]'))");
         }
         // Do NOT call warmVectorIndexes — use PRAGMA instead.
-        final r = await db
-            .execute("PRAGMA vector_index_warm('docs.embedding')");
+        final r =
+            await db.execute("PRAGMA vector_index_warm('docs.embedding')");
         expect(r.message, contains('warmed'));
 
         // Confirm binding is now usable.
@@ -51,8 +51,7 @@ void main() {
         );
         await db.execute("INSERT INTO docs VALUES (1, VEC('[1, 0]'))");
 
-        var r = await db
-            .execute("PRAGMA vector_index_warm('docs.embedding')");
+        var r = await db.execute("PRAGMA vector_index_warm('docs.embedding')");
         expect(r.message, contains('warmed'));
 
         // Second call is a no-op (binding.index already set).
@@ -67,8 +66,7 @@ void main() {
       final db = await Database.open(_tmp('bad'));
       try {
         expect(
-          () async => db
-              .execute("PRAGMA vector_index_warm('nope.nada')"),
+          () async => db.execute("PRAGMA vector_index_warm('nope.nada')"),
           throwsA(isA<StateError>()),
         );
       } finally {
@@ -92,8 +90,15 @@ void main() {
 
         final r = await db.execute("PRAGMA vector_verify('docs.embedding')");
         expect(r.rows.length, 1);
-        expect(r.columns, containsAll(['n_rows', 'n_index',
-            'missing_from_index', 'extra_in_index', 'dim_bad']));
+        expect(
+            r.columns,
+            containsAll([
+              'n_rows',
+              'n_index',
+              'missing_from_index',
+              'extra_in_index',
+              'dim_bad'
+            ]));
         final row = r.rows.single;
         expect(row[2], 5); // n_rows
         expect(row[3], 5); // n_index
@@ -170,8 +175,7 @@ void main() {
       }
     });
 
-    test('vector_index_warm and vector_verify appear in pragma_list',
-        () async {
+    test('vector_index_warm and vector_verify appear in pragma_list', () async {
       final db = await Database.open(_tmp('list'));
       try {
         final r = await db.execute('PRAGMA pragma_list');

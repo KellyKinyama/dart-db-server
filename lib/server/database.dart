@@ -1188,6 +1188,83 @@ class Database {
     return 0;
   }
 
+  /// V52: split a `tbl.col` target into `(tableName, columnName)`.
+  /// Throws `StateError` with a message naming [pragmaName] when the
+  /// target is malformed. Used by every vector-related PRAGMA that
+  /// takes a `'tbl.col'` argument.
+  static (String, String) _parseTblCol(String target, String pragmaName) {
+    final dot = target.indexOf('.');
+    if (dot < 0) {
+      throw StateError(
+        'PRAGMA $pragmaName target must be "tbl.col", got "$target"',
+      );
+    }
+    return (target.substring(0, dot), target.substring(dot + 1));
+  }
+
+  /// V53: shared payload-filter resolver used by every TVF that
+  /// accepts a JSON filter map. Returns `(allowed, bail)`:
+  ///  * `(null, false)` — no filter supplied; caller runs unfiltered.
+  ///  * `(set, false)` — non-empty filter matched some rows; caller
+  ///    intersects candidate ids against `set`.
+  ///  * `(_, true)` — bail out with empty rows. Bail cases: malformed
+  ///    JSON, key not in `spec.filterColumns`, or the intersected set
+  ///    is empty (no matching rows exist).
+  static (Set<Object>?, bool) _resolvePayloadFilter(
+    String? filterJson,
+    _VectorIndexBinding binding,
+  ) {
+    if (filterJson == null || filterJson.isEmpty) return (null, false);
+    Map<String, Object?> filterMap;
+    try {
+      final decoded = jsonDecode(filterJson);
+      if (decoded is! Map || decoded.isEmpty) return (null, false);
+      filterMap = decoded.cast<String, Object?>();
+    } catch (_) {
+      return (null, true);
+    }
+    final declared = <String>{
+      for (final c in binding.spec.filterColumns) c.toLowerCase(),
+    };
+    Set<Object>? allowed;
+    for (final entry in filterMap.entries) {
+      final lowerKey = entry.key.toLowerCase();
+      if (!declared.contains(lowerKey)) return (null, true);
+      final buckets = binding.payloadIndex[lowerKey];
+      if (buckets == null) return (null, true);
+      final set = buckets[entry.value] ?? const <Object>{};
+      allowed = allowed == null
+          ? Set<Object>.from(set)
+          : allowed.intersection(set);
+      if (allowed.isEmpty) return (null, true);
+    }
+    return (allowed, false);
+  }
+
+  /// V53b: intersect payload-index buckets using a pre-parsed
+  /// [filterMap]. Returns `null` when any filter key has no bucket
+  /// registered or the running intersection is empty (i.e. caller
+  /// should bail out with empty rows). Column-declared validation
+  /// and JSON parsing must be done separately — this helper is only
+  /// the set-intersection kernel shared between the `_filtered` and
+  /// `_filtered_batch` TVF variants.
+  static Set<Object>? _intersectPayloadBuckets(
+    Map<String, Object?> filterMap,
+    _VectorIndexBinding binding,
+  ) {
+    Set<Object>? allowed;
+    for (final entry in filterMap.entries) {
+      final buckets = binding.payloadIndex[entry.key.toLowerCase()];
+      if (buckets == null) return null;
+      final set = buckets[entry.value] ?? const <Object>{};
+      allowed = allowed == null
+          ? Set<Object>.from(set)
+          : allowed.intersection(set);
+      if (allowed.isEmpty) return null;
+    }
+    return allowed;
+  }
+
   /// V36: rebuild [_VectorIndexBinding.payloadIndex] from scratch by
   /// scanning `t.rows`. Called after any UPDATE touching a tracked
   /// column (via the [payloadIndexDirty] flag) and on initial build.
@@ -1314,18 +1391,10 @@ class Database {
   /// `warmVectorIndexes` first).
   QueryResult _vectorAnalyze(String target) {
     final parts = target.split(':');
-    final tblCol = parts[0];
     final k = parts.length > 1 ? int.tryParse(parts[1]) ?? 10 : 10;
     final sampleSize = parts.length > 2 ? int.tryParse(parts[2]) ?? 32 : 32;
 
-    final dot = tblCol.indexOf('.');
-    if (dot < 0) {
-      throw StateError(
-        'PRAGMA vector_analyze target must be "tbl.col", got "$tblCol"',
-      );
-    }
-    final tableName = tblCol.substring(0, dot);
-    final colName = tblCol.substring(dot + 1);
+    final (tableName, colName) = _parseTblCol(parts[0], 'vector_analyze');
     final key = '${tableName.toLowerCase()}:${colName.toLowerCase()}';
     final binding = _vectorIndexes[key];
     if (binding == null) {
@@ -1424,15 +1493,8 @@ class Database {
   /// need warmVectorIndexes() to actually rebuild; the pragma just
   /// invalidates.
   QueryResult _vectorIndexRebuild(String target) {
-    final dot = target.indexOf('.');
-    if (dot < 0) {
-      throw StateError(
-        'PRAGMA vector_index_rebuild target must be "tbl.col", got '
-        '"$target"',
-      );
-    }
-    final tableName = target.substring(0, dot);
-    final colName = target.substring(dot + 1);
+    final (tableName, colName) =
+        _parseTblCol(target, 'vector_index_rebuild');
     final key = '${tableName.toLowerCase()}:${colName.toLowerCase()}';
     final binding = _vectorIndexes[key];
     if (binding == null) {
@@ -1475,14 +1537,7 @@ class Database {
   /// malformed or dim-mismatched values are counted as `dim_bad` —
   /// separate from `missing_from_index`.
   QueryResult _vectorVerify(String target) {
-    final dot = target.indexOf('.');
-    if (dot < 0) {
-      throw StateError(
-        'PRAGMA vector_verify target must be "tbl.col", got "$target"',
-      );
-    }
-    final tableName = target.substring(0, dot);
-    final colName = target.substring(dot + 1);
+    final (tableName, colName) = _parseTblCol(target, 'vector_verify');
     final key = '${tableName.toLowerCase()}:${colName.toLowerCase()}';
     final binding = _vectorIndexes[key];
     if (binding == null) {
@@ -2348,14 +2403,7 @@ class Database {
         "PRAGMA $name requires a 'tbl.col' target.",
       );
     }
-    final dot = target.indexOf('.');
-    if (dot < 0) {
-      throw StateError(
-        'PRAGMA $name target must be "tbl.col", got "$target"',
-      );
-    }
-    final tableName = target.substring(0, dot);
-    final colName = target.substring(dot + 1);
+    final (tableName, colName) = _parseTblCol(target, name);
     if (name == 'fts5_warm') {
       await warmFts5(tableName, colName);
       return QueryResult.message('fts5_warm: $tableName.$colName warmed');
@@ -7560,9 +7608,9 @@ class Database {
             math.max(binding.spec.nprobe * 4, binding.spec.nprobe + 4));
 
     // Helper — runs the underlying index search with a given k.
-    List<VectorSearchHit> runSearch(int wantK) => _runVectorSearch(
-        idx, binding.spec, query!, wantK,
-        metricOverride: requiredMetric, nprobe: expandedNprobe);
+    List<VectorSearchHit> runSearch(int wantK) =>
+        _runVectorSearch(idx, binding.spec, query!, wantK,
+            metricOverride: requiredMetric, nprobe: expandedNprobe);
 
     // Materialize the projected row for a hit; returns null when the
     // WHERE clause filters it out. Any eval error bails the fast path.
@@ -10408,30 +10456,9 @@ class Database {
     Set<Object>? allowed;
     if (args.length >= 6 && args[5] != null) {
       final filterJson = args[5].toString();
-      if (filterJson.isNotEmpty) {
-        try {
-          final decoded = jsonDecode(filterJson);
-          if (decoded is Map && decoded.isNotEmpty) {
-            final filterMap = decoded.cast<String, Object?>();
-            final declared = {
-              for (final c in binding.spec.filterColumns) c.toLowerCase(),
-            };
-            for (final entry in filterMap.entries) {
-              if (!declared.contains(entry.key.toLowerCase())) return const [];
-              final buckets = binding.payloadIndex[entry.key.toLowerCase()];
-              if (buckets == null) return const [];
-              final set = buckets[entry.value] ?? const <Object>{};
-              allowed = allowed == null
-                  ? Set<Object>.from(set)
-                  : allowed.intersection(set);
-              if (allowed.isEmpty) return const [];
-            }
-          }
-        } catch (_) {
-          // Malformed filter — bail rather than silently ignore.
-          return const [];
-        }
-      }
+      final (a, bail) = _resolvePayloadFilter(filterJson, binding);
+      if (bail) return const [];
+      allowed = a;
     }
 
     // Paged branch — hit.id is the PK; no row-position remap needed.
@@ -10597,20 +10624,12 @@ class Database {
       _applyPendingPagedDeltas(binding);
       final idx = binding.index;
       if (idx == null) return const [];
-      Set<Object>? allowed;
-      for (final entry in filterMap.entries) {
-        final buckets = binding.payloadIndex[entry.key.toLowerCase()];
-        if (buckets == null) return const [];
-        final set = buckets[entry.value] ?? const <Object>{};
-        allowed =
-            allowed == null ? Set<Object>.from(set) : allowed.intersection(set);
-        if (allowed.isEmpty) return const [];
-      }
-      if (allowed == null || allowed.isEmpty) return const [];
+      final allowed = _intersectPayloadBuckets(filterMap, binding);
+      if (allowed == null) return const [];
 
-      List<VectorSearchHit> runSearch(int wantK) => _runVectorSearch(
-          idx, binding.spec, query!, wantK,
-          metricOverride: metric);
+      List<VectorSearchHit> runSearch(int wantK) =>
+          _runVectorSearch(idx, binding.spec, query!, wantK,
+              metricOverride: metric);
 
       final approxSize = allowed.length;
       final wantBudgets = <int>[
@@ -10642,16 +10661,8 @@ class Database {
     if (idx == null) return const [];
 
     // Intersect the payload sets.
-    Set<Object>? allowed;
-    for (final entry in filterMap.entries) {
-      final buckets = binding.payloadIndex[entry.key.toLowerCase()];
-      if (buckets == null) return const [];
-      final set = buckets[entry.value] ?? const <Object>{};
-      allowed =
-          allowed == null ? Set<Object>.from(set) : allowed.intersection(set);
-      if (allowed.isEmpty) return const [];
-    }
-    if (allowed == null || allowed.isEmpty) return const [];
+    final allowed = _intersectPayloadBuckets(filterMap, binding);
+    if (allowed == null) return const [];
 
     // Over-fetch modestly and post-filter against `allowed`.
     final tableSize = t.rows.length;
@@ -10660,9 +10671,9 @@ class Database {
       math.min(math.max(k * 16, 64), tableSize),
     ];
 
-    List<VectorSearchHit> runSearch(int wantK) => _runVectorSearch(
-        idx, binding.spec, query!, wantK,
-        metricOverride: metric);
+    List<VectorSearchHit> runSearch(int wantK) =>
+        _runVectorSearch(idx, binding.spec, query!, wantK,
+            metricOverride: metric);
 
     final pkColIdx = t.columns.indexWhere((c) => c.primaryKey);
     final seen = <int>{};
@@ -10789,16 +10800,8 @@ class Database {
       if (idx == null) return const [];
 
       // Intersect payload sets ONCE.
-      Set<Object>? allowed;
-      for (final entry in filterMap.entries) {
-        final buckets = binding.payloadIndex[entry.key.toLowerCase()];
-        if (buckets == null) return const [];
-        final set = buckets[entry.value] ?? const <Object>{};
-        allowed =
-            allowed == null ? Set<Object>.from(set) : allowed.intersection(set);
-        if (allowed.isEmpty) return const [];
-      }
-      if (allowed == null || allowed.isEmpty) return const [];
+      final allowed = _intersectPayloadBuckets(filterMap, binding);
+      if (allowed == null) return const [];
 
       final approxSize = allowed.length;
       final wantBudgets = <int>[
@@ -10850,16 +10853,8 @@ class Database {
     final sharedIdx = _vectorIndexFor(tableName, colName);
     if (sharedIdx == null) return const [];
 
-    Set<Object>? allowed;
-    for (final entry in filterMap.entries) {
-      final buckets = binding.payloadIndex[entry.key.toLowerCase()];
-      if (buckets == null) return const [];
-      final set = buckets[entry.value] ?? const <Object>{};
-      allowed =
-          allowed == null ? Set<Object>.from(set) : allowed.intersection(set);
-      if (allowed.isEmpty) return const [];
-    }
-    if (allowed == null || allowed.isEmpty) return const [];
+    final allowed = _intersectPayloadBuckets(filterMap, binding);
+    if (allowed == null) return const [];
 
     final tableSize = t.rows.length;
     final wantBudgets = <int>[
@@ -10870,9 +10865,9 @@ class Database {
 
     final out = <Map<String, Object?>>[];
     for (final q in queries) {
-      List<VectorSearchHit> runSearch(int wantK) => _runVectorSearch(
-          sharedIdx, binding.spec, q.vec, wantK,
-          metricOverride: metric);
+      List<VectorSearchHit> runSearch(int wantK) =>
+          _runVectorSearch(sharedIdx, binding.spec, q.vec, wantK,
+              metricOverride: metric);
 
       final seen = <int>{};
       final results = <Map<String, Object?>>[];
@@ -10970,31 +10965,9 @@ class Database {
     if (textColIdx < 0) return const [];
 
     // Optional payload filter → intersected `allowed` set.
-    Set<int>? allowed;
-    if (filterJson != null && filterJson.isNotEmpty) {
-      try {
-        final decoded = jsonDecode(filterJson);
-        if (decoded is Map && decoded.isNotEmpty) {
-          final filterMap = decoded.cast<String, Object?>();
-          final declared = {
-            for (final c in binding.spec.filterColumns) c.toLowerCase(),
-          };
-          for (final entry in filterMap.entries) {
-            if (!declared.contains(entry.key.toLowerCase())) return const [];
-            final buckets = binding.payloadIndex[entry.key.toLowerCase()];
-            if (buckets == null) return const [];
-            final set = <int>{
-              for (final id in buckets[entry.value] ?? const <Object>{})
-                if (id is int) id,
-            };
-            allowed = allowed == null ? set : allowed.intersection(set);
-            if (allowed.isEmpty) return const [];
-          }
-        }
-      } catch (_) {
-        // Malformed filter — treat as no filter.
-      }
-    }
+    final (allowed, filterBail) =
+        _resolvePayloadFilter(filterJson, binding);
+    if (filterBail) return const [];
 
     final idx = _vectorIndexFor(tableName, vecCol);
     if (idx == null) return const [];
@@ -11092,25 +11065,9 @@ class Database {
 
     Set<Object>? allowed;
     if (filterJson != null && filterJson.isNotEmpty) {
-      try {
-        final decoded = jsonDecode(filterJson);
-        if (decoded is Map && decoded.isNotEmpty) {
-          final filterMap = decoded.cast<String, Object?>();
-          final declared = {
-            for (final c in binding.spec.filterColumns) c.toLowerCase(),
-          };
-          for (final entry in filterMap.entries) {
-            if (!declared.contains(entry.key.toLowerCase())) return const [];
-            final buckets = binding.payloadIndex[entry.key.toLowerCase()];
-            if (buckets == null) return const [];
-            final set = buckets[entry.value] ?? const <Object>{};
-            allowed = allowed == null
-                ? Set<Object>.from(set)
-                : allowed.intersection(set);
-            if (allowed.isEmpty) return const [];
-          }
-        }
-      } catch (_) {}
+      final (a, bail) = _resolvePayloadFilter(filterJson, binding);
+      if (bail) return const [];
+      allowed = a;
     }
 
     final fetch = math.max(k * 4, 32);
@@ -11196,25 +11153,9 @@ class Database {
 
     Set<Object>? allowed;
     if (filterJson != null && filterJson.isNotEmpty) {
-      try {
-        final decoded = jsonDecode(filterJson);
-        if (decoded is Map && decoded.isNotEmpty) {
-          final filterMap = decoded.cast<String, Object?>();
-          final declared = {
-            for (final c in binding.spec.filterColumns) c.toLowerCase(),
-          };
-          for (final entry in filterMap.entries) {
-            if (!declared.contains(entry.key.toLowerCase())) return const [];
-            final buckets = binding.payloadIndex[entry.key.toLowerCase()];
-            if (buckets == null) return const [];
-            final set = buckets[entry.value] ?? const <Object>{};
-            allowed = allowed == null
-                ? Set<Object>.from(set)
-                : allowed.intersection(set);
-            if (allowed.isEmpty) return const [];
-          }
-        }
-      } catch (_) {}
+      final (a, bail) = _resolvePayloadFilter(filterJson, binding);
+      if (bail) return const [];
+      allowed = a;
     }
 
     final fetch = math.max(k * 4, 32);
@@ -11356,31 +11297,9 @@ class Database {
     if (textColIdx < 0) return const [];
 
     // Payload filter → intersected `allowed` (computed once).
-    Set<int>? allowed;
-    if (filterJson != null && filterJson.isNotEmpty) {
-      try {
-        final decoded = jsonDecode(filterJson);
-        if (decoded is Map && decoded.isNotEmpty) {
-          final filterMap = decoded.cast<String, Object?>();
-          final declared = {
-            for (final c in binding.spec.filterColumns) c.toLowerCase(),
-          };
-          for (final entry in filterMap.entries) {
-            if (!declared.contains(entry.key.toLowerCase())) return const [];
-            final buckets = binding.payloadIndex[entry.key.toLowerCase()];
-            if (buckets == null) return const [];
-            final set = <int>{
-              for (final id in buckets[entry.value] ?? const <Object>{})
-                if (id is int) id,
-            };
-            allowed = allowed == null ? set : allowed.intersection(set);
-            if (allowed.isEmpty) return const [];
-          }
-        }
-      } catch (_) {
-        // Malformed filter — treat as no filter.
-      }
-    }
+    final (allowed, filterBail) =
+        _resolvePayloadFilter(filterJson, binding);
+    if (filterBail) return const [];
 
     // Build once: vector index + FTS5 corpus + PK column resolution.
     final idx = _vectorIndexFor(tableName, vecCol);
