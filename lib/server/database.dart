@@ -1151,6 +1151,31 @@ class Database {
     }
   }
 
+  /// V51: unified 6-way search dispatch. Replaces the copy-pasted
+  /// `if (idx is FlatIndex) ...` cascades that used to appear at
+  /// every KNN / range / hybrid site. Applies V25 cosine-normalisation
+  /// automatically for LSH/PQ/IvfPq bindings.
+  static List<VectorSearchHit> _runVectorSearch(
+    Object idx,
+    VectorIndexSpec spec,
+    Vector query,
+    int k, {
+    VectorMetric? metricOverride,
+    int? nprobe,
+  }) {
+    final metric = metricOverride ?? spec.metric;
+    if (idx is FlatIndex) return idx.search(query, k, metric: metric);
+    if (idx is HnswIndex) return idx.search(query, k, metric: metric);
+    if (idx is IvfFlatIndex) {
+      return idx.search(query, k, metric: metric, nprobe: nprobe);
+    }
+    final normQ = _maybeNormalizeForSpec(query, spec);
+    if (idx is LshIndex) return idx.search(normQ, k);
+    if (idx is PqIndex) return idx.search(normQ, k);
+    if (idx is IvfPqIndex) return idx.search(normQ, k, nprobe: nprobe);
+    return const [];
+  }
+
   /// V28: number of entries currently held by a built vector index,
   /// dispatched across the six kinds. Zero for a not-yet-built binding.
   static int _vectorIndexLength(Object? idx) {
@@ -1375,23 +1400,7 @@ class Database {
           .map((h) => h.id)
           .toSet();
 
-      List<VectorSearchHit> idxHits;
-      final effQ = _maybeNormalizeForSpec(pick, binding.spec);
-      if (idx is FlatIndex) {
-        idxHits = idx.search(pick, k, metric: binding.spec.metric);
-      } else if (idx is HnswIndex) {
-        idxHits = idx.search(pick, k, metric: binding.spec.metric);
-      } else if (idx is IvfFlatIndex) {
-        idxHits = idx.search(pick, k, metric: binding.spec.metric);
-      } else if (idx is LshIndex) {
-        idxHits = idx.search(effQ, k);
-      } else if (idx is PqIndex) {
-        idxHits = idx.search(effQ, k);
-      } else if (idx is IvfPqIndex) {
-        idxHits = idx.search(effQ, k);
-      } else {
-        idxHits = const [];
-      }
+      final idxHits = _runVectorSearch(idx, binding.spec, pick, k);
 
       final idxIds = idxHits.map((h) => h.id).toSet();
       final overlap = bruteHits.intersection(idxIds).length;
@@ -1534,8 +1543,7 @@ class Database {
       expectedIds.add(ri);
       if (!indexIds.contains(ri)) missing++;
     }
-    final extra = indexIds.length -
-        indexIds.intersection(expectedIds).length;
+    final extra = indexIds.length - indexIds.intersection(expectedIds).length;
     return QueryResult(
       columns: const [
         'tbl',
@@ -7543,9 +7551,6 @@ class Database {
     final idx = _vectorIndexFor(s.fromTable!, colArg.name);
     if (idx == null) return null;
 
-    // V25: LSH/PQ/IvfPq cosine bindings expect unit-norm queries.
-    final Vector effectiveQuery = _maybeNormalizeForSpec(query, binding.spec);
-
     // V31: expand IVF/IvfPq nprobe when a WHERE filter is present so
     // filter attrition doesn't starve the k-hit budget. Bounded by
     // nlist.
@@ -7555,23 +7560,9 @@ class Database {
             math.max(binding.spec.nprobe * 4, binding.spec.nprobe + 4));
 
     // Helper — runs the underlying index search with a given k.
-    List<VectorSearchHit> runSearch(int wantK) {
-      if (idx is FlatIndex) {
-        return idx.search(query!, wantK, metric: requiredMetric);
-      } else if (idx is HnswIndex) {
-        return idx.search(query!, wantK, metric: requiredMetric);
-      } else if (idx is IvfFlatIndex) {
-        return idx.search(query!, wantK,
-            metric: requiredMetric, nprobe: expandedNprobe);
-      } else if (idx is LshIndex) {
-        return idx.search(effectiveQuery, wantK);
-      } else if (idx is PqIndex) {
-        return idx.search(effectiveQuery, wantK);
-      } else if (idx is IvfPqIndex) {
-        return idx.search(effectiveQuery, wantK, nprobe: expandedNprobe);
-      }
-      return const [];
-    }
+    List<VectorSearchHit> runSearch(int wantK) => _runVectorSearch(
+        idx, binding.spec, query!, wantK,
+        metricOverride: requiredMetric, nprobe: expandedNprobe);
 
     // Materialize the projected row for a hit; returns null when the
     // WHERE clause filters it out. Any eval error bails the fast path.
@@ -10300,23 +10291,8 @@ class Database {
         (c) => c.name.toLowerCase() == colName.toLowerCase(),
       );
       if (!colOk) return const [];
-      final effQ = _maybeNormalizeForSpec(query, binding.spec);
-      List<VectorSearchHit> hits;
-      if (idx is FlatIndex) {
-        hits = idx.search(query, k, metric: metric);
-      } else if (idx is HnswIndex) {
-        hits = idx.search(query, k, metric: metric);
-      } else if (idx is IvfFlatIndex) {
-        hits = idx.search(query, k, metric: metric);
-      } else if (idx is LshIndex) {
-        hits = idx.search(effQ, k);
-      } else if (idx is PqIndex) {
-        hits = idx.search(effQ, k);
-      } else if (idx is IvfPqIndex) {
-        hits = idx.search(effQ, k);
-      } else {
-        return const [];
-      }
+      final hits =
+          _runVectorSearch(idx, binding.spec, query, k, metricOverride: metric);
       return [
         for (final h in hits) {'rowid': h.id, 'distance': h.distance},
       ];
@@ -10336,21 +10312,11 @@ class Database {
     List<VectorSearchHit> hits;
     if (binding != null && query.dim == binding.spec.dim) {
       final idx = _vectorIndexFor(tableName, colName);
-      final effQ = _maybeNormalizeForSpec(query, binding.spec);
-      if (idx is FlatIndex) {
-        hits = idx.search(query, k, metric: metric);
-      } else if (idx is HnswIndex) {
-        hits = idx.search(query, k, metric: metric);
-      } else if (idx is IvfFlatIndex) {
-        hits = idx.search(query, k, metric: metric);
-      } else if (idx is LshIndex) {
-        hits = idx.search(effQ, k);
-      } else if (idx is PqIndex) {
-        hits = idx.search(effQ, k);
-      } else if (idx is IvfPqIndex) {
-        hits = idx.search(effQ, k);
-      } else {
+      if (idx == null) {
         hits = const [];
+      } else {
+        hits = _runVectorSearch(idx, binding.spec, query, k,
+            metricOverride: metric);
       }
     } else {
       final flat = FlatIndex(query.dim, defaultMetric: metric);
@@ -10642,23 +10608,9 @@ class Database {
       }
       if (allowed == null || allowed.isEmpty) return const [];
 
-      final effQ = _maybeNormalizeForSpec(query, binding.spec);
-      List<VectorSearchHit> runSearch(int wantK) {
-        if (idx is FlatIndex) {
-          return idx.search(query!, wantK, metric: metric);
-        } else if (idx is HnswIndex) {
-          return idx.search(query!, wantK, metric: metric);
-        } else if (idx is IvfFlatIndex) {
-          return idx.search(query!, wantK, metric: metric);
-        } else if (idx is LshIndex) {
-          return idx.search(effQ, wantK);
-        } else if (idx is PqIndex) {
-          return idx.search(effQ, wantK);
-        } else if (idx is IvfPqIndex) {
-          return idx.search(effQ, wantK);
-        }
-        return const [];
-      }
+      List<VectorSearchHit> runSearch(int wantK) => _runVectorSearch(
+          idx, binding.spec, query!, wantK,
+          metricOverride: metric);
 
       final approxSize = allowed.length;
       final wantBudgets = <int>[
@@ -10707,24 +10659,10 @@ class Database {
       math.min(math.max(k * 4, 16), tableSize),
       math.min(math.max(k * 16, 64), tableSize),
     ];
-    final effQ = _maybeNormalizeForSpec(query, binding.spec);
 
-    List<VectorSearchHit> runSearch(int wantK) {
-      if (idx is FlatIndex) {
-        return idx.search(query!, wantK, metric: metric);
-      } else if (idx is HnswIndex) {
-        return idx.search(query!, wantK, metric: metric);
-      } else if (idx is IvfFlatIndex) {
-        return idx.search(query!, wantK, metric: metric);
-      } else if (idx is LshIndex) {
-        return idx.search(effQ, wantK);
-      } else if (idx is PqIndex) {
-        return idx.search(effQ, wantK);
-      } else if (idx is IvfPqIndex) {
-        return idx.search(effQ, wantK);
-      }
-      return const [];
-    }
+    List<VectorSearchHit> runSearch(int wantK) => _runVectorSearch(
+        idx, binding.spec, query!, wantK,
+        metricOverride: metric);
 
     final pkColIdx = t.columns.indexWhere((c) => c.primaryKey);
     final seen = <int>{};
@@ -10932,22 +10870,9 @@ class Database {
 
     final out = <Map<String, Object?>>[];
     for (final q in queries) {
-      final effQ = _maybeNormalizeForSpec(q.vec, binding.spec);
-      List<VectorSearchHit> runSearch(int wantK) {
-        if (sharedIdx is FlatIndex) {
-          return sharedIdx.search(q.vec, wantK, metric: metric);
-        }
-        if (sharedIdx is HnswIndex) {
-          return sharedIdx.search(q.vec, wantK, metric: metric);
-        }
-        if (sharedIdx is IvfFlatIndex) {
-          return sharedIdx.search(q.vec, wantK, metric: metric);
-        }
-        if (sharedIdx is LshIndex) return sharedIdx.search(effQ, wantK);
-        if (sharedIdx is PqIndex) return sharedIdx.search(effQ, wantK);
-        if (sharedIdx is IvfPqIndex) return sharedIdx.search(effQ, wantK);
-        return const [];
-      }
+      List<VectorSearchHit> runSearch(int wantK) => _runVectorSearch(
+          sharedIdx, binding.spec, q.vec, wantK,
+          metricOverride: metric);
 
       final seen = <int>{};
       final results = <Map<String, Object?>>[];
@@ -11079,23 +11004,7 @@ class Database {
     final fetch = math.max(k * 4, 32);
 
     // --- Vector side ------------------------------------------------------
-    final effQ = _maybeNormalizeForSpec(query, binding.spec);
-    List<VectorSearchHit> vecHits;
-    if (idx is FlatIndex) {
-      vecHits = idx.search(query, fetch, metric: binding.spec.metric);
-    } else if (idx is HnswIndex) {
-      vecHits = idx.search(query, fetch, metric: binding.spec.metric);
-    } else if (idx is IvfFlatIndex) {
-      vecHits = idx.search(query, fetch, metric: binding.spec.metric);
-    } else if (idx is LshIndex) {
-      vecHits = idx.search(effQ, fetch);
-    } else if (idx is PqIndex) {
-      vecHits = idx.search(effQ, fetch);
-    } else if (idx is IvfPqIndex) {
-      vecHits = idx.search(effQ, fetch);
-    } else {
-      vecHits = const [];
-    }
+    final vecHits = _runVectorSearch(idx, binding.spec, query, fetch);
     final vecRank = <int, int>{}; // rowid → 1-based rank
     final vecDist = <int, double>{};
     var rank = 0;
@@ -11205,23 +11114,7 @@ class Database {
     }
 
     final fetch = math.max(k * 4, 32);
-    final effQ = _maybeNormalizeForSpec(query, binding.spec);
-    List<VectorSearchHit> vecHits;
-    if (idx is FlatIndex) {
-      vecHits = idx.search(query, fetch, metric: binding.spec.metric);
-    } else if (idx is HnswIndex) {
-      vecHits = idx.search(query, fetch, metric: binding.spec.metric);
-    } else if (idx is IvfFlatIndex) {
-      vecHits = idx.search(query, fetch, metric: binding.spec.metric);
-    } else if (idx is LshIndex) {
-      vecHits = idx.search(effQ, fetch);
-    } else if (idx is PqIndex) {
-      vecHits = idx.search(effQ, fetch);
-    } else if (idx is IvfPqIndex) {
-      vecHits = idx.search(effQ, fetch);
-    } else {
-      vecHits = const [];
-    }
+    final vecHits = _runVectorSearch(idx, binding.spec, query, fetch);
     final vecRank = <Object, int>{};
     final vecDist = <Object, double>{};
     var rank = 0;
@@ -11327,23 +11220,7 @@ class Database {
     final fetch = math.max(k * 4, 32);
     final out = <Map<String, Object?>>[];
     for (final q in queries) {
-      final effQ = _maybeNormalizeForSpec(q.vec, binding.spec);
-      List<VectorSearchHit> vecHits;
-      if (idx is FlatIndex) {
-        vecHits = idx.search(q.vec, fetch, metric: binding.spec.metric);
-      } else if (idx is HnswIndex) {
-        vecHits = idx.search(q.vec, fetch, metric: binding.spec.metric);
-      } else if (idx is IvfFlatIndex) {
-        vecHits = idx.search(q.vec, fetch, metric: binding.spec.metric);
-      } else if (idx is LshIndex) {
-        vecHits = idx.search(effQ, fetch);
-      } else if (idx is PqIndex) {
-        vecHits = idx.search(effQ, fetch);
-      } else if (idx is IvfPqIndex) {
-        vecHits = idx.search(effQ, fetch);
-      } else {
-        vecHits = const [];
-      }
+      final vecHits = _runVectorSearch(idx, binding.spec, q.vec, fetch);
       final vecRank = <Object, int>{};
       final vecDist = <Object, double>{};
       var rank = 0;
@@ -11517,23 +11394,7 @@ class Database {
       final q = queries[qi];
       if (q.vec.dim != binding.spec.dim) continue;
       // Vector side.
-      final effQ = _maybeNormalizeForSpec(q.vec, binding.spec);
-      List<VectorSearchHit> vecHits;
-      if (idx is FlatIndex) {
-        vecHits = idx.search(q.vec, fetch, metric: binding.spec.metric);
-      } else if (idx is HnswIndex) {
-        vecHits = idx.search(q.vec, fetch, metric: binding.spec.metric);
-      } else if (idx is IvfFlatIndex) {
-        vecHits = idx.search(q.vec, fetch, metric: binding.spec.metric);
-      } else if (idx is LshIndex) {
-        vecHits = idx.search(effQ, fetch);
-      } else if (idx is PqIndex) {
-        vecHits = idx.search(effQ, fetch);
-      } else if (idx is IvfPqIndex) {
-        vecHits = idx.search(effQ, fetch);
-      } else {
-        vecHits = const [];
-      }
+      final vecHits = _runVectorSearch(idx, binding.spec, q.vec, fetch);
       final vecRank = <int, int>{};
       final vecDist = <int, double>{};
       var rank = 0;
@@ -11695,24 +11556,10 @@ class Database {
         if (binding != null && query.dim != binding.spec.dim) {
           continue; // skip this query, keep numbering
         }
-        final effQ = binding != null
-            ? _maybeNormalizeForSpec(query, binding.spec)
-            : query;
-        if (sharedIndex is FlatIndex) {
-          hits = sharedIndex.search(query, k, metric: metric);
-        } else if (sharedIndex is HnswIndex) {
-          hits = sharedIndex.search(query, k, metric: metric);
-        } else if (sharedIndex is IvfFlatIndex) {
-          hits = sharedIndex.search(query, k, metric: metric);
-        } else if (sharedIndex is LshIndex) {
-          hits = sharedIndex.search(effQ, k);
-        } else if (sharedIndex is PqIndex) {
-          hits = sharedIndex.search(effQ, k);
-        } else if (sharedIndex is IvfPqIndex) {
-          hits = sharedIndex.search(effQ, k);
-        } else {
-          hits = const [];
-        }
+        hits = binding != null
+            ? _runVectorSearch(sharedIndex, binding.spec, query, k,
+                metricOverride: metric)
+            : const [];
       } else {
         if (query.dim != adhocDim) continue;
         hits = adhoc!.search(query, k, metric: metric);
@@ -11840,20 +11687,9 @@ class Database {
       if (sharedDim != null && query.dim != sharedDim) continue;
 
       List<VectorSearchHit> hits;
-      final effQ =
-          binding != null ? _maybeNormalizeForSpec(query, binding.spec) : query;
-      if (sharedIndex is FlatIndex) {
-        hits = sharedIndex.search(query, k, metric: metric);
-      } else if (sharedIndex is HnswIndex) {
-        hits = sharedIndex.search(query, k, metric: metric);
-      } else if (sharedIndex is IvfFlatIndex) {
-        hits = sharedIndex.search(query, k, metric: metric);
-      } else if (sharedIndex is LshIndex) {
-        hits = sharedIndex.search(effQ, k);
-      } else if (sharedIndex is PqIndex) {
-        hits = sharedIndex.search(effQ, k);
-      } else if (sharedIndex is IvfPqIndex) {
-        hits = sharedIndex.search(effQ, k);
+      if (sharedIndex != null && binding != null) {
+        hits = _runVectorSearch(sharedIndex, binding.spec, query, k,
+            metricOverride: metric);
       } else if (adhoc != null) {
         hits = adhoc.search(query, k, metric: metric);
       } else {
