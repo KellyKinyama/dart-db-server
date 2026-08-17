@@ -81,25 +81,78 @@ Future<void> _seed(Database db) async {
   // Toy 4-D vectors: dimensions are (has_screen, is_wearable, has_audio,
   // premium_tier). Real code would compute these with a model call.
   final rows = <List<Object?>>[
-    [1, 1, 'electronics', '4K OLED TV', 'A 55-inch 4K OLED television',
-        1299.0, '[1.0, 0.0, 0.9, 0.9]'],
-    [2, 1, 'electronics', 'Bluetooth Headphones',
-        'Wireless noise-cancelling headphones', 249.0,
-        '[0.0, 0.5, 1.0, 0.7]'],
-    [3, 1, 'wearables', 'Fitness Watch',
-        'Waterproof activity tracker with HR sensor', 149.0,
-        '[0.4, 1.0, 0.2, 0.4]'],
-    [4, 1, 'wearables', 'Smart Ring',
-        'Sleep and recovery ring', 299.0, '[0.0, 1.0, 0.0, 0.8]'],
-    [5, 2, 'electronics', 'Desk Monitor',
-        '27-inch 1440p IPS panel', 349.0, '[1.0, 0.0, 0.0, 0.6]'],
-    [6, 2, 'electronics', 'Streaming Speaker',
-        'Compact bookshelf smart speaker', 129.0, '[0.0, 0.0, 1.0, 0.3]'],
-    [7, 2, 'wearables', 'GPS Running Watch',
-        'Trail-runner GPS watch with topo maps', 449.0,
-        '[0.4, 1.0, 0.1, 0.9]'],
-    [8, 2, 'books', 'Cookbook: Weeknight',
-        'Fast recipes for busy families', 24.0, '[0.0, 0.0, 0.0, 0.1]'],
+    [
+      1,
+      1,
+      'electronics',
+      '4K OLED TV',
+      'A 55-inch 4K OLED television',
+      1299.0,
+      '[1.0, 0.0, 0.9, 0.9]'
+    ],
+    [
+      2,
+      1,
+      'electronics',
+      'Bluetooth Headphones',
+      'Wireless noise-cancelling headphones',
+      249.0,
+      '[0.0, 0.5, 1.0, 0.7]'
+    ],
+    [
+      3,
+      1,
+      'wearables',
+      'Fitness Watch',
+      'Waterproof activity tracker with HR sensor',
+      149.0,
+      '[0.4, 1.0, 0.2, 0.4]'
+    ],
+    [
+      4,
+      1,
+      'wearables',
+      'Smart Ring',
+      'Sleep and recovery ring',
+      299.0,
+      '[0.0, 1.0, 0.0, 0.8]'
+    ],
+    [
+      5,
+      2,
+      'electronics',
+      'Desk Monitor',
+      '27-inch 1440p IPS panel',
+      349.0,
+      '[1.0, 0.0, 0.0, 0.6]'
+    ],
+    [
+      6,
+      2,
+      'electronics',
+      'Streaming Speaker',
+      'Compact bookshelf smart speaker',
+      129.0,
+      '[0.0, 0.0, 1.0, 0.3]'
+    ],
+    [
+      7,
+      2,
+      'wearables',
+      'GPS Running Watch',
+      'Trail-runner GPS watch with topo maps',
+      449.0,
+      '[0.4, 1.0, 0.1, 0.9]'
+    ],
+    [
+      8,
+      2,
+      'books',
+      'Cookbook: Weeknight',
+      'Fast recipes for busy families',
+      24.0,
+      '[0.0, 0.0, 0.0, 0.1]'
+    ],
   ];
 
   for (final r in rows) {
@@ -247,8 +300,7 @@ Future<void> _adminPragmas(Database db) async {
   _dump(await db.execute('PRAGMA vector_index_list'));
 
   _banner('8. PRAGMA vector_index_stats');
-  _dump(
-      await db.execute("PRAGMA vector_index_stats('products.embedding')"));
+  _dump(await db.execute("PRAGMA vector_index_stats('products.embedding')"));
 
   _banner('9. PRAGMA vector_verify_all');
   _dump(await db.execute('PRAGMA vector_verify_all'));
