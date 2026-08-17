@@ -85,6 +85,18 @@ PRAGMA vector_index_stats('articles.embedding');
 --   → (tbl, col, kind, metric, dim, n, live, tombstones, approx_bytes)
 ```
 
+Call `vector_index_stats` with no argument to get one row per binding.
+
+For the FTS5 side (only meaningful once you've warmed a corpus):
+
+```sql
+PRAGMA fts5_list;
+--   → (tbl, col, doc_count, vocab_size, avg_doc_length)
+
+PRAGMA fts5_stats('articles.body');
+--   → same columns, one row
+```
+
 `tombstones` grows on `UPDATE` / `DELETE` for HNSW. When
 `tombstones / n > 0.3` the binding auto-rebuilds on the next query, but
 you can force it earlier:

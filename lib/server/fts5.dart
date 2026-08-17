@@ -376,6 +376,9 @@ class Fts5Index {
   /// Average document length, in tokens.
   final double avgDocLength;
 
+  /// Distinct-term (vocabulary) count.
+  int get vocabSize => _df.length;
+
   Fts5Index._(this._docs, this._df, this.avgDocLength);
 
   /// Tokenise each document with [tokenizeFts] and build the index.

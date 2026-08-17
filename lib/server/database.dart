@@ -13990,6 +13990,7 @@ class Database {
       'vector_index_warm',
       'vector_verify',
       'fts5_warm',
+      'fts5_stats',
     };
     if (s.value != null && !introspectionWithArg.contains(name)) {
       _pragmas[name] = s.value;
@@ -14230,6 +14231,8 @@ class Database {
             'vector_verify',
             'vector_verify_all',
             'fts5_warm',
+            'fts5_list',
+            'fts5_stats',
           ];
           return QueryResult(
             columns: const ['name'],
@@ -14358,6 +14361,61 @@ class Database {
         }
       case 'vector_verify_all':
         return _vectorVerifyAll();
+      case 'fts5_list':
+        {
+          final rows = <List<Object?>>[];
+          for (final entry in _fts5IndexCache.entries) {
+            final sep = entry.key.indexOf(':');
+            if (sep < 0) continue;
+            final idx = entry.value;
+            rows.add([
+              entry.key.substring(0, sep),
+              entry.key.substring(sep + 1),
+              idx.docCount,
+              idx.vocabSize,
+              idx.avgDocLength,
+            ]);
+          }
+          return QueryResult(
+            columns: const [
+              'tbl',
+              'col',
+              'doc_count',
+              'vocab_size',
+              'avg_doc_length',
+            ],
+            rows: rows,
+          );
+        }
+      case 'fts5_stats':
+        {
+          if (target == null) {
+            throw StateError(
+              "PRAGMA fts5_stats requires a 'tbl.col' target.",
+            );
+          }
+          final (tbl, col) = _parseTblCol(target, 'fts5_stats');
+          final key = '${tbl.toLowerCase()}:${col.toLowerCase()}';
+          final idx = _fts5IndexCache[key];
+          if (idx == null) {
+            throw StateError(
+              'PRAGMA fts5_stats: FTS5 corpus for $tbl.$col not warmed — '
+              'call PRAGMA fts5_warm or db.warmFts5(...) first',
+            );
+          }
+          return QueryResult(
+            columns: const [
+              'tbl',
+              'col',
+              'doc_count',
+              'vocab_size',
+              'avg_doc_length',
+            ],
+            rows: [
+              [tbl, col, idx.docCount, idx.vocabSize, idx.avgDocLength],
+            ],
+          );
+        }
       case 'optimize':
         {
           // SQLite normally inspects each table and may run ANALYZE on

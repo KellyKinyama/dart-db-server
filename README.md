@@ -181,6 +181,8 @@ PRAGMA vector_index_rebuild_all;       -- rebuild everything
 PRAGMA vector_index_warm('t.col');     -- targeted async warm (paged)
 PRAGMA vector_index_warm_all;          -- warm every binding
 PRAGMA fts5_warm('t.col');             -- warm FTS5 corpus (paged)
+PRAGMA fts5_list;                      -- list warmed FTS5 corpora
+PRAGMA fts5_stats('t.col');            -- doc_count, vocab_size, avg length
 ```
 
 For an end-to-end walkthrough — seed, k-NN, filtered k-NN, range,

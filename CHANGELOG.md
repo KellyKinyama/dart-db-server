@@ -1,13 +1,20 @@
 ## 0.1.2
 
-- `dart format` sweep across the whole tree so pub.dev's format check
-  passes cleanly (18 files reformatted, no code changes).
+- **New: FTS5 admin PRAGMAs.**
+  - `PRAGMA fts5_list` — one row per warmed FTS5 corpus with
+    `(tbl, col, doc_count, vocab_size, avg_doc_length)`.
+  - `PRAGMA fts5_stats('tbl.col')` — same columns for a single corpus;
+    throws a clear `StateError` when the corpus hasn't been warmed.
+- `Fts5Index` grew a `vocabSize` getter (distinct-term count).
+- `dart format` sweep across 18 files (test suite + 3 lib files); no
+  code changes, purely whitespace so pub.dev's format check passes.
 - Fix a `dangling_library_doc_comments` info in the example script by
   adding an explicit `library;` directive.
 - Add pub.dev + CI + license badges to the README.
 - GitHub Actions workflow: `dart format`, `dart analyze --fatal-infos`,
   and `dart test` on every push / PR (Dart stable + beta), plus a
   `dart pub publish --dry-run` job.
+- 6 new tests; suite now at 1537.
 
 ## 0.1.1
 
