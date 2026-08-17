@@ -165,6 +165,7 @@ ORDER BY s.distance;
 | `vec_hybrid_search`              | Fuse vector distance + BM25 via RRF           |
 | `vec_hybrid_search_batch`        | Batch variant of the above                    |
 | `vec_search_join`                | Row-to-row k-NN join between two tables       |
+| `vec_search_join_filtered`       | Row-to-row k-NN join with payload filter      |
 | `vec_batch_insert`               | Bulk insert (id, vec) pairs from JSON         |
 | `vec_import_csv`                 | Bulk insert (id, vec) pairs from a CSV file   |
 

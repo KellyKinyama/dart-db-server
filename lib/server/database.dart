@@ -10364,6 +10364,9 @@ class Database {
       case 'VEC_SEARCH_JOIN':
         rows = _vecSearchJoinRows(args);
         break;
+      case 'VEC_SEARCH_JOIN_FILTERED':
+        rows = _vecSearchJoinFilteredRows(args);
+        break;
       case 'VEC_BATCH_INSERT':
         rows = _vecBatchInsertRows(args);
         break;
@@ -11065,18 +11068,9 @@ class Database {
 
       final out = <Map<String, Object?>>[];
       for (final q in queries) {
-        final effQ = _maybeNormalizeForSpec(q.vec, binding.spec);
-        List<VectorSearchHit> runSearch(int wantK) {
-          if (idx is FlatIndex) return idx.search(q.vec, wantK, metric: metric);
-          if (idx is HnswIndex) return idx.search(q.vec, wantK, metric: metric);
-          if (idx is IvfFlatIndex) {
-            return idx.search(q.vec, wantK, metric: metric);
-          }
-          if (idx is LshIndex) return idx.search(effQ, wantK);
-          if (idx is PqIndex) return idx.search(effQ, wantK);
-          if (idx is IvfPqIndex) return idx.search(effQ, wantK);
-          return const [];
-        }
+        List<VectorSearchHit> runSearch(int wantK) =>
+            _runVectorSearch(idx, binding.spec, q.vec, wantK,
+                metricOverride: metric);
 
         final seen = <Object>{};
         final results = <Map<String, Object?>>[];
@@ -11861,6 +11855,115 @@ class Database {
           'distance': h.distance,
         });
       }
+    }
+    return out;
+  }
+
+  /// V61: `vec_search_join_filtered(target_table, target_column,
+  /// query_table, query_column, k, filter_json[, metric])` — payload-
+  /// filtered companion to V16 `vec_search_join`. Every query row's
+  /// k-NN is restricted to target rows matching [filter_json]; the
+  /// filter is intersected once up front and reused across queries.
+  /// In-memory target tables only — the filter would need a paged
+  /// payload index which V39/V43 already gate similarly. Requires
+  /// the target binding to declare `filter_cols`; every filter key
+  /// must be in that list.
+  List<Map<String, Object?>> _vecSearchJoinFilteredRows(List<Object?> args) {
+    if (args.length < 6) {
+      throw StateError(
+        'vec_search_join_filtered: expected (target_table, '
+        'target_column, query_table, query_column, k, '
+        'filter_json[, metric])',
+      );
+    }
+    final targetTable = args[0]?.toString();
+    final targetCol = args[1]?.toString();
+    final queryTable = args[2]?.toString();
+    final queryCol = args[3]?.toString();
+    final k = args[4] == null ? 0 : (args[4] as num).toInt();
+    final filterJson = args[5]?.toString();
+    if (targetTable == null ||
+        targetCol == null ||
+        queryTable == null ||
+        queryCol == null ||
+        filterJson == null ||
+        k <= 0) {
+      return const [];
+    }
+
+    final key = '${targetTable.toLowerCase()}:${targetCol.toLowerCase()}';
+    final binding = _vectorIndexes[key];
+    if (binding == null) return const [];
+    if (binding.spec.filterColumns.isEmpty) return const [];
+
+    // Metric override.
+    VectorMetric metric = binding.spec.metric;
+    if (args.length >= 7 && args[6] != null) {
+      try {
+        metric = _parseVectorMetric(args[6].toString());
+      } catch (_) {
+        return const [];
+      }
+    }
+
+    // Parse + intersect the payload filter ONCE.
+    final (allowed, bail) = _resolvePayloadFilter(filterJson, binding);
+    if (bail) return const [];
+    if (allowed == null) return const [];
+
+    final tTarget = _tables[targetTable];
+    final tQuery = _tables[queryTable];
+    if (tTarget == null || tQuery == null) return const [];
+    final queryColIdx = tQuery.columns.indexWhere(
+      (c) => c.name.toLowerCase() == queryCol.toLowerCase(),
+    );
+    if (queryColIdx < 0) return const [];
+    final targetPkIdx = tTarget.columns.indexWhere((c) => c.primaryKey);
+    final queryPkIdx = tQuery.columns.indexWhere((c) => c.primaryKey);
+
+    final idx = _vectorIndexFor(targetTable, targetCol);
+    if (idx == null) return const [];
+
+    final tableSize = tTarget.rows.length;
+    final wantBudgets = <int>[
+      math.min(math.max(k * 4, 16), tableSize),
+      math.min(math.max(k * 16, 64), tableSize),
+    ];
+
+    final out = <Map<String, Object?>>[];
+    for (var qi = 0; qi < tQuery.rows.length; qi++) {
+      final row = tQuery.rows[qi];
+      final raw = row[queryColIdx];
+      if (raw == null) continue;
+      Vector query;
+      try {
+        query = coerceVector(raw)!;
+      } catch (_) {
+        continue;
+      }
+      if (query.dim != binding.spec.dim) continue;
+
+      final queryRowid = queryPkIdx >= 0 ? row[queryPkIdx] : qi;
+      final seen = <int>{};
+      final results = <Map<String, Object?>>[];
+      for (final budget in wantBudgets) {
+        final hits = _runVectorSearch(idx, binding.spec, query, budget,
+            metricOverride: metric);
+        for (final hit in hits) {
+          final rid = hit.id;
+          if (rid is! int || !seen.add(rid)) continue;
+          if (!allowed.contains(rid)) continue;
+          if (rid < 0 || rid >= tTarget.rows.length) continue;
+          results.add({
+            'query_rowid': queryRowid,
+            'rowid': targetPkIdx >= 0 ? tTarget.rows[rid][targetPkIdx] : rid,
+            'distance': hit.distance,
+          });
+          if (results.length >= k) break;
+        }
+        if (results.length >= k) break;
+      }
+      out.addAll(results);
     }
     return out;
   }

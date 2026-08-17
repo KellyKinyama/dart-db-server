@@ -1,3 +1,17 @@
+## 0.1.3
+
+- **New: `vec_search_join_filtered` TVF.**
+  - Signature: `vec_search_join_filtered(target_table, target_column,
+    query_table, query_column, k, filter_json[, metric])`.
+  - Payload-filtered companion to V16 `vec_search_join`. Every query
+    row's k-NN is restricted to target rows matching `filter_json`;
+    the filter is intersected once up front and reused across queries.
+  - In-memory target tables only, matching V39 / V43 semantics.
+- Small tightening: the paged branch of `vec_search_filtered_batch`
+  now uses the shared `_runVectorSearch` dispatcher (a leftover
+  copy-paste V51 missed).
+- 5 new tests; suite now at 1542.
+
 ## 0.1.2
 
 - **New: FTS5 admin PRAGMAs.**

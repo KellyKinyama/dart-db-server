@@ -31,6 +31,7 @@ For a runnable walkthrough, see
 | `vec_range_search(t, col, q, threshold)` | Every row within a distance threshold. | Duplicate detection |
 | `vec_hybrid_search(t, vec_col, text_col, q_vec, q_text, k)` | Vector + BM25 fused via Reciprocal Rank Fusion. | Hybrid |
 | `vec_search_join(a, ac, b, bc, k)` | Row-to-row k-NN join between two tables. | Recommendations |
+| `vec_search_join_filtered(...)` | Row-to-row k-NN join with a `filter_json` payload filter. | Recommendations |
 | `PRAGMA vector_index_list` / `_stats` / `_verify[_all]` / `_rebuild[_all]` / `_warm[_all]` | Admin surface. | Operations |
 
 ## Choosing embeddings
