@@ -451,6 +451,9 @@ class FlatIndex {
   /// Number of vectors currently stored.
   int get length => _ids.length;
 
+  /// V50: snapshot of live ids in insertion order.
+  Iterable<Object?> get liveIds => List<Object?>.unmodifiable(_ids);
+
   FlatIndex(this.dim, {this.defaultMetric = VectorMetric.l2sq})
       : _data = Float32List(0);
 
@@ -721,6 +724,12 @@ class HnswIndex {
   int get liveCount => _ids.length - _tombstoneCount;
   double get tombstoneRatio =>
       _ids.isEmpty ? 0.0 : _tombstoneCount / _ids.length;
+
+  /// V50: snapshot of live (non-tombstoned) ids, insertion order.
+  Iterable<Object?> get liveIds => [
+        for (final id in _ids)
+          if (id != _tombstone) id,
+      ];
 
   /// Add [v] under key [id]. Runs one graph-insertion step; not thread
   /// safe. Ids need not be unique, but [removeId] removes only the
@@ -1389,6 +1398,12 @@ class IvfFlatIndex {
   int get length => _n;
   bool get isTrained => _trained;
 
+  /// V50: snapshot of all ids across every cell.
+  Iterable<Object?> get liveIds => [
+        for (var c = 0; c < nlist; c++)
+          for (var i = 0; i < _cellCounts[c]; i++) _cellIds[c][i],
+      ];
+
   /// Train the coarse quantizer on [samples]. Must be called once
   /// before [add]. [samples] should be representative of the data
   /// distribution and contain at least [nlist] vectors.
@@ -1712,6 +1727,9 @@ class LshIndex {
         _projectors = _randomGaussianMatrix(nbits, dim, seed);
 
   int get length => _ids.length;
+
+  /// V50: snapshot of ids in insertion order.
+  Iterable<Object?> get liveIds => List<Object?>.unmodifiable(_ids);
 
   /// Add [v] under key [id]. Encodes on-the-fly; codes are stored
   /// contiguously in [_codes].
@@ -2056,6 +2074,9 @@ class PqIndex {
   int get length => _ids.length;
   bool get isTrained => _pq.trained;
 
+  /// V50: snapshot of ids in insertion order.
+  Iterable<Object?> get liveIds => List<Object?>.unmodifiable(_ids);
+
   /// Fit codebooks on training vectors.
   void train(List<Vector> samples) {
     if (samples.isEmpty) {
@@ -2267,6 +2288,12 @@ class IvfPqIndex {
 
   int get length => _n;
   bool get isTrained => _trained;
+
+  /// V50: snapshot of all ids across every cell.
+  Iterable<Object?> get liveIds => [
+        for (var c = 0; c < nlist; c++)
+          for (var i = 0; i < _cellCounts[c]; i++) _cellIds[c][i],
+      ];
 
   /// Train coarse quantizer + PQ codebooks on residuals.
   void train(List<Vector> samples) {

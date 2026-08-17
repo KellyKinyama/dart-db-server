@@ -503,6 +503,27 @@ class Database {
     }
   }
 
+  /// V49: targeted async warm for a single binding — same async cost
+  /// as [warmVectorIndexes] but confined to one `(table, column)`.
+  /// Idempotent; a no-op when the binding is already built.
+  Future<void> warmVectorIndex(String tableName, String columnName) async {
+    final key = '${tableName.toLowerCase()}:${columnName.toLowerCase()}';
+    final binding = _vectorIndexes[key];
+    if (binding == null) {
+      throw StateError(
+        'warmVectorIndex: no vector index on $tableName.$columnName',
+      );
+    }
+    if (binding.index != null) return;
+    final pt = _pagedTable(binding.spec.table);
+    if (pt != null) {
+      await _buildPagedVectorIndex(binding, pt);
+    } else {
+      _vectorIndexFor(binding.spec.table, binding.spec.column);
+    }
+    if (path != null) await _persist();
+  }
+
   /// Build a vector index over a paged table by streaming its rows.
   /// Uses the table's PK as the index id (paged tables always have a
   /// PK). Same kind-dispatch as `_vectorIndexFor`.
@@ -1432,6 +1453,126 @@ class Database {
     );
   }
 
+  /// V50: `PRAGMA vector_verify('tbl.col')` — consistency check
+  /// between a binding's built index and the underlying (in-memory)
+  /// rows. Reports two counters:
+  ///  * `missing_from_index`: rows whose vector column is non-null and
+  ///    correctly-dimensioned but whose row-position isn't in the
+  ///    binding.index's id set.
+  ///  * `extra_in_index`: index ids that no longer correspond to any
+  ///    row (e.g. after an out-of-band edit).
+  /// Paged bindings and unbuilt bindings are rejected because paged
+  /// ids are PKs and require pt.scan to enumerate. Rows containing
+  /// malformed or dim-mismatched values are counted as `dim_bad` —
+  /// separate from `missing_from_index`.
+  QueryResult _vectorVerify(String target) {
+    final dot = target.indexOf('.');
+    if (dot < 0) {
+      throw StateError(
+        'PRAGMA vector_verify target must be "tbl.col", got "$target"',
+      );
+    }
+    final tableName = target.substring(0, dot);
+    final colName = target.substring(dot + 1);
+    final key = '${tableName.toLowerCase()}:${colName.toLowerCase()}';
+    final binding = _vectorIndexes[key];
+    if (binding == null) {
+      throw StateError(
+        'PRAGMA vector_verify: no vector index on $tableName.$colName',
+      );
+    }
+    if (_isPaged(tableName)) {
+      throw StateError(
+        'PRAGMA vector_verify: paged tables not supported (would '
+        'require pt.scan())',
+      );
+    }
+    final idx = binding.index;
+    if (idx == null) {
+      throw StateError(
+        'PRAGMA vector_verify: binding not built; call '
+        'warmVectorIndexes() or PRAGMA vector_index_warm first',
+      );
+    }
+    final t = _tables[tableName];
+    if (t == null) {
+      throw StateError(
+        'PRAGMA vector_verify: table $tableName not found',
+      );
+    }
+    final colIdx = t.columns.indexWhere(
+      (c) => c.name.toLowerCase() == colName.toLowerCase(),
+    );
+    if (colIdx < 0) {
+      throw StateError(
+        'PRAGMA vector_verify: column $colName not found in $tableName',
+      );
+    }
+
+    final indexIds = <int>{
+      for (final pos in _vectorIndexIdsOf(idx))
+        if (pos is int) pos,
+    };
+    var missing = 0;
+    var dimBad = 0;
+    final expectedIds = <int>{};
+    for (var ri = 0; ri < t.rows.length; ri++) {
+      final raw = t.rows[ri][colIdx];
+      if (raw == null) continue;
+      Vector? v;
+      try {
+        v = coerceVector(raw);
+      } catch (_) {
+        dimBad++;
+        continue;
+      }
+      if (v == null) continue;
+      if (v.dim != binding.spec.dim) {
+        dimBad++;
+        continue;
+      }
+      expectedIds.add(ri);
+      if (!indexIds.contains(ri)) missing++;
+    }
+    final extra = indexIds.length -
+        indexIds.intersection(expectedIds).length;
+    return QueryResult(
+      columns: const [
+        'tbl',
+        'col',
+        'n_rows',
+        'n_index',
+        'missing_from_index',
+        'extra_in_index',
+        'dim_bad',
+      ],
+      rows: [
+        [
+          tableName,
+          colName,
+          t.rows.length,
+          indexIds.length,
+          missing,
+          extra,
+          dimBad,
+        ],
+      ],
+    );
+  }
+
+  /// V50 helper: enumerate the id list of a built vector index.
+  /// Every index kind exposes an insertion-order `liveIds` (HNSW skips
+  /// tombstones internally).
+  static Iterable<Object?> _vectorIndexIdsOf(Object idx) {
+    if (idx is FlatIndex) return idx.liveIds;
+    if (idx is HnswIndex) return idx.liveIds;
+    if (idx is IvfFlatIndex) return idx.liveIds;
+    if (idx is LshIndex) return idx.liveIds;
+    if (idx is PqIndex) return idx.liveIds;
+    if (idx is IvfPqIndex) return idx.liveIds;
+    return const [];
+  }
+
   /// V21 incremental-maintenance-aware invalidation.
   ///
   /// * Plain `INSERT` (mode `normal`) leaves the built index intact —
@@ -2185,30 +2326,36 @@ class Database {
     }
   }
 
-  /// V48: async-only PRAGMAs that must actually complete before the
-  /// caller sees the result. Currently just `fts5_warm`, which drives
-  /// `warmFts5` synchronously so the caller's next hybrid-search TVF
-  /// finds the corpus in the cache.
+  /// V48/V49: async-only PRAGMAs that must actually complete before
+  /// the caller sees the result. Handled here rather than in the sync
+  /// `_pragma` dispatch so `unawaited(...)` racing doesn't strand
+  /// callers whose next statement depends on the pragma's side effect.
   Future<QueryResult?> _maybeRunAsyncPragma(Statement stmt) async {
     if (stmt is! PragmaStmt) return null;
     final name = stmt.name.toLowerCase();
-    if (name != 'fts5_warm') return null;
+    if (name != 'fts5_warm' && name != 'vector_index_warm') return null;
     final target = stmt.value?.toString();
     if (target == null) {
       throw StateError(
-        "PRAGMA fts5_warm requires a 'tbl.col' target.",
+        "PRAGMA $name requires a 'tbl.col' target.",
       );
     }
     final dot = target.indexOf('.');
     if (dot < 0) {
       throw StateError(
-        'PRAGMA fts5_warm target must be "tbl.col", got "$target"',
+        'PRAGMA $name target must be "tbl.col", got "$target"',
       );
     }
     final tableName = target.substring(0, dot);
     final colName = target.substring(dot + 1);
-    await warmFts5(tableName, colName);
-    return QueryResult.message('fts5_warm: $tableName.$colName warmed');
+    if (name == 'fts5_warm') {
+      await warmFts5(tableName, colName);
+      return QueryResult.message('fts5_warm: $tableName.$colName warmed');
+    }
+    await warmVectorIndex(tableName, colName);
+    return QueryResult.message(
+      'vector_index_warm: $tableName.$colName warmed',
+    );
   }
 
   /// If [stmt] is either a `CREATE TABLE … USING paged` or a DML/SELECT
@@ -13850,6 +13997,8 @@ class Database {
       'vector_index_stats',
       'vector_analyze',
       'vector_index_rebuild',
+      'vector_index_warm',
+      'vector_verify',
       'fts5_warm',
     };
     if (s.value != null && !introspectionWithArg.contains(name)) {
@@ -14085,6 +14234,8 @@ class Database {
             'vector_index_stats',
             'vector_analyze',
             'vector_index_rebuild',
+            'vector_index_warm',
+            'vector_verify',
             'fts5_warm',
           ];
           return QueryResult(
@@ -14200,6 +14351,15 @@ class Database {
             );
           }
           return _vectorIndexRebuild(target);
+        }
+      case 'vector_verify':
+        {
+          if (target == null) {
+            throw StateError(
+              "PRAGMA vector_verify requires a 'tbl.col' target.",
+            );
+          }
+          return _vectorVerify(target);
         }
       case 'optimize':
         {

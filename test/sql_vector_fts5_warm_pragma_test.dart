@@ -15,8 +15,7 @@ String _tmp(String tag) {
 
 void main() {
   group('V48 PRAGMA fts5_warm', () {
-    test('warms paged FTS5 corpus so hybrid TVF works next call',
-        () async {
+    test('warms paged FTS5 corpus so hybrid TVF works next call', () async {
       final db = await Database.open(_tmp('paged_warm'));
       try {
         await db.execute('PRAGMA default_table_kind = paged');
@@ -55,8 +54,7 @@ void main() {
           'CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT, '
           'embedding BLOB VECTOR(dim=2))',
         );
-        await db
-            .execute("INSERT INTO docs VALUES (1, 'hello', VEC('[1, 0]'))");
+        await db.execute("INSERT INTO docs VALUES (1, 'hello', VEC('[1, 0]'))");
         await db.warmVectorIndexes();
 
         final r = await db.execute("PRAGMA fts5_warm('docs.body')");
