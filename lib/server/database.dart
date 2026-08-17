@@ -1905,7 +1905,15 @@ class Database {
         if (paged != null) {
           result = paged;
         } else {
-          result = _dispatch(stmt);
+          // V48: async-only PRAGMAs (currently just `fts5_warm`) also
+          // pre-empt `_dispatch` — they need to await work the sync
+          // pragma handler can't.
+          final asyncPragma = await _maybeRunAsyncPragma(stmt);
+          if (asyncPragma != null) {
+            result = asyncPragma;
+          } else {
+            result = _dispatch(stmt);
+          }
         }
       } finally {
         _executionStack.removeLast();
@@ -2175,6 +2183,32 @@ class Database {
         'RELEASE the savepoint first.',
       );
     }
+  }
+
+  /// V48: async-only PRAGMAs that must actually complete before the
+  /// caller sees the result. Currently just `fts5_warm`, which drives
+  /// `warmFts5` synchronously so the caller's next hybrid-search TVF
+  /// finds the corpus in the cache.
+  Future<QueryResult?> _maybeRunAsyncPragma(Statement stmt) async {
+    if (stmt is! PragmaStmt) return null;
+    final name = stmt.name.toLowerCase();
+    if (name != 'fts5_warm') return null;
+    final target = stmt.value?.toString();
+    if (target == null) {
+      throw StateError(
+        "PRAGMA fts5_warm requires a 'tbl.col' target.",
+      );
+    }
+    final dot = target.indexOf('.');
+    if (dot < 0) {
+      throw StateError(
+        'PRAGMA fts5_warm target must be "tbl.col", got "$target"',
+      );
+    }
+    final tableName = target.substring(0, dot);
+    final colName = target.substring(dot + 1);
+    await warmFts5(tableName, colName);
+    return QueryResult.message('fts5_warm: $tableName.$colName warmed');
   }
 
   /// If [stmt] is either a `CREATE TABLE … USING paged` or a DML/SELECT
@@ -13816,6 +13850,7 @@ class Database {
       'vector_index_stats',
       'vector_analyze',
       'vector_index_rebuild',
+      'fts5_warm',
     };
     if (s.value != null && !introspectionWithArg.contains(name)) {
       _pragmas[name] = s.value;
@@ -14050,6 +14085,7 @@ class Database {
             'vector_index_stats',
             'vector_analyze',
             'vector_index_rebuild',
+            'fts5_warm',
           ];
           return QueryResult(
             columns: const ['name'],

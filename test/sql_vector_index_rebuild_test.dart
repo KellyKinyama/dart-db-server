@@ -17,8 +17,7 @@ String _tmp(String tag) {
 
 void main() {
   group('V47 PRAGMA vector_index_rebuild', () {
-    test('in-memory binding rebuilds synchronously and stays usable',
-        () async {
+    test('in-memory binding rebuilds synchronously and stays usable', () async {
       final db = await Database.open(_tmp('inmem'));
       try {
         await db.execute(
@@ -81,8 +80,8 @@ void main() {
         );
 
         // Read stats BEFORE rebuild.
-        final before = await db
-            .execute("PRAGMA vector_index_stats('docs.embedding')");
+        final before =
+            await db.execute("PRAGMA vector_index_stats('docs.embedding')");
         final tombBefore = before.rows.single[7] as int; // tombstones col
 
         // Rebuild.
@@ -96,8 +95,8 @@ void main() {
           "ORDER BY VEC_L2(embedding, VEC('[0, 0, 0, 0]')) ASC LIMIT 1",
         );
 
-        final after = await db
-            .execute("PRAGMA vector_index_stats('docs.embedding')");
+        final after =
+            await db.execute("PRAGMA vector_index_stats('docs.embedding')");
         final tombAfter = after.rows.single[7] as int;
 
         // Tombstones must decrease strictly (post-rebuild = 0).
