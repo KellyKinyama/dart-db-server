@@ -1,3 +1,11 @@
+## 0.1.1
+
+- Docs-only release. Adds a `doc/` folder with real-world vector-database
+  recipes: RAG semantic search, multi-tenant search, hybrid vector +
+  BM25, recommendations, duplicate detection, index selection, and
+  production operations.
+- README: index of the new recipes.
+
 ## 0.1.0
 
 Initial pub.dev release.
