@@ -187,6 +187,16 @@ Run it with:
 dart run example/vector_semantic_search.dart
 ```
 
+Deeper real-world recipes live in [`doc/`](doc/README.md):
+
+- [RAG semantic search](doc/rag-semantic-search.md) — retrieval-augmented Q&A over a document corpus.
+- [Multi-tenant search](doc/multi-tenant-search.md) — payload-filter pruning for SaaS.
+- [Hybrid vector + BM25](doc/hybrid-search.md) — RRF fusion for lexical + semantic ranking.
+- [Recommendations](doc/recommendations.md) — collaborative filtering with `vec_search_join`.
+- [Duplicate detection](doc/duplicate-detection.md) — threshold-based range search.
+- [Index selection](doc/index-selection.md) — which of the six index kinds to pick.
+- [Operations](doc/operations.md) — warming, verifying, rebuilding, and monitoring.
+
 ## Wire protocol
 
 Each TCP client sends one JSON object per line and receives one JSON
