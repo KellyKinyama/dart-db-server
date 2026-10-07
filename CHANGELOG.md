@@ -1,3 +1,9 @@
+## 0.1.5
+
+- Publishing hygiene: ignore runtime vector-store data files
+  (`kb_vectors.json` / `*.lock`) so they are never bundled into the
+  published package.
+
 ## 0.1.4
 
 - Docs-only release. Fix all 13 unresolved-symbol warnings that

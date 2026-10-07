@@ -10,3 +10,8 @@ memory.lock
 *.log
 mydatabase.json
 
+
+# Runtime vector-store data
+kb_vectors.json
+kb_vectors.json.*
+*.lock
