@@ -49,14 +49,16 @@ class OracleServer {
   /// [OracleUserStore.addUser].
   final OracleUserStore userStore;
 
-  /// Serializes statement execution across sessions. The shared engine keeps a
-  /// single global transaction snapshot, so a session that opens a transaction
-  /// holds this gate for the transaction's whole lifetime; other sessions'
-  /// statements queue until it commits/rolls back. This yields serializable
-  /// per-session isolation: uncommitted work is never visible to another
-  /// session. Statements outside a transaction grab-run-release and do not
-  /// block each other beyond their own execution.
-  final _TxnGate _txnGate = _TxnGate();
+  /// Serializes only what must be serialized. A statement outside a transaction
+  /// takes a SHARED lock, so reads (and writes, which the engine's own lock
+  /// serializes) run concurrently across sessions. A session that opens a
+  /// transaction takes the EXCLUSIVE lock and holds it for the transaction's
+  /// whole lifetime, so other sessions' statements block until it commits or
+  /// rolls back — the shared engine keeps a single global transaction
+  /// snapshot, so this is what makes uncommitted work invisible to another
+  /// session (serializable isolation) without serializing the common
+  /// no-transaction read path.
+  final _SessionGate _gate = _SessionGate();
 
   static OracleUserStore _buildUserStore(Map<String, String> users) {
     final store = OracleUserStore();
@@ -136,13 +138,13 @@ class OracleConnection {
     if (_phase == OraclePhase.closed) return;
     _phase = OraclePhase.closed;
     // A session that disconnects mid-transaction must roll back and release the
-    // gate, or it would block every other session forever.
-    if (identical(server._txnGate.owner, this)) {
-      server._txnGate.owner = null;
+    // exclusive lock, or it would block every other session forever.
+    if (identical(server._gate.owner, this)) {
+      server._gate.owner = null;
       try {
         if (server.db.inTransaction) await server.db.execute('ROLLBACK');
       } catch (_) {}
-      server._txnGate.release();
+      server._gate.releaseExclusive();
     }
     await _sub?.cancel();
     try {
@@ -328,7 +330,7 @@ class OracleConnection {
   /// no-op acknowledgement.
   Future<void> _handleCommit() async {
     server._log('conn $id COMMIT');
-    final response = await _guarded<Uint8List>(() async {
+    final response = await _guarded<Uint8List>('COMMIT', () async {
       try {
         if (server.db.inTransaction) await server.db.execute('COMMIT');
         return buildStatusOk();
@@ -343,7 +345,7 @@ class OracleConnection {
   /// no-op acknowledgement.
   Future<void> _handleRollback() async {
     server._log('conn $id ROLLBACK');
-    final response = await _guarded<Uint8List>(() async {
+    final response = await _guarded<Uint8List>('ROLLBACK', () async {
       try {
         if (server.db.inTransaction) await server.db.execute('ROLLBACK');
         return buildStatusOk();
@@ -354,28 +356,50 @@ class OracleConnection {
     _sendTtc(response);
   }
 
-  /// Runs [action] under the server's transaction gate, reconciling this
-  /// session's ownership of the single engine transaction afterward. A session
-  /// that opens a transaction keeps the gate (blocking other sessions) until it
-  /// commits or rolls back.
-  Future<T> _guarded<T>(Future<T> Function() action) async {
-    final reentrant = identical(server._txnGate.owner, this);
-    if (!reentrant) await server._txnGate.acquire();
+  /// Runs [action] under the session gate. A statement that opens a transaction
+  /// takes the exclusive lock and — if it does open one — keeps it (becoming
+  /// the gate owner) until commit/rollback; the owner's later statements run
+  /// reentrantly under that held lock. Every other statement takes the shared
+  /// lock so reads run concurrently.
+  Future<T> _guarded<T>(String sql, Future<T> Function() action) async {
+    // The owner already holds the exclusive lock; release it only when the
+    // transaction ends.
+    if (identical(server._gate.owner, this)) {
+      try {
+        return await action();
+      } finally {
+        if (!server.db.inTransaction) {
+          server._gate.owner = null;
+          server._gate.releaseExclusive();
+        }
+      }
+    }
+    if (_opensTransaction(sql)) {
+      await server._gate.acquireExclusive();
+      var keep = false;
+      try {
+        final r = await action();
+        if (server.db.inTransaction) {
+          server._gate.owner = this; // hold the lock across the transaction
+          keep = true;
+        }
+        return r;
+      } finally {
+        if (!keep) server._gate.releaseExclusive();
+      }
+    }
+    await server._gate.acquireShared();
     try {
       return await action();
     } finally {
-      final nowInTxn = server.db.inTransaction;
-      if (reentrant) {
-        if (!nowInTxn) {
-          server._txnGate.owner = null;
-          server._txnGate.release();
-        }
-      } else if (nowInTxn && server._txnGate.owner == null) {
-        server._txnGate.owner = this; // opened a transaction; keep the gate
-      } else {
-        server._txnGate.release();
-      }
+      server._gate.releaseShared();
     }
+  }
+
+  /// Whether [sql] opens a transaction (and so must take the exclusive lock).
+  static bool _opensTransaction(String sql) {
+    final s = sql.trimLeft().toUpperCase();
+    return s.startsWith('BEGIN') || s.startsWith('START TRANSACTION');
   }
 
   /// Decodes and runs a TTC EXECUTE (function 94) against the database, then
@@ -417,7 +441,7 @@ class OracleConnection {
       sql = cached;
     }
     server._log('conn $id EXECUTE [cursor $cursorId] "$sql"');
-    final response = await _guarded<Uint8List>(() async {
+    final response = await _guarded<Uint8List>(sql, () async {
       try {
         final result = await server.db.execute(sql);
         return result.columns.isNotEmpty
@@ -450,28 +474,59 @@ String _oraErrorText(Object e) {
 /// A FIFO async gate that also tracks the connection currently holding an open
 /// transaction. The owner keeps the gate across multiple statements; everyone
 /// else queues.
-class _TxnGate {
-  final List<Completer<void>> _waiters = <Completer<void>>[];
-  bool _locked = false;
+/// A fair multi-reader / single-writer gate that also tracks the connection
+/// holding an open transaction (which keeps the write lock across statements).
+class _SessionGate {
+  int _readers = 0;
+  bool _writer = false;
+  final List<Completer<void>> _readWaiters = <Completer<void>>[];
+  final List<Completer<void>> _writeWaiters = <Completer<void>>[];
 
   /// The connection that owns the in-progress transaction, if any.
   OracleConnection? owner;
 
-  Future<void> acquire() {
-    if (!_locked) {
-      _locked = true;
+  Future<void> acquireShared() {
+    if (!_writer && _writeWaiters.isEmpty) {
+      _readers++;
       return Future<void>.value();
     }
     final c = Completer<void>();
-    _waiters.add(c);
+    _readWaiters.add(c);
     return c.future;
   }
 
-  void release() {
-    if (_waiters.isNotEmpty) {
-      _waiters.removeAt(0).complete();
-    } else {
-      _locked = false;
+  void releaseShared() {
+    _readers--;
+    _drain();
+  }
+
+  Future<void> acquireExclusive() {
+    if (!_writer && _readers == 0) {
+      _writer = true;
+      return Future<void>.value();
+    }
+    final c = Completer<void>();
+    _writeWaiters.add(c);
+    return c.future;
+  }
+
+  void releaseExclusive() {
+    _writer = false;
+    _drain();
+  }
+
+  void _drain() {
+    // Prefer a waiting writer to avoid writer starvation.
+    if (!_writer && _readers == 0 && _writeWaiters.isNotEmpty) {
+      _writer = true;
+      _writeWaiters.removeAt(0).complete();
+      return;
+    }
+    if (!_writer && _readWaiters.isNotEmpty) {
+      while (_readWaiters.isNotEmpty) {
+        _readers++;
+        _readWaiters.removeAt(0).complete();
+      }
     }
   }
 }

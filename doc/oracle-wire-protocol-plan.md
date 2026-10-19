@@ -268,6 +268,21 @@ cached cursors (`ttcFuncReExecute` / `ttcFuncReExecuteAndFetch`),
 > trade-off is concurrency, not correctness: cross-session reads serialize
 > while any transaction is open (no row-level MVCC).
 
+> **Update (performance — concurrent reads):** the gate was upgraded from a
+> single FIFO mutex to a fair **reader/writer** gate (`_SessionGate`). Only a
+> transaction-opening statement takes the **exclusive** lock and holds it for
+> the transaction's lifetime; **every other statement takes a shared lock**,
+> so reads (and writes, which the engine's own lock already serializes) from
+> different sessions run **concurrently** in the common no-transaction case —
+> the previous design serialized them all. Isolation is unchanged: a shared
+> acquire blocks while any session holds an open transaction's exclusive lock,
+> so uncommitted work stays invisible. Statement classification is
+> conservative (only `BEGIN` / `START TRANSACTION` take the exclusive lock);
+> a misclassified autocommit write is still correct because the engine's
+> internal write lock serializes it and it opens no transaction.
+> `test/oracle_isolation_test.dart` adds a many-session concurrent-read check
+> alongside the isolation proofs.
+
 **Phase 5 — Rich type codecs.** Incrementally add server-side encoders by
 inverting the client decoders, each behind a conformance test:
 - NUMBER (Oracle's base-100 mantissa) and the integer/float fast paths.

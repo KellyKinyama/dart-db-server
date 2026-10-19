@@ -118,4 +118,34 @@ void main() {
     final bResp = decodeExecuteResponse(ttcBody(await fb.next()), isQuery: true);
     expect(bResp.rows, isEmpty); // A's insert was rolled back on disconnect
   });
+
+  test('reads from many sessions run concurrently (no transaction)', () async {
+    final (seed, seedFrames) = await login();
+    addTearDown(() async => seed.close());
+    seed.add(wrapData(buildExecuteRequest(
+        'CREATE TABLE t (id INTEGER PRIMARY KEY)')));
+    await seedFrames.next();
+    seed.add(wrapData(buildExecuteRequest('INSERT INTO t VALUES (42)')));
+    await seedFrames.next();
+
+    // Three sessions each fire a SELECT without awaiting; with the shared lock
+    // they proceed concurrently (no transaction is open) and all see the row.
+    final sessions = await Future.wait([login(), login(), login()]);
+    addTearDown(() async {
+      for (final (s, _) in sessions) {
+        await s.close();
+      }
+    });
+    final pending = <Future<ExecuteResponse>>[];
+    for (final (s, f) in sessions) {
+      s.add(wrapData(buildExecuteRequest('SELECT id FROM t', isQuery: true)));
+      pending.add(f.next().then((frame) =>
+          decodeExecuteResponse(ttcBody(frame), isQuery: true)));
+    }
+    for (final resp in await Future.wait(pending)) {
+      expect(resp.rows, [
+        [42],
+      ]);
+    }
+  });
 }
