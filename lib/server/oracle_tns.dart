@@ -38,10 +38,12 @@ const int tnsVersionMinLargeSdu = 315; // 4-byte SDU/TDU fields present
 const int tnsVersionMinDataFlags = 318; // flag2 (accept flags) present
 const int tnsVersionMinEndOfResponse = 319; // end-of-request/response markers
 
-/// Highest version this server negotiates. Pinned to 318 for now: enables the
-/// 4-byte SDU and the accept-flag word without taking on the 319
-/// end-of-request/response marker protocol (a later phase).
-const int tnsServerVersion = 318;
+/// Highest version this server negotiates. Pinned to 314 — one below
+/// [tnsVersionMinLargeSdu] (315) — so the client keeps the classic 2-byte
+/// packet-length framing on DATA packets instead of switching to the 4-byte
+/// large-SDU header. Large-SDU framing (and >64 KB packets / multi-packet
+/// results) is a later phase.
+const int tnsServerVersion = 314;
 
 const int tnsDefaultSdu = 8192;
 const int tnsDefaultTdu = 32767;

@@ -27,8 +27,10 @@ dependencies:
   # path: ^1.8.0
   crypto: ^3.0.3
   # AES-256-CBC, SHA-512 and PBKDF2 for the Oracle (TNS/TTC) wire auth
-  # verifier side; the same primitives the sibling thin client uses.
-  pointycastle: ^3.9.1
+  # verifier side; the same primitives the sibling thin client uses. Range
+  # spans 3.9+ and 4.x so the real-client validation project (which also pulls
+  # the `oracledb` client, pinned to ^4.0.0) resolves to one shared version.
+  pointycastle: ">=3.9.1 <5.0.0"
 
 dev_dependencies:
   lints: ^5.0.0

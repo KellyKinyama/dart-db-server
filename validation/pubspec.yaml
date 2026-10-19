@@ -1,0 +1,19 @@
+name: oracle_wire_validation
+description: >
+  Validates the dart_db_server Oracle (TNS/TTC) wire front-end against the real
+  pure-Dart `oracledb` client — the client connects to the server as if it were
+  a real Oracle database. Not published.
+publish_to: none
+
+environment:
+  sdk: ^3.12.0
+
+dependencies:
+  dart_db_server:
+    path: ..
+  oracledb:
+    path: ../../dart-oracledb
+
+dev_dependencies:
+  test: ^1.24.0
+  lints: ^5.0.0

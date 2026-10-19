@@ -24,14 +24,21 @@
 A client can connect from TCP all the way through a real SQL `SELECT`.
 Delivered modules live in `lib/server/oracle_*.dart`, enabled with
 `dart run bin/dart_db_server.dart --oracle-port 1521 --oracle-user user/pass`,
-and covered by `test/oracle_wire_test.dart`, `test/oracle_auth_test.dart`,
-and `test/oracle_execute_test.dart` (19 tests, including live socket
-round-trips). See the per-phase **Landed** notes below for detail.
+and covered by the `test/oracle_*_test.dart` suites (31 tests, including live
+socket round-trips). See the per-phase **Landed** notes below for detail.
 
-> **Not yet validated against a real Oracle client.** Every phase is
-> verified against faithful mirrors of the sibling client's decoders/
-> encoders (the correct spec), but a live run of the actual `oracledb` /
-> node-oracledb client is still the outstanding confidence check.
+> **✅ Validated against the real `oracledb` client.** The actual pure-Dart
+> thin client connects to the server (no Docker / real Oracle needed, since the
+> server *is* the database): it negotiates, authenticates via O5LOGON, runs its
+> connect-time charset probe, and round-trips `CREATE` / `INSERT` / `SELECT`
+> with native `int` / `double` / `String` values; a wrong password is
+> rejected. Harness: `validation/` (separate project pulling both the server
+> and the `oracledb` client via path) — `validation/test/realclient_test.dart`
+> and `validation/bin/validate.dart`. Two real-world fixes fell out of this:
+> the server now negotiates TNS version **314** (one below large-SDU framing,
+> so the client keeps 2-byte packet lengths — >64 KB packets are a later
+> phase), and it answers the client's `nls_database_parameters` charset probe
+> with a synthetic `AL32UTF8` / `AL16UTF16` result.
 
 ## Why this is tractable (we are not starting from zero)
 

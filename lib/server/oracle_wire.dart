@@ -23,6 +23,7 @@ import 'oracle_codec.dart';
 import 'oracle_execute.dart';
 import 'oracle_tns.dart';
 import 'oracle_ttc.dart';
+import 'result.dart';
 
 // TTC message types (first byte of a TTC message body). Full set lives in the
 // client's `protocol/constants.dart`; only the ones the transport, negotiation
@@ -443,7 +444,9 @@ class OracleConnection {
     server._log('conn $id EXECUTE [cursor $cursorId] "$sql"');
     final response = await _guarded<Uint8List>(sql, () async {
       try {
-        final result = await server.db.execute(sql);
+        // Serve the client's connect-time data-dictionary probes synthetically;
+        // the SQL engine has no Oracle system catalog.
+        final result = _systemQueryResult(sql) ?? await server.db.execute(sql);
         return result.columns.isNotEmpty
             ? buildQueryResponse(result, cursorId: cursorId)
             : buildDmlResponse(result, cursorId: cursorId);
@@ -469,6 +472,26 @@ class OracleConnection {
 String _oraErrorText(Object e) {
   final text = e.toString().replaceAll('\n', ' ').trim();
   return text.length > 512 ? text.substring(0, 512) : text;
+}
+
+/// Synthesizes results for the Oracle data-dictionary probes a thin client
+/// issues at connect time (the SQL engine has no Oracle system catalog).
+/// Returns null for anything else so the real engine handles it.
+QueryResult? _systemQueryResult(String sql) {
+  final s = sql.toLowerCase();
+  if (s.contains('nls_database_parameters') ||
+      s.contains('nls_session_parameters')) {
+    // The driver reads NLS_CHARACTERSET / NLS_NCHAR_CHARACTERSET to pick its
+    // codecs; report the UTF-8 / UTF-16 pair the negotiation already advertised.
+    return const QueryResult(
+      columns: ['PARAMETER', 'VALUE'],
+      rows: [
+        ['NLS_CHARACTERSET', 'AL32UTF8'],
+        ['NLS_NCHAR_CHARACTERSET', 'AL16UTF16'],
+      ],
+    );
+  }
+  return null;
 }
 
 /// A FIFO async gate that also tracks the connection currently holding an open
