@@ -21,6 +21,16 @@ import 'oracle_codec.dart';
 const int ttcMsgProtocol = 1;
 const int ttcMsgDataTypes = 2;
 
+/// TTC message types that prefix every TTC body (shared across auth, execute,
+/// and negotiation). The protocol/data-types negotiation reuse 1/2 above.
+const int ttcMsgTypeFunction = 3; // RPC function call
+const int ttcMsgTypeError = 4; // error / success-with-rowcount
+const int ttcMsgTypeRowHeader = 6; // fetch row header
+const int ttcMsgTypeRowData = 7; // one result row
+const int ttcMsgTypeParameter = 8; // key-value parameter block
+const int ttcMsgTypeStatus = 9; // terminal call status
+const int ttcMsgTypeDescribeInfo = 16; // query column metadata
+
 /// Server protocol version byte the client stores (Oracle 8.1+ uses 6).
 const int ttcServerVersion = 6;
 

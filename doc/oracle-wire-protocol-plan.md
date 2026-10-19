@@ -169,6 +169,23 @@ prefetch/fetch-array protocol and `ttcFuncFetch` continuations from
 `errors.dart`. *Exit:* `SELECT`/`INSERT`/`UPDATE`/`DELETE` with binds work
 from a stock client.
 
+> **Landed (no-bind path):** `lib/server/oracle_execute.dart`.
+> `decodeExecuteRequest` walks the OALL8 header (field version 24) to recover
+> the SQL text, cursor id, and bind count; the connection runs it through
+> `Database.execute()`. Responses are encoded as the inverse of the client's
+> response decoders: DML/DDL as a success `ERROR(num=0, rowCount)`, queries as
+> `DESCRIBE_INFO` + `ROW_HEADER` + per-row `ROW_DATA` + a terminal
+> `ORA-01403` (end of fetch). Result columns are described as **VARCHAR2** and
+> values sent as UTF-8 strings — a valid shape the client decodes to `String`,
+> which sidesteps Oracle's base-100 NUMBER encoding for now. `test/
+> oracle_execute_test.dart` round-trips the request decode, validates each
+> response encoding with mirrors of the client decoders, and drives a **live**
+> login → CREATE → INSERT → SELECT over a socket (`test/oracle_support.dart`
+> centralizes the client simulation). **Next:** bind variables (metadata +
+> values), native NUMBER/DATE/etc. column encoding, multi-packet/large result
+> flow control and `ttcFuncFetch` continuations, then confirm against the real
+> `oracledb` client.
+
 **Phase 4 — Transactions & statement lifecycle.** `ttcFuncCommit` /
 `ttcFuncRollback`, cursor close (`ttcFuncCloseCursors`), re-execute of
 cached cursors (`ttcFuncReExecute` / `ttcFuncReExecuteAndFetch`),

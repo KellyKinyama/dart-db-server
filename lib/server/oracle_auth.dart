@@ -22,12 +22,7 @@ import 'dart:typed_data';
 
 import 'oracle_codec.dart';
 import 'oracle_crypto.dart';
-
-// TTC message types (first byte of a TTC body).
-const int ttcMsgTypeFunction = 3;
-const int ttcMsgTypeError = 4;
-const int ttcMsgTypeParameter = 8;
-const int ttcMsgTypeStatus = 9;
+import 'oracle_ttc.dart';
 
 // TTC function codes (second byte when message type is FUNCTION).
 const int ttcAuthPhaseOne = 0x76;

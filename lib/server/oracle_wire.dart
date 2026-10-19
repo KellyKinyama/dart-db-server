@@ -20,6 +20,7 @@ import 'dart:typed_data';
 import 'database.dart';
 import 'oracle_auth.dart';
 import 'oracle_codec.dart';
+import 'oracle_execute.dart';
 import 'oracle_tns.dart';
 import 'oracle_ttc.dart';
 
@@ -254,15 +255,50 @@ class OracleConnection {
         }
         _sendTtc(resp.bytes);
         break;
+      case ttcFuncExecute:
+        unawaited(_handleExecute(body));
+        break;
       default:
         server._log('conn $id TTC function $functionCode (phase $_phase, '
             'not yet implemented)');
     }
   }
 
+  /// Decodes and runs a TTC EXECUTE (function 94) against the database, then
+  /// replies with a query result set or a DML/DDL status.
+  Future<void> _handleExecute(ReadBuffer body) async {
+    final ExecuteRequestInfo info;
+    try {
+      info = decodeExecuteRequest(body);
+    } catch (e) {
+      server._log('conn $id EXECUTE decode error: $e');
+      _sendTtc(buildExecuteError(600, 'internal error decoding execute'));
+      return;
+    }
+    if (_phase != OraclePhase.ready) {
+      _sendTtc(buildExecuteError(1012, 'not logged on'));
+      return;
+    }
+    if (info.hasBinds) {
+      server._log('conn $id EXECUTE with ${info.numParams} binds (unsupported)');
+      _sendTtc(buildExecuteError(600, 'bind variables are not yet supported'));
+      return;
+    }
+    server._log('conn $id EXECUTE "${info.sql}"');
+    try {
+      final result = await server.db.execute(info.sql);
+      if (result.columns.isNotEmpty) {
+        _sendTtc(buildQueryResponse(result));
+      } else {
+        _sendTtc(buildDmlResponse(result));
+      }
+    } catch (e) {
+      _sendTtc(buildExecuteError(900, _oraErrorText(e)));
+    }
+  }
+
   /// Wraps a TTC message body in a TNS DATA packet and sends it.
   void _sendTtc(Uint8List ttcBody) => _send(buildDataPacket(ttcBody));
-
   void _send(Uint8List bytes) {
     try {
       socket.add(bytes);
@@ -270,4 +306,10 @@ class OracleConnection {
       server._log('conn $id send failed: $e');
     }
   }
+}
+
+/// Flattens an error into a single-line message for a TTC error reply.
+String _oraErrorText(Object e) {
+  final text = e.toString().replaceAll('\n', ' ').trim();
+  return text.length > 512 ? text.substring(0, 512) : text;
 }
