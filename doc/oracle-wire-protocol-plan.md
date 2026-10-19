@@ -17,7 +17,7 @@
 | 1 — TTC negotiation | ✅ | PROTOCOL + DATA-TYPES exchange (charset, caps, field version 24) |
 | 2 — Authentication | ✅ (SHA512/O5LOGON) | Verifier side: AUTH_PHASE_ONE/TWO, no plaintext storage; PBKDF2/12c + FAST_AUTH pending |
 | 3 — Execute & fetch | ✅ (no-bind) | Decode OALL8, run `Database.execute()`, reply DML status / query rows (columns as VARCHAR2); binds + native types pending |
-| 4 — Transactions & lifecycle | ⬜ | commit/rollback, cursor close, re-execute, ping |
+| 4 — Transactions & lifecycle | ◻ (commit/rollback/ping) | COMMIT, ROLLBACK, PING acknowledged; cursor close + re-execute pending |
 | 5 — Rich type codecs | ⬜ | NUMBER, DATE/TS, INTERVAL, ROWID, LOB, JSON, VECTOR |
 | 6 — TLS & robustness | ⬜ | native-net-encryption/TLS, SDU renegotiation, fuzz hardening |
 
@@ -215,6 +215,18 @@ from a stock client.
 cached cursors (`ttcFuncReExecute` / `ttcFuncReExecuteAndFetch`),
 `ttcPing`, and graceful `ttcClose`. Map to the engine's existing
 `BEGIN/COMMIT/ROLLBACK` and prepared-statement cache.
+
+> **Landed (commit/rollback/ping):** `oracle_execute.dart` `buildStatusOk`
+> plus dispatch in `oracle_wire.dart` for `ttcFuncCommit` (14),
+> `ttcFuncRollback` (15), and `ttcFuncPing` (0x93) — each a bare FUNCTION RPC
+> (`[3][func][seq][token]`) acknowledged with a success STATUS the client
+> reads as end-of-call. Because the engine applies writes immediately and
+> persists on its own schedule, COMMIT/ROLLBACK are acknowledgements rather
+> than a true durable boundary / undo (documented limitation).
+> `test/oracle_lifecycle_test.dart` drives each call live after login and
+> confirms the connection stays usable. **Next:** cursor close
+> (`ttcFuncCloseCursors` piggyback), cached-cursor re-execute, graceful
+> `ttcClose`, and real per-session transaction semantics.
 
 **Phase 5 — Rich type codecs.** Incrementally add server-side encoders by
 inverting the client decoders, each behind a conformance test:

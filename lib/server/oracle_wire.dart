@@ -258,6 +258,23 @@ class OracleConnection {
       case ttcFuncExecute:
         unawaited(_handleExecute(body));
         break;
+      case ttcFuncCommit:
+        // The engine applies writes immediately and persists on its own
+        // schedule, so a COMMIT is acknowledged without a distinct durable
+        // transaction boundary (documented limitation).
+        server._log('conn $id COMMIT');
+        _sendTtc(buildStatusOk());
+        break;
+      case ttcFuncRollback:
+        // Writes are already applied in this model, so ROLLBACK is a
+        // best-effort acknowledgement rather than a true undo (documented
+        // limitation).
+        server._log('conn $id ROLLBACK');
+        _sendTtc(buildStatusOk());
+        break;
+      case ttcFuncPing:
+        _sendTtc(buildStatusOk());
+        break;
       default:
         server._log('conn $id TTC function $functionCode (phase $_phase, '
             'not yet implemented)');

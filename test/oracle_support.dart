@@ -20,6 +20,9 @@ const int tnsPacketConnect = 1;
 const int tnsPacketAccept = 2;
 const int tnsPacketData = 6;
 const int ttcFuncExecute = 94;
+const int ttcFuncCommit = 14;
+const int ttcFuncRollback = 15;
+const int ttcFuncPing = 0x93;
 const int ttcAuthPhaseOne = 0x76;
 const int ttcAuthPhaseTwo = 0x73;
 
@@ -254,6 +257,17 @@ Future<void> handshakeAndLogin(
 }
 
 // --- EXECUTE request/response (client side) --------------------------------
+
+/// Builds a bare FUNCTION RPC request (COMMIT, ROLLBACK, PING) at TTC field
+/// version 24: message type, function code, sequence, and the 23.1 token.
+Uint8List buildFunctionRequest(int functionCode, {int seq = 4}) {
+  final b = WriteBuffer();
+  b.writeUint8(ttcMsgTypeFunction);
+  b.writeUint8(functionCode);
+  b.writeUint8(seq);
+  b.writeUB8(0); // token number
+  return b.toBytes();
+}
 
 /// Builds a no-bind EXECUTE (OALL8) request body at TTC field version 24.
 Uint8List buildExecuteRequest(String sql, {bool isQuery = false, int seq = 3}) {

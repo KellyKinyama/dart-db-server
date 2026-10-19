@@ -23,6 +23,11 @@ import 'result.dart';
 /// TTC RPC function code for a full execute (OALL8).
 const int ttcFuncExecute = 94;
 
+/// TTC RPC function codes for the transaction / lifecycle calls.
+const int ttcFuncCommit = 14;
+const int ttcFuncRollback = 15;
+const int ttcFuncPing = 0x93;
+
 /// Oracle VARCHAR2 data type indicator.
 const int _oraTypeVarchar = 1;
 
@@ -154,6 +159,17 @@ Uint8List buildDmlResponse(QueryResult result) {
 Uint8List buildExecuteError(int errorCode, String message) {
   final b = WriteBuffer();
   _writeErrorBody(b, num: errorCode, message: message);
+  return b.toBytes();
+}
+
+/// Builds a bare success STATUS message — the terminal reply for COMMIT,
+/// ROLLBACK, and PING, which carry no result data. The client's
+/// `decodeExecuteResponse` reads it as a successful end-of-call.
+Uint8List buildStatusOk() {
+  final b = WriteBuffer();
+  b.writeUint8(ttcMsgTypeStatus);
+  b.writeUB4(0); // call status
+  b.writeUB2(0); // end-to-end sequence
   return b.toBytes();
 }
 
