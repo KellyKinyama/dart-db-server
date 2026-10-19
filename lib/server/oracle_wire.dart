@@ -18,15 +18,17 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'database.dart';
+import 'oracle_auth.dart';
 import 'oracle_codec.dart';
 import 'oracle_tns.dart';
 import 'oracle_ttc.dart';
 
-// TTC function codes (first byte of a TTC message). Full set lives in the
-// client's `protocol/constants.dart`; only the ones the transport and
-// negotiation phases need are named here.
+// TTC message types (first byte of a TTC message body). Full set lives in the
+// client's `protocol/constants.dart`; only the ones the transport, negotiation
+// and auth phases need are named here.
 const int _ttcProtocol = ttcMsgProtocol; // 1: protocol negotiation
 const int _ttcDataTypes = ttcMsgDataTypes; // 2: data-type negotiation
+const int _ttcFunction = ttcMsgTypeFunction; // 3: RPC function call
 
 /// Oracle TNS/TTC server fronting a [Database].
 class OracleServer {
@@ -34,11 +36,23 @@ class OracleServer {
     this.db, {
     InternetAddress? address,
     this.port = 1521,
-  }) : address = address ?? InternetAddress.loopbackIPv4;
+    Map<String, String> users = const <String, String>{},
+  })  : address = address ?? InternetAddress.loopbackIPv4,
+        userStore = _buildUserStore(users);
 
   final Database db;
   final InternetAddress address;
   final int port;
+
+  /// Registered database users (verifier side). Add more with
+  /// [OracleUserStore.addUser].
+  final OracleUserStore userStore;
+
+  static OracleUserStore _buildUserStore(Map<String, String> users) {
+    final store = OracleUserStore();
+    users.forEach(store.addUser);
+    return store;
+  }
 
   ServerSocket? _socket;
   final Set<OracleConnection> _conns = <OracleConnection>{};
@@ -85,6 +99,7 @@ class OracleConnection {
   Uint8List _buffered = Uint8List(0);
   StreamSubscription<Uint8List>? _sub;
   OraclePhase _phase = OraclePhase.connect;
+  final AuthPhaseState _auth = AuthPhaseState();
 
   int _version = tnsServerVersion;
 
@@ -192,12 +207,12 @@ class OracleConnection {
   void _handleData(TnsPacket packet) {
     if (packet.payload.isEmpty) return; // no TTC body
     final ttc = ReadBuffer(packet.payload);
-    final functionCode = ttc.readUint8();
-    _handleTtc(functionCode, ttc, packet);
+    final messageType = ttc.readUint8();
+    _handleTtc(messageType, ttc);
   }
 
-  void _handleTtc(int functionCode, ReadBuffer body, TnsPacket packet) {
-    switch (functionCode) {
+  void _handleTtc(int messageType, ReadBuffer body) {
+    switch (messageType) {
       case _ttcProtocol:
         server._log('conn $id TTC PROTOCOL request -> response');
         _phase = OraclePhase.negotiate;
@@ -208,12 +223,41 @@ class OracleConnection {
         _phase = OraclePhase.auth;
         _sendTtc(buildDataTypesResponse());
         break;
+      case _ttcFunction:
+        _handleFunction(body);
+        break;
+      default:
+        server._log('conn $id TTC message type $messageType (phase $_phase, '
+            'not yet implemented)');
+    }
+    // Execute/fetch responses are implemented in the next phase of
+    // doc/oracle-wire-protocol-plan.md.
+  }
+
+  /// Dispatches a TTC FUNCTION (message type 3) call by its function code.
+  void _handleFunction(ReadBuffer body) {
+    final functionCode = body.readUint8();
+    body.readUint8(); // sequence number
+    switch (functionCode) {
+      case ttcAuthPhaseOne:
+        final resp = handleAuthPhaseOne(body, server.userStore, _auth);
+        server._log('conn $id AUTH_PHASE_ONE user=${_auth.username ?? '?'}');
+        _sendTtc(resp.bytes);
+        break;
+      case ttcAuthPhaseTwo:
+        final resp = handleAuthPhaseTwo(body, _auth);
+        if (resp.authenticated) {
+          _phase = OraclePhase.ready;
+          server._log('conn $id authenticated user=${_auth.username ?? '?'}');
+        } else {
+          server._log('conn $id auth failed user=${_auth.username ?? '?'}');
+        }
+        _sendTtc(resp.bytes);
+        break;
       default:
         server._log('conn $id TTC function $functionCode (phase $_phase, '
             'not yet implemented)');
     }
-    // Authentication and execute/fetch responses are implemented in the next
-    // phases of doc/oracle-wire-protocol-plan.md.
   }
 
   /// Wraps a TTC message body in a TNS DATA packet and sends it.

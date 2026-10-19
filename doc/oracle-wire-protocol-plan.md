@@ -141,6 +141,24 @@ Implement the server half of:
   matches. Start with one hard-coded test user, then a `CREATE USER`
   surface. *Exit:* `oracledb` client authenticates end-to-end.
 
+> **Landed (O5LOGON/SHA512 verifier):** `lib/server/oracle_crypto.dart`
+> (SHA-512, PBKDF2-HMAC-SHA512, AES-256-CBC raw/PKCS7 via `pointycastle`)
+> and `lib/server/oracle_auth.dart` — the verifier side. The server stores
+> only `{salt, SHA512(password‖salt)[0:32]}` per user (never plaintext). In
+> AUTH_PHASE_ONE (function `0x76`) it seals a fresh 48-byte nonce into
+> `AUTH_SESSKEY` and advertises the salt in `AUTH_VFR_DATA` (flags = verifier
+> type `0x939`); in AUTH_PHASE_TWO (`0x73`) it decrypts the client session
+> key, derives the combo key (PBKDF2 over `hex(partB‖serverNonce)`, client
+> default mixing), decrypts `AUTH_PASSWORD`, and re-derives the hash to
+> confirm — constant-time compared. Success returns a STATUS message; failure
+> and unknown users return a TTC ORA-01017 error. Users are registered via
+> the `OracleServer(users: {...})` constructor or `--oracle-user user/pass`.
+> `test/oracle_auth_test.dart` simulates the client proof and covers accept /
+> wrong-password / unknown-user, plus a **live end-to-end** socket handshake
+> CONNECT → PROTOCOL → DATA-TYPES → AUTH1 → AUTH2 → authenticated. **Next:**
+> PBKDF2/12c + FAST_AUTH paths, and confirm against the real `oracledb`
+> client; then Phase 3 execute/fetch.
+
 **Phase 3 — Execute & fetch (the money path).** Decode the OALL8
 `ttcFuncExecute` message (SQL text, bind metadata, bind values, fetch
 array size, options) via the inverse of `execute_message.dart` +

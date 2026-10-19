@@ -24,6 +24,7 @@ Future<void> main(List<String> args) async {
   String host = '127.0.0.1';
   bool repl = false;
   bool memory = false;
+  final oracleUsers = <String, String>{};
 
   for (var i = 0; i < args.length; i++) {
     final a = args[i];
@@ -37,6 +38,16 @@ Future<void> main(List<String> args) async {
         break;
       case '--oracle-port':
         oraclePort = int.parse(next() ?? '$oraclePort');
+        break;
+      case '--oracle-user':
+        final spec = next();
+        if (spec != null && spec.contains('/')) {
+          final slash = spec.indexOf('/');
+          oracleUsers[spec.substring(0, slash)] = spec.substring(slash + 1);
+        } else {
+          stderr.writeln('--oracle-user expects user/password');
+          exit(64);
+        }
         break;
       case '--host':
         host = next() ?? host;
@@ -68,8 +79,8 @@ Future<void> main(List<String> args) async {
 
   OracleServer? oracleServer;
   if (oraclePort > 0) {
-    oracleServer =
-        OracleServer(db, address: InternetAddress(host), port: oraclePort);
+    oracleServer = OracleServer(db,
+        address: InternetAddress(host), port: oraclePort, users: oracleUsers);
     await oracleServer.start();
   }
 
@@ -103,6 +114,7 @@ Options:
   --file <path>    JSON file used for persistence (default: mydatabase.json)
   --port <n>       TCP port to listen on (default: 4555, 0 disables)
   --oracle-port <n> Oracle TNS/TTC wire port (default: 0 disabled, e.g. 1521)
+  --oracle-user <u/p> Register an Oracle wire user (repeatable)
   --host <addr>    Bind address (default: 127.0.0.1)
   --repl           Also start an interactive REPL on stdin
   --memory         Run in-memory only (no persistence)
