@@ -93,11 +93,19 @@ to the client.
 
 ## Phased roadmap
 
-**Phase 0 — Spike & transcripts.** Stand up a raw TCP listener that
-accepts a TNS CONNECT and replies with a hard-coded ACCEPT captured from a
-real session; confirm a client progresses past connect. Record golden
-transcripts for every subsequent phase. *Exit:* client reaches cap
-negotiation.
+**Phase 0 — Spike & transcripts. ✅ (initial)** Stand up a raw TCP listener
+that accepts a TNS CONNECT and replies with an ACCEPT; confirm a client
+progresses past connect. Record golden transcripts for every subsequent
+phase. *Exit:* client reaches cap negotiation.
+
+> **Landed:** `lib/server/oracle_codec.dart` (TNS/TTC byte buffers),
+> `lib/server/oracle_tns.dart` (TNS framing: CONNECT parse, version
+> negotiation, ACCEPT/DATA build), and `lib/server/oracle_wire.dart`
+> (`OracleServer` + per-connection state machine that answers CONNECT with
+> ACCEPT and frames DATA/MARKER). Enable with
+> `dart run bin/dart_db_server.dart --oracle-port 1521`. Covered by
+> `test/oracle_wire_test.dart`. **Next:** record golden transcripts from a
+> real client and implement the TTC PROTOCOL + DATA-TYPES exchange.
 
 **Phase 1 — TNS transport + negotiation.** Full CONNECT/ACCEPT (incl.
 large-SDU/`tnsVersionMinLargeSdu`, data-flags, end-of-request flags),

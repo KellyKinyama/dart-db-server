@@ -20,6 +20,7 @@ import 'package:dart_db_server/dart_db_server.dart';
 Future<void> main(List<String> args) async {
   String filePath = 'mydatabase.json';
   int port = 4555;
+  int oraclePort = 0;
   String host = '127.0.0.1';
   bool repl = false;
   bool memory = false;
@@ -33,6 +34,9 @@ Future<void> main(List<String> args) async {
         break;
       case '--port':
         port = int.parse(next() ?? '$port');
+        break;
+      case '--oracle-port':
+        oraclePort = int.parse(next() ?? '$oraclePort');
         break;
       case '--host':
         host = next() ?? host;
@@ -62,9 +66,17 @@ Future<void> main(List<String> args) async {
     await server.start();
   }
 
+  OracleServer? oracleServer;
+  if (oraclePort > 0) {
+    oracleServer =
+        OracleServer(db, address: InternetAddress(host), port: oraclePort);
+    await oracleServer.start();
+  }
+
   ProcessSignal.sigint.watch().listen((_) async {
     stdout.writeln('\nshutting down...');
     await server?.stop();
+    await oracleServer?.stop();
     await db.flush();
     exit(0);
   });
@@ -72,6 +84,7 @@ Future<void> main(List<String> args) async {
   if (repl || port == 0) {
     await _runRepl(db);
     await server?.stop();
+    await oracleServer?.stop();
     await db.flush();
   } else {
     // Block forever (server is running in the background).
@@ -89,6 +102,7 @@ Usage: dart run bin/dart_db_server.dart [options]
 Options:
   --file <path>    JSON file used for persistence (default: mydatabase.json)
   --port <n>       TCP port to listen on (default: 4555, 0 disables)
+  --oracle-port <n> Oracle TNS/TTC wire port (default: 0 disabled, e.g. 1521)
   --host <addr>    Bind address (default: 127.0.0.1)
   --repl           Also start an interactive REPL on stdin
   --memory         Run in-memory only (no persistence)
