@@ -17,7 +17,7 @@
 | 1 — TTC negotiation | ✅ | PROTOCOL + DATA-TYPES exchange (charset, caps, field version 24) |
 | 2 — Authentication | ✅ (SHA512/O5LOGON) | Verifier side: AUTH_PHASE_ONE/TWO, no plaintext storage; PBKDF2/12c + FAST_AUTH pending |
 | 3 — Execute & fetch | ✅ (no-bind) | Decode OALL8, run `Database.execute()`, reply DML status / query rows; binds pending |
-| 4 — Transactions & lifecycle | ◻ (commit/rollback/ping) | COMMIT/ROLLBACK drive the engine transaction (real undo/persist); PING acked; cursor close + re-execute pending |
+| 4 — Transactions & lifecycle | ◻ (most) | COMMIT/ROLLBACK drive the engine; PING; statement-cache cursor re-execute; close-cursors piggyback; logoff via socket close. Per-session isolation pending |
 | 5 — Rich type codecs | ◻ (NUMBER, RAW) | Numeric columns → native NUMBER, byte buffers → RAW; DATE/INTERVAL/LOB/JSON/VECTOR pending |
 | 6 — TLS & robustness | ⬜ | native-net-encryption/TLS, SDU renegotiation, fuzz hardening |
 
@@ -237,6 +237,19 @@ cached cursors (`ttcFuncReExecute` / `ttcFuncReExecuteAndFetch`),
 > undoes an insert and COMMIT persists it over a live socket. Per-session
 > isolation across concurrent connections is still not modeled (one shared
 > engine transaction).
+
+> **Update (cursors & lifecycle):** `oracle_wire.dart` now keeps a
+> per-connection cursor cache (cursor id → SQL). A fresh EXECUTE (cursor 0)
+> is assigned an id that the response echoes in its ERROR body, so the
+> client's transparent statement cache stores it; a cache hit re-executes
+> with that id and **no SQL on the wire**, which the server resolves from the
+> cache. A leading **close-cursors piggyback** (message type 17, function
+> 105) prepended to any call is consumed and frees the listed cursors; an
+> unknown cursor id draws an invalid-cursor error. Graceful **logoff** needs
+> no RPC — the client's `disconnect()` just closes the socket, which the
+> `onDone` handler already cleans up. Covered by `test/oracle_cursor_test.dart`
+> (re-execute by id, piggyback free). **Still pending:** per-session
+> transaction isolation across concurrent connections (one shared engine).
 
 **Phase 5 — Rich type codecs.** Incrementally add server-side encoders by
 inverting the client decoders, each behind a conformance test:

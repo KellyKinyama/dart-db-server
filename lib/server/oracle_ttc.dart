@@ -30,6 +30,7 @@ const int ttcMsgTypeRowData = 7; // one result row
 const int ttcMsgTypeParameter = 8; // key-value parameter block
 const int ttcMsgTypeStatus = 9; // terminal call status
 const int ttcMsgTypeDescribeInfo = 16; // query column metadata
+const int ttcMsgTypePiggyback = 17; // piggybacked control message
 
 /// Server protocol version byte the client stores (Oracle 8.1+ uses 6).
 const int ttcServerVersion = 6;

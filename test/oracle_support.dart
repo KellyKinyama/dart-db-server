@@ -270,8 +270,11 @@ Uint8List buildFunctionRequest(int functionCode, {int seq = 4}) {
   return b.toBytes();
 }
 
-/// Builds a no-bind EXECUTE (OALL8) request body at TTC field version 24.
-Uint8List buildExecuteRequest(String sql, {bool isQuery = false, int seq = 3}) {
+/// Builds a no-bind EXECUTE (OALL8) request body at TTC field version 24. When
+/// [cursorId] is non-zero this is a cached re-execute: no SQL bytes travel.
+Uint8List buildExecuteRequest(String sql,
+    {bool isQuery = false, int seq = 3, int cursorId = 0}) {
+  final fresh = cursorId == 0;
   final sqlBytes = Uint8List.fromList(utf8.encode(sql));
   final b = WriteBuffer();
   b.writeUint8(ttcMsgTypeFunction);
@@ -279,9 +282,9 @@ Uint8List buildExecuteRequest(String sql, {bool isQuery = false, int seq = 3}) {
   b.writeUint8(seq);
   b.writeUB8(0); // token
   b.writeUB4(isQuery ? 0x61 : 0x8021); // options (value irrelevant to server)
-  b.writeUB4(0); // cursorId
-  b.writeUint8(1); // sql ptr
-  b.writeUB4(sqlBytes.length);
+  b.writeUB4(cursorId);
+  b.writeUint8(fresh ? 1 : 0); // sql ptr
+  b.writeUB4(fresh ? sqlBytes.length : 0);
   b.writeUint8(1); // pointer vector
   b.writeUB4(13);
   b.writeUint8(0); // al8o4
@@ -316,10 +319,29 @@ Uint8List buildExecuteRequest(String sql, {bool isQuery = false, int seq = 3}) {
   b.writeUint8(0); // length of sql id
   b.writeUint8(0); // chunk ids
   b.writeUB4(0);
-  b.writeBytesWithLength(sqlBytes);
-  b.writeUB4(1); // al8i4[0]
+  if (fresh) {
+    b.writeBytesWithLength(sqlBytes);
+    b.writeUB4(1); // al8i4[0]
+  } else {
+    b.writeUB4(0); // al8i4[0]
+  }
   for (var i = 1; i < 13; i++) {
     b.writeUB4(0);
+  }
+  return b.toBytes();
+}
+
+/// Builds a close-cursors piggyback body (prepended before a real message).
+Uint8List buildCloseCursorsPiggyback(List<int> cursorIds, {int seq = 9}) {
+  final b = WriteBuffer();
+  b.writeUint8(ttcMsgTypePiggyback);
+  b.writeUint8(105); // ttcFuncCloseCursors
+  b.writeUint8(seq);
+  b.writeUB8(0); // token number
+  b.writeUint8(1); // pointer
+  b.writeUB4(cursorIds.length);
+  for (final id in cursorIds) {
+    b.writeUB4(id);
   }
   return b.toBytes();
 }
@@ -330,6 +352,7 @@ class ExecuteResponse {
   final List<int> columnTypes = []; // Oracle wire type per column
   final List<List<Object?>> rows = [];
   int? rowsAffected;
+  int cursorId = 0;
   int errorNum = 0;
   String? errorMessage;
 }
@@ -462,7 +485,7 @@ void _decodeError(ReadBuffer r, ExecuteResponse out, {required bool isQuery}) {
   r.readUB2(); // error number (short)
   r.readUB2(); // array elem error
   r.readUB2(); // array elem error
-  r.readUB4(); // cursor id
+  out.cursorId = r.readUB4(); // cursor id
   r.readSB4(); // error position
   for (var i = 0; i < 6; i++) {
     r.readUint8();

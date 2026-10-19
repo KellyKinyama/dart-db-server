@@ -29,6 +29,9 @@ const int ttcFuncCommit = 14;
 const int ttcFuncRollback = 15;
 const int ttcFuncPing = 0x93;
 
+/// TTC RPC function code for the close-cursors piggyback.
+const int ttcFuncCloseCursors = 105;
+
 /// Oracle VARCHAR2 data type indicator.
 const int _oraTypeVarchar = 1;
 
@@ -141,9 +144,10 @@ ExecuteRequestInfo decodeExecuteRequest(
 }
 
 /// Builds the response for a query [result]: DESCRIBE_INFO, one ROW_HEADER, a
-/// ROW_DATA per row, and a terminal ORA-01403 (end of fetch). Returns the TTC
-/// body (no TNS framing).
-Uint8List buildQueryResponse(QueryResult result) {
+/// ROW_DATA per row, and a terminal ORA-01403 (end of fetch). [cursorId] is
+/// echoed so the client can cache the statement. Returns the TTC body (no TNS
+/// framing).
+Uint8List buildQueryResponse(QueryResult result, {int cursorId = 0}) {
   final b = WriteBuffer();
   // Describe a column as NUMBER only when every non-null value is a
   // representable number; otherwise fall back to VARCHAR2 (stringified).
@@ -156,7 +160,10 @@ Uint8List buildQueryResponse(QueryResult result) {
   for (final row in result.rows) {
     _writeRowData(b, row, types);
   }
-  _writeErrorBody(b, num: _oraNoDataFound, message: 'ORA-01403: no data found');
+  _writeErrorBody(b,
+      num: _oraNoDataFound,
+      cursorId: cursorId,
+      message: 'ORA-01403: no data found');
   return b.toBytes();
 }
 
@@ -183,10 +190,10 @@ int _inferColumnOraType(List<List<Object?>> rows, int colIndex) {
 }
 
 /// Builds the response for a non-query [result] (DML/DDL): a success ERROR with
-/// the affected row count.
-Uint8List buildDmlResponse(QueryResult result) {
+/// the affected row count. [cursorId] is echoed for statement caching.
+Uint8List buildDmlResponse(QueryResult result, {int cursorId = 0}) {
   final b = WriteBuffer();
-  _writeErrorBody(b, num: 0, rowCount: result.affected);
+  _writeErrorBody(b, num: 0, rowCount: result.affected, cursorId: cursorId);
   return b.toBytes();
 }
 

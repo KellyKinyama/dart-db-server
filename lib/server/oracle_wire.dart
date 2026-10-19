@@ -102,6 +102,12 @@ class OracleConnection {
   OraclePhase _phase = OraclePhase.connect;
   final AuthPhaseState _auth = AuthPhaseState();
 
+  /// Server-side statement cursors: cursor id -> SQL text. Lets the client's
+  /// transparent statement cache re-execute a statement by id with no SQL on
+  /// the wire.
+  final Map<int, String> _cursors = <int, String>{};
+  int _nextCursorId = 1;
+
   int _version = tnsServerVersion;
 
   void _start() {
@@ -208,8 +214,35 @@ class OracleConnection {
   void _handleData(TnsPacket packet) {
     if (packet.payload.isEmpty) return; // no TTC body
     final ttc = ReadBuffer(packet.payload);
-    final messageType = ttc.readUint8();
-    _handleTtc(messageType, ttc);
+    // The client may prepend piggyback control messages (e.g. close-cursors)
+    // before the real function call; consume them first.
+    while (ttc.hasRemaining) {
+      final messageType = ttc.readUint8();
+      if (messageType == ttcMsgTypePiggyback) {
+        _skipPiggyback(ttc);
+        continue;
+      }
+      _handleTtc(messageType, ttc);
+      return; // one real message per DATA packet
+    }
+  }
+
+  /// Consumes a piggyback message. Only close-cursors (105) has a body we can
+  /// walk; it frees the listed cursors from the cache.
+  void _skipPiggyback(ReadBuffer body) {
+    final functionCode = body.readUint8();
+    body.readUint8(); // sequence
+    body.readUB8(); // token number (field version >= 18)
+    if (functionCode == ttcFuncCloseCursors) {
+      body.readUint8(); // pointer
+      final count = body.readUB4();
+      for (var i = 0; i < count; i++) {
+        _cursors.remove(body.readUB4());
+      }
+      server._log('conn $id closed $count cursor(s) via piggyback');
+    } else {
+      server._log('conn $id ignoring piggyback function $functionCode');
+    }
   }
 
   void _handleTtc(int messageType, ReadBuffer body) {
@@ -324,13 +357,31 @@ class OracleConnection {
       _sendTtc(buildExecuteError(600, 'bind variables are not yet supported'));
       return;
     }
-    server._log('conn $id EXECUTE "${info.sql}"');
+    // Resolve the SQL and cursor id: a fresh statement (cursor 0) is assigned a
+    // new id and cached; a cached re-execute (cursor != 0) carries no SQL and
+    // is looked up by id.
+    final String sql;
+    final int cursorId;
+    if (info.cursorId == 0) {
+      cursorId = _nextCursorId++;
+      sql = info.sql;
+      _cursors[cursorId] = sql;
+    } else {
+      cursorId = info.cursorId;
+      final cached = _cursors[cursorId];
+      if (cached == null) {
+        _sendTtc(buildExecuteError(1001, 'invalid cursor'));
+        return;
+      }
+      sql = cached;
+    }
+    server._log('conn $id EXECUTE [cursor $cursorId] "$sql"');
     try {
-      final result = await server.db.execute(info.sql);
+      final result = await server.db.execute(sql);
       if (result.columns.isNotEmpty) {
-        _sendTtc(buildQueryResponse(result));
+        _sendTtc(buildQueryResponse(result, cursorId: cursorId));
       } else {
-        _sendTtc(buildDmlResponse(result));
+        _sendTtc(buildDmlResponse(result, cursorId: cursorId));
       }
     } catch (e) {
       _sendTtc(buildExecuteError(900, _oraErrorText(e)));
