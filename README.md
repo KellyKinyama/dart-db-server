@@ -219,16 +219,21 @@ object per line in response.
 
 ## Plan: Oracle wire protocol compatibility
 
-A design plan / roadmap for adding an **Oracle-compatible server
-front-end** — so unmodified Oracle clients (node-oracledb thin,
-python-oracledb thin, JDBC thin, and the pure-Dart `oracledb` driver)
-can connect to `dart_db_server` the same way `mysql_wire.dart` serves
-MySQL clients — lives in
+An **Oracle-compatible server front-end** is in progress — so unmodified
+Oracle clients (node-oracledb thin, python-oracledb thin, JDBC thin, and
+the pure-Dart `oracledb` driver) can connect to `dart_db_server` the same
+way `mysql_wire.dart` serves MySQL clients. The TNS transport, TTC
+negotiation, O5LOGON authentication, and no-bind SQL execute/fetch paths
+are implemented (`lib/server/oracle_*.dart`); a client can connect from
+TCP through a real `SELECT`. Enable it with:
+
+```powershell
+dart run bin/dart_db_server.dart --oracle-port 1521 --oracle-user scott/tiger
+```
+
+The full methodology (inverting the sibling `../dart-oracledb` thin
+client), architecture, phased roadmap, progress, and known risks live in
 [`doc/oracle-wire-protocol-plan.md`](doc/oracle-wire-protocol-plan.md).
-It covers the reverse-engineering methodology (inverting the sibling
-`../dart-oracledb` thin client), the target architecture, a phased
-roadmap (TNS transport → auth → execute/fetch → type codecs → TLS), and
-the known risks.
 
 ## Layout
 

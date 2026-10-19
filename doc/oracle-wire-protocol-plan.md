@@ -9,6 +9,30 @@
 > front-end that translates the wire format to/from the existing
 > `Database.execute()` core.
 
+## Progress at a glance
+
+| Phase | Status | What works |
+| ----- | ------ | ---------- |
+| 0 — TNS transport | ✅ | CONNECT parse, version negotiation, ACCEPT, DATA/MARKER framing |
+| 1 — TTC negotiation | ✅ | PROTOCOL + DATA-TYPES exchange (charset, caps, field version 24) |
+| 2 — Authentication | ✅ (SHA512/O5LOGON) | Verifier side: AUTH_PHASE_ONE/TWO, no plaintext storage; PBKDF2/12c + FAST_AUTH pending |
+| 3 — Execute & fetch | ✅ (no-bind) | Decode OALL8, run `Database.execute()`, reply DML status / query rows (columns as VARCHAR2); binds + native types pending |
+| 4 — Transactions & lifecycle | ⬜ | commit/rollback, cursor close, re-execute, ping |
+| 5 — Rich type codecs | ⬜ | NUMBER, DATE/TS, INTERVAL, ROWID, LOB, JSON, VECTOR |
+| 6 — TLS & robustness | ⬜ | native-net-encryption/TLS, SDU renegotiation, fuzz hardening |
+
+A client can connect from TCP all the way through a real SQL `SELECT`.
+Delivered modules live in `lib/server/oracle_*.dart`, enabled with
+`dart run bin/dart_db_server.dart --oracle-port 1521 --oracle-user user/pass`,
+and covered by `test/oracle_wire_test.dart`, `test/oracle_auth_test.dart`,
+and `test/oracle_execute_test.dart` (19 tests, including live socket
+round-trips). See the per-phase **Landed** notes below for detail.
+
+> **Not yet validated against a real Oracle client.** Every phase is
+> verified against faithful mirrors of the sibling client's decoders/
+> encoders (the correct spec), but a live run of the actual `oracledb` /
+> node-oracledb client is still the outstanding confidence check.
+
 ## Why this is tractable (we are not starting from zero)
 
 The hardest part of reverse-engineering a closed protocol — figuring out
