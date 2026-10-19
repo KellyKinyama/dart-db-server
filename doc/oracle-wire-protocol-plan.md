@@ -104,14 +104,28 @@ phase. *Exit:* client reaches cap negotiation.
 > (`OracleServer` + per-connection state machine that answers CONNECT with
 > ACCEPT and frames DATA/MARKER). Enable with
 > `dart run bin/dart_db_server.dart --oracle-port 1521`. Covered by
-> `test/oracle_wire_test.dart`. **Next:** record golden transcripts from a
-> real client and implement the TTC PROTOCOL + DATA-TYPES exchange.
+> `test/oracle_wire_test.dart`.
 
-**Phase 1 — TNS transport + negotiation.** Full CONNECT/ACCEPT (incl.
+**Phase 1 — TNS transport + negotiation. ◻ (in progress)** Full
+CONNECT/ACCEPT (incl.
 large-SDU/`tnsVersionMinLargeSdu`, data-flags, end-of-request flags),
 MARKER/RESEND/ABORT handling, DATA packet framing, and the TTC
 PROTOCOL + DATA-TYPES negotiation handshake. *Exit:* client and server
 agree on version, charset (AL32UTF8 / 873), and the type table.
+
+> **Landed:** `lib/server/oracle_ttc.dart` — the TTC negotiation layer.
+> The connection state machine now answers the classical handshake: a
+> PROTOCOL request (function 1) gets a `buildProtocolResponse` (server
+> version, banner, AL32UTF8/873 charset, AL16UTF16/2000 national charset,
+> FDO, and 53-byte compile / 7-byte runtime capability vectors with field
+> version 24 at slot 7), and a DATA-TYPES request (function 2) gets a
+> `buildDataTypesResponse` (type 2 + `0x0000` terminator). The DATA-packet
+> decoder now lifts the 2-byte data-flags field off the TTC body.
+> `test/oracle_wire_test.dart` drives the full CONNECT -> PROTOCOL ->
+> DATA-TYPES exchange at the byte level and decodes each response with a
+> mirror of the client's `ProtocolResponse.decode`. **Next:** AUTH phase
+> (function 0x76) lands the connection in Phase 2; record a real-client
+> transcript to confirm the negotiation bytes before auth.
 
 **Phase 2 — Authentication (verifier side).** This is the crypto core.
 Implement the server half of:

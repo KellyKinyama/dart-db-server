@@ -20,12 +20,13 @@ import 'dart:typed_data';
 import 'database.dart';
 import 'oracle_codec.dart';
 import 'oracle_tns.dart';
+import 'oracle_ttc.dart';
 
 // TTC function codes (first byte of a TTC message). Full set lives in the
-// client's `protocol/constants.dart`; only the ones the transport phase needs
-// are named here.
-const int _ttcProtocol = 1; // protocol negotiation
-const int _ttcDataTypes = 2; // data-type negotiation
+// client's `protocol/constants.dart`; only the ones the transport and
+// negotiation phases need are named here.
+const int _ttcProtocol = ttcMsgProtocol; // 1: protocol negotiation
+const int _ttcDataTypes = ttcMsgDataTypes; // 2: data-type negotiation
 
 /// Oracle TNS/TTC server fronting a [Database].
 class OracleServer {
@@ -189,11 +190,7 @@ class OracleConnection {
   }
 
   void _handleData(TnsPacket packet) {
-    if (packet.payload.length < 3) return; // need TTC header
-    // TTC header: function code (1), sequence (1), data flags (2 BE) — but the
-    // 2 data-flags bytes are at the TNS DATA layer here; the TTC message body
-    // starts with its function code. The client wraps TTC in DATA with the
-    // 2-byte data flags already stripped into packet.flags.
+    if (packet.payload.isEmpty) return; // no TTC body
     final ttc = ReadBuffer(packet.payload);
     final functionCode = ttc.readUint8();
     _handleTtc(functionCode, ttc, packet);
@@ -202,18 +199,25 @@ class OracleConnection {
   void _handleTtc(int functionCode, ReadBuffer body, TnsPacket packet) {
     switch (functionCode) {
       case _ttcProtocol:
-        server._log('conn $id TTC PROTOCOL negotiation (not yet implemented)');
+        server._log('conn $id TTC PROTOCOL request -> response');
+        _phase = OraclePhase.negotiate;
+        _sendTtc(buildProtocolResponse());
         break;
       case _ttcDataTypes:
-        server._log('conn $id TTC DATA TYPES negotiation (not yet implemented)');
+        server._log('conn $id TTC DATA TYPES request -> response');
+        _phase = OraclePhase.auth;
+        _sendTtc(buildDataTypesResponse());
         break;
       default:
         server._log('conn $id TTC function $functionCode (phase $_phase, '
             'not yet implemented)');
     }
-    // Negotiation, auth, and execute/fetch responses are implemented in the
-    // next phases of doc/oracle-wire-protocol-plan.md.
+    // Authentication and execute/fetch responses are implemented in the next
+    // phases of doc/oracle-wire-protocol-plan.md.
   }
+
+  /// Wraps a TTC message body in a TNS DATA packet and sends it.
+  void _sendTtc(Uint8List ttcBody) => _send(buildDataPacket(ttcBody));
 
   void _send(Uint8List bytes) {
     try {

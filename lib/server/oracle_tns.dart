@@ -112,13 +112,23 @@ class TnsPacket {
         'truncated: have ${data.length}, need $packetLength',
       );
     }
-    var flags = 0;
-    if (type == tnsPacketData && payloadLength >= 2) {
-      flags = (data[tnsHeaderSize] << 8) | data[tnsHeaderSize + 1];
+    // A DATA packet carries a 2-byte data-flags field ahead of its TTC
+    // payload; lift it into [flags] and expose only the TTC bytes as [payload].
+    if (type == tnsPacketData) {
+      if (payloadLength >= 2) {
+        final flags = r.readUint16BE();
+        final body = payloadLength > 2 ? r.readBytes(payloadLength - 2)
+            : Uint8List(0);
+        return TnsPacket(type: type, payload: body, flags: flags);
+      }
+      return TnsPacket(
+        type: type,
+        payload: payloadLength > 0 ? r.readBytes(payloadLength) : Uint8List(0),
+      );
     }
     final payload =
         payloadLength > 0 ? r.readBytes(payloadLength) : Uint8List(0);
-    return TnsPacket(type: type, payload: payload, flags: flags);
+    return TnsPacket(type: type, payload: payload);
   }
 
   /// Returns the full frame length declared in [data]'s header, or null if
