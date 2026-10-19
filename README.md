@@ -217,6 +217,19 @@ object per line in response.
 {"id": 1, "ok": true, "columns": ["id","name"], "rows": [[1,"Alice"]], "affected": 1}
 ```
 
+## Plan: Oracle wire protocol compatibility
+
+A design plan / roadmap for adding an **Oracle-compatible server
+front-end** — so unmodified Oracle clients (node-oracledb thin,
+python-oracledb thin, JDBC thin, and the pure-Dart `oracledb` driver)
+can connect to `dart_db_server` the same way `mysql_wire.dart` serves
+MySQL clients — lives in
+[`doc/oracle-wire-protocol-plan.md`](doc/oracle-wire-protocol-plan.md).
+It covers the reverse-engineering methodology (inverting the sibling
+`../dart-oracledb` thin client), the target architecture, a phased
+roadmap (TNS transport → auth → execute/fetch → type codecs → TLS), and
+the known risks.
+
 ## Layout
 
 ```

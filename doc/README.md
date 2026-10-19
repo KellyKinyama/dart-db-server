@@ -65,3 +65,9 @@ provider.
 - [ ] A recurring `PRAGMA vector_verify_all` runs in a health check.
 - [ ] `PRAGMA vector_analyze('t.col')` has been run once on real data
       to record the expected recall of the chosen index kind.
+
+## Design docs
+
+| Doc | Topic |
+| --- | --- |
+| [oracle-wire-protocol-plan.md](oracle-wire-protocol-plan.md) | Roadmap for an Oracle-compatible server front-end (reverse-engineering the TNS/TTC wire protocol). |
