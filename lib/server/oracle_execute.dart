@@ -35,6 +35,9 @@ const int _oraTypeVarchar = 1;
 /// Oracle NUMBER data type indicator.
 const int _oraTypeNumber = 2;
 
+/// Oracle RAW data type indicator.
+const int _oraTypeRaw = 23;
+
 /// The TTC field version the server negotiates (see `oracle_ttc.dart`).
 const int executeFieldVersion = 24;
 
@@ -158,18 +161,25 @@ Uint8List buildQueryResponse(QueryResult result) {
 }
 
 /// Infers the Oracle wire type for column [colIndex]: NUMBER when every
-/// non-null value is a representable number, else VARCHAR2.
+/// non-null value is a representable number, RAW when every value is a byte
+/// buffer, else VARCHAR2.
 int _inferColumnOraType(List<List<Object?>> rows, int colIndex) {
   var sawValue = false;
+  var allNumber = true;
+  var allRaw = true;
   for (final row in rows) {
     if (colIndex >= row.length) continue;
     final v = row[colIndex];
     if (v == null) continue;
     sawValue = true;
-    if (v is num && isOracleNumberRepresentable(v)) continue;
-    return _oraTypeVarchar;
+    if (!(v is num && isOracleNumberRepresentable(v))) allNumber = false;
+    if (v is! Uint8List) allRaw = false;
+    if (!allNumber && !allRaw) return _oraTypeVarchar;
   }
-  return sawValue ? _oraTypeNumber : _oraTypeVarchar;
+  if (!sawValue) return _oraTypeVarchar;
+  if (allNumber) return _oraTypeNumber;
+  if (allRaw) return _oraTypeRaw;
+  return _oraTypeVarchar;
 }
 
 /// Builds the response for a non-query [result] (DML/DDL): a success ERROR with
@@ -217,11 +227,14 @@ void _writeDescribeInfo(WriteBuffer b, List<String> columns, List<int> types) {
   b.writeUB4(0); // tail bytes
 }
 
-/// Writes one column's metadata (NUMBER or VARCHAR2), laid out exactly as the
-/// client's `_processColumnInfo` reads it at field version 24.
+/// Writes one column's metadata (NUMBER, RAW, or VARCHAR2), laid out exactly
+/// as the client's `_processColumnInfo` reads it at field version 24.
 void _writeColumnInfo(WriteBuffer b, String name, int position, int oraType) {
-  final isNumber = oraType == _oraTypeNumber;
-  final maxLen = isNumber ? 22 : 4000;
+  final maxLen = oraType == _oraTypeNumber
+      ? 22
+      : oraType == _oraTypeRaw
+          ? 2000
+          : 4000;
   final nameBytes = Uint8List.fromList(utf8.encode(name));
   b.writeUint8(oraType); // data type
   b.writeUint8(0); // flags
@@ -270,10 +283,13 @@ void _writeRowData(WriteBuffer b, List<Object?> row, List<int> types) {
   b.writeUint8(ttcMsgTypeRowData);
   for (var i = 0; i < row.length; i++) {
     final cell = row[i];
+    final type = i < types.length ? types[i] : _oraTypeVarchar;
     if (cell == null) {
       b.writeBytesWithLength(Uint8List(0)); // 0-length == NULL
-    } else if (i < types.length && types[i] == _oraTypeNumber && cell is num) {
+    } else if (type == _oraTypeNumber && cell is num) {
       b.writeBytesWithLength(encodeOracleNumber(cell));
+    } else if (type == _oraTypeRaw && cell is Uint8List) {
+      b.writeBytesWithLength(cell);
     } else {
       b.writeBytesWithLength(Uint8List.fromList(utf8.encode(cell.toString())));
     }

@@ -16,9 +16,9 @@
 | 0 — TNS transport | ✅ | CONNECT parse, version negotiation, ACCEPT, DATA/MARKER framing |
 | 1 — TTC negotiation | ✅ | PROTOCOL + DATA-TYPES exchange (charset, caps, field version 24) |
 | 2 — Authentication | ✅ (SHA512/O5LOGON) | Verifier side: AUTH_PHASE_ONE/TWO, no plaintext storage; PBKDF2/12c + FAST_AUTH pending |
-| 3 — Execute & fetch | ✅ (no-bind) | Decode OALL8, run `Database.execute()`, reply DML status / query rows (columns as VARCHAR2); binds + native types pending |
-| 4 — Transactions & lifecycle | ◻ (commit/rollback/ping) | COMMIT, ROLLBACK, PING acknowledged; cursor close + re-execute pending |
-| 5 — Rich type codecs | ◻ (NUMBER) | Numeric columns encode as native Oracle NUMBER (int/double round-trip); DATE/INTERVAL/LOB/JSON/VECTOR pending |
+| 3 — Execute & fetch | ✅ (no-bind) | Decode OALL8, run `Database.execute()`, reply DML status / query rows; binds pending |
+| 4 — Transactions & lifecycle | ◻ (commit/rollback/ping) | COMMIT/ROLLBACK drive the engine transaction (real undo/persist); PING acked; cursor close + re-execute pending |
+| 5 — Rich type codecs | ◻ (NUMBER, RAW) | Numeric columns → native NUMBER, byte buffers → RAW; DATE/INTERVAL/LOB/JSON/VECTOR pending |
 | 6 — TLS & robustness | ⬜ | native-net-encryption/TLS, SDU renegotiation, fuzz hardening |
 
 A client can connect from TCP all the way through a real SQL `SELECT`.
@@ -228,6 +228,16 @@ cached cursors (`ttcFuncReExecute` / `ttcFuncReExecuteAndFetch`),
 > (`ttcFuncCloseCursors` piggyback), cached-cursor re-execute, graceful
 > `ttcClose`, and real per-session transaction semantics.
 
+> **Update (real transactions):** COMMIT and ROLLBACK now drive the engine
+> when a transaction is open — `db.inTransaction` gates a real
+> `db.execute('COMMIT'/'ROLLBACK')`, so a client that issues `BEGIN` then
+> DML has its work actually persisted or undone by the TTC lifecycle call;
+> outside a transaction they stay harmless acks (no regression to the
+> auto-commit path). `test/oracle_lifecycle_test.dart` proves ROLLBACK
+> undoes an insert and COMMIT persists it over a live socket. Per-session
+> isolation across concurrent connections is still not modeled (one shared
+> engine transaction).
+
 **Phase 5 — Rich type codecs.** Incrementally add server-side encoders by
 inverting the client decoders, each behind a conformance test:
 - NUMBER (Oracle's base-100 mantissa) and the integer/float fast paths.
@@ -251,6 +261,13 @@ inverting the client decoders, each behind a conformance test:
 > DATE/TIMESTAMP, INTERVAL, ROWID, LOB locators, JSON (OSON), VECTOR — noting
 > the engine stores most non-numeric values as text, so those apply where the
 > engine surfaces a typed value.
+
+> **Update (RAW):** byte-buffer (`Uint8List`) columns are now described as
+> Oracle **RAW** (type 23) and their bytes sent length-prefixed, so a BLOB
+> column round-trips as `Uint8List` on the client instead of a stringified
+> form. Per-column inference picks NUMBER / RAW / VARCHAR2 by scanning the
+> values; an empty byte buffer reads back as NULL (indistinguishable on the
+> wire), covered by `test/oracle_execute_test.dart`.
 - Native JSON / OSON (`oson.dart`) and VECTOR (`oracle_vector.dart`,
   dense + sparse) for 23ai parity.
 

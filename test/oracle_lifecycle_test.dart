@@ -65,5 +65,58 @@ void main() {
         [1],
       ]);
     });
+
+    test('ROLLBACK undoes work inside an explicit transaction', () async {
+      final db = await Database.open(null);
+      final server = OracleServer(db, port: 0, users: {
+        'testuser': 'testpassword',
+      });
+      await server.start();
+      addTearDown(() async => server.stop());
+
+      final socket = await Socket.connect(
+        InternetAddress.loopbackIPv4,
+        server.boundPort,
+      );
+      addTearDown(() async => socket.close());
+      final frames = FrameReader(socket);
+
+      await handshakeAndLogin(socket, frames,
+          username: 'testuser', password: 'testpassword');
+
+      socket.add(wrapData(buildExecuteRequest(
+          'CREATE TABLE acct (id INTEGER PRIMARY KEY)')));
+      await frames.next();
+
+      // Open a transaction, insert, then roll it back via the TTC call.
+      socket.add(wrapData(buildExecuteRequest('BEGIN')));
+      await frames.next();
+      socket.add(wrapData(buildExecuteRequest('INSERT INTO acct VALUES (1)')));
+      expect(decodeExecuteResponse(ttcBody(await frames.next())).rowsAffected, 1);
+      socket.add(wrapData(buildFunctionRequest(ttcFuncRollback)));
+      expect(decodeExecuteResponse(ttcBody(await frames.next())).errorNum, 0);
+
+      socket.add(wrapData(buildExecuteRequest(
+          'SELECT id FROM acct', isQuery: true)));
+      final afterRollback = decodeExecuteResponse(ttcBody(await frames.next()),
+          isQuery: true);
+      expect(afterRollback.rows, isEmpty); // the insert was undone
+
+      // A committed transaction persists its work.
+      socket.add(wrapData(buildExecuteRequest('BEGIN')));
+      await frames.next();
+      socket.add(wrapData(buildExecuteRequest('INSERT INTO acct VALUES (2)')));
+      await frames.next();
+      socket.add(wrapData(buildFunctionRequest(ttcFuncCommit)));
+      expect(decodeExecuteResponse(ttcBody(await frames.next())).errorNum, 0);
+
+      socket.add(wrapData(buildExecuteRequest(
+          'SELECT id FROM acct', isQuery: true)));
+      final afterCommit = decodeExecuteResponse(ttcBody(await frames.next()),
+          isQuery: true);
+      expect(afterCommit.rows, [
+        [2],
+      ]);
+    });
   });
 }

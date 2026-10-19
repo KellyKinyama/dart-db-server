@@ -259,18 +259,10 @@ class OracleConnection {
         unawaited(_handleExecute(body));
         break;
       case ttcFuncCommit:
-        // The engine applies writes immediately and persists on its own
-        // schedule, so a COMMIT is acknowledged without a distinct durable
-        // transaction boundary (documented limitation).
-        server._log('conn $id COMMIT');
-        _sendTtc(buildStatusOk());
+        unawaited(_handleCommit());
         break;
       case ttcFuncRollback:
-        // Writes are already applied in this model, so ROLLBACK is a
-        // best-effort acknowledgement rather than a true undo (documented
-        // limitation).
-        server._log('conn $id ROLLBACK');
-        _sendTtc(buildStatusOk());
+        unawaited(_handleRollback());
         break;
       case ttcFuncPing:
         _sendTtc(buildStatusOk());
@@ -279,6 +271,37 @@ class OracleConnection {
         server._log('conn $id TTC function $functionCode (phase $_phase, '
             'not yet implemented)');
     }
+  }
+
+  /// COMMIT: drives the engine's transaction when one is open, otherwise a
+  /// no-op acknowledgement (the engine auto-persists outside a transaction).
+  Future<void> _handleCommit() async {
+    server._log('conn $id COMMIT');
+    if (server.db.inTransaction) {
+      try {
+        await server.db.execute('COMMIT');
+      } catch (e) {
+        _sendTtc(buildExecuteError(900, _oraErrorText(e)));
+        return;
+      }
+    }
+    _sendTtc(buildStatusOk());
+  }
+
+  /// ROLLBACK: drives the engine's transaction when one is open, otherwise a
+  /// best-effort acknowledgement (writes applied outside a transaction cannot
+  /// be undone in this model).
+  Future<void> _handleRollback() async {
+    server._log('conn $id ROLLBACK');
+    if (server.db.inTransaction) {
+      try {
+        await server.db.execute('ROLLBACK');
+      } catch (e) {
+        _sendTtc(buildExecuteError(900, _oraErrorText(e)));
+        return;
+      }
+    }
+    _sendTtc(buildStatusOk());
   }
 
   /// Decodes and runs a TTC EXECUTE (function 94) against the database, then

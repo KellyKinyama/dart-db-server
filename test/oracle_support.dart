@@ -446,6 +446,8 @@ void _decodeRowData(ReadBuffer r, ExecuteResponse out) {
       row.add(null);
     } else if (out.columnTypes[i] == 2) {
       row.add(decodeOracleNumber(ReadBuffer(bytes))); // NUMBER
+    } else if (out.columnTypes[i] == 23) {
+      row.add(Uint8List.fromList(bytes)); // RAW
     } else {
       row.add(utf8.decode(bytes));
     }

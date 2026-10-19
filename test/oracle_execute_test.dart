@@ -7,6 +7,7 @@
 library;
 
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:dart_db_server/dart_db_server.dart';
 import 'package:dart_db_server/server/oracle_codec.dart';
@@ -106,6 +107,24 @@ void main() {
         ['1'],
         ['two'],
       ]);
+    });
+
+    test('byte-buffer columns round-trip as native RAW', () {
+      final result = QueryResult(
+        columns: const ['B'],
+        rows: [
+          [Uint8List.fromList([0xDE, 0xAD, 0xBE, 0xEF])],
+          [Uint8List.fromList([])],
+          [null],
+        ],
+      );
+      final resp = decodeExecuteResponse(buildQueryResponse(result),
+          isQuery: true);
+      expect(resp.columnTypes.single, 23); // Oracle RAW
+      expect(resp.rows[0].single, [0xDE, 0xAD, 0xBE, 0xEF]);
+      // An empty byte buffer is indistinguishable from NULL on the wire.
+      expect(resp.rows[1].single, isNull);
+      expect(resp.rows[2].single, isNull);
     });
 
     test('DML response reports the affected row count', () {
