@@ -17,7 +17,7 @@
 | 1 — TTC negotiation | ✅ | PROTOCOL + DATA-TYPES exchange (charset, caps, field version 24) |
 | 2 — Authentication | ✅ (SHA512/O5LOGON) | Verifier side: AUTH_PHASE_ONE/TWO, no plaintext storage; PBKDF2/12c + FAST_AUTH pending |
 | 3 — Execute & fetch | ✅ (no-bind) | Decode OALL8, run `Database.execute()`, reply DML status / query rows; binds pending |
-| 4 — Transactions & lifecycle | ◻ (most) | COMMIT/ROLLBACK drive the engine; PING; statement-cache cursor re-execute; close-cursors piggyback; logoff via socket close. Per-session isolation pending |
+| 4 — Transactions & lifecycle | ✅ | COMMIT/ROLLBACK drive the engine; PING; statement-cache cursor re-execute; close-cursors piggyback; logoff via socket close; **per-session isolation** (serializable) |
 | 5 — Rich type codecs | ◻ (NUMBER, RAW) | Numeric columns → native NUMBER, byte buffers → RAW; DATE/INTERVAL/LOB/JSON/VECTOR pending |
 | 6 — TLS & robustness | ⬜ | native-net-encryption/TLS, SDU renegotiation, fuzz hardening |
 
@@ -248,8 +248,25 @@ cached cursors (`ttcFuncReExecute` / `ttcFuncReExecuteAndFetch`),
 > unknown cursor id draws an invalid-cursor error. Graceful **logoff** needs
 > no RPC — the client's `disconnect()` just closes the socket, which the
 > `onDone` handler already cleans up. Covered by `test/oracle_cursor_test.dart`
-> (re-execute by id, piggyback free). **Still pending:** per-session
-> transaction isolation across concurrent connections (one shared engine).
+> (re-execute by id, piggyback free).
+
+> **Update (per-session isolation):** the single shared engine keeps one
+> global transaction snapshot (`_tables` is swapped to it), so correct
+> isolation is enforced by **serializing** sessions through a FIFO gate in
+> `oracle_wire.dart`. A session that opens a transaction (`BEGIN`, or a
+> `db.inTransaction` that stays set after a statement) becomes the gate's
+> owner and holds it across every statement until it commits or rolls back;
+> other sessions' statements — including reads — queue until then, so a
+> session's uncommitted work is never visible to another (serializable
+> isolation). Statements outside a transaction grab-run-release and never
+> block each other beyond their own execution, so the no-transaction fast
+> path is unchanged. A session that disconnects mid-transaction is rolled
+> back and the gate released, so one stuck client can't wedge the server.
+> `test/oracle_isolation_test.dart` proves an uncommitted insert is invisible
+> and blocks a second session until rollback, that a commit makes it visible,
+> and that a mid-transaction disconnect frees the gate. The remaining
+> trade-off is concurrency, not correctness: cross-session reads serialize
+> while any transaction is open (no row-level MVCC).
 
 **Phase 5 — Rich type codecs.** Incrementally add server-side encoders by
 inverting the client decoders, each behind a conformance test:

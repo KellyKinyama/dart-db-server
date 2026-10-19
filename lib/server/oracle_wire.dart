@@ -49,6 +49,15 @@ class OracleServer {
   /// [OracleUserStore.addUser].
   final OracleUserStore userStore;
 
+  /// Serializes statement execution across sessions. The shared engine keeps a
+  /// single global transaction snapshot, so a session that opens a transaction
+  /// holds this gate for the transaction's whole lifetime; other sessions'
+  /// statements queue until it commits/rolls back. This yields serializable
+  /// per-session isolation: uncommitted work is never visible to another
+  /// session. Statements outside a transaction grab-run-release and do not
+  /// block each other beyond their own execution.
+  final _TxnGate _txnGate = _TxnGate();
+
   static OracleUserStore _buildUserStore(Map<String, String> users) {
     final store = OracleUserStore();
     users.forEach(store.addUser);
@@ -126,6 +135,15 @@ class OracleConnection {
   Future<void> close() async {
     if (_phase == OraclePhase.closed) return;
     _phase = OraclePhase.closed;
+    // A session that disconnects mid-transaction must roll back and release the
+    // gate, or it would block every other session forever.
+    if (identical(server._txnGate.owner, this)) {
+      server._txnGate.owner = null;
+      try {
+        if (server.db.inTransaction) await server.db.execute('ROLLBACK');
+      } catch (_) {}
+      server._txnGate.release();
+    }
     await _sub?.cancel();
     try {
       await socket.close();
@@ -306,35 +324,58 @@ class OracleConnection {
     }
   }
 
-  /// COMMIT: drives the engine's transaction when one is open, otherwise a
-  /// no-op acknowledgement (the engine auto-persists outside a transaction).
+  /// COMMIT: ends this session's transaction when it owns one, otherwise a
+  /// no-op acknowledgement.
   Future<void> _handleCommit() async {
     server._log('conn $id COMMIT');
-    if (server.db.inTransaction) {
+    final response = await _guarded<Uint8List>(() async {
       try {
-        await server.db.execute('COMMIT');
+        if (server.db.inTransaction) await server.db.execute('COMMIT');
+        return buildStatusOk();
       } catch (e) {
-        _sendTtc(buildExecuteError(900, _oraErrorText(e)));
-        return;
+        return buildExecuteError(900, _oraErrorText(e));
       }
-    }
-    _sendTtc(buildStatusOk());
+    });
+    _sendTtc(response);
   }
 
-  /// ROLLBACK: drives the engine's transaction when one is open, otherwise a
-  /// best-effort acknowledgement (writes applied outside a transaction cannot
-  /// be undone in this model).
+  /// ROLLBACK: undoes this session's transaction when it owns one, otherwise a
+  /// no-op acknowledgement.
   Future<void> _handleRollback() async {
     server._log('conn $id ROLLBACK');
-    if (server.db.inTransaction) {
+    final response = await _guarded<Uint8List>(() async {
       try {
-        await server.db.execute('ROLLBACK');
+        if (server.db.inTransaction) await server.db.execute('ROLLBACK');
+        return buildStatusOk();
       } catch (e) {
-        _sendTtc(buildExecuteError(900, _oraErrorText(e)));
-        return;
+        return buildExecuteError(900, _oraErrorText(e));
+      }
+    });
+    _sendTtc(response);
+  }
+
+  /// Runs [action] under the server's transaction gate, reconciling this
+  /// session's ownership of the single engine transaction afterward. A session
+  /// that opens a transaction keeps the gate (blocking other sessions) until it
+  /// commits or rolls back.
+  Future<T> _guarded<T>(Future<T> Function() action) async {
+    final reentrant = identical(server._txnGate.owner, this);
+    if (!reentrant) await server._txnGate.acquire();
+    try {
+      return await action();
+    } finally {
+      final nowInTxn = server.db.inTransaction;
+      if (reentrant) {
+        if (!nowInTxn) {
+          server._txnGate.owner = null;
+          server._txnGate.release();
+        }
+      } else if (nowInTxn && server._txnGate.owner == null) {
+        server._txnGate.owner = this; // opened a transaction; keep the gate
+      } else {
+        server._txnGate.release();
       }
     }
-    _sendTtc(buildStatusOk());
   }
 
   /// Decodes and runs a TTC EXECUTE (function 94) against the database, then
@@ -376,16 +417,17 @@ class OracleConnection {
       sql = cached;
     }
     server._log('conn $id EXECUTE [cursor $cursorId] "$sql"');
-    try {
-      final result = await server.db.execute(sql);
-      if (result.columns.isNotEmpty) {
-        _sendTtc(buildQueryResponse(result, cursorId: cursorId));
-      } else {
-        _sendTtc(buildDmlResponse(result, cursorId: cursorId));
+    final response = await _guarded<Uint8List>(() async {
+      try {
+        final result = await server.db.execute(sql);
+        return result.columns.isNotEmpty
+            ? buildQueryResponse(result, cursorId: cursorId)
+            : buildDmlResponse(result, cursorId: cursorId);
+      } catch (e) {
+        return buildExecuteError(900, _oraErrorText(e));
       }
-    } catch (e) {
-      _sendTtc(buildExecuteError(900, _oraErrorText(e)));
-    }
+    });
+    _sendTtc(response);
   }
 
   /// Wraps a TTC message body in a TNS DATA packet and sends it.
@@ -403,4 +445,33 @@ class OracleConnection {
 String _oraErrorText(Object e) {
   final text = e.toString().replaceAll('\n', ' ').trim();
   return text.length > 512 ? text.substring(0, 512) : text;
+}
+
+/// A FIFO async gate that also tracks the connection currently holding an open
+/// transaction. The owner keeps the gate across multiple statements; everyone
+/// else queues.
+class _TxnGate {
+  final List<Completer<void>> _waiters = <Completer<void>>[];
+  bool _locked = false;
+
+  /// The connection that owns the in-progress transaction, if any.
+  OracleConnection? owner;
+
+  Future<void> acquire() {
+    if (!_locked) {
+      _locked = true;
+      return Future<void>.value();
+    }
+    final c = Completer<void>();
+    _waiters.add(c);
+    return c.future;
+  }
+
+  void release() {
+    if (_waiters.isNotEmpty) {
+      _waiters.removeAt(0).complete();
+    } else {
+      _locked = false;
+    }
+  }
 }
