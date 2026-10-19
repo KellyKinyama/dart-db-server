@@ -13,6 +13,7 @@ import 'dart:typed_data';
 
 import 'package:dart_db_server/server/oracle_codec.dart';
 import 'package:dart_db_server/server/oracle_crypto.dart';
+import 'package:dart_db_server/server/oracle_number.dart';
 import 'package:dart_db_server/server/oracle_ttc.dart';
 
 const int tnsHeaderSize = 8;
@@ -326,6 +327,7 @@ Uint8List buildExecuteRequest(String sql, {bool isQuery = false, int seq = 3}) {
 /// A decoded EXECUTE response (query rows or a DML/DDL status).
 class ExecuteResponse {
   final List<String> columns = [];
+  final List<int> columnTypes = []; // Oracle wire type per column
   final List<List<Object?>> rows = [];
   int? rowsAffected;
   int errorNum = 0;
@@ -369,7 +371,7 @@ void _decodeDescribe(ReadBuffer r, ExecuteResponse out) {
   final numCols = r.readUB4();
   if (numCols > 0) r.readUint8();
   for (var i = 0; i < numCols; i++) {
-    out.columns.add(_decodeColumn(r));
+    _decodeColumn(r, out);
   }
   final dateBytes = r.readUB4();
   if (dateBytes > 0) r.readBytesWithLength();
@@ -381,8 +383,8 @@ void _decodeDescribe(ReadBuffer r, ExecuteResponse out) {
   if (tailBytes > 0) r.readBytesWithLength();
 }
 
-String _decodeColumn(ReadBuffer r) {
-  r.readUint8(); // data type
+String _decodeColumn(ReadBuffer r, ExecuteResponse out) {
+  final dataType = r.readUint8(); // data type
   r.readUint8(); // flags
   r.readUint8(); // precision
   r.readUint8(); // scale
@@ -419,6 +421,8 @@ String _decodeColumn(ReadBuffer r) {
   r.readUB4(); // dimensions
   r.readUint8(); // format
   r.readUint8(); // flags
+  out.columns.add(name);
+  out.columnTypes.add(dataType);
   return name;
 }
 
@@ -438,7 +442,13 @@ void _decodeRowData(ReadBuffer r, ExecuteResponse out) {
   final row = <Object?>[];
   for (var i = 0; i < out.columns.length; i++) {
     final bytes = r.readBytesWithLength();
-    row.add(bytes.isEmpty ? null : utf8.decode(bytes));
+    if (bytes.isEmpty) {
+      row.add(null);
+    } else if (out.columnTypes[i] == 2) {
+      row.add(decodeOracleNumber(ReadBuffer(bytes))); // NUMBER
+    } else {
+      row.add(utf8.decode(bytes));
+    }
   }
   out.rows.add(row);
 }

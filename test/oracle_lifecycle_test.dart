@@ -62,7 +62,7 @@ void main() {
       final sel = decodeExecuteResponse(ttcBody(await frames.next()),
           isQuery: true);
       expect(sel.rows, [
-        ['1'],
+        [1],
       ]);
     });
   });

@@ -18,7 +18,7 @@
 | 2 — Authentication | ✅ (SHA512/O5LOGON) | Verifier side: AUTH_PHASE_ONE/TWO, no plaintext storage; PBKDF2/12c + FAST_AUTH pending |
 | 3 — Execute & fetch | ✅ (no-bind) | Decode OALL8, run `Database.execute()`, reply DML status / query rows (columns as VARCHAR2); binds + native types pending |
 | 4 — Transactions & lifecycle | ◻ (commit/rollback/ping) | COMMIT, ROLLBACK, PING acknowledged; cursor close + re-execute pending |
-| 5 — Rich type codecs | ⬜ | NUMBER, DATE/TS, INTERVAL, ROWID, LOB, JSON, VECTOR |
+| 5 — Rich type codecs | ◻ (NUMBER) | Numeric columns encode as native Oracle NUMBER (int/double round-trip); DATE/INTERVAL/LOB/JSON/VECTOR pending |
 | 6 — TLS & robustness | ⬜ | native-net-encryption/TLS, SDU renegotiation, fuzz hardening |
 
 A client can connect from TCP all the way through a real SQL `SELECT`.
@@ -238,6 +238,19 @@ inverting the client decoders, each behind a conformance test:
 - LOB locators + the `ttcLobOp` streaming ops (`lob_op_message.dart`,
   `lob_locator.dart`): length, read, write, trim, chunk-size, temp-LOB
   create/free.
+
+> **Landed (NUMBER):** `lib/server/oracle_number.dart` — a verbatim port of
+> the client's base-100 `encodeNumber`/`decodeNumber`. `buildQueryResponse`
+> now infers each column's type from its values: a column whose every
+> non-null value is a representable number is described as **NUMBER** (type 2)
+> and its cells encoded with `encodeOracleNumber`, so the client returns real
+> `int`/`double` values instead of strings; mixed or non-numeric columns stay
+> VARCHAR2. `test/oracle_execute_test.dart` round-trips ints, negatives, zero,
+> and decimals (decoded with the ported `decodeOracleNumber`, byte-identical
+> to the client), and the live SELECT now yields native numbers. **Next:**
+> DATE/TIMESTAMP, INTERVAL, ROWID, LOB locators, JSON (OSON), VECTOR — noting
+> the engine stores most non-numeric values as text, so those apply where the
+> engine surfaces a typed value.
 - Native JSON / OSON (`oson.dart`) and VECTOR (`oracle_vector.dart`,
   dense + sparse) for 23ai parity.
 

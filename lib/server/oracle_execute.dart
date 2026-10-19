@@ -17,6 +17,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import 'oracle_codec.dart';
+import 'oracle_number.dart';
 import 'oracle_ttc.dart';
 import 'result.dart';
 
@@ -30,6 +31,9 @@ const int ttcFuncPing = 0x93;
 
 /// Oracle VARCHAR2 data type indicator.
 const int _oraTypeVarchar = 1;
+
+/// Oracle NUMBER data type indicator.
+const int _oraTypeNumber = 2;
 
 /// The TTC field version the server negotiates (see `oracle_ttc.dart`).
 const int executeFieldVersion = 24;
@@ -138,13 +142,34 @@ ExecuteRequestInfo decodeExecuteRequest(
 /// body (no TNS framing).
 Uint8List buildQueryResponse(QueryResult result) {
   final b = WriteBuffer();
-  _writeDescribeInfo(b, result.columns);
+  // Describe a column as NUMBER only when every non-null value is a
+  // representable number; otherwise fall back to VARCHAR2 (stringified).
+  final types = [
+    for (var i = 0; i < result.columns.length; i++)
+      _inferColumnOraType(result.rows, i),
+  ];
+  _writeDescribeInfo(b, result.columns, types);
   _writeRowHeader(b);
   for (final row in result.rows) {
-    _writeRowData(b, row);
+    _writeRowData(b, row, types);
   }
   _writeErrorBody(b, num: _oraNoDataFound, message: 'ORA-01403: no data found');
   return b.toBytes();
+}
+
+/// Infers the Oracle wire type for column [colIndex]: NUMBER when every
+/// non-null value is a representable number, else VARCHAR2.
+int _inferColumnOraType(List<List<Object?>> rows, int colIndex) {
+  var sawValue = false;
+  for (final row in rows) {
+    if (colIndex >= row.length) continue;
+    final v = row[colIndex];
+    if (v == null) continue;
+    sawValue = true;
+    if (v is num && isOracleNumberRepresentable(v)) continue;
+    return _oraTypeVarchar;
+  }
+  return sawValue ? _oraTypeNumber : _oraTypeVarchar;
 }
 
 /// Builds the response for a non-query [result] (DML/DDL): a success ERROR with
@@ -173,7 +198,7 @@ Uint8List buildStatusOk() {
   return b.toBytes();
 }
 
-void _writeDescribeInfo(WriteBuffer b, List<String> columns) {
+void _writeDescribeInfo(WriteBuffer b, List<String> columns, List<int> types) {
   b.writeUint8(ttcMsgTypeDescribeInfo);
   b.writeBytesWithLength(Uint8List(0)); // version bytes
   b.writeUB4(0); // max row size
@@ -182,7 +207,7 @@ void _writeDescribeInfo(WriteBuffer b, List<String> columns) {
     b.writeUint8(0); // one spare UB1 the client skips
   }
   for (var i = 0; i < columns.length; i++) {
-    _writeColumnInfo(b, columns[i], i + 1);
+    _writeColumnInfo(b, columns[i], i + 1, types[i]);
   }
   b.writeUB4(0); // current date bytes
   b.writeUB4(0); // dcbflag
@@ -192,15 +217,16 @@ void _writeDescribeInfo(WriteBuffer b, List<String> columns) {
   b.writeUB4(0); // tail bytes
 }
 
-/// Writes one column's metadata as VARCHAR2, laid out exactly as the client's
-/// `_processColumnInfo` reads it at field version 24.
-void _writeColumnInfo(WriteBuffer b, String name, int position) {
-  const maxLen = 4000;
+/// Writes one column's metadata (NUMBER or VARCHAR2), laid out exactly as the
+/// client's `_processColumnInfo` reads it at field version 24.
+void _writeColumnInfo(WriteBuffer b, String name, int position, int oraType) {
+  final isNumber = oraType == _oraTypeNumber;
+  final maxLen = isNumber ? 22 : 4000;
   final nameBytes = Uint8List.fromList(utf8.encode(name));
-  b.writeUint8(_oraTypeVarchar); // data type
+  b.writeUint8(oraType); // data type
   b.writeUint8(0); // flags
   b.writeUint8(0); // precision
-  b.writeUint8(0); // scale
+  b.writeUint8(0); // scale (0: client keeps the int-vs-double heuristic)
   b.writeUB4(maxLen); // max size
   b.writeUB4(0); // max num array elements
   b.writeUB8(0); // cont flags
@@ -240,11 +266,14 @@ void _writeRowHeader(WriteBuffer b) {
   b.writeUB4(0); // rxhrid length
 }
 
-void _writeRowData(WriteBuffer b, List<Object?> row) {
+void _writeRowData(WriteBuffer b, List<Object?> row, List<int> types) {
   b.writeUint8(ttcMsgTypeRowData);
-  for (final cell in row) {
+  for (var i = 0; i < row.length; i++) {
+    final cell = row[i];
     if (cell == null) {
-      b.writeBytesWithLength(Uint8List(0)); // 0-length == NULL for VARCHAR2
+      b.writeBytesWithLength(Uint8List(0)); // 0-length == NULL
+    } else if (i < types.length && types[i] == _oraTypeNumber && cell is num) {
+      b.writeBytesWithLength(encodeOracleNumber(cell));
     } else {
       b.writeBytesWithLength(Uint8List.fromList(utf8.encode(cell.toString())));
     }

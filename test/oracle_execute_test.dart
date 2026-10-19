@@ -49,8 +49,8 @@ void main() {
       expect(resp.errorNum, 0); // ORA-01403 maps to end-of-fetch
       expect(resp.columns, ['ID', 'NAME']);
       expect(resp.rows, [
-        ['1', 'alice'],
-        ['2', null],
+        [1, 'alice'],
+        [2, null],
       ]);
     });
 
@@ -60,6 +60,52 @@ void main() {
           isQuery: true);
       expect(resp.columns, ['X']);
       expect(resp.rows, isEmpty);
+    });
+
+    test('numeric columns round-trip as native NUMBER values', () {
+      const result = QueryResult(
+        columns: ['N'],
+        rows: [
+          [0],
+          [42],
+          [-7],
+          [1234567],
+          [3.14],
+          [-0.5],
+          [2.5],
+          [null],
+        ],
+      );
+      final resp = decodeExecuteResponse(buildQueryResponse(result),
+          isQuery: true);
+      expect(resp.columnTypes.single, 2); // Oracle NUMBER
+      expect(resp.rows, [
+        [0],
+        [42],
+        [-7],
+        [1234567],
+        [3.14],
+        [-0.5],
+        [2.5],
+        [null],
+      ]);
+    });
+
+    test('mixed numeric/text column falls back to VARCHAR2 strings', () {
+      const result = QueryResult(
+        columns: ['M'],
+        rows: [
+          [1],
+          ['two'],
+        ],
+      );
+      final resp = decodeExecuteResponse(buildQueryResponse(result),
+          isQuery: true);
+      expect(resp.columnTypes.single, 1); // VARCHAR2
+      expect(resp.rows, [
+        ['1'],
+        ['two'],
+      ]);
     });
 
     test('DML response reports the affected row count', () {
@@ -122,8 +168,8 @@ void main() {
       expect(sel.errorNum, 0);
       expect(sel.columns, ['id', 'name']);
       expect(sel.rows, [
-        ['1', 'alice'],
-        ['2', 'bob'],
+        [1, 'alice'],
+        [2, 'bob'],
       ]);
     });
   });
