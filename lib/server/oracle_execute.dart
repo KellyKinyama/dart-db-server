@@ -59,6 +59,7 @@ class ExecuteRequestInfo {
     required this.cursorId,
     required this.sql,
     required this.numParams,
+    this.binds = const [],
   });
 
   final int options;
@@ -67,8 +68,11 @@ class ExecuteRequestInfo {
   /// The SQL text, when the request carried it (a fresh statement, cursorId 0).
   final String sql;
 
-  /// Number of bind parameters declared. Non-zero binds are not yet handled.
+  /// Number of bind parameters declared.
   final int numParams;
+
+  /// Decoded IN bind values in wire order (one per declared parameter).
+  final List<Object?> binds;
 
   bool get hasBinds => numParams > 0;
 }
@@ -135,12 +139,66 @@ ExecuteRequestInfo decodeExecuteRequest(
   for (var i = 1; i < 13; i++) {
     body.readUB4(); // al8i4[1..12]
   }
+  final binds = numParams > 0
+      ? _decodeBinds(body, numParams, ttcFieldVersion)
+      : const <Object?>[];
   return ExecuteRequestInfo(
     options: options,
     cursorId: cursorId,
     sql: sql,
     numParams: numParams,
+    binds: binds,
   );
+}
+
+/// Decodes [numParams] bind metadata blocks followed by the single ROW_DATA
+/// message carrying the IN bind values, returning the values in wire order.
+List<Object?> _decodeBinds(ReadBuffer body, int numParams, int fv) {
+  final oraTypes = <int>[];
+  for (var i = 0; i < numParams; i++) {
+    oraTypes.add(body.readUint8()); // data type
+    body.readUint8(); // flag (bind-use indicators)
+    body.readUint8(); // precision
+    body.readUint8(); // scale
+    body.readUB4(); // max size
+    body.readUB4(); // max num array elements
+    body.readUB4(); // cont flag (LOB prefetch)
+    body.readUB4(); // OID
+    body.readUB2(); // version
+    body.readUB2(); // charset field
+    body.readUint8(); // csfrm
+    body.readUB4(); // LOB prefetch length
+    if (fv >= _fv12_2) {
+      body.readUB4(); // oaccolid
+    }
+  }
+  if (!body.hasRemaining) {
+    return List<Object?>.filled(numParams, null); // all-NULL / no row data
+  }
+  body.readUint8(); // ROW_DATA message type (7)
+  return [for (final ot in oraTypes) _decodeBindValue(body, ot)];
+}
+
+/// Decodes one IN bind value. Supported: NUMBER, VARCHAR2/CHAR, RAW, and NULL
+/// (a zero-length value). Other types are not yet handled.
+Object? _decodeBindValue(ReadBuffer body, int oraType) {
+  final bytes = body.readBytesWithLength();
+  if (bytes.isEmpty) return null; // NULL (also an empty string in Oracle)
+  switch (oraType) {
+    case 2: // NUMBER
+    case 3: // INTEGER
+    case 4: // FLOAT
+    case 6: // VARNUM
+      return decodeOracleNumber(ReadBuffer(bytes));
+    case 1: // VARCHAR
+    case 5: // STRING
+    case 96: // CHAR
+      return utf8.decode(bytes, allowMalformed: true);
+    case 23: // RAW
+      return Uint8List.fromList(bytes);
+    default:
+      throw FormatException('unsupported bind type $oraType');
+  }
 }
 
 /// Builds the response for a query [result]: DESCRIBE_INFO, one ROW_HEADER, a

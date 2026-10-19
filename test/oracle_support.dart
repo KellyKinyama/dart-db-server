@@ -272,8 +272,12 @@ Uint8List buildFunctionRequest(int functionCode, {int seq = 4}) {
 
 /// Builds a no-bind EXECUTE (OALL8) request body at TTC field version 24. When
 /// [cursorId] is non-zero this is a cached re-execute: no SQL bytes travel.
+/// When [binds] is non-empty, bind metadata + a ROW_DATA value block follow.
 Uint8List buildExecuteRequest(String sql,
-    {bool isQuery = false, int seq = 3, int cursorId = 0}) {
+    {bool isQuery = false,
+    int seq = 3,
+    int cursorId = 0,
+    List<Object?> binds = const []}) {
   final fresh = cursorId == 0;
   final sqlBytes = Uint8List.fromList(utf8.encode(sql));
   final b = WriteBuffer();
@@ -292,8 +296,8 @@ Uint8List buildExecuteRequest(String sql,
   b.writeUint8(0); // prefetch buffer size
   b.writeUB4(isQuery ? 50 : 1); // prefetch num rows
   b.writeUB4(0x7fffffff); // max long size
-  b.writeUint8(0); // numParams ptr
-  b.writeUB4(0); // numParams
+  b.writeUint8(binds.isEmpty ? 0 : 1); // numParams ptr
+  b.writeUB4(binds.length); // numParams
   b.writeUint8(0); // al8pp
   b.writeUint8(0); // al8txn
   b.writeUint8(0); // al8txl
@@ -328,7 +332,51 @@ Uint8List buildExecuteRequest(String sql,
   for (var i = 1; i < 13; i++) {
     b.writeUB4(0);
   }
+  if (binds.isNotEmpty) {
+    for (final v in binds) {
+      _writeBindMeta(b, _bindOraType(v));
+    }
+    b.writeUint8(ttcMsgTypeRowData);
+    for (final v in binds) {
+      _writeBindValue(b, v);
+    }
+  }
   return b.toBytes();
+}
+
+int _bindOraType(Object? v) {
+  if (v == null) return 1; // VARCHAR (null)
+  if (v is num) return 2; // NUMBER
+  if (v is Uint8List) return 23; // RAW
+  return 1; // VARCHAR / STRING
+}
+
+void _writeBindMeta(WriteBuffer b, int oraType) {
+  b.writeUint8(oraType);
+  b.writeUint8(32); // bind-use indicators flag (ignored by server)
+  b.writeUint8(0); // precision
+  b.writeUint8(0); // scale
+  b.writeUB4(oraType == 2 ? 22 : 4000); // max size
+  b.writeUB4(0); // max num elements
+  b.writeUB4(0); // cont flag
+  b.writeUB4(0); // OID
+  b.writeUB2(0); // version
+  b.writeUB2(0); // charset field
+  b.writeUint8(0); // csfrm
+  b.writeUB4(0); // LOB prefetch length
+  b.writeUB4(0); // oaccolid (fv >= 12.2)
+}
+
+void _writeBindValue(WriteBuffer b, Object? v) {
+  if (v == null) {
+    b.writeUint8(0); // zero-length NULL indicator
+  } else if (v is num) {
+    b.writeBytesWithLength(encodeOracleNumber(v));
+  } else if (v is Uint8List) {
+    b.writeBytesWithLength(v);
+  } else {
+    b.writeBytesWithLength(Uint8List.fromList(utf8.encode(v.toString())));
+  }
 }
 
 /// Builds a close-cursors piggyback body (prepended before a real message).

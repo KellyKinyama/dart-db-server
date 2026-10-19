@@ -16,7 +16,7 @@
 | 0 — TNS transport | ✅ | CONNECT parse, version negotiation, ACCEPT, DATA/MARKER framing |
 | 1 — TTC negotiation | ✅ | PROTOCOL + DATA-TYPES exchange (charset, caps, field version 24) |
 | 2 — Authentication | ✅ (SHA512/O5LOGON) | Verifier side: AUTH_PHASE_ONE/TWO, no plaintext storage; PBKDF2/12c + FAST_AUTH pending |
-| 3 — Execute & fetch | ✅ (no-bind) | Decode OALL8, run `Database.execute()`, reply DML status / query rows; binds pending |
+| 3 — Execute & fetch | ✅ | Decode OALL8, run via the engine, reply DML status / query rows; **positional + named bind variables**; large-result flow a later phase |
 | 4 — Transactions & lifecycle | ✅ | COMMIT/ROLLBACK drive the engine; PING; statement-cache cursor re-execute; close-cursors piggyback; logoff via socket close; **per-session isolation** (serializable) |
 | 5 — Rich type codecs | ◻ (NUMBER, RAW) | Numeric columns → native NUMBER, byte buffers → RAW; DATE/INTERVAL/LOB/JSON/VECTOR pending |
 | 6 — TLS & robustness | ⬜ | native-net-encryption/TLS, SDU renegotiation, fuzz hardening |
@@ -216,6 +216,18 @@ from a stock client.
 > values), native NUMBER/DATE/etc. column encoding, multi-packet/large result
 > flow control and `ttcFuncFetch` continuations, then confirm against the real
 > `oracledb` client.
+
+> **Update (bind variables):** `decodeExecuteRequest` now decodes the bind
+> metadata blocks and the ROW_DATA value block (NUMBER, VARCHAR2/CHAR, RAW,
+> NULL) after the OALL8 header — for fresh executes and cached re-executes
+> alike (binds travel even when the SQL doesn't). The wire sends values
+> positionally; `_executeWithBinds` tokenizes the SQL with the engine's lexer,
+> maps each value to the placeholder in first-appearance order, and runs
+> `Database.executeWith(positional:, named:)` — so `:1`/`:2` (positional),
+> `:name` (named), and repeated placeholders all bind correctly. Proven
+> against the **real `oracledb` client** (`validation/test/realclient_test.dart`:
+> positional List binds, a named `:dept` filter, and a repeated `:x`) plus a
+> self-contained main-suite test.
 
 **Phase 4 — Transactions & statement lifecycle.** `ttcFuncCommit` /
 `ttcFuncRollback`, cursor close (`ttcFuncCloseCursors`), re-execute of

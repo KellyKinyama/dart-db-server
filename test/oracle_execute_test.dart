@@ -191,5 +191,48 @@ void main() {
         [2, 'bob'],
       ]);
     });
+
+    test('positional and named bind variables round-trip', () async {
+      final db = await Database.open(null);
+      final server = OracleServer(db, port: 0, users: {
+        'testuser': 'testpassword',
+      });
+      await server.start();
+      addTearDown(() async => server.stop());
+
+      final socket = await Socket.connect(
+        InternetAddress.loopbackIPv4,
+        server.boundPort,
+      );
+      addTearDown(() async => socket.close());
+      final frames = FrameReader(socket);
+      await handshakeAndLogin(socket, frames,
+          username: 'testuser', password: 'testpassword');
+
+      socket.add(wrapData(buildExecuteRequest(
+          'CREATE TABLE emp (id INTEGER PRIMARY KEY, name TEXT, dept INTEGER)')));
+      await frames.next();
+
+      // Positional binds (:1, :2, :3).
+      socket.add(wrapData(buildExecuteRequest(
+          'INSERT INTO emp VALUES (:1, :2, :3)',
+          binds: [1, 'alice', 10])));
+      expect(decodeExecuteResponse(ttcBody(await frames.next())).rowsAffected, 1);
+      socket.add(wrapData(buildExecuteRequest(
+          'INSERT INTO emp VALUES (:1, :2, :3)',
+          binds: [2, 'bob', 20])));
+      await frames.next();
+
+      // Named bind.
+      socket.add(wrapData(buildExecuteRequest(
+          'SELECT name FROM emp WHERE dept = :dept ORDER BY id',
+          isQuery: true,
+          binds: [10])));
+      final sel = decodeExecuteResponse(ttcBody(await frames.next()),
+          isQuery: true);
+      expect(sel.rows, [
+        ['alice'],
+      ]);
+    });
   });
 }

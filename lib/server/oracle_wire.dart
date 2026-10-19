@@ -23,6 +23,7 @@ import 'oracle_codec.dart';
 import 'oracle_execute.dart';
 import 'oracle_tns.dart';
 import 'oracle_ttc.dart';
+import 'lexer.dart';
 import 'result.dart';
 
 // TTC message types (first byte of a TTC message body). Full set lives in the
@@ -418,11 +419,6 @@ class OracleConnection {
       _sendTtc(buildExecuteError(1012, 'not logged on'));
       return;
     }
-    if (info.hasBinds) {
-      server._log('conn $id EXECUTE with ${info.numParams} binds (unsupported)');
-      _sendTtc(buildExecuteError(600, 'bind variables are not yet supported'));
-      return;
-    }
     // Resolve the SQL and cursor id: a fresh statement (cursor 0) is assigned a
     // new id and cached; a cached re-execute (cursor != 0) carries no SQL and
     // is looked up by id.
@@ -441,12 +437,21 @@ class OracleConnection {
       }
       sql = cached;
     }
-    server._log('conn $id EXECUTE [cursor $cursorId] "$sql"');
+    server._log('conn $id EXECUTE [cursor $cursorId] "$sql"'
+        '${info.hasBinds ? ' binds=${info.binds}' : ''}');
     final response = await _guarded<Uint8List>(sql, () async {
       try {
         // Serve the client's connect-time data-dictionary probes synthetically;
         // the SQL engine has no Oracle system catalog.
-        final result = _systemQueryResult(sql) ?? await server.db.execute(sql);
+        final QueryResult result;
+        final sys = _systemQueryResult(sql);
+        if (sys != null) {
+          result = sys;
+        } else if (info.hasBinds) {
+          result = await _executeWithBinds(sql, info.binds);
+        } else {
+          result = await server.db.execute(sql);
+        }
         return result.columns.isNotEmpty
             ? buildQueryResponse(result, cursorId: cursorId)
             : buildDmlResponse(result, cursorId: cursorId);
@@ -455,6 +460,33 @@ class OracleConnection {
       }
     });
     _sendTtc(response);
+  }
+
+  /// Binds the wire's positional [binds] to the SQL's placeholders (in
+  /// first-appearance order) and runs it. Oracle sends bind values positionally;
+  /// the engine tokenizes `:name` / `:1` as named and `?` as positional.
+  Future<QueryResult> _executeWithBinds(String sql, List<Object?> binds) {
+    final positional = <Object?>[];
+    final named = <String, Object?>{};
+    final seen = <String>{};
+    var i = 0;
+    for (final tok in Lexer(sql).tokenize()) {
+      if (tok.type != TokType.param || !seen.add(tok.text)) continue;
+      final value = i < binds.length ? binds[i] : null;
+      i++;
+      if (tok.text.startsWith('?')) {
+        final idx = tok.text == '?'
+            ? positional.length + 1
+            : int.parse(tok.text.substring(1));
+        while (positional.length < idx) {
+          positional.add(null);
+        }
+        positional[idx - 1] = value;
+      } else {
+        named[tok.text.substring(1)] = value; // strip the sigil
+      }
+    }
+    return server.db.executeWith(sql, positional: positional, named: named);
   }
 
   /// Wraps a TTC message body in a TNS DATA packet and sends it.

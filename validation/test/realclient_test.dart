@@ -80,4 +80,47 @@ void main() {
     expect(r.rows[0][0], -42); // 'neg'
     expect(r.rows[1][0], closeTo(3.14, 1e-9)); // 'pi'
   });
+
+  test('positional and named bind variables work', () async {
+    final db = await Database.open(null);
+    final server = await _startServer(db);
+    addTearDown(() async => server.stop());
+
+    final conn = await OracleConnection.connect(
+      '127.0.0.1:${server.boundPort}/DARTDB',
+      user: 'testuser',
+      password: 'testpassword',
+    );
+    addTearDown(() async => conn.close());
+
+    await conn.execute(
+        'CREATE TABLE emp (id INTEGER PRIMARY KEY, name TEXT, dept INTEGER)');
+
+    // Positional binds (a List -> :1, :2, :3).
+    final ins = await conn.execute(
+      'INSERT INTO emp VALUES (:1, :2, :3)',
+      [1, 'alice', 10],
+    );
+    expect(ins.rowsAffected, 1);
+    await conn.execute('INSERT INTO emp VALUES (:1, :2, :3)', [2, 'bob', 20]);
+    await conn.execute('INSERT INTO emp VALUES (:1, :2, :3)', [3, 'carol', 10]);
+
+    // Named bind in a WHERE clause.
+    final sel = await conn.execute(
+      'SELECT id, name FROM emp WHERE dept = :dept ORDER BY id',
+      {'dept': 10},
+    );
+    expect(sel.rows.length, 2);
+    expect(sel.rows[0][0], 1);
+    expect(sel.rows[0][1], 'alice');
+    expect(sel.rows[1][0], 3);
+    expect(sel.rows[1][1], 'carol');
+
+    // A repeated named placeholder binds once.
+    final rep = await conn.execute(
+      'SELECT name FROM emp WHERE id = :x OR dept = :x ORDER BY id',
+      {'x': 10},
+    );
+    expect(rep.rows.map((r) => r[0]).toList(), ['alice', 'carol']);
+  });
 }
