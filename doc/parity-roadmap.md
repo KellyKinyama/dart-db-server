@@ -172,8 +172,11 @@ Sequenced sub-phases so value lands incrementally:
    p(@out)` writes `OUT`/`INOUT` parameters back to the passed `@var`. Oracle
    **ref cursors** are supported: `SYS_REFCURSOR` variables with `OPEN cur FOR
    <select>`, surfaced to the caller as a result set via an `OUT SYS_REFCURSOR`
-   parameter, a function `RETURN`, or an anonymous block. (Cursor `FETCH`/`CLOSE`
-   and package-level state deferred.)
+   parameter, a function `RETURN`, or an anonymous block. PL/SQL **EXCEPTION**
+   handlers (`WHEN exc [OR …] THEN` / `WHEN OTHERS`, `RAISE`), the **cursor FOR
+   loop** (`FOR rec IN (<select>) LOOP`), and **persistent package state**
+   (body-level package variables) all work. (Explicit cursor `FETCH`/`CLOSE`
+   with `%FOUND`/`%NOTFOUND` deferred.)
 - **Risk:** high — new execution model, transaction/savepoint interaction,
   error-mapping to each protocol's error packets, and recursion/termination
   guards.
@@ -221,15 +224,16 @@ second front-end.
   with a hand-rolled protobuf codec (varint / length-delimited / fixed64) and
   the `[4-byte length][1-byte type][payload]` message framing. Reuses the same
   `Database` core.
-- **Status:** ✅ SQL path done — `Connection.CapabilitiesGet/Set`,
-  `Session.AuthenticateStart/Continue` with `MYSQL41` (challenge-response) and
-  `PLAIN`, and `Sql.StmtExecute` (namespace `sql`) streaming
+- **Status:** ✅ done — `Connection.CapabilitiesGet/Set`,
+  `Session.AuthenticateStart/Continue` with `MYSQL41` / `SHA256_MEMORY`
+  (challenge-response) and `PLAIN`, `Sql.StmtExecute` (namespace `sql`) streaming
   `Resultset.ColumnMetaData`/`Row`/`FetchDone`/`StmtExecuteOk` with a
-  `rows_affected` notice for DML. Result values are typed (SINT / DOUBLE /
-  BYTES, NULL as a zero-length field). `Session.Reset/Close` and
-  `Connection.Close` handled. **Deferred:** CRUD document/table ops
-  (`Crud.Find/Insert/Update/Delete`), X-protocol TLS (`CapabilitiesSet tls=1`),
-  and `SHA256_MEMORY` auth.
+  `rows_affected` notice for DML, and `Crud.Find/Insert/Update/Delete` (TABLE
+  data model) translated to SQL via a `Mysqlx.Expr` → SQL translator. Result
+  values are typed (SINT / DOUBLE / BYTES, NULL as a zero-length field).
+  `Session.Reset/Close` and `Connection.Close` handled. **Deferred:** CRUD
+  document (collection) ops + document-path expressions, and X-protocol TLS
+  (`CapabilitiesSet tls=1`).
 - **Why last:** largest surface, smallest audience (most tooling uses the
   classic protocol, already supported).
 - **Done when:** ~~a MySQL X client (`mysqlx` shell / connector) connects and runs

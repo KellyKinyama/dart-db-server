@@ -31,7 +31,7 @@ dialects disagree on syntax, the parser accepts all of the common spellings.
 | LOB streaming | ✅ temp LOBs, chunked transfer, `ttcLobOp` | n/a (values inline) |
 | Multi-statement | n/a | ✅ `CLIENT_MULTI_STATEMENTS` |
 | Compression | ❌ | ✅ `CLIENT_COMPRESS` (zlib); `zstd` not advertised |
-| Proprietary extras | — | ✅ X protocol (DevAPI, port 33060) — SQL via `Sql.StmtExecute`; CRUD document ops deferred |
+| Proprietary extras | — | ✅ X protocol (DevAPI, port 33060) — SQL via `Sql.StmtExecute` and `Crud.Find/Insert/Update/Delete` (TABLE); `MYSQL41`/`SHA256_MEMORY`/`PLAIN` auth; document-collection CRUD deferred |
 | Real third-party driver test | ✅ `oracledb` (Node) over the wire | ✅ `package:mysql_client` (Dart) |
 
 Validated against **Oracle 23ai + 21c** and the **`mysql_client`** driver.
@@ -66,8 +66,8 @@ standard / Oracle 12c+), and `WHERE ROWNUM <= n` (Oracle legacy).
 | `(+)` outer-join operator | ✅ | comma joins → CROSS; `(+)` rewrites to LEFT/RIGHT (3+-table chains best-effort) |
 | `FETCH FIRST … ROWS ONLY` / `OFFSET … ROWS` | ✅ | `WITH TIES` ≈ `ONLY` |
 | `CONNECT BY` hierarchical queries | ✅ | `PRIOR`, `LEVEL`, `CONNECT_BY_ISLEAF`, `START WITH`, `ORDER SIBLINGS BY`, cycle guard (`SYS_CONNECT_BY_PATH` / `CONNECT_BY_ROOT` deferred) |
-| PL/SQL anonymous blocks + `CREATE PROCEDURE`/`FUNCTION` | ✅ | `DECLARE`/`:=`/`IF`-`ELSIF`/`WHILE`/`FOR lo..hi`/`LOOP`+`EXIT`/`SELECT INTO`/`DBMS_OUTPUT`; stored FUNCTIONs callable in expressions (`SELECT f(x)`, `WHERE`, nested); `EXCEPTION` + cursors deferred |
-| `CREATE PACKAGE` / `PACKAGE BODY` | ✅ | spec accepted; body members callable as `pkg.func(args)` / `CALL pkg.proc(args)`; `DROP PACKAGE`; package-level state + ref-cursor returns deferred |
+| PL/SQL anonymous blocks + `CREATE PROCEDURE`/`FUNCTION` | ✅ | `DECLARE`/`:=`/`IF`-`ELSIF`/`WHILE`/`FOR lo..hi`/cursor `FOR rec IN (…)`/`LOOP`+`EXIT`/`SELECT INTO`/`DBMS_OUTPUT`/`EXCEPTION`+`RAISE`; stored FUNCTIONs callable in expressions (`SELECT f(x)`, `WHERE`, nested); explicit cursor `FETCH`/`CLOSE` deferred |
+| `CREATE PACKAGE` / `PACKAGE BODY` | ✅ | spec accepted; body members callable as `pkg.func(args)` / `CALL pkg.proc(args)`; persistent body-level package state; `DROP PACKAGE` |
 | Ref cursors (`SYS_REFCURSOR`, `OPEN … FOR`) | ✅ | surfaced as a result set via `OUT SYS_REFCURSOR`, function `RETURN`, or anonymous block; `FETCH`/`CLOSE` deferred |
 | `INSERT ALL` / `INSERT FIRST` multi-table insert | ✅ | unconditional, conditional `WHEN`/`ELSE`, `INTO` without `VALUES` |
 
@@ -128,15 +128,15 @@ The engine ships capabilities neither stock Oracle nor MySQL expose the same way
 
 ## 6. Known gaps & non-goals
 
-- **Oracle:** PL/SQL `EXCEPTION` handlers and explicit cursors
-  (`FETCH`/`CLOSE`, `%ROWTYPE`/`%FOUND`) — the rest of PL/SQL (blocks,
-  procedures, functions, packages, control flow, `SELECT INTO`, `SYS_REFCURSOR`
-  via `OPEN … FOR`) is supported; package-level state; `SYS_CONNECT_BY_PATH` /
+- **Oracle:** explicit cursors (`FETCH`/`CLOSE`, `%ROWTYPE`/`%FOUND`) — the
+  rest of PL/SQL (blocks, procedures, functions, packages + persistent package
+  state, control flow, `SELECT INTO`, `SYS_REFCURSOR` via `OPEN … FOR`, the
+  cursor `FOR` loop, `EXCEPTION`/`RAISE`) is supported; `SYS_CONNECT_BY_PATH` /
   `CONNECT_BY_ROOT`; real-client TLS (client-SDK bug, not server).
-- **MySQL:** X-protocol CRUD document ops (`Crud.Find/Insert/Update/Delete`;
-  SQL via `Sql.StmtExecute` is supported) and the rest of
-  `INFORMATION_SCHEMA` (`TABLES`/`COLUMNS`/`SCHEMATA`/`VIEWS` are supported;
-  `KEY_COLUMN_USAGE` / `STATISTICS` / constraint views are not yet).
+- **MySQL:** X-protocol CRUD document-collection ops (TABLE-model
+  `Crud.Find/Insert/Update/Delete` and SQL via `Sql.StmtExecute` are supported)
+  and the rest of `INFORMATION_SCHEMA` (`TABLES`/`COLUMNS`/`SCHEMATA`/`VIEWS` are
+  supported; `KEY_COLUMN_USAGE` / `STATISTICS` / constraint views are not yet).
 - **Engine quirks:** `(+)` RIGHT joins on 3+-table chains null the whole
   accumulated left side (best-effort vs Oracle's per-table semantics).
 
