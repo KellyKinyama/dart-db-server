@@ -1847,6 +1847,26 @@ class Parser {
       }
       fromIndexHint = _consumeIndexedHint();
       while (true) {
+        // Comma join: `FROM a, b` is a CROSS JOIN; any join predicate lives
+        // in the WHERE clause (and Oracle (+) markers there turn it outer).
+        if (_match(TokType.punct, ',')) {
+          String? ctbl;
+          SelectStmt? csub;
+          if (_match(TokType.punct, '(')) {
+            csub = _parseSelect();
+            _expect(TokType.punct, ')');
+          } else {
+            ctbl = _parseQualifiedTableName();
+          }
+          String? calias;
+          if (_matchKw('AS')) {
+            calias = _expectName();
+          } else if (_check(TokType.ident) && !_isClauseStartWord()) {
+            calias = _advance().text;
+          }
+          joins.add(JoinClause('CROSS', ctbl, calias, null, subquery: csub));
+          continue;
+        }
         String? joinType;
         bool natural = false;
         if (_matchKw('NATURAL')) {
@@ -1925,6 +1945,11 @@ class Parser {
     }
     Expr? where;
     if (_matchKw('WHERE')) where = _parseExpr();
+    // Oracle legacy (+) outer joins: rewrite comma/CROSS joins into LEFT/RIGHT
+    // joins, moving the marked equality predicate(s) from WHERE into the ON.
+    if (where != null && joins.isNotEmpty) {
+      where = _rewriteOracleOuterJoins(fromTable, fromAlias, joins, where);
+    }
     final groupBy = <Expr>[];
     List<List<Expr>>? groupingSets;
     Expr? having;
@@ -2179,6 +2204,109 @@ class Parser {
       default:
         return op; // '=' is symmetric
     }
+  }
+
+  /// Flatten a top-level AND chain into its conjuncts.
+  List<Expr> _andConjuncts(Expr e) {
+    if (e is BinaryExpr && e.op == 'AND') {
+      return [..._andConjuncts(e.left), ..._andConjuncts(e.right)];
+    }
+    return [e];
+  }
+
+  Expr? _combineAnd(List<Expr> parts) {
+    if (parts.isEmpty) return null;
+    var e = parts.first;
+    for (var i = 1; i < parts.length; i++) {
+      e = BinaryExpr('AND', e, parts[i]);
+    }
+    return e;
+  }
+
+  /// Rewrite Oracle legacy `(+)` outer joins. Comma/CROSS joins whose join
+  /// predicate carries a `(+)` marker in WHERE become LEFT/RIGHT joins with
+  /// that predicate relocated to their ON clause. Returns the residual WHERE.
+  Expr? _rewriteOracleOuterJoins(
+    String? baseTable,
+    String? baseAlias,
+    List<JoinClause> joins,
+    Expr where,
+  ) {
+    // Chain position of a table name/alias: base is 0, joins[i] is i+1.
+    int? posOf(String? name) {
+      if (name == null) return null;
+      final n = name.toUpperCase();
+      if (baseTable != null && baseTable.toUpperCase() == n) return 0;
+      if (baseAlias != null && baseAlias.toUpperCase() == n) return 0;
+      for (var i = 0; i < joins.length; i++) {
+        if (joins[i].table != null && joins[i].table!.toUpperCase() == n) {
+          return i + 1;
+        }
+        if (joins[i].alias != null && joins[i].alias!.toUpperCase() == n) {
+          return i + 1;
+        }
+      }
+      return null;
+    }
+
+    // (table, isMarked) for a column-ish operand, else null.
+    (String?, bool)? operandTable(Expr e) {
+      if (e is OuterJoinExpr) return (e.column.table, true);
+      if (e is ColumnExpr) return (e.table, false);
+      return null;
+    }
+
+    final conjuncts = _andConjuncts(where);
+    final residual = <Expr>[];
+    // joinIndex (into `joins`) -> ON predicates and the implied join type.
+    final onByJoin = <int, List<Expr>>{};
+    final typeByJoin = <int, String>{};
+
+    for (final c in conjuncts) {
+      if (c is! BinaryExpr || c.op == 'AND' || c.op == 'OR') {
+        residual.add(c);
+        continue;
+      }
+      final l = operandTable(c.left);
+      final r = operandTable(c.right);
+      if (l == null || r == null || (!l.$2 && !r.$2)) {
+        residual.add(c); // no (+) marker involved
+        continue;
+      }
+      final lp = posOf(l.$1);
+      final rp = posOf(r.$1);
+      if (lp == null || rp == null || lp == rp) {
+        residual.add(c);
+        continue;
+      }
+      final later = lp > rp ? lp : rp;
+      final joinIdx = later - 1; // index into `joins`
+      if (joins[joinIdx].type != 'CROSS') {
+        residual.add(c);
+        continue;
+      }
+      // The marked side is the null-supplying table. If it is the later table
+      // in the chain, the right side of this join is optional -> LEFT; if it is
+      // the earlier table, the accumulated left is optional -> RIGHT.
+      final markedPos = l.$2 ? lp : rp;
+      typeByJoin[joinIdx] = markedPos == later ? 'LEFT' : 'RIGHT';
+      (onByJoin[joinIdx] ??= <Expr>[]).add(c);
+    }
+
+    if (onByJoin.isEmpty) return where; // nothing rewritten
+
+    onByJoin.forEach((idx, preds) {
+      final j = joins[idx];
+      joins[idx] = JoinClause(
+        typeByJoin[idx]!,
+        j.table,
+        j.alias,
+        _combineAnd(preds),
+        subquery: j.subquery,
+        indexedBy: j.indexedBy,
+      );
+    });
+    return _combineAnd(residual);
   }
 
   SelectItem _parseSelectItem() {
@@ -2528,7 +2656,7 @@ class Parser {
         if (cu == 'NEXTVAL' || cu == 'CURRVAL') {
           return SequenceExpr(t.text, isCurrval: cu == 'CURRVAL');
         }
-        return ColumnExpr(col, table: t.text);
+        return _maybeOuterJoin(ColumnExpr(col, table: t.text));
       }
       // Special bare-word datetime literals (no parentheses).
       const bareFns = {
@@ -2549,7 +2677,7 @@ class Parser {
       if (t.upper == 'ROWNUM') {
         return FunctionCallExpr('ROW_NUMBER', const [], window: WindowSpec());
       }
-      return ColumnExpr(t.text);
+      return _maybeOuterJoin(ColumnExpr(t.text));
     }
     // Fall back: a keyword used in expression position becomes a column
     // reference. Allows e.g. `SELECT before FROM t` even though BEFORE is a
@@ -2570,6 +2698,22 @@ class Parser {
       return ColumnExpr(t.text);
     }
     throw FormatException('Unexpected token "${t.text}" at offset ${t.offset}');
+  }
+
+  /// If the current tokens are the Oracle legacy outer-join marker `( + )`,
+  /// consume them and wrap [col]; otherwise return [col] unchanged.
+  Expr _maybeOuterJoin(ColumnExpr col) {
+    if (_check(TokType.punct, '(') &&
+        _peek(1).type == TokType.op &&
+        _peek(1).text == '+' &&
+        _peek(2).type == TokType.punct &&
+        _peek(2).text == ')') {
+      _advance();
+      _advance();
+      _advance();
+      return OuterJoinExpr(col);
+    }
+    return col;
   }
 
   Expr _parseFunctionCall(String name) {

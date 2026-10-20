@@ -164,6 +164,33 @@ void main() {
     ]);
   });
 
+  test('Oracle (+) outer join works for a real client', () async {
+    final db = await Database.open(null);
+    await db.execute(
+      'CREATE TABLE emp (id INTEGER PRIMARY KEY, name TEXT, mgr INTEGER)',
+    );
+    await db.execute("INSERT INTO emp VALUES (1, 'king', NULL)");
+    await db.execute("INSERT INTO emp VALUES (2, 'bob', 1)");
+    final server = await _startServer(db);
+    addTearDown(() async => server.stop());
+
+    final conn = await OracleConnection.connect(
+      '127.0.0.1:${server.boundPort}/DARTDB',
+      user: 'testuser',
+      password: 'testpassword',
+    );
+    addTearDown(() async => conn.close());
+
+    final r = await conn.execute(
+      'SELECT e.name, m.name FROM emp e, emp m '
+      'WHERE e.mgr = m.id(+) ORDER BY e.id',
+    );
+    expect(r.rows.map((row) => row.toList()).toList(), [
+      ['king', null],
+      ['bob', 'king'],
+    ]);
+  });
+
   test('a wrong password is rejected', () async {
     final db = await Database.open(null);
     final server = await _startServer(db);

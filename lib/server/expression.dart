@@ -146,6 +146,16 @@ class ColumnExpr extends Expr {
   }
 }
 
+/// Oracle legacy outer-join marker: `col(+)`. Transparent during evaluation
+/// (returns the inner value); the SELECT parser's outer-join rewrite reads the
+/// marker to turn a comma/CROSS join into a LEFT/RIGHT join, then unwraps it.
+class OuterJoinExpr extends Expr {
+  final ColumnExpr column;
+  OuterJoinExpr(this.column);
+  @override
+  Object? eval(Map<String, Object?> row) => column.eval(row);
+}
+
 class UnaryExpr extends Expr {
   final String op; // NOT, -
   final Expr operand;

@@ -10069,7 +10069,8 @@ class Database implements SequenceProvider {
       left = _materializeRelation(s.fromTable!, s.fromAlias, outer);
     }
     var working = left;
-    for (final j in s.joins) {
+    for (var ji = 0; ji < s.joins.length; ji++) {
+      final j = s.joins[ji];
       final right = j.subquery != null
           ? _materializeSubquery(j.subquery!, j.alias, outer)
           : _materializeRelation(j.table!, j.alias, outer);
@@ -10159,7 +10160,7 @@ class Database implements SequenceProvider {
               }
             }
             if (!matched) {
-              final nulls = _nullSideOf(_keyTableName(s, working));
+              final nulls = _leftNullsFor(s, ji);
               next.add({...nulls, ...r});
             }
           }
@@ -10182,7 +10183,7 @@ class Database implements SequenceProvider {
             }
           }
           // Unmatched right rows
-          final leftNulls = _nullSideOf(_keyTableName(s, working));
+          final leftNulls = _leftNullsFor(s, ji);
           for (var ri = 0; ri < right.length; ri++) {
             if (!matchedRightIdx.contains(ri)) {
               next.add({...leftNulls, ...right[ri]});
@@ -12596,19 +12597,33 @@ class Database implements SequenceProvider {
     return out;
   }
 
-  Map<String, Object?> _nullSideOf(String tableName) {
-    if (!_tables.containsKey(tableName)) return const {};
-    final t = _tables[tableName]!;
+  /// Null map for the left side of a RIGHT/FULL join: every column of the base
+  /// relation plus all joins preceding [joinIdx], keyed bare, by real table
+  /// name, and by alias, so a projection of `alias.col` sees NULL (not a stale
+  /// fall-through to the bare name carried by the right row).
+  Map<String, Object?> _leftNullsFor(SelectStmt s, int joinIdx) {
     final out = <String, Object?>{};
-    for (final c in t.columns) {
-      out[c.name] = null;
-      out['${t.name}.${c.name}'] = null;
+    void addRel(String? table, String? alias, SelectStmt? sub) {
+      List<String> cols;
+      if (sub != null) {
+        cols = _selectTopLevel(sub).columns;
+      } else if (table != null) {
+        cols = _materializeColumns(table);
+      } else {
+        return;
+      }
+      for (final c in cols) {
+        out[c] = null;
+        if (table != null) out['$table.$c'] = null;
+        if (alias != null) out['$alias.$c'] = null;
+      }
+    }
+
+    addRel(s.fromTable, s.fromAlias, s.fromSubquery);
+    for (var i = 0; i < joinIdx; i++) {
+      addRel(s.joins[i].table, s.joins[i].alias, s.joins[i].subquery);
     }
     return out;
-  }
-
-  String _keyTableName(SelectStmt s, List<Map<String, Object?>> working) {
-    return s.fromAlias ?? s.fromTable ?? '';
   }
 
   _Projection _buildProjection(SelectStmt s) {
