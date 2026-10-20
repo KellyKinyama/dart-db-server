@@ -24,6 +24,32 @@ void main() {
     expect(await one('SELECT s.NEXTVAL FROM DUAL'), 2);
   });
 
+  test('multiple NEXTVAL refs in one row return the same value', () async {
+    await db.execute('CREATE SEQUENCE s START WITH 1');
+    expect(
+      (await db.execute('SELECT s.NEXTVAL, s.NEXTVAL FROM DUAL')).rows.first,
+      [1, 1],
+    );
+    // A new statement advances once.
+    expect(await one('SELECT s.NEXTVAL FROM DUAL'), 2);
+  });
+
+  test('NEXTVAL advances per row but is stable within a row', () async {
+    await db.execute('CREATE TABLE src (n INTEGER PRIMARY KEY)');
+    await db.execute('INSERT INTO src VALUES (1)');
+    await db.execute('INSERT INTO src VALUES (2)');
+    await db.execute('INSERT INTO src VALUES (3)');
+    await db.execute('CREATE TABLE dst (a INTEGER, b INTEGER)');
+    await db.execute('CREATE SEQUENCE q START WITH 10 INCREMENT BY 10');
+    await db.execute('INSERT INTO dst SELECT q.NEXTVAL, q.NEXTVAL FROM src');
+    final r = await db.execute('SELECT a, b FROM dst ORDER BY a');
+    expect(r.rows.map((x) => x.toList()).toList(), [
+      [10, 10],
+      [20, 20],
+      [30, 30],
+    ]);
+  });
+
   test('CURRVAL returns the last issued value', () async {
     await db.execute('CREATE SEQUENCE s START WITH 7');
     await db.execute('SELECT s.NEXTVAL FROM DUAL');

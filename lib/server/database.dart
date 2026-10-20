@@ -109,6 +109,13 @@ class Database implements SequenceProvider {
   /// intentionally non-transactional (NEXTVAL is not rolled back), matching
   /// Oracle, so this map is not snapshotted by transactions.
   final Map<String, _SequenceState> _sequences = <String, _SequenceState>{};
+
+  /// Monotonic "row epoch" for the once-per-row NEXTVAL guarantee. Bumped at
+  /// each statement and at every per-row evaluation boundary; all NEXTVAL
+  /// references sharing an epoch return the same value. Bumping too often is
+  /// harmless (it just falls back to advancing per reference).
+  int _seqEpoch = 0;
+  void _beginSeqRow() => _seqEpoch++;
   final String? path;
 
   /// When true, [_persist] writes the database as a real SQLite-format
@@ -2346,6 +2353,7 @@ class Database implements SequenceProvider {
     // Make this database the sequence provider for NEXTVAL/CURRVAL evaluated
     // while running the statement (nested trigger dispatch re-pushes safely).
     SequenceExpr.providerStack.add(this);
+    _beginSeqRow();
     try {
       if (stmt is CreateTableStmt) {
         result = _createTable(stmt);
@@ -4816,7 +4824,7 @@ class Database implements SequenceProvider {
   }
 
   @override
-  int sequenceNextval(String name) => _lookupSequence(name).next(name);
+  int sequenceNextval(String name) => _lookupSequence(name).next(name, _seqEpoch);
 
   @override
   int sequenceCurrval(String name) => _lookupSequence(name).current(name);
@@ -4865,6 +4873,7 @@ class Database implements SequenceProvider {
     final toInsert = <List<Object?>>[];
 
     for (final srow in sourceRows) {
+      _beginSeqRow();
       // Find the first target row satisfying ON, building a combined view of
       // target columns (bare, real-name- and alias-qualified) plus the source
       // columns already present in [srow].
@@ -5012,6 +5021,7 @@ class Database implements SequenceProvider {
     }
 
     for (final values in sourceRows) {
+      _beginSeqRow();
       final row = List<Object?>.filled(t.columns.length, null, growable: true);
       // Apply column defaults first.
       for (var i = 0; i < t.columns.length; i++) {
@@ -5353,6 +5363,7 @@ class Database implements SequenceProvider {
           : ((_evalScalar(s.offset!, const {}) as num?)?.toInt() ?? 0);
       for (final ri in rowOrder) {
         if (lim == 0 || (lim > 0 && count >= lim)) break;
+        _beginSeqRow();
         final row = t.rows[ri];
         final view = t.rowToMap(row);
         // For UPDATE ... FROM other, look for the first `other` row that
@@ -6453,9 +6464,10 @@ class Database implements SequenceProvider {
         if (e is FunctionCallExpr && e.isWindow) winFns.add(e);
       }
       if (winFns.isEmpty) {
-        resultRows = working
-            .map((src) => proj.exprs.map((e) => e.eval(src)).toList())
-            .toList();
+        resultRows = working.map((src) {
+          _beginSeqRow();
+          return proj.exprs.map((e) => e.eval(src)).toList();
+        }).toList();
       } else {
         // Pre-compute window values per-row, indexed by FunctionCallExpr.
         final winValues = <FunctionCallExpr, List<Object?>>{};
@@ -6463,6 +6475,7 @@ class Database implements SequenceProvider {
           winValues[fn] = _evalWindowFn(fn, working, s.namedWindows);
         }
         resultRows = List.generate(working.length, (i) {
+          _beginSeqRow();
           final src = working[i];
           return List.generate(proj.exprs.length, (j) {
             final e = proj.exprs[j];
@@ -17296,6 +17309,11 @@ class _SequenceState {
   /// Last value issued by NEXTVAL, or null before the first NEXTVAL.
   int? _last;
 
+  /// Row-epoch memo: within one row (same epoch) all NEXTVAL references return
+  /// the same value, matching Oracle's once-per-row guarantee.
+  int? _memoEpoch;
+  int? _memoValue;
+
   _SequenceState({
     required this.startWith,
     required this.incrementBy,
@@ -17304,7 +17322,15 @@ class _SequenceState {
     required this.cycle,
   });
 
-  int next(String name) {
+  int next(String name, int epoch) {
+    if (_memoEpoch == epoch && _memoValue != null) return _memoValue!;
+    final v = _advance(name);
+    _memoEpoch = epoch;
+    _memoValue = v;
+    return v;
+  }
+
+  int _advance(String name) {
     if (_last == null) {
       _last = startWith;
       return _last!;
