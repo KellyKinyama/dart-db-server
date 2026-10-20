@@ -633,8 +633,22 @@ class FunctionCallExpr extends Expr {
   bool get isAggregate => kAggregateFunctions.contains(name);
   bool get isWindow => window != null;
 
+  /// Per-row precomputed window values, set by the SELECT executor before it
+  /// evaluates a projection row. Lets a window call nested inside a larger
+  /// scalar expression (e.g. `'row ' || ROW_NUMBER() OVER ()`, which is how
+  /// Oracle ROWNUM lowers) resolve to its row value instead of being treated
+  /// as an unknown scalar function.
+  static Map<FunctionCallExpr, Object?>? windowRowValues;
+
   @override
   Object? eval(Map<String, Object?> row) {
+    if (isWindow) {
+      final wv = windowRowValues;
+      if (wv != null && wv.containsKey(this)) return wv[this];
+      throw StateError(
+        'Window function $name() OVER (...) is only valid in a query projection',
+      );
+    }
     if (isAggregate) {
       throw StateError(
         'Aggregate function $name() cannot be evaluated as a scalar',

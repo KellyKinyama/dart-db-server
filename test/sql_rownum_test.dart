@@ -123,5 +123,46 @@ void main() {
     );
     expect(r.rows.map((x) => x.first).toList(), ['n2', 'n3', 'n4']);
   });
+
+  test('ROWNUM nested inside a larger scalar expression', () async {
+    expect(
+      (await db.execute("SELECT 'row ' || ROWNUM FROM t WHERE id <= 3"))
+          .rows
+          .map((x) => x.first)
+          .toList(),
+      ['row 1', 'row 2', 'row 3'],
+    );
+    expect(
+      (await db.execute('SELECT ROWNUM * 10 FROM t WHERE id <= 3'))
+          .rows
+          .map((x) => x.first)
+          .toList(),
+      [10, 20, 30],
+    );
+  });
+
+  test('ROWNUM in CASE and alongside a bare ROWNUM', () async {
+    final r = await db.execute(
+      "SELECT ROWNUM, 'r' || ROWNUM, "
+      'CASE WHEN ROWNUM = 1 THEN name END FROM t WHERE id <= 3',
+    );
+    expect(r.rows.map((x) => x.toList()).toList(), [
+      [1, 'r1', 'n1'],
+      [2, 'r2', null],
+      [3, 'r3', null],
+    ]);
+  });
+
+  test('explicit window function nested in an expression', () async {
+    final r = await db.execute(
+      'SELECT name, ROW_NUMBER() OVER (ORDER BY id DESC) + 100 FROM t '
+      'WHERE id <= 3',
+    );
+    expect(r.rows.map((x) => x.toList()).toList(), [
+      ['n1', 103],
+      ['n2', 102],
+      ['n3', 101],
+    ]);
+  });
 }
 

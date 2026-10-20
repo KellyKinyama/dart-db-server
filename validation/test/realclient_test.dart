@@ -102,6 +102,11 @@ void main() {
       [2, 2],
       [3, 3],
     ]);
+
+    // ROWNUM nested inside a larger scalar expression.
+    final nested =
+        await conn.execute("SELECT 'n' || ROWNUM FROM nums WHERE ROWNUM <= 3");
+    expect(nested.rows.map((row) => row[0]).toList(), ['n1', 'n2', 'n3']);
   });
 
   test('sequence NEXTVAL drives a primary key for a real client', () async {

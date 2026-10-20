@@ -6458,10 +6458,11 @@ class Database implements SequenceProvider {
       // Build projection in non-aggregate path.
       final proj = _buildProjection(s);
       outCols = proj.outCols;
-      // Detect window functions at the top level of the bound projection.
+      // Detect window functions anywhere in the bound projection (top level or
+      // nested inside a larger scalar expression, e.g. `'r' || ROWNUM`).
       final winFns = <FunctionCallExpr>[];
       for (final e in proj.exprs) {
-        if (e is FunctionCallExpr && e.isWindow) winFns.add(e);
+        _collectWindowFns(e, winFns);
       }
       if (winFns.isEmpty) {
         resultRows = working.map((src) {
@@ -6477,13 +6478,15 @@ class Database implements SequenceProvider {
         resultRows = List.generate(working.length, (i) {
           _beginSeqRow();
           final src = working[i];
-          return List.generate(proj.exprs.length, (j) {
-            final e = proj.exprs[j];
-            if (e is FunctionCallExpr && e.isWindow) {
-              return winValues[e]![i];
-            }
-            return e.eval(src);
-          });
+          // Publish this row's window values so nested window calls resolve.
+          FunctionCallExpr.windowRowValues = {
+            for (final fn in winFns) fn: winValues[fn]![i],
+          };
+          try {
+            return [for (final e in proj.exprs) e.eval(src)];
+          } finally {
+            FunctionCallExpr.windowRowValues = null;
+          }
         });
       }
       orderingMaps = working;
@@ -12846,6 +12849,54 @@ class Database implements SequenceProvider {
     if (e is CastExpr) return _containsAggregate(e.expr);
     if (e is FunctionCallExpr) return e.args.any(_containsAggregate);
     return false;
+  }
+
+  /// Collect every window-function call nested anywhere in [e] (top level or
+  /// inside a larger scalar expression) so the SELECT executor can precompute
+  /// their per-row values and publish them via FunctionCallExpr.windowRowValues.
+  void _collectWindowFns(Expr? e, List<FunctionCallExpr> out) {
+    if (e == null) return;
+    if (e is FunctionCallExpr) {
+      if (e.isWindow) out.add(e);
+      for (final a in e.args) {
+        _collectWindowFns(a, out);
+      }
+      _collectWindowFns(e.filterExpr, out);
+      return;
+    }
+    if (e is BinaryExpr) {
+      _collectWindowFns(e.left, out);
+      _collectWindowFns(e.right, out);
+      return;
+    }
+    if (e is UnaryExpr) {
+      _collectWindowFns(e.operand, out);
+      return;
+    }
+    if (e is BetweenExpr) {
+      _collectWindowFns(e.value, out);
+      _collectWindowFns(e.low, out);
+      _collectWindowFns(e.high, out);
+      return;
+    }
+    if (e is InExpr) {
+      _collectWindowFns(e.value, out);
+      for (final v in e.values) {
+        _collectWindowFns(v, out);
+      }
+      return;
+    }
+    if (e is CaseExpr) {
+      for (final w in e.whens) {
+        _collectWindowFns(w, out);
+      }
+      for (final t in e.thens) {
+        _collectWindowFns(t, out);
+      }
+      _collectWindowFns(e.elseExpr, out);
+      return;
+    }
+    if (e is CastExpr) _collectWindowFns(e.expr, out);
   }
 
   Object? _evalProjectedWithAggregates(
