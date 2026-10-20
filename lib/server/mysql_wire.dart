@@ -2,16 +2,20 @@
 ///
 /// Speaks enough of the protocol that the official `mysql` CLI, MySQL
 /// Workbench and standard drivers (JDBC, `package:mysql_client`, etc.)
-/// can connect, log in with `mysql_native_password`, run text
-/// `COM_QUERY` statements, and read text-protocol result sets.
+/// can connect, authenticate, run text and prepared statements, and read
+/// text- and binary-protocol result sets.
 ///
-/// Scope of this scaffold:
-///   * Handshake v10 + `mysql_native_password` (empty or SHA1-challenged).
-///   * `COM_QUERY`, `COM_PING`, `COM_QUIT`, `COM_INIT_DB`, `COM_STATISTICS`,
-///     `COM_FIELD_LIST` (minimal).
-///   * `COM_STMT_*` (prepared statements), SSL/`COM_SSL_REQUEST`,
-///     `caching_sha2_password`, compression, and the X protocol are all
-///     TODO — clients that demand them will receive an ERR packet.
+/// Implemented:
+///   * Handshake v10 with `mysql_native_password` and `caching_sha2_password`.
+///   * TLS upgrade via `COM_SSL_REQUEST` (`SecureSocket.secureServer`).
+///   * `COM_QUERY` (text protocol), `COM_PING`, `COM_QUIT`, `COM_INIT_DB`,
+///     `COM_STATISTICS`, `COM_FIELD_LIST`.
+///   * `COM_STMT_PREPARE/EXECUTE/CLOSE/RESET` (binary-protocol result sets).
+///   * `CLIENT_MULTI_STATEMENTS` (one result set per statement).
+///
+/// Not yet supported (clients that demand these get an ERR packet):
+///   * Protocol compression (`CLIENT_COMPRESS`, zstd).
+///   * The X protocol (DevAPI, port 33060).
 library;
 
 import 'dart:async';
