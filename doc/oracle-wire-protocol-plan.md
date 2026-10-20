@@ -382,3 +382,132 @@ handling, and fuzz/malformed-packet hardening (reuse the
   emitted correctly or fetch decoding fails loud on the client.
 - **Undocumented corners** — any message the capture reveals but the
   client doesn't exercise will need live probing against a real server.
+
+## Closing the remaining work
+
+Everything below follows the same proven recipe: **invert the client's
+encoder/decoder** for the type or message, **integrate with the engine**
+(which stores most rich values as text/primitives, so a symmetric
+round-trip is only possible where the engine has a native type), and
+**validate against the real `oracledb` client** in `validation/`. Items are
+ordered by value ÷ effort.
+
+### Priority & dependencies
+
+```
+1. Large-SDU framing ─┬─► prerequisite for FAST_AUTH (needs version ≥ 318)
+                      └─► lets single packets exceed 64 KB
+2. INTERVAL codecs      (easy — mirrors the DATE work already shipped)
+3. VECTOR codecs        (engine has native vectors → full round-trip)
+4. JSON codecs          (text fallback easy; native OSON hard)
+5. 12c PBKDF2 verifier  (independent — broadens client compatibility)
+6. TLS / TCPS           (independent — SecureServerSocket)
+7. FAST_AUTH            (after #1; a round-trip optimization, not a gap)
+8. LOB locators + ttcLobOp streaming   (largest — a server LOB store)
+```
+
+### 0. Large-SDU framing (foundational)
+
+- **Why:** the server pins TNS version **314** so DATA packets keep the
+  classic 2-byte length header. Version ≥ 315 switches to a **4-byte**
+  packet length, which unlocks the accept-flag word (≥ 318, needed for
+  FAST_AUTH) and >64 KB single packets. Multi-packet already removes the
+  *result-size* cap, so this is only needed for FAST_AUTH and larger SDUs.
+- **Invert:** `transport/packet.dart` `readTnsPacketLength` / `encodeTnsPacket`
+  with `useLargeSdu` — the length moves to bytes 0–3 for DATA packets.
+- **Do:** add a per-connection `_useLargeSdu` (set when negotiated version ≥
+  315); make `TnsPacket.frameLength` / DATA decode and `buildDataPacket` read
+  /write a 4-byte length when set; keep CONNECT/ACCEPT on 2-byte framing. Then
+  raise `tnsServerVersion` to 318.
+- **Validate:** existing suites + real client must still pass at version 318.
+
+### 1. INTERVAL codecs (Phase 5) — type 182 / 183
+
+- **Invert:** `oracle_interval.dart` + `data_types.dart`. `INTERVAL YEAR TO
+  MONTH` (type **182**, 5 bytes: 4-byte years + 1-byte months, offset-encoded);
+  `INTERVAL DAY TO SECOND` (type **183**, 11 bytes: 4-byte days, hour, minute,
+  second, 4-byte fractional seconds, all offset-encoded).
+- **Engine fit:** no native interval → decode a **bind** value to an Oracle
+  interval literal / ISO-8601 duration **string** (same asymmetric shape as
+  DATE); fetch returns it as VARCHAR2 text. Add the two cases to
+  `_decodeBindValue`.
+- **Validate:** bind an `OracleIntervalDS` / `Duration` from the real client.
+
+### 2. VECTOR codecs (Phase 5) — type 127
+
+- **Invert:** `oracle_vector.dart` (dense `Float32List`/`Float64List`/
+  `Int8List`/`Uint8List` by storage format; sparse `OracleSparseVector`) and
+  the describe's 23.4 vector fields (dimensions / format / flags — currently
+  written as 0).
+- **Engine fit:** the engine **has native vectors**, so a full
+  bind→store→fetch round-trip is achievable: decode a bound vector to the
+  engine's `Vector`, and on fetch encode a vector column to the VECTOR wire
+  form with the correct describe metadata.
+- **Validate:** real client `VECTOR_DISTANCE` query + a `Float32List` bind.
+
+### 3. JSON / OSON codecs (Phase 5) — type 119
+
+- **Phase a (easy):** describe `JSON` columns as **VARCHAR2** and send the
+  JSON text; a bound JSON value decodes from its text. Works immediately, no
+  OSON.
+- **Phase b (full):** invert `oson.dart` to encode `Map`/`List` →
+  **OSON** binary (type 119) and decode OSON binds, so JSON round-trips as
+  native `Map`/`List` on the client. This is the large sub-item (a full binary
+  format).
+- **Validate:** real client fetch of a `JSON` column as `Map`.
+
+### 4. 12c PBKDF2 verifier + FAST_AUTH (Phase 2)
+
+- **12c PBKDF2 (type 0x4815):** the server currently advertises the SHA512
+  verifier (0x939), which the real client accepts. To also serve clients that
+  require the 12c verifier, advertise `0x4815` and add the PBKDF2 branch from
+  `crypto/auth.dart`: `passwordKey = PBKDF2(password, salt ‖
+  "AUTH_PBKDF2_SPEEDY_KEY", iterations, 64)`, `passwordHash =
+  SHA512(passwordKey ‖ salt)[0:32]`, plus the `AUTH_PBKDF2_SPEEDY_KEY`
+  validation (decrypt with the combo key → compare `passwordKey`). Send
+  `AUTH_PBKDF2_VGEN_COUNT` / `AUTH_PBKDF2_CSK_SALT` / `AUTH_PBKDF2_SDER_COUNT`
+  in AUTH_PHASE_ONE. Store `{salt, iterations, mixingSalt, mixingIterations,
+  passwordKey}` per user — still no plaintext. `oracle_crypto.dart` already has
+  `pbkdf2Sha512`.
+- **FAST_AUTH (23ai, 1 round trip):** depends on **#0** (advertise the
+  `0x10000000` accept flag, which needs version ≥ 318). Then the client sends
+  one FAST_AUTH envelope batching PROTOCOL + DATA-TYPES + AUTH_PHASE_ONE
+  (`fast_auth_message.dart` / `transport.sendFastAuth`); the server decodes it
+  and replies with all three responses in one packet. A round-trip
+  optimization, not a functional gap.
+- **Validate:** real client with a 12c-verifier user; node-oracledb FAST_AUTH.
+
+### 5. TLS / TCPS (Phase 6)
+
+- **Invert:** `transport/tls.dart`; mirror `mysql_wire.dart`'s `tlsContext`.
+- **Do:** add an optional `SecurityContext` to `OracleServer`; when set, bind
+  with `SecureServerSocket` so the client connects via `tcps://host:port/svc`.
+  The TNS/TTC layers are unchanged above the socket. (Oracle **Native Network
+  Encryption** — in-band TNS-negotiated crypto — is a separate, harder item;
+  defer it.)
+- **Validate:** real client over `tcps` with a self-signed test cert (as the
+  MySQL TLS tests already do).
+
+### 6. LOB locators + `ttcLobOp` streaming (Phase 5) — type 112 / 113
+
+- **Phase a (inline, easier):** the client's default `fetchLobs: false`
+  **materializes** a CLOB/BLOB inline. Describe the column as CLOB (112) /
+  BLOB (113) and send the value in the fetch shape the client's inline
+  materializer reads (length-prefixed, CLOB as UTF-8/UTF-16). This covers the
+  common "just read the text/bytes" case without a locator.
+- **Phase b (locators, hardest):** implement the LOB locator + the
+  `ttcLobOp` RPC (func **0x60**, `lob_op_message.dart` / `lob_locator.dart`):
+  a server-side LOB store keyed by locator, answering get-length, read, write,
+  trim, get-chunk-size, and temporary-LOB create/free. Needed for
+  `fetchLobs: true` streaming and temp LOBs.
+- **Validate:** real client CLOB/BLOB read (Phase a), then `fetchLobs: true`
+  streaming (Phase b).
+
+### Cross-cutting
+
+- **Describe metadata:** each new fetched type needs its exact
+  `_writeColumnInfo` fields (csfrm for NCLOB, the 23.4 vector trio, LOB
+  cont-flags). Get these from `_processColumnInfo` in `execute_message.dart`.
+- **Every item** lands behind a `validation/` real-client test plus a
+  self-contained mirror test, matching the existing cadence.
+
