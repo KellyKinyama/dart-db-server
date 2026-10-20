@@ -100,7 +100,7 @@ typed literals `DATE '…'` / `TIMESTAMP '…'`.
 | String functions (`CONCAT`, `CONCAT_WS`, `SUBSTRING`, `LEFT`/`RIGHT`, `LPAD`/`RPAD`, `REPLACE`, `REVERSE`, `SOUNDEX`, …) | ✅ |
 | `JSON_*` / `JSONB_*` function family | ✅ |
 | `INFORMATION_SCHEMA` views | ✅ `TABLES` / `COLUMNS` / `SCHEMATA` / `VIEWS` (sqlite_master-backed; no `KEY_COLUMN_USAGE` / `STATISTICS` yet) |
-| Stored procedures / `DELIMITER` | ❌ |
+| Stored procedures / `DELIMITER` | ✅ `CREATE`/`DROP PROCEDURE`, `CALL` (IN params, result passthrough); `DELIMITER` no-op. Stored FUNCTIONS in expressions + OUT-param `@var` writeback not yet |
 
 ---
 

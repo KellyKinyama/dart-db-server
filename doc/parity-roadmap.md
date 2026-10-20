@@ -145,9 +145,12 @@ Sequenced sub-phases so value lands incrementally:
    SQL and `SELECT INTO`, plus an output buffer. Dialect-neutral AST + interpreter
    in `routine.dart`; `Database.runRoutine` entry point. Expressions/statements
    are SQL strings with `:name` binds for locals.
-2. **3b — MySQL routines (M).** `DELIMITER` handling in the MySQL front-end,
-   `CREATE PROCEDURE`/`CREATE FUNCTION`, `CALL`, `IN`/`OUT`/`INOUT` params,
-   `DECLARE`, result-set passthrough. Store routines in a `_routines` catalog.
+2. **3b — MySQL routines (M).** ✅ done (procedures) — `CREATE PROCEDURE`/`FUNCTION`
+   (IN/OUT/INOUT params), the MySQL block grammar (`DECLARE`, `SET`,
+   `IF/ELSEIF/ELSE`, `WHILE`, `LOOP`+`LEAVE`, `REPEAT`, `SELECT INTO`), `CALL`,
+   result-set passthrough, `DROP PROCEDURE|FUNCTION`, and `DELIMITER` (no-op).
+   Routines live in a `_routines` catalog. (Stored FUNCTIONS in expressions and
+   OUT-param `@var` writeback deferred.)
 3. **3c — Oracle PL/SQL (L).** Anonymous `BEGIN … END;` blocks, `CREATE
    PROCEDURE`/`FUNCTION`, cursors (`OPEN`/`FETCH`/`CLOSE`, `%ROWTYPE`,
    `%FOUND`), `EXCEPTION … WHEN`, and `DBMS_OUTPUT` capture. Route via the TTC
