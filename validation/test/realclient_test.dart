@@ -300,6 +300,56 @@ void main() {
     );
   });
 
+  test('a temporary BLOB round-trips through write/read and a bound insert',
+      () async {
+    final db = await Database.open(null);
+    final server = await _startServer(db);
+    addTearDown(() async => server.stop());
+
+    final conn = await OracleConnection.connect(
+      '127.0.0.1:${server.boundPort}/DARTDB',
+      user: 'testuser',
+      password: 'testpassword',
+    );
+    addTearDown(() async => conn.close());
+
+    // Temp BLOB: create (CREATE_TEMP + GET_CHUNK_SIZE), write (WRITE), read
+    // back (GET_LENGTH + READ).
+    final blob = await conn.createTemporaryBlob();
+    await blob.write(1, Uint8List.fromList([10, 20, 30, 40, 50]));
+    expect(await blob.read(), [10, 20, 30, 40, 50]);
+
+    // Bind the temp BLOB into a BLOB column; the server resolves the locator to
+    // its bytes and the column reads back.
+    await conn.execute('CREATE TABLE b (id INTEGER PRIMARY KEY, data BLOB)');
+    await conn.execute('INSERT INTO b VALUES (:1, :2)', [1, blob]);
+    final r = await conn.execute('SELECT data FROM b');
+    expect(r.rows[0][0], [10, 20, 30, 40, 50]);
+  });
+
+  test('a temporary CLOB round-trips through write/read and a bound insert',
+      () async {
+    final db = await Database.open(null);
+    final server = await _startServer(db);
+    addTearDown(() async => server.stop());
+
+    final conn = await OracleConnection.connect(
+      '127.0.0.1:${server.boundPort}/DARTDB',
+      user: 'testuser',
+      password: 'testpassword',
+    );
+    addTearDown(() async => conn.close());
+
+    final clob = await conn.createTemporaryClob();
+    await clob.write(1, 'hello lob world');
+    expect(await clob.read(), 'hello lob world');
+
+    await conn.execute('CREATE TABLE c (id INTEGER PRIMARY KEY, txt CLOB)');
+    await conn.execute('INSERT INTO c VALUES (:1, :2)', [1, clob]);
+    final r = await conn.execute('SELECT txt FROM c');
+    expect(r.rows[0][0], 'hello lob world');
+  });
+
   // NOTE: TLS (TCPS) is implemented and validated server-side by the
   // self-contained test/oracle_tls_test.dart (a standard SecureSocket client).
   // A real-`oracledb`-client TLS test is intentionally omitted: the client's

@@ -404,7 +404,7 @@ ordered by value ÷ effort.
 5. 12c PBKDF2 verifier  (independent — broadens client compatibility)  ✅ done
 6. TLS / TCPS           (independent — SecureServerSocket)  ✅ done (server side)
 7. FAST_AUTH            (after #1; a round-trip optimization, not a gap)  ✅ done
-8. LOB locators + ttcLobOp streaming   (largest — a server LOB store)
+8. LOB locators + ttcLobOp streaming   (largest — a server LOB store)  ✅ done (temp LOBs)
 ```
 
 ### 0. Large-SDU framing (foundational) — ✅ done
@@ -518,20 +518,27 @@ ordered by value ÷ effort.
 - **Deferred:** Oracle **Native Network Encryption** (in-band TNS-negotiated
   crypto) remains a separate, harder item.
 
-### 6. LOB locators + `ttcLobOp` streaming (Phase 5) — type 112 / 113
+### 6. LOB locators + `ttcLobOp` streaming (Phase 5) — type 112 / 113 — ✅ done (temp LOBs)
 
-- **Phase a (inline, easier):** the client's default `fetchLobs: false`
-  **materializes** a CLOB/BLOB inline. Describe the column as CLOB (112) /
-  BLOB (113) and send the value in the fetch shape the client's inline
-  materializer reads (length-prefixed, CLOB as UTF-8/UTF-16). This covers the
-  common "just read the text/bytes" case without a locator.
-- **Phase b (locators, hardest):** implement the LOB locator + the
-  `ttcLobOp` RPC (func **0x60**, `lob_op_message.dart` / `lob_locator.dart`):
-  a server-side LOB store keyed by locator, answering get-length, read, write,
-  trim, get-chunk-size, and temporary-LOB create/free. Needed for
-  `fetchLobs: true` streaming and temp LOBs.
-- **Validate:** real client CLOB/BLOB read (Phase a), then `fetchLobs: true`
-  streaming (Phase b).
+- **Status:** shipped for temporary LOBs. A new `oracle_lob.dart` adds a
+  per-connection `LobStore` and the `ttcLobOp` RPC handler (func **0x60**),
+  inverting the client's `lob_op_message.dart` / `lob_locator.dart`: CREATE_TEMP
+  mints a 40-byte locator with an embedded store id, and GET_CHUNK_SIZE / WRITE
+  / READ / GET_LENGTH / TRIM / FREE_TEMP drive it. When such a locator is bound
+  to an INSERT (type 112 CLOB / 113 BLOB), the EXECUTE decoder resolves it back
+  to its bytes — UTF-8-decoded to a `String` for CLOB, raw `Uint8List` for BLOB
+  — which the engine stores. Verified by a self-contained handler test and real
+  `oracledb`-client CLOB and BLOB round-trips (`createTemporaryClob/Blob` →
+  write → read, and a bound insert → select).
+- **Remaining:** fetching a CLOB/BLOB *column* as a locator (the server
+  currently returns stored LOB values as VARCHAR2/RAW inline, which the client
+  reads directly — no column-side locator or `fetchLobs: true` streaming yet);
+  NCLOB (UTF-16 var-length-charset) and multi-byte CLOB unit counting (the
+  handler counts bytes, exact for single-byte text).
+- **Inverted:** the LOB locator + the `ttcLobOp` RPC
+  (`lob_op_message.dart` / `lob_locator.dart`): a server-side LOB store keyed
+  by locator, answering get-length, read, write, trim, get-chunk-size, and
+  temporary-LOB create/free.
 
 ### Cross-cutting
 

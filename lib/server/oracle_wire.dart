@@ -21,6 +21,7 @@ import 'database.dart';
 import 'oracle_auth.dart';
 import 'oracle_codec.dart';
 import 'oracle_execute.dart';
+import 'oracle_lob.dart';
 import 'oracle_tns.dart';
 import 'oracle_ttc.dart';
 import 'lexer.dart';
@@ -146,6 +147,10 @@ class OracleConnection {
   /// the wire.
   final Map<int, String> _cursors = <int, String>{};
   int _nextCursorId = 1;
+
+  /// Per-connection temporary-LOB store (session-scoped), driven by the
+  /// client's `ttcLobOp` RPC and resolved when a locator is bound.
+  final LobStore _lobStore = LobStore();
 
   int _version = tnsServerVersion;
 
@@ -420,6 +425,9 @@ class OracleConnection {
       case ttcFuncPing:
         _sendTtc(buildStatusOk());
         break;
+      case ttcFuncLobOp:
+        _sendTtc(handleLobOp(body, _lobStore));
+        break;
       default:
         server._log('conn $id TTC function $functionCode (phase $_phase, '
             'not yet implemented)');
@@ -507,7 +515,7 @@ class OracleConnection {
   Future<void> _handleExecute(ReadBuffer body) async {
     final ExecuteRequestInfo info;
     try {
-      info = decodeExecuteRequest(body);
+      info = decodeExecuteRequest(body, lobStore: _lobStore);
     } catch (e) {
       server._log('conn $id EXECUTE decode error: $e');
       _sendTtc(buildExecuteError(600, 'internal error decoding execute'));

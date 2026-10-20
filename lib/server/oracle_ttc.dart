@@ -29,6 +29,7 @@ const int ttcMsgTypeRowHeader = 6; // fetch row header
 const int ttcMsgTypeRowData = 7; // one result row
 const int ttcMsgTypeParameter = 8; // key-value parameter block
 const int ttcMsgTypeStatus = 9; // terminal call status
+const int ttcMsgTypeLobData = 14; // LOB operation data payload
 const int ttcMsgTypeDescribeInfo = 16; // query column metadata
 const int ttcMsgTypePiggyback = 17; // piggybacked control message
 const int ttcMsgTypeFastAuth = 34; // 23ai FAST_AUTH combined handshake

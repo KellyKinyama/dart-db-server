@@ -18,6 +18,7 @@ import 'dart:typed_data';
 
 import 'oracle_codec.dart';
 import 'oracle_json.dart';
+import 'oracle_lob.dart';
 import 'oracle_number.dart';
 import 'oracle_ttc.dart';
 import 'result.dart';
@@ -48,6 +49,10 @@ const int _oraTypeVector = 127;
 
 /// Oracle native JSON data type indicator (Oracle 21c+).
 const int _oraTypeJson = 119;
+
+/// Oracle CLOB / BLOB data type indicators.
+const int _oraTypeClob = 112;
+const int _oraTypeBlob = 113;
 
 /// The TTC field version the server negotiates (see `oracle_ttc.dart`).
 const int executeFieldVersion = 24;
@@ -90,6 +95,7 @@ class ExecuteRequestInfo {
 ExecuteRequestInfo decodeExecuteRequest(
   ReadBuffer body, {
   int ttcFieldVersion = executeFieldVersion,
+  LobStore? lobStore,
 }) {
   if (ttcFieldVersion >= _fv23_1Ext1) {
     body.readUB8(); // token number
@@ -148,7 +154,7 @@ ExecuteRequestInfo decodeExecuteRequest(
     body.readUB4(); // al8i4[1..12]
   }
   final binds = numParams > 0
-      ? _decodeBinds(body, numParams, ttcFieldVersion)
+      ? _decodeBinds(body, numParams, ttcFieldVersion, lobStore)
       : const <Object?>[];
   return ExecuteRequestInfo(
     options: options,
@@ -161,7 +167,8 @@ ExecuteRequestInfo decodeExecuteRequest(
 
 /// Decodes [numParams] bind metadata blocks followed by the single ROW_DATA
 /// message carrying the IN bind values, returning the values in wire order.
-List<Object?> _decodeBinds(ReadBuffer body, int numParams, int fv) {
+List<Object?> _decodeBinds(
+    ReadBuffer body, int numParams, int fv, LobStore? lobStore) {
   final oraTypes = <int>[];
   for (var i = 0; i < numParams; i++) {
     oraTypes.add(body.readUint8()); // data type
@@ -184,16 +191,21 @@ List<Object?> _decodeBinds(ReadBuffer body, int numParams, int fv) {
     return List<Object?>.filled(numParams, null); // all-NULL / no row data
   }
   body.readUint8(); // ROW_DATA message type (7)
-  return [for (final ot in oraTypes) _decodeBindValue(body, ot)];
+  return [for (final ot in oraTypes) _decodeBindValue(body, ot, lobStore)];
 }
 
 /// Decodes one IN bind value. Supported: NUMBER, VARCHAR2/CHAR, RAW, DATE /
 /// TIMESTAMP (decoded to an ISO-8601 string the engine stores as text),
 /// INTERVAL YEAR TO MONTH / DAY TO SECOND (decoded to a signed literal
-/// string), and NULL (a zero-length value). Other types are not yet handled.
-Object? _decodeBindValue(ReadBuffer body, int oraType) {
+/// string), CLOB / BLOB (a bound temporary-LOB locator resolved to its stored
+/// text/bytes via [lobStore]), and NULL (a zero-length value). Other types are
+/// not yet handled.
+Object? _decodeBindValue(ReadBuffer body, int oraType, LobStore? lobStore) {
   if (oraType == _oraTypeVector) return _decodeVectorBind(body);
   if (oraType == _oraTypeJson) return _decodeJsonBind(body);
+  if (oraType == _oraTypeClob || oraType == _oraTypeBlob) {
+    return _decodeLobBind(body, oraType, lobStore);
+  }
   final bytes = body.readBytesWithLength();
   if (bytes.isEmpty) return null; // NULL (also an empty string in Oracle)
   switch (oraType) {
@@ -342,6 +354,22 @@ Object? _decodeJsonBind(ReadBuffer body) {
   body.readBytesWithLength(); // 40-byte value-based QLocator (ignored)
   final oson = body.readBytesWithLength();
   return decodeOson(oson);
+}
+
+/// Decodes a bound CLOB (112) / BLOB (113) value: the client writes a UB4
+/// locator length then the length-prefixed locator bytes of a temporary LOB it
+/// created via `ttcLobOp` CREATE_TEMP. [lobStore] resolves the locator to its
+/// stored bytes — UTF-8-decoded to a `String` for CLOB (the engine stores text)
+/// or raw `Uint8List` for BLOB. A zero-length locator is SQL NULL.
+Object? _decodeLobBind(ReadBuffer body, int oraType, LobStore? lobStore) {
+  body.readUB4(); // locator length
+  final locator = body.readBytesWithLength();
+  if (locator.isEmpty) return null; // SQL NULL
+  final bytes = lobStore?.resolve(locator) ?? Uint8List(0);
+  if (oraType == _oraTypeClob) {
+    return utf8.decode(bytes, allowMalformed: true);
+  }
+  return Uint8List.fromList(bytes);
 }
 
 /// Decodes a VECTOR image into the engine's [Vector] (always `Float32List`).
