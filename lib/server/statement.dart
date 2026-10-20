@@ -390,6 +390,9 @@ class SelectStmt extends Statement {
   /// aggregation per set, and unions the results.
   final List<List<Expr>>? groupingSets;
 
+  /// Oracle hierarchical query: `START WITH ... CONNECT BY ...`.
+  final ConnectByClause? connectBy;
+
   SelectStmt({
     required this.projection,
     this.fromTable,
@@ -413,6 +416,23 @@ class SelectStmt extends Statement {
     this.namedWindows = const {},
     this.indexedBy,
     this.groupingSets,
+    this.connectBy,
+  });
+}
+
+/// Oracle hierarchical query clause. [startWith] selects the root rows (all
+/// rows when null); [connectBy] is the parent→child join predicate, where
+/// `PRIOR expr` refers to the parent row.
+class ConnectByClause {
+  final Expr? startWith;
+  final Expr connectBy;
+  final bool nocycle;
+  final List<OrderByItem> orderSiblings;
+  ConnectByClause(
+    this.startWith,
+    this.connectBy, {
+    this.nocycle = false,
+    this.orderSiblings = const [],
   });
 }
 

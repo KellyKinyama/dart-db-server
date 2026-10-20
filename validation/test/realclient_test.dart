@@ -198,6 +198,35 @@ void main() {
         (await conn.execute('SELECT id, v FROM hi')).rows[0].toList(), [2, 50]);
   });
 
+  test('CONNECT BY hierarchy works for a real client', () async {
+    final db = await Database.open(null);
+    await db.execute(
+      'CREATE TABLE org (id INTEGER PRIMARY KEY, name TEXT, mgr INTEGER)',
+    );
+    await db.execute("INSERT INTO org VALUES (1, 'king', NULL)");
+    await db.execute("INSERT INTO org VALUES (2, 'bob', 1)");
+    await db.execute("INSERT INTO org VALUES (3, 'carl', 2)");
+    final server = await _startServer(db);
+    addTearDown(() async => server.stop());
+
+    final conn = await OracleConnection.connect(
+      '127.0.0.1:${server.boundPort}/DARTDB',
+      user: 'testuser',
+      password: 'testpassword',
+    );
+    addTearDown(() async => conn.close());
+
+    final r = await conn.execute(
+      'SELECT LEVEL, name FROM org '
+      'START WITH mgr IS NULL CONNECT BY PRIOR id = mgr',
+    );
+    expect(r.rows.map((row) => row.toList()).toList(), [
+      [1, 'king'],
+      [2, 'bob'],
+      [3, 'carl'],
+    ]);
+  });
+
   test('Oracle (+) outer join works for a real client', () async {
     final db = await Database.open(null);
     await db.execute(

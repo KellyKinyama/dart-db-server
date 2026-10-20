@@ -6470,8 +6470,9 @@ class Database implements SequenceProvider {
     if (vrn != null) return vrn;
 
     final reordered = _reorderInnerJoins(s);
-    final fromRows =
-        _planScan(reordered, outer) ?? _resolveFromRows(reordered, outer);
+    final fromRows = s.connectBy != null
+        ? _resolveHierarchicalRows(s, outer)
+        : (_planScan(reordered, outer) ?? _resolveFromRows(reordered, outer));
 
     // WHERE
     var working = fromRows;
@@ -10130,6 +10131,72 @@ class Database implements SequenceProvider {
       j++;
     }
     return direction ?? 1;
+  }
+
+  /// Build the rows of an Oracle hierarchical (CONNECT BY) query in depth-first
+  /// pre-order, injecting the LEVEL and CONNECT_BY_ISLEAF pseudo-columns. The
+  /// caller still applies WHERE / projection / ORDER BY to the result, matching
+  /// Oracle (WHERE filters *after* the hierarchy is built).
+  List<Map<String, Object?>> _resolveHierarchicalRows(
+    SelectStmt s, [
+    Map<String, Object?> outer = const {},
+  ]) {
+    final cb = s.connectBy!;
+    final base = _resolveFromRows(s, outer);
+    final startWith =
+        cb.startWith == null ? null : _bindExpr(cb.startWith!, outer);
+    final connectBy = _bindExpr(cb.connectBy, outer);
+
+    List<Map<String, Object?>> sortSiblings(List<Map<String, Object?>> rows) {
+      if (cb.orderSiblings.isEmpty) return rows;
+      final copy = List<Map<String, Object?>>.from(rows);
+      copy.sort((a, b) {
+        for (final item in cb.orderSiblings) {
+          final e = _bindExpr(item.expr, outer);
+          final va = e.eval(a);
+          final vb = e.eval(b);
+          if (va == null && vb == null) continue;
+          if (va == null) return item.descending ? 1 : -1;
+          if (vb == null) return item.descending ? -1 : 1;
+          final cmp = sqlCompare(va, vb);
+          if (cmp != 0) return item.descending ? -cmp : cmp;
+        }
+        return 0;
+      });
+      return copy;
+    }
+
+    final out = <Map<String, Object?>>[];
+
+    void visit(Map<String, Object?> node, int level, Set<int> pathIds) {
+      final children = <Map<String, Object?>>[];
+      for (final cand in base) {
+        final scope = <String, Object?>{...cand};
+        node.forEach((k, v) => scope['PRIOR.$k'] = v);
+        if (evalPredicate(connectBy, scope)) children.add(cand);
+      }
+      // Drop children already on the current path (cycle guard).
+      final next = sortSiblings(children)
+          .where((c) => !pathIds.contains(identityHashCode(c)))
+          .toList();
+      out.add(<String, Object?>{
+        ...node,
+        'LEVEL': level,
+        'CONNECT_BY_ISLEAF': next.isEmpty ? 1 : 0,
+      });
+      for (final c in next) {
+        visit(c, level + 1, {...pathIds, identityHashCode(c)});
+      }
+    }
+
+    final roots = <Map<String, Object?>>[];
+    for (final r in base) {
+      if (startWith == null || evalPredicate(startWith, r)) roots.add(r);
+    }
+    for (final root in sortSiblings(roots)) {
+      visit(root, 1, {identityHashCode(root)});
+    }
+    return out;
   }
 
   List<Map<String, Object?>> _resolveFromRows(

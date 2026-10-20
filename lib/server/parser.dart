@@ -92,9 +92,11 @@ class Parser {
   }
 
   /// True when the current token is a non-reserved word that introduces a
-  /// trailing clause (e.g. `FETCH`) and so must not be mistaken for a table
-  /// alias in `FROM t FETCH FIRST ...`.
-  bool _isClauseStartWord() => _checkWord('FETCH');
+  /// trailing clause (e.g. `FETCH`, or Oracle `START` / `CONNECT`) and so must
+  /// not be mistaken for a table alias in `FROM t FETCH ...` / `FROM t START
+  /// WITH ...`.
+  bool _isClauseStartWord() =>
+      _checkWord('FETCH') || _checkWord('START') || _checkWord('CONNECT');
 
   /// Like [_expect] but for a bareword matched by uppercased text (keyword or
   /// identifier), e.g. the non-reserved words in MERGE (USING, MATCHED, ...).
@@ -2004,6 +2006,9 @@ class Parser {
     if (where != null && joins.isNotEmpty) {
       where = _rewriteOracleOuterJoins(fromTable, fromAlias, joins, where);
     }
+    // Oracle hierarchical query: [START WITH ...] CONNECT BY [NOCYCLE] ...
+    // (START WITH and CONNECT BY may appear in either order).
+    final connectBy = _parseConnectBy();
     final groupBy = <Expr>[];
     List<List<Expr>>? groupingSets;
     Expr? having;
@@ -2152,6 +2157,50 @@ class Parser {
       namedWindows: namedWindows,
       indexedBy: fromIndexHint,
       groupingSets: groupingSets,
+      connectBy: connectBy,
+    );
+  }
+
+  /// Parse an Oracle hierarchical clause: `START WITH expr` /
+  /// `CONNECT BY [NOCYCLE] expr`, accepting the two parts in either order.
+  /// Returns null when no CONNECT BY is present.
+  ConnectByClause? _parseConnectBy() {
+    Expr? startWith;
+    Expr? connectByExpr;
+    var nocycle = false;
+    var sawOrderSiblings = false;
+    final orderSiblings = <OrderByItem>[];
+    while (true) {
+      if (_checkWord('START') && _peek(1).upper == 'WITH') {
+        _advance(); // START
+        _advance(); // WITH
+        startWith = _parseExpr();
+      } else if (_checkWord('CONNECT') && _peek(1).upper == 'BY') {
+        _advance(); // CONNECT
+        _advance(); // BY
+        nocycle = _matchWord('NOCYCLE');
+        connectByExpr = _parseExpr();
+      } else if (!sawOrderSiblings &&
+          _checkWord('ORDER') &&
+          _peek(1).upper == 'SIBLINGS') {
+        _advance(); // ORDER
+        _advance(); // SIBLINGS
+        _expectKw('BY');
+        orderSiblings.add(_parseOrderByItem());
+        while (_match(TokType.punct, ',')) {
+          orderSiblings.add(_parseOrderByItem());
+        }
+        sawOrderSiblings = true;
+      } else {
+        break;
+      }
+    }
+    if (connectByExpr == null) return null;
+    return ConnectByClause(
+      startWith,
+      connectByExpr,
+      nocycle: nocycle,
+      orderSiblings: orderSiblings,
     );
   }
 
@@ -2593,6 +2642,16 @@ class Parser {
 
   Expr _parsePrimary() {
     final t = _peek();
+    // CONNECT BY `PRIOR expr` — a high-precedence prefix referring to the
+    // parent row. Only treated as the operator when followed by a column /
+    // parenthesised expression (so a stray identifier named PRIOR still works).
+    if (_checkWord('PRIOR') &&
+        (_peek(1).type == TokType.ident ||
+            _peek(1).type == TokType.keyword ||
+            (_peek(1).type == TokType.punct && _peek(1).text == '('))) {
+      _advance();
+      return PriorExpr(_parsePrimary());
+    }
     // ANSI/Oracle typed datetime literals: DATE '...', TIMESTAMP '...',
     // TIME '...'. The type keyword directly precedes a string literal. We
     // keep the string value (the engine represents dates as text), so it

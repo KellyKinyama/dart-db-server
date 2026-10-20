@@ -156,6 +156,28 @@ class OuterJoinExpr extends Expr {
   Object? eval(Map<String, Object?> row) => column.eval(row);
 }
 
+/// `PRIOR expr` inside a CONNECT BY condition: refers to the **parent** row.
+/// The hierarchical executor publishes each candidate parent's columns under a
+/// `PRIOR.` prefix while testing the CONNECT BY predicate.
+class PriorExpr extends Expr {
+  final Expr inner;
+  PriorExpr(this.inner);
+  @override
+  Object? eval(Map<String, Object?> row) {
+    final e = inner;
+    if (e is ColumnExpr) {
+      final key = 'PRIOR.${e.name}';
+      if (row.containsKey(key)) return row[key];
+      final up = 'PRIOR.${e.name.toUpperCase()}';
+      if (row.containsKey(up)) return row[up];
+      final lo = 'PRIOR.${e.name.toLowerCase()}';
+      if (row.containsKey(lo)) return row[lo];
+      return null;
+    }
+    return inner.eval(row);
+  }
+}
+
 class UnaryExpr extends Expr {
   final String op; // NOT, -
   final Expr operand;
