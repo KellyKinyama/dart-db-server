@@ -20,6 +20,7 @@ import 'oracle_codec.dart';
 import 'oracle_number.dart';
 import 'oracle_ttc.dart';
 import 'result.dart';
+import 'vector.dart';
 
 /// TTC RPC function code for a full execute (OALL8).
 const int ttcFuncExecute = 94;
@@ -40,6 +41,9 @@ const int _oraTypeNumber = 2;
 
 /// Oracle RAW data type indicator.
 const int _oraTypeRaw = 23;
+
+/// Oracle VECTOR data type indicator (Oracle 23ai).
+const int _oraTypeVector = 127;
 
 /// The TTC field version the server negotiates (see `oracle_ttc.dart`).
 const int executeFieldVersion = 24;
@@ -184,6 +188,7 @@ List<Object?> _decodeBinds(ReadBuffer body, int numParams, int fv) {
 /// INTERVAL YEAR TO MONTH / DAY TO SECOND (decoded to a signed literal
 /// string), and NULL (a zero-length value). Other types are not yet handled.
 Object? _decodeBindValue(ReadBuffer body, int oraType) {
+  if (oraType == _oraTypeVector) return _decodeVectorBind(body);
   final bytes = body.readBytesWithLength();
   if (bytes.isEmpty) return null; // NULL (also an empty string in Oracle)
   switch (oraType) {
@@ -286,6 +291,148 @@ String _decodeOracleDateTime(Uint8List b) {
   return micros > 0 ? '$base.${micros.toString().padLeft(6, '0')}' : base;
 }
 
+// ===========================================================================
+// VECTOR (Oracle 23ai) — type 127
+// ===========================================================================
+
+/// Magic byte that opens a VECTOR image (client `tnsVectorMagicByte`).
+const int _vectorMagicByte = 0xDB;
+const int _vectorVersionBase = 0;
+const int _vectorVersionWithSparse = 2;
+const int _vectorFlagNorm = 0x0002;
+const int _vectorFlagNormSrc = 0x0010;
+const int _vectorFlagSparse = 0x0020;
+const int _vectorFormatFloat32 = 2;
+const int _vectorFormatFloat64 = 3;
+const int _vectorFormatInt8 = 4;
+const int _vectorFormatBinary = 5;
+const int _vectorImageHeaderLength = 9;
+const int _vectorNormLength = 8;
+
+/// Decodes a VECTOR bind value (type 127) into the engine's [Vector].
+///
+/// The client writes a VECTOR bind as a 40-byte value-based QLocator — a UB4
+/// byte count (40) then the length-prefixed locator — followed by the
+/// length-prefixed vector image (client `_writeQLocator` + `encodeVector`). A
+/// NULL arrives as a single zero-length indicator.
+Vector? _decodeVectorBind(ReadBuffer body) {
+  final marker = body.peekUint8();
+  if (marker == 0 || marker == 0xFF) {
+    body.readUint8(); // zero-length NULL indicator
+    return null;
+  }
+  body.readUB4(); // QLocator byte count (40)
+  body.readBytesWithLength(); // 40-byte value-based QLocator (ignored)
+  final image = body.readBytesWithLength();
+  return _decodeVectorImage(image);
+}
+
+/// Decodes a VECTOR image into the engine's [Vector] (always `Float32List`).
+/// Inverts the client's `encodeVector` for dense FLOAT32 / FLOAT64 / INT8
+/// vectors (the formats the engine's `Float32` storage can represent);
+/// BINARY and sparse images are rejected. FLOAT32 / FLOAT64 elements are read
+/// from Oracle's byte-comparable IEEE form.
+Vector _decodeVectorImage(Uint8List image) {
+  if (image.length < _vectorImageHeaderLength || image[0] != _vectorMagicByte) {
+    throw const FormatException('malformed VECTOR image');
+  }
+  final data = ByteData.sublistView(image);
+  final version = image[1];
+  if (version > _vectorVersionWithSparse) {
+    throw FormatException('unsupported VECTOR image version $version');
+  }
+  final flags = data.getUint16(2);
+  if ((flags & _vectorFlagSparse) != 0) {
+    throw const FormatException('sparse VECTOR binds are not supported');
+  }
+  final format = image[4];
+  final count = data.getUint32(5);
+  var pos = _vectorImageHeaderLength;
+  if (format == _vectorFormatBinary || (flags & _vectorFlagNorm) != 0) {
+    pos += _vectorNormLength; // skip the norm (or its reserved space)
+  }
+  final out = Float32List(count);
+  switch (format) {
+    case _vectorFormatFloat32:
+      for (var i = 0; i < count; i++, pos += 4) {
+        out[i] = _readComparableFloat32(data, pos);
+      }
+    case _vectorFormatFloat64:
+      for (var i = 0; i < count; i++, pos += 8) {
+        out[i] = _readComparableFloat64(data, pos);
+      }
+    case _vectorFormatInt8:
+      for (var i = 0; i < count; i++, pos += 1) {
+        final b = image[pos];
+        out[i] = (b > 127 ? b - 256 : b).toDouble();
+      }
+    default:
+      throw FormatException('unsupported VECTOR format $format');
+  }
+  return Vector(out);
+}
+
+/// Encodes the engine's [Vector] (a `Float32List`) into a dense FLOAT32
+/// VECTOR image (client `encodeVector` for a `Float32List`): the 9-byte
+/// header, 8 zero norm bytes, then the byte-comparable FLOAT32 elements.
+Uint8List _encodeVectorImage(Vector vector) {
+  final values = vector.values;
+  final size = _vectorImageHeaderLength + _vectorNormLength + values.length * 4;
+  final image = Uint8List(size);
+  final data = ByteData.sublistView(image);
+  image[0] = _vectorMagicByte;
+  image[1] = _vectorVersionBase;
+  data.setUint16(2, _vectorFlagNormSrc | _vectorFlagNorm);
+  image[4] = _vectorFormatFloat32;
+  data.setUint32(5, values.length);
+  // Bytes 9..16 stay zero: the norm (the server would compute it).
+  var pos = _vectorImageHeaderLength + _vectorNormLength;
+  for (final v in values) {
+    _writeComparableFloat32(data, pos, v);
+    pos += 4;
+  }
+  return image;
+}
+
+final ByteData _floatScratch = ByteData(8);
+
+/// Reads a FLOAT32 element in Oracle's byte-comparable form (client
+/// `_readComparableFloat32`).
+double _readComparableFloat32(ByteData data, int pos) {
+  var bits = data.getUint32(pos);
+  bits = (bits & 0x80000000) != 0 ? bits & 0x7FFFFFFF : ~bits & 0xFFFFFFFF;
+  _floatScratch.setUint32(0, bits);
+  return _floatScratch.getFloat32(0);
+}
+
+/// Reads a FLOAT64 element in Oracle's byte-comparable form (client
+/// `_readComparableFloat64`).
+double _readComparableFloat64(ByteData data, int pos) {
+  var hi = data.getUint32(pos);
+  var lo = data.getUint32(pos + 4);
+  if ((hi & 0x80000000) != 0) {
+    hi &= 0x7FFFFFFF;
+  } else {
+    hi = ~hi & 0xFFFFFFFF;
+    lo = ~lo & 0xFFFFFFFF;
+  }
+  _floatScratch
+    ..setUint32(0, hi)
+    ..setUint32(4, lo);
+  return _floatScratch.getFloat64(0);
+}
+
+/// Writes [value] as a FLOAT32 element in Oracle's byte-comparable form
+/// (client `_writeComparableFloat32`).
+void _writeComparableFloat32(ByteData data, int pos, double value) {
+  _floatScratch.setFloat32(0, value);
+  final bits = _floatScratch.getUint32(0);
+  data.setUint32(
+    pos,
+    (bits & 0x80000000) == 0 ? bits | 0x80000000 : ~bits & 0xFFFFFFFF,
+  );
+}
+
 /// Builds the response for a query [result]: DESCRIBE_INFO, one ROW_HEADER, a
 /// ROW_DATA per row, and a terminal ORA-01403 (end of fetch). [cursorId] is
 /// echoed so the client can cache the statement. Returns the TTC body (no TNS
@@ -310,13 +457,14 @@ Uint8List buildQueryResponse(QueryResult result, {int cursorId = 0}) {
   return b.toBytes();
 }
 
-/// Infers the Oracle wire type for column [colIndex]: NUMBER when every
-/// non-null value is a representable number, RAW when every value is a byte
-/// buffer, else VARCHAR2.
+/// Infers the Oracle wire type for column [colIndex]: VECTOR when every
+/// non-null value is a [Vector], NUMBER when every non-null value is a
+/// representable number, RAW when every value is a byte buffer, else VARCHAR2.
 int _inferColumnOraType(List<List<Object?>> rows, int colIndex) {
   var sawValue = false;
   var allNumber = true;
   var allRaw = true;
+  var allVector = true;
   for (final row in rows) {
     if (colIndex >= row.length) continue;
     final v = row[colIndex];
@@ -324,9 +472,11 @@ int _inferColumnOraType(List<List<Object?>> rows, int colIndex) {
     sawValue = true;
     if (!(v is num && isOracleNumberRepresentable(v))) allNumber = false;
     if (v is! Uint8List) allRaw = false;
-    if (!allNumber && !allRaw) return _oraTypeVarchar;
+    if (v is! Vector) allVector = false;
+    if (!allNumber && !allRaw && !allVector) return _oraTypeVarchar;
   }
   if (!sawValue) return _oraTypeVarchar;
+  if (allVector) return _oraTypeVector;
   if (allNumber) return _oraTypeNumber;
   if (allRaw) return _oraTypeRaw;
   return _oraTypeVarchar;
@@ -377,14 +527,16 @@ void _writeDescribeInfo(WriteBuffer b, List<String> columns, List<int> types) {
   b.writeUB4(0); // tail bytes
 }
 
-/// Writes one column's metadata (NUMBER, RAW, or VARCHAR2), laid out exactly
-/// as the client's `_processColumnInfo` reads it at field version 24.
+/// Writes one column's metadata (NUMBER, RAW, VARCHAR2, or VECTOR), laid out
+/// exactly as the client's `_processColumnInfo` reads it at field version 24.
 void _writeColumnInfo(WriteBuffer b, String name, int position, int oraType) {
   final maxLen = oraType == _oraTypeNumber
       ? 22
       : oraType == _oraTypeRaw
           ? 2000
-          : 4000;
+          : oraType == _oraTypeVector
+              ? 8200
+              : 4000;
   final nameBytes = Uint8List.fromList(utf8.encode(name));
   b.writeUint8(oraType); // data type
   b.writeUint8(0); // flags
@@ -434,7 +586,9 @@ void _writeRowData(WriteBuffer b, List<Object?> row, List<int> types) {
   for (var i = 0; i < row.length; i++) {
     final cell = row[i];
     final type = i < types.length ? types[i] : _oraTypeVarchar;
-    if (cell == null) {
+    if (type == _oraTypeVector) {
+      _writeVectorColumn(b, cell);
+    } else if (cell == null) {
       b.writeBytesWithLength(Uint8List(0)); // 0-length == NULL
     } else if (type == _oraTypeNumber && cell is num) {
       b.writeBytesWithLength(encodeOracleNumber(cell));
@@ -444,6 +598,23 @@ void _writeRowData(WriteBuffer b, List<Object?> row, List<int> types) {
       b.writeBytesWithLength(Uint8List.fromList(utf8.encode(cell.toString())));
     }
   }
+}
+
+/// Writes a VECTOR column value in the LOB-prefetch inline shape the client's
+/// VECTOR column decoder reads (client `execute_message` `oraTypeVector`): a
+/// UB4 marker (0 ⇒ SQL NULL), UB8 size and UB4 chunk size (unused), the
+/// length-prefixed vector image, then an empty length-prefixed locator.
+void _writeVectorColumn(WriteBuffer b, Object? cell) {
+  if (cell is! Vector) {
+    b.writeUB4(0); // SQL NULL
+    return;
+  }
+  final image = _encodeVectorImage(cell);
+  b.writeUB4(image.length); // marker / locator length (non-zero)
+  b.writeUB8(image.length); // size (unused by the client)
+  b.writeUB4(0); // chunk size (unused)
+  b.writeBytesWithLength(image);
+  b.writeBytesWithLength(Uint8List(0)); // locator (unused)
 }
 
 /// Writes a TTC ERROR body at field version 24. [num] 0 is a DML success (with

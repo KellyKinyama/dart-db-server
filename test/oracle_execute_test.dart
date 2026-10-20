@@ -326,5 +326,42 @@ void main() {
         ['-1-03', '-2 01:02:03.500000000'],
       ]);
     });
+
+    test('VECTOR binds and columns round-trip (dense FLOAT32)', () async {
+      final db = await Database.open(null);
+      final server = OracleServer(db, port: 0, users: {
+        'testuser': 'testpassword',
+      });
+      await server.start();
+      addTearDown(() async => server.stop());
+
+      final socket = await Socket.connect(
+        InternetAddress.loopbackIPv4,
+        server.boundPort,
+      );
+      addTearDown(() async => socket.close());
+      final frames = FrameReader(socket);
+      await handshakeAndLogin(socket, frames,
+          username: 'testuser', password: 'testpassword');
+
+      socket.add(wrapData(buildExecuteRequest(
+          'CREATE TABLE embeds (id INTEGER PRIMARY KEY, emb VECTOR)')));
+      await frames.next();
+
+      socket.add(wrapData(buildExecuteRequest(
+          'INSERT INTO embeds VALUES (:1, :2)',
+          binds: [
+            1,
+            VectorBind([1.5, -2.5, 3.25]),
+          ])));
+      expect(
+          decodeExecuteResponse(ttcBody(await frames.next())).rowsAffected, 1);
+
+      socket.add(wrapData(buildExecuteRequest(
+          'SELECT emb FROM embeds ORDER BY id', isQuery: true)));
+      final sel = await readExecuteResponse(frames, isQuery: true);
+      expect(sel.rows.length, 1);
+      expect(sel.rows[0][0], [1.5, -2.5, 3.25]);
+    });
   });
 }

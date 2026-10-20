@@ -399,7 +399,7 @@ ordered by value ÷ effort.
 1. Large-SDU framing ─┬─► prerequisite for FAST_AUTH (needs version ≥ 318)  ✅ done
                       └─► lets single packets exceed 64 KB
 2. INTERVAL codecs      (easy — mirrors the DATE work already shipped)  ✅ done
-3. VECTOR codecs        (engine has native vectors → full round-trip)
+3. VECTOR codecs        (engine has native vectors → full round-trip)  ✅ done (dense)
 4. JSON codecs          (text fallback easy; native OSON hard)
 5. 12c PBKDF2 verifier  (independent — broadens client compatibility)
 6. TLS / TCPS           (independent — SecureServerSocket)
@@ -440,17 +440,25 @@ ordered by value ÷ effort.
   `_decodeBindValue`.
 - **Validate:** bind an `OracleIntervalDS` / `Duration` from the real client.
 
-### 2. VECTOR codecs (Phase 5) — type 127
+### 2. VECTOR codecs (Phase 5) — type 127 — ✅ done (dense)
 
-- **Invert:** `oracle_vector.dart` (dense `Float32List`/`Float64List`/
+- **Status:** shipped for dense vectors. A VECTOR bind (type 127) decodes
+  through the 40-byte value-based QLocator + inline image to the engine's
+  native `Vector` (`Float32List`); the engine stores it. On fetch, a column of
+  `Vector` values is described as VECTOR and each value is written in the
+  LOB-prefetch inline shape (UB4 marker, UB8 size, UB4 chunk, length-prefixed
+  image, empty locator). FLOAT32 / FLOAT64 / INT8 images decode (to the
+  engine's Float32 storage); the fetch image is dense FLOAT32. Sparse and
+  BINARY images are rejected for now. Verified by a self-contained mirror test
+  and a real `oracledb` client `Float32List` round-trip.
+- **Inverted:** `oracle_vector.dart` (dense `Float32List`/`Float64List`/
   `Int8List`/`Uint8List` by storage format; sparse `OracleSparseVector`) and
-  the describe's 23.4 vector fields (dimensions / format / flags — currently
-  written as 0).
-- **Engine fit:** the engine **has native vectors**, so a full
-  bind→store→fetch round-trip is achievable: decode a bound vector to the
-  engine's `Vector`, and on fetch encode a vector column to the VECTOR wire
-  form with the correct describe metadata.
-- **Validate:** real client `VECTOR_DISTANCE` query + a `Float32List` bind.
+  the describe's 23.4 vector fields (dimensions / format / flags).
+- **Engine fit:** the engine **has native vectors**, so the full
+  bind→store→fetch round-trip works: decode a bound vector to the engine's
+  `Vector`, and on fetch encode a vector column to the VECTOR wire form.
+- **Remaining:** sparse (`OracleSparseVector`) and BINARY vectors, and a real
+  `VECTOR_DISTANCE` query (the engine's similarity path).
 
 ### 3. JSON / OSON codecs (Phase 5) — type 119
 

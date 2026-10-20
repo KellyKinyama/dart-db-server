@@ -355,6 +355,7 @@ Uint8List buildExecuteRequest(String sql,
 int _bindOraType(Object? v) {
   if (v == null) return 1; // VARCHAR (null)
   if (v is RawBind) return v.oraType;
+  if (v is VectorBind) return 127; // VECTOR
   if (v is num) return 2; // NUMBER
   if (v is Uint8List) return 23; // RAW
   return 1; // VARCHAR / STRING
@@ -381,6 +382,10 @@ void _writeBindValue(WriteBuffer b, Object? v) {
     b.writeUint8(0); // zero-length NULL indicator
   } else if (v is RawBind) {
     b.writeBytesWithLength(v.bytes);
+  } else if (v is VectorBind) {
+    final image = encodeVectorImageF32(v.values);
+    _writeQLocator(b, image.length);
+    b.writeBytesWithLength(image);
   } else if (v is num) {
     b.writeBytesWithLength(encodeOracleNumber(v));
   } else if (v is Uint8List) {
@@ -388,6 +393,76 @@ void _writeBindValue(WriteBuffer b, Object? v) {
   } else {
     b.writeBytesWithLength(Uint8List.fromList(utf8.encode(v.toString())));
   }
+}
+
+/// Writes the 40-byte value-based QLocator that precedes an inline VECTOR bind
+/// value (client `_writeQLocator`): a UB4 byte count (40) then the
+/// length-prefixed locator.
+void _writeQLocator(WriteBuffer b, int payloadLength) {
+  final loc = WriteBuffer()
+    ..writeUint16BE(38)
+    ..writeUint16BE(4) // tnsLobQLocatorVersion
+    ..writeUint8(0x20 | 0x01 | 0x40) // value-based | blob | abstract
+    ..writeUint8(0x08) // init
+    ..writeUint16BE(0)
+    ..writeUint16BE(1)
+    ..writeUint32BE(0)
+    ..writeUint32BE(payloadLength)
+    ..writeUint16BE(0)
+    ..writeUint16BE(0)
+    ..writeUint16BE(0)
+    ..writeUint32BE(0)
+    ..writeUint32BE(0)
+    ..writeUint32BE(0)
+    ..writeUint32BE(0);
+  final bytes = loc.toBytes();
+  b.writeUB4(bytes.length);
+  b.writeBytesWithLength(bytes);
+}
+
+/// A VECTOR bind value (a dense FLOAT32 vector), encoded as the client does.
+class VectorBind {
+  VectorBind(this.values);
+  final List<double> values;
+}
+
+/// Encodes a dense FLOAT32 VECTOR image (client `encodeVector` for a
+/// `Float32List`): 9-byte header, 8 zero norm bytes, byte-comparable FLOAT32
+/// elements.
+Uint8List encodeVectorImageF32(List<double> values) {
+  final image = Uint8List(9 + 8 + values.length * 4);
+  final data = ByteData.sublistView(image);
+  image[0] = 0xDB; // magic
+  image[1] = 0; // version base
+  data.setUint16(2, 0x0010 | 0x0002); // NORMSRC | NORM
+  image[4] = 2; // FLOAT32
+  data.setUint32(5, values.length);
+  var pos = 17;
+  final scratch = ByteData(4);
+  for (final v in values) {
+    scratch.setFloat32(0, v);
+    final bits = scratch.getUint32(0);
+    data.setUint32(
+        pos, (bits & 0x80000000) == 0 ? bits | 0x80000000 : ~bits & 0xFFFFFFFF);
+    pos += 4;
+  }
+  return image;
+}
+
+/// Decodes a dense FLOAT32 VECTOR image back to a list of doubles.
+List<double> decodeVectorImageF32(Uint8List image) {
+  final data = ByteData.sublistView(image);
+  final count = data.getUint32(5);
+  final out = List<double>.filled(count, 0);
+  var pos = 17;
+  final scratch = ByteData(4);
+  for (var i = 0; i < count; i++, pos += 4) {
+    var bits = data.getUint32(pos);
+    bits = (bits & 0x80000000) != 0 ? bits & 0x7FFFFFFF : ~bits & 0xFFFFFFFF;
+    scratch.setUint32(0, bits);
+    out[i] = scratch.getFloat32(0);
+  }
+  return out;
 }
 
 /// A bind value with an explicit Oracle wire type and pre-encoded bytes, for
@@ -577,6 +652,20 @@ void _decodeRowHeader(ReadBuffer r) {
 void _decodeRowData(ReadBuffer r, ExecuteResponse out) {
   final row = <Object?>[];
   for (var i = 0; i < out.columns.length; i++) {
+    if (out.columnTypes[i] == 127) {
+      // VECTOR: UB4 marker (0 = NULL), UB8 size, UB4 chunk, image, locator.
+      final marker = r.readUB4();
+      if (marker == 0) {
+        row.add(null);
+        continue;
+      }
+      r.readUB8(); // size
+      r.readUB4(); // chunk size
+      final image = r.readBytesWithLength();
+      r.readBytesWithLength(); // locator (unused)
+      row.add(decodeVectorImageF32(image));
+      continue;
+    }
     final bytes = r.readBytesWithLength();
     if (bytes.isEmpty) {
       row.add(null);

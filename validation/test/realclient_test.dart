@@ -3,6 +3,8 @@
 /// Oracle database. Self-contained — no Docker / real Oracle required.
 library;
 
+import 'dart:typed_data';
+
 import 'package:dart_db_server/dart_db_server.dart';
 import 'package:oracledb/oracledb.dart';
 import 'package:test/test.dart';
@@ -205,5 +207,31 @@ void main() {
     expect(r.rows[0][1], '+3 04:05:06.123456789');
     expect(r.rows[1][0], '-1-03');
     expect(r.rows[1][1], '-2 01:02:03.500000000');
+  });
+
+  test('a VECTOR bind and column round-trip (dense FLOAT32)', () async {
+    final db = await Database.open(null);
+    final server = await _startServer(db);
+    addTearDown(() async => server.stop());
+
+    final conn = await OracleConnection.connect(
+      '127.0.0.1:${server.boundPort}/DARTDB',
+      user: 'testuser',
+      password: 'testpassword',
+    );
+    addTearDown(() async => conn.close());
+
+    await conn.execute(
+        'CREATE TABLE embeds (id INTEGER PRIMARY KEY, emb VECTOR)');
+
+    // A Float32List binds as a dense FLOAT32 VECTOR; the engine stores it
+    // natively and returns it on fetch.
+    await conn.execute('INSERT INTO embeds VALUES (:1, :2)',
+        [1, Float32List.fromList([1.5, -2.5, 3.25])]);
+
+    final r = await conn.execute('SELECT emb FROM embeds ORDER BY id');
+    expect(r.rows.length, 1);
+    final back = r.rows[0][0] as Float32List;
+    expect(back, [1.5, -2.5, 3.25]);
   });
 }
