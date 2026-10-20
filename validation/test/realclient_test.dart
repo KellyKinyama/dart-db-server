@@ -325,6 +325,30 @@ void main() {
     expect(back['short'], 7);
   });
 
+  test('a JSON column holding scalar values is typed as JSON', () async {
+    final db = await Database.open(null);
+    final server = await _startServer(db);
+    addTearDown(() async => server.stop());
+
+    final conn = await OracleConnection.connect(
+      '127.0.0.1:${server.boundPort}/DARTDB',
+      user: 'testuser',
+      password: 'testpassword',
+    );
+    addTearDown(() async => conn.close());
+
+    await conn.execute('CREATE TABLE js (id INTEGER PRIMARY KEY, doc JSON)');
+    // Scalar JSON values stored in a JSON column: the declared column type
+    // makes the server describe and encode them as JSON (OSON), so they
+    // round-trip as their scalar Dart type rather than being misread.
+    await conn.execute('INSERT INTO js VALUES (:1, :2)', [1, 'a json string']);
+    await conn.execute('INSERT INTO js VALUES (:1, :2)', [2, 42]);
+
+    final r = await conn.execute('SELECT doc FROM js ORDER BY id');
+    expect(r.rows[0][0], 'a json string');
+    expect(r.rows[1][0], 42);
+  });
+
   test('a 12c PBKDF2-verifier user authenticates', () async {
     final db = await Database.open(null);
     final server = await _startServer(db);
@@ -409,6 +433,61 @@ void main() {
     await conn.execute('INSERT INTO c VALUES (:1, :2)', [1, clob]);
     final r = await conn.execute('SELECT txt FROM c');
     expect(r.rows[0][0], 'hello lob world');
+  });
+
+  test('CLOB and BLOB columns fetch as OracleLob handles with fetchLobs:true',
+      () async {
+    final db = await Database.open(null);
+    final server = await _startServer(db);
+    addTearDown(() async => server.stop());
+
+    final conn = await OracleConnection.connect(
+      '127.0.0.1:${server.boundPort}/DARTDB',
+      user: 'testuser',
+      password: 'testpassword',
+    );
+    addTearDown(() async => conn.close());
+
+    await conn.execute(
+        'CREATE TABLE lobs (id INTEGER PRIMARY KEY, txt CLOB, data BLOB)');
+    final clob = await conn.createTemporaryClob();
+    await clob.write(1, 'streamed clob');
+    final blob = await conn.createTemporaryBlob();
+    await blob.write(1, Uint8List.fromList([7, 8, 9, 254]));
+    await conn.execute('INSERT INTO lobs VALUES (:1, :2, :3)', [1, clob, blob]);
+
+    // fetchLobs:true describes the columns as CLOB/BLOB and hands back live
+    // OracleLob handles the driver reads via ttcLobOp over the column locator.
+    final r = await conn.execute('SELECT txt, data FROM lobs', null,
+        const OracleExecuteOptions(fetchLobs: true));
+    final txt = r.rows[0][0] as OracleLob;
+    final data = r.rows[0][1] as OracleLob;
+    expect(await txt.read(), 'streamed clob');
+    expect(await data.read(), [7, 8, 9, 254]);
+  });
+
+  test('a CLOB column materializes to a String by default', () async {
+    final db = await Database.open(null);
+    final server = await _startServer(db);
+    addTearDown(() async => server.stop());
+
+    final conn = await OracleConnection.connect(
+      '127.0.0.1:${server.boundPort}/DARTDB',
+      user: 'testuser',
+      password: 'testpassword',
+    );
+    addTearDown(() async => conn.close());
+
+    await conn.execute('CREATE TABLE c (id INTEGER PRIMARY KEY, txt CLOB)');
+    final clob = await conn.createTemporaryClob();
+    await clob.write(1, 'default materialized');
+    await conn.execute('INSERT INTO c VALUES (:1, :2)', [1, clob]);
+
+    // Default (fetchLobs:false): the driver reads the column LOB and returns a
+    // plain String.
+    final r = await conn.execute('SELECT txt FROM c');
+    expect(r.rows[0][0], 'default materialized');
+    expect(r.rows[0][0], isA<String>());
   });
 
   // NOTE: TLS (TCPS) is implemented and validated server-side by the

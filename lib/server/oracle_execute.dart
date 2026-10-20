@@ -480,26 +480,51 @@ void _writeComparableFloat32(ByteData data, int pos, double value) {
 
 /// Builds the response for a query [result]: DESCRIBE_INFO, one ROW_HEADER, a
 /// ROW_DATA per row, and a terminal ORA-01403 (end of fetch). [cursorId] is
-/// echoed so the client can cache the statement. Returns the TTC body (no TNS
-/// framing).
-Uint8List buildQueryResponse(QueryResult result, {int cursorId = 0}) {
+/// echoed so the client can cache the statement. [lobStore] mints the locators
+/// for CLOB/BLOB columns. Returns the TTC body (no TNS framing).
+Uint8List buildQueryResponse(QueryResult result,
+    {int cursorId = 0, LobStore? lobStore}) {
   final b = WriteBuffer();
-  // Describe a column as NUMBER only when every non-null value is a
-  // representable number; otherwise fall back to VARCHAR2 (stringified).
+  // Prefer each column's declared type (CLOB/BLOB/JSON/VECTOR); fall back to
+  // value inference (NUMBER / RAW / VARCHAR2) when it is unknown.
   final types = [
-    for (var i = 0; i < result.columns.length; i++)
-      _inferColumnOraType(result.rows, i),
+    for (var i = 0; i < result.columns.length; i++) _columnOraType(result, i),
   ];
   _writeDescribeInfo(b, result.columns, types);
   _writeRowHeader(b);
   for (final row in result.rows) {
-    _writeRowData(b, row, types);
+    _writeRowData(b, row, types, lobStore);
   }
   _writeErrorBody(b,
       num: _oraNoDataFound,
       cursorId: cursorId,
       message: 'ORA-01403: no data found');
   return b.toBytes();
+}
+
+/// The Oracle wire type for result column [colIndex]: the declared column type
+/// (CLOB/BLOB/JSON/VECTOR) when known, else value inference.
+int _columnOraType(QueryResult result, int colIndex) {
+  final declared = result.columnTypes != null &&
+          colIndex < result.columnTypes!.length
+      ? result.columnTypes![colIndex]
+      : null;
+  if (declared != null) {
+    final t = _oraTypeForDeclared(declared);
+    if (t != null) return t;
+  }
+  return _inferColumnOraType(result.rows, colIndex);
+}
+
+/// Maps a declared DDL type token to its Oracle wire type, or null when the
+/// type is not one the describe layer special-cases.
+int? _oraTypeForDeclared(String declared) {
+  final d = declared.toLowerCase();
+  if (d.contains('clob')) return _oraTypeClob; // CLOB and NCLOB
+  if (d.contains('blob')) return _oraTypeBlob;
+  if (d.contains('json')) return _oraTypeJson;
+  if (d.contains('vector')) return _oraTypeVector;
+  return null;
 }
 
 /// Infers the Oracle wire type for column [colIndex]: VECTOR when every
@@ -577,7 +602,9 @@ void _writeDescribeInfo(WriteBuffer b, List<String> columns, List<int> types) {
 }
 
 /// Writes one column's metadata (NUMBER, RAW, VARCHAR2, or VECTOR), laid out
-/// exactly as the client's `_processColumnInfo` reads it at field version 24.
+/// Writes one column's metadata (NUMBER, RAW, VARCHAR2, VECTOR, JSON, or
+/// CLOB/BLOB), laid out exactly as the client's `_processColumnInfo` reads it
+/// at field version 24.
 void _writeColumnInfo(WriteBuffer b, String name, int position, int oraType) {
   final maxLen = oraType == _oraTypeNumber
       ? 22
@@ -587,7 +614,9 @@ void _writeColumnInfo(WriteBuffer b, String name, int position, int oraType) {
               ? 8200
               : oraType == _oraTypeJson
                   ? 8200
-                  : 4000;
+                  : (oraType == _oraTypeClob || oraType == _oraTypeBlob)
+                      ? 4000
+                      : 4000;
   final nameBytes = Uint8List.fromList(utf8.encode(name));
   b.writeUint8(oraType); // data type
   b.writeUint8(0); // flags
@@ -632,7 +661,8 @@ void _writeRowHeader(WriteBuffer b) {
   b.writeUB4(0); // rxhrid length
 }
 
-void _writeRowData(WriteBuffer b, List<Object?> row, List<int> types) {
+void _writeRowData(
+    WriteBuffer b, List<Object?> row, List<int> types, LobStore? lobStore) {
   b.writeUint8(ttcMsgTypeRowData);
   for (var i = 0; i < row.length; i++) {
     final cell = row[i];
@@ -641,6 +671,8 @@ void _writeRowData(WriteBuffer b, List<Object?> row, List<int> types) {
       _writeVectorColumn(b, cell);
     } else if (type == _oraTypeJson) {
       _writeJsonColumn(b, cell);
+    } else if (type == _oraTypeClob || type == _oraTypeBlob) {
+      _writeLobColumn(b, cell, type == _oraTypeClob, lobStore);
     } else if (cell == null) {
       b.writeBytesWithLength(Uint8List(0)); // 0-length == NULL
     } else if (type == _oraTypeNumber && cell is num) {
@@ -651,6 +683,34 @@ void _writeRowData(WriteBuffer b, List<Object?> row, List<int> types) {
       b.writeBytesWithLength(Uint8List.fromList(utf8.encode(cell.toString())));
     }
   }
+}
+
+/// Writes a CLOB (112) / BLOB (113) column value as a LOB locator the client
+/// reads back with a `ttcLobOp` READ (client `execute_message` `oraTypeClob` /
+/// `oraTypeBlob`): a UB4 locator length (0 ⇒ SQL NULL), UB8 LOB length
+/// (characters for CLOB, bytes for BLOB), UB4 chunk size, then the
+/// length-prefixed locator. [lobStore] mints a server LOB holding the value.
+void _writeLobColumn(
+    WriteBuffer b, Object? cell, bool isClob, LobStore? lobStore) {
+  if (cell == null || lobStore == null) {
+    b.writeUB4(0); // SQL NULL
+    return;
+  }
+  final List<int> bytes;
+  final int lobLength;
+  if (isClob) {
+    final text = cell is String ? cell : cell.toString();
+    bytes = utf8.encode(text);
+    lobLength = text.length; // characters (UTF-16 code units)
+  } else {
+    bytes = cell is Uint8List ? cell : Uint8List.fromList(const <int>[]);
+    lobLength = bytes.length;
+  }
+  final locator = lobStore.createColumnLob(bytes);
+  b.writeUB4(locator.length); // locator length
+  b.writeUB8(lobLength); // LOB length (chars for CLOB, bytes for BLOB)
+  b.writeUB4(lobChunkSize); // chunk size
+  b.writeBytesWithLength(locator);
 }
 
 /// Writes a VECTOR column value in the LOB-prefetch inline shape the client's

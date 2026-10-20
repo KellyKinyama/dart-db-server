@@ -523,23 +523,31 @@ ordered by value ÷ effort.
 - **Deferred:** Oracle **Native Network Encryption** (in-band TNS-negotiated
   crypto) remains a separate, harder item.
 
-### 6. LOB locators + `ttcLobOp` streaming (Phase 5) — type 112 / 113 — ✅ done (temp LOBs)
+### 6. LOB locators + `ttcLobOp` streaming (Phase 5) — type 112 / 113 — ✅ done
 
-- **Status:** shipped for temporary LOBs. A new `oracle_lob.dart` adds a
-  per-connection `LobStore` and the `ttcLobOp` RPC handler (func **0x60**),
-  inverting the client's `lob_op_message.dart` / `lob_locator.dart`: CREATE_TEMP
-  mints a 40-byte locator with an embedded store id, and GET_CHUNK_SIZE / WRITE
-  / READ / GET_LENGTH / TRIM / FREE_TEMP drive it. When such a locator is bound
-  to an INSERT (type 112 CLOB / 113 BLOB), the EXECUTE decoder resolves it back
-  to its bytes — UTF-8-decoded to a `String` for CLOB, raw `Uint8List` for BLOB
-  — which the engine stores. Verified by a self-contained handler test and real
-  `oracledb`-client CLOB and BLOB round-trips (`createTemporaryClob/Blob` →
-  write → read, and a bound insert → select).
-- **Remaining:** fetching a CLOB/BLOB *column* as a locator (the server
-  currently returns stored LOB values as VARCHAR2/RAW inline, which the client
-  reads directly — no column-side locator or `fetchLobs: true` streaming yet);
-  NCLOB (UTF-16 var-length-charset) and multi-byte CLOB unit counting (the
-  handler counts bytes, exact for single-byte text).
+- **Status:** shipped for temporary LOBs **and CLOB/BLOB columns**. A new
+  `oracle_lob.dart` adds a per-connection `LobStore` and the `ttcLobOp` RPC
+  handler (func **0x60**), inverting the client's `lob_op_message.dart` /
+  `lob_locator.dart`: CREATE_TEMP mints a 40-byte locator with an embedded store
+  id, and GET_CHUNK_SIZE / WRITE / READ / GET_LENGTH / TRIM / FREE_TEMP drive it.
+  When such a locator is bound to an INSERT (type 112 CLOB / 113 BLOB), the
+  EXECUTE decoder resolves it back to its bytes — UTF-8-decoded to a `String`
+  for CLOB, raw `Uint8List` for BLOB — which the engine stores.
+- **Column fetch:** now that the engine exposes declared column types
+  (`QueryResult.columnTypes`), a CLOB/BLOB **column** is described as 112/113 and
+  its value is sent as a locator (`LobStore.createColumnLob`) the client reads
+  back with a `ttcLobOp` READ — so `fetchLobs: true` yields live `OracleLob`
+  handles and the default path materializes a `String`/`Uint8List`. JSON columns
+  (including scalar values) and VECTOR columns are likewise type-driven now.
+- **Verified:** self-contained handler + column-fetch tests, and real
+  `oracledb`-client round-trips: temp CLOB/BLOB write→read + bound insert→select,
+  `fetchLobs: true` → `OracleLob`, default → `String`, and a JSON column holding
+  scalars.
+- **Remaining:** NCLOB (UTF-16 var-length-charset) and multi-byte CLOB unit
+  counting (the handler counts bytes, exact for single-byte text); column-LOB
+  entries accumulate per connection (no reaping) until the connection closes;
+  column types resolve only for simple single-table SELECTs (joins / expressions
+  fall back to value inference).
 - **Inverted:** the LOB locator + the `ttcLobOp` RPC
   (`lob_op_message.dart` / `lob_locator.dart`): a server-side LOB store keyed
   by locator, answering get-length, read, write, trim, get-chunk-size, and

@@ -692,6 +692,19 @@ void _decodeRowData(ReadBuffer r, ExecuteResponse out) {
       row.add(decodeOson(oson));
       continue;
     }
+    if (out.columnTypes[i] == 112 || out.columnTypes[i] == 113) {
+      // CLOB/BLOB: UB4 locator length (0 = NULL), UB8 LOB length, UB4 chunk
+      // size, then the length-prefixed locator the caller reads with a LOB op.
+      final marker = r.readUB4();
+      if (marker == 0) {
+        row.add(null);
+        continue;
+      }
+      r.readUB8(); // LOB length
+      r.readUB4(); // chunk size
+      row.add(r.readBytesWithLength()); // the locator bytes (Uint8List)
+      continue;
+    }
     final bytes = r.readBytesWithLength();
     if (bytes.isEmpty) {
       row.add(null);

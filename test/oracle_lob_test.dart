@@ -4,12 +4,17 @@
 /// decoding each response the way the client's `_walkLobOpMessage` does.
 library;
 
+import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:dart_db_server/server/oracle_codec.dart';
+import 'package:dart_db_server/server/oracle_execute.dart';
 import 'package:dart_db_server/server/oracle_lob.dart';
 import 'package:dart_db_server/server/oracle_ttc.dart';
+import 'package:dart_db_server/server/result.dart';
 import 'package:test/test.dart';
+
+import 'oracle_support.dart';
 
 // LOB op codes (client tnsLobOp*).
 const int _opGetLength = 0x0001;
@@ -149,5 +154,51 @@ void main() {
 
     // The bound locator resolves to the written bytes.
     expect(store.resolve(locator), payload);
+  });
+
+  test('a CLOB column is described as CLOB (112) and read via its locator', () {
+    final store = LobStore();
+    final result = QueryResult(
+      columns: ['txt'],
+      columnTypes: ['CLOB'],
+      rows: [
+        ['hello from column'],
+      ],
+    );
+    final resp = decodeExecuteResponse(
+        buildQueryResponse(result, lobStore: store),
+        isQuery: true);
+    expect(resp.columnTypes, [112]); // described as CLOB
+    final locator = resp.rows[0][0] as Uint8List;
+
+    // The client reads the column LOB back via a ttcLobOp READ.
+    final read = handleLobOp(
+        ReadBuffer(_lobReq(_opRead,
+            locator: locator, sourceOffset: 1, sendAmount: true, amount: 100)),
+        store);
+    expect(utf8.decode(_readResult(read).data), 'hello from column');
+  });
+
+  test('a BLOB column is described as BLOB (113) and read via its locator', () {
+    final store = LobStore();
+    final bytes = Uint8List.fromList([1, 2, 3, 250, 255]);
+    final result = QueryResult(
+      columns: ['data'],
+      columnTypes: ['BLOB'],
+      rows: [
+        [bytes],
+      ],
+    );
+    final resp = decodeExecuteResponse(
+        buildQueryResponse(result, lobStore: store),
+        isQuery: true);
+    expect(resp.columnTypes, [113]); // described as BLOB
+    final locator = resp.rows[0][0] as Uint8List;
+
+    final read = handleLobOp(
+        ReadBuffer(_lobReq(_opRead,
+            locator: locator, sourceOffset: 1, sendAmount: true, amount: 100)),
+        store);
+    expect(_readResult(read).data, bytes);
   });
 }

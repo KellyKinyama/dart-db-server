@@ -559,7 +559,7 @@ class OracleConnection {
           result = await server.db.execute(sql);
         }
         return result.columns.isNotEmpty
-            ? buildQueryResponse(result, cursorId: cursorId)
+            ? buildQueryResponse(result, cursorId: cursorId, lobStore: _lobStore)
             : buildDmlResponse(result, cursorId: cursorId);
       } catch (e) {
         return buildExecuteError(900, _oraErrorText(e));

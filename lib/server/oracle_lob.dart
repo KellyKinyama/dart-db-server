@@ -34,8 +34,8 @@ const int _lobOpFreeTemp = 0x0111;
 /// Bytes in a LOB locator (client `tnsLobLocatorBufferSize`).
 const int lobLocatorSize = 40;
 
-/// Chunk size reported for a temporary LOB (bytes / characters).
-const int _lobChunkSize = 8132;
+/// Chunk size reported for a LOB (bytes / characters).
+const int lobChunkSize = 8132;
 
 /// Field-version gate for the 23ai token number (client
 /// `ttcCcapFieldVersion23_1Ext1`), matching the EXECUTE decoder.
@@ -80,6 +80,14 @@ class LobStore {
   Uint8List? resolve(Uint8List locator) {
     final lob = _lookup(locator);
     return lob == null ? null : Uint8List.fromList(lob.bytes);
+  }
+
+  /// Mints a locator for a fetched CLOB/BLOB column value: stores [bytes] in a
+  /// fresh server LOB the client reads back with a `ttcLobOp` READ. Returns the
+  /// 40-byte locator to embed in the row data.
+  Uint8List createColumnLob(List<int> bytes) {
+    final lob = _create()..bytes = List<int>.of(bytes);
+    return _locatorFor(lob);
   }
 
   Uint8List _locatorFor(_ServerLob lob) {
@@ -183,7 +191,7 @@ Uint8List handleLobOp(ReadBuffer body, LobStore store,
       break;
 
     case _lobOpGetChunkSize:
-      _writeAmountParameter(b, req.locator, _lobChunkSize);
+      _writeAmountParameter(b, req.locator, lobChunkSize);
       break;
 
     case _lobOpGetLength:
