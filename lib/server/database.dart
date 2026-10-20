@@ -17,6 +17,7 @@ import 'fts5.dart';
 import 'parser.dart';
 import 'prepared.dart';
 import 'result.dart';
+import 'routine.dart';
 import 'rtree.dart';
 import 'schema.dart';
 import 'session.dart';
@@ -2178,6 +2179,17 @@ class Database implements SequenceProvider {
     Map<String, Object?> named = const {},
   }) {
     return prepare(sql).execute(positional: positional, named: named);
+  }
+
+  /// Run a procedural [block] (the Phase-3a routine core) against this
+  /// database, seeding its local scope with [args]. Each embedded SQL
+  /// statement/expression executes through the normal locked path, so call
+  /// this at the top level (not from inside a held write lock).
+  Future<RoutineResult> runRoutine(
+    RoutineBlock block, {
+    Map<String, Object?> args = const {},
+  }) {
+    return RoutineInterpreter(this, initialVars: args).run(block);
   }
 
   Future<QueryResult> executeStmt(Statement stmt) async {
