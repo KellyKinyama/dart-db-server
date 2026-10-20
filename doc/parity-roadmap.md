@@ -208,15 +208,25 @@ Server-side TLS exists; the real `oracledb` thin client's `upgradeToTls` uses
 
 The MySQL 8 X DevAPI on port 33060 — a protobuf-framed protocol, effectively a
 second front-end.
-- **Sketch:** a new `mysqlx_wire.dart` server: Protobuf message framing
-  (`Mysqlx.*` messages), `Sess.AuthenticateStart/Continue` (SHA256/MySQL41),
-  `Crud.Find/Insert/Update/Delete` translated to engine statements, and
-  `Sql.StmtExecute` for raw SQL. Reuses the same `Database` core; needs a
-  protobuf codec (hand-rolled or `package:protobuf`).
+- **Sketch:** a new [`mysqlx_wire.dart`](../lib/server/mysqlx_wire.dart) server
+  with a hand-rolled protobuf codec (varint / length-delimited / fixed64) and
+  the `[4-byte length][1-byte type][payload]` message framing. Reuses the same
+  `Database` core.
+- **Status:** ✅ SQL path done — `Connection.CapabilitiesGet/Set`,
+  `Session.AuthenticateStart/Continue` with `MYSQL41` (challenge-response) and
+  `PLAIN`, and `Sql.StmtExecute` (namespace `sql`) streaming
+  `Resultset.ColumnMetaData`/`Row`/`FetchDone`/`StmtExecuteOk` with a
+  `rows_affected` notice for DML. Result values are typed (SINT / DOUBLE /
+  BYTES, NULL as a zero-length field). `Session.Reset/Close` and
+  `Connection.Close` handled. **Deferred:** CRUD document/table ops
+  (`Crud.Find/Insert/Update/Delete`), X-protocol TLS (`CapabilitiesSet tls=1`),
+  and `SHA256_MEMORY` auth.
 - **Why last:** largest surface, smallest audience (most tooling uses the
   classic protocol, already supported).
-- **Done when:** a MySQL X client (`mysqlx` shell / connector) connects and runs
-  CRUD + SQL.
+- **Done when:** ~~a MySQL X client (`mysqlx` shell / connector) connects and runs
+  CRUD + SQL.~~ SQL via `Sql.StmtExecute` is validated end-to-end in
+  [`mysqlx_wire_test.dart`](../test/mysqlx_wire_test.dart) (capabilities,
+  MYSQL41 + PLAIN auth, typed result sets); CRUD remains a follow-on.
 
 ---
 

@@ -3,13 +3,14 @@
 How the single SQL engine in `dart_db_server` lines up against **Oracle** and
 **MySQL** — both at the wire-protocol level and at the SQL-surface level.
 
-> **One engine, two front-ends.** Every statement, function, and type below is
-> executed by the same core ([`lib/server/database.dart`](../lib/server/database.dart),
+> **One engine, multiple front-ends.** Every statement, function, and type below
+> is executed by the same core ([`lib/server/database.dart`](../lib/server/database.dart),
 > [`lib/server/expression.dart`](../lib/server/expression.dart)). The Oracle TTC
-> server ([`oracle_wire.dart`](../lib/server/oracle_wire.dart)) and the MySQL
-> classic-protocol server ([`mysql_wire.dart`](../lib/server/mysql_wire.dart))
+> server ([`oracle_wire.dart`](../lib/server/oracle_wire.dart)), the MySQL
+> classic-protocol server ([`mysql_wire.dart`](../lib/server/mysql_wire.dart)),
+> and the MySQL X-protocol server ([`mysqlx_wire.dart`](../lib/server/mysqlx_wire.dart))
 > are thin translation layers over it. A feature added to the engine is
-> therefore available to clients of **both** protocols at once.
+> therefore available to clients of **all** protocols at once.
 
 The dialect is SQLite-rooted (the parser/engine started from a SQLite-compatible
 core) with Oracle and MySQL compatibility layered on top. Where the three
@@ -30,7 +31,7 @@ dialects disagree on syntax, the parser accepts all of the common spellings.
 | LOB streaming | ✅ temp LOBs, chunked transfer, `ttcLobOp` | n/a (values inline) |
 | Multi-statement | n/a | ✅ `CLIENT_MULTI_STATEMENTS` |
 | Compression | ❌ | ✅ `CLIENT_COMPRESS` (zlib); `zstd` not advertised |
-| Proprietary extras | — | ❌ X protocol (DevAPI, port 33060) |
+| Proprietary extras | — | ✅ X protocol (DevAPI, port 33060) — SQL via `Sql.StmtExecute`; CRUD document ops deferred |
 | Real third-party driver test | ✅ `oracledb` (Node) over the wire | ✅ `package:mysql_client` (Dart) |
 
 Validated against **Oracle 23ai + 21c** and the **`mysql_client`** driver.
@@ -128,7 +129,8 @@ The engine ships capabilities neither stock Oracle nor MySQL expose the same way
   `%ROWTYPE`/`%FOUND`) — the rest of PL/SQL (blocks, procedures, functions,
   control flow, `SELECT INTO`) is supported; `SYS_CONNECT_BY_PATH` /
   `CONNECT_BY_ROOT`; real-client TLS (client-SDK bug, not server).
-- **MySQL:** X protocol and the rest of
+- **MySQL:** X-protocol CRUD document ops (`Crud.Find/Insert/Update/Delete`;
+  SQL via `Sql.StmtExecute` is supported) and the rest of
   `INFORMATION_SCHEMA` (`TABLES`/`COLUMNS`/`SCHEMATA`/`VIEWS` are supported;
   `KEY_COLUMN_USAGE` / `STATISTICS` / constraint views are not yet).
 - **Engine quirks:** `(+)` RIGHT joins on 3+-table chains null the whole
