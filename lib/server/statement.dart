@@ -185,6 +185,25 @@ class CallStmt extends Statement {
   CallStmt(this.name, this.args);
 }
 
+/// `CREATE [OR REPLACE] PACKAGE [BODY] name` — Oracle package. The spec
+/// (isBody=false) declares the public API and is accepted as a no-op; the body
+/// (isBody=true) carries the member routines with qualified `pkg.member` names.
+class CreatePackageStmt extends Statement {
+  final String name;
+  final bool isBody;
+  final bool orReplace;
+  final List<StoredRoutine> routines;
+  CreatePackageStmt(this.name, this.routines,
+      {this.isBody = false, this.orReplace = false});
+}
+
+/// `DROP PACKAGE [BODY] [IF EXISTS] name` — drops every member routine.
+class DropPackageStmt extends Statement {
+  final String name;
+  final bool ifExists;
+  DropPackageStmt(this.name, {this.ifExists = false});
+}
+
 /// An Oracle PL/SQL anonymous block: `[DECLARE …] BEGIN … END;`.
 class PlsqlBlockStmt extends Statement {
   final RoutineBlock block;

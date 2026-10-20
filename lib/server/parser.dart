@@ -472,6 +472,9 @@ class Parser {
     if (_matchWord('FUNCTION')) {
       return _parseCreateRoutine(true, orReplace: orReplace);
     }
+    if (_matchWord('PACKAGE')) {
+      return _parseCreatePackage(orReplace: orReplace);
+    }
     throw FormatException(
       'Expected TABLE, INDEX, VIEW or TRIGGER after CREATE',
     );
@@ -1135,6 +1138,15 @@ class Parser {
       return DropProcedureStmt(_expectIdent().text,
           isFunction: isFunction, ifExists: ifExists);
     }
+    if (_matchWord('PACKAGE')) {
+      _matchWord('BODY'); // DROP PACKAGE BODY drops the same member set
+      bool ifExists = false;
+      if (_matchKw('IF')) {
+        _expectKw('EXISTS');
+        ifExists = true;
+      }
+      return DropPackageStmt(_expectIdent().text, ifExists: ifExists);
+    }
     throw FormatException('Expected TABLE, INDEX, VIEW or TRIGGER after DROP');
   }
 
@@ -1209,6 +1221,34 @@ class Parser {
   CreateProcedureStmt _parseCreateRoutine(bool isFunction,
       {bool orReplace = false}) {
     final name = _expectIdent().text;
+    final params = _parseRoutineParams();
+    String? returnType;
+    if (isFunction) {
+      // MySQL `RETURNS t`; Oracle `RETURN t`.
+      if (!_matchWord('RETURNS')) _matchWord('RETURN');
+      returnType = _consumeRoutineType();
+    }
+    final RoutineBlock block;
+    if (_matchWord('IS') || _matchWord('AS')) {
+      // Oracle PL/SQL: declarations between IS/AS and BEGIN, then the body.
+      final decls = _parsePlsqlDeclarations();
+      block = _parsePlsqlBody(decls);
+    } else {
+      // MySQL: optional characteristics, then a BEGIN … END block.
+      _consumeRoutineCharacteristics();
+      block = _parseRoutineBody();
+    }
+    return CreateProcedureStmt(
+      StoredRoutine(name, params, block,
+          isFunction: isFunction, returnType: returnType),
+      orReplace: orReplace,
+    );
+  }
+
+  /// Parse an optional `(param [, param]*)` list shared by `CREATE
+  /// PROCEDURE/FUNCTION` and package members. Each param is
+  /// `[IN|OUT|INOUT] name type` (MySQL) or `name [IN|OUT|INOUT] type` (Oracle).
+  List<RoutineParam> _parseRoutineParams() {
     final params = <RoutineParam>[];
     if (_match(TokType.punct, '(')) {
       if (!_check(TokType.punct, ')')) {
@@ -1244,27 +1284,101 @@ class Parser {
       }
       _expect(TokType.punct, ')');
     }
+    return params;
+  }
+
+  // ---- CREATE PACKAGE / PACKAGE BODY (Oracle) -----------------------------
+  Statement _parseCreatePackage({bool orReplace = false}) {
+    final isBody = _matchWord('BODY');
+    final pkgName = _expectIdent().text;
+    // Tolerate AUTHID / other clauses before the opening IS/AS.
+    while (!_isAtEnd() && !_checkWord('IS') && !_checkWord('AS')) {
+      _advance();
+    }
+    if (!_matchWord('IS')) _expectWord('AS');
+    if (!isBody) {
+      // Package spec: declarations only (no executable bodies). Skip to the
+      // matching END; members live in the body.
+      _skipPackageSpec();
+      return CreatePackageStmt(pkgName, const [],
+          isBody: false, orReplace: orReplace);
+    }
+    final routines = _parsePackageBodyMembers(pkgName);
+    return CreatePackageStmt(pkgName, routines,
+        isBody: true, orReplace: orReplace);
+  }
+
+  /// Skip a package spec body (procedure/function/variable declarations) up to
+  /// and including its terminating `END [name];`.
+  void _skipPackageSpec() {
+    var depth = 0;
+    while (!_isAtEnd()) {
+      if (_check(TokType.punct, '(')) {
+        depth++;
+      } else if (_check(TokType.punct, ')')) {
+        if (depth > 0) depth--;
+      } else if (depth == 0 && _checkWord('END')) {
+        break;
+      }
+      _advance();
+    }
+    _expectWord('END');
+    if (_check(TokType.ident)) _advance(); // optional package name
+    _match(TokType.punct, ';');
+  }
+
+  /// Parse the member routines of a package body, returning them with
+  /// qualified `pkg.member` names. Package-level declarations and an optional
+  /// initialization block are tolerated (parsed and discarded).
+  List<StoredRoutine> _parsePackageBodyMembers(String pkgName) {
+    final members = <StoredRoutine>[];
+    while (!_checkWord('END') && !_isAtEnd()) {
+      if (_matchWord('PROCEDURE')) {
+        members.add(_parsePackageRoutine(pkgName, false));
+      } else if (_matchWord('FUNCTION')) {
+        members.add(_parsePackageRoutine(pkgName, true));
+      } else if (_checkWord('BEGIN')) {
+        // Package initialization block — not executed; parse and discard.
+        _parsePlsqlBody(const []);
+      } else {
+        // Package-level declaration (var/const/type/cursor) — skip to ';'.
+        _skipToSemicolon();
+      }
+    }
+    _expectWord('END');
+    if (_check(TokType.ident)) _advance(); // optional package name
+    _match(TokType.punct, ';');
+    return members;
+  }
+
+  StoredRoutine _parsePackageRoutine(String pkgName, bool isFunction) {
+    final memberName = _expectIdent().text;
+    final params = _parseRoutineParams();
     String? returnType;
     if (isFunction) {
-      // MySQL `RETURNS t`; Oracle `RETURN t`.
       if (!_matchWord('RETURNS')) _matchWord('RETURN');
       returnType = _consumeRoutineType();
     }
-    final RoutineBlock block;
-    if (_matchWord('IS') || _matchWord('AS')) {
-      // Oracle PL/SQL: declarations between IS/AS and BEGIN, then the body.
-      final decls = _parsePlsqlDeclarations();
-      block = _parsePlsqlBody(decls);
-    } else {
-      // MySQL: optional characteristics, then a BEGIN … END block.
-      _consumeRoutineCharacteristics();
-      block = _parseRoutineBody();
+    if (!_matchWord('IS')) _expectWord('AS');
+    final decls = _parsePlsqlDeclarations();
+    final block = _parsePlsqlBody(decls);
+    return StoredRoutine('$pkgName.$memberName', params, block,
+        isFunction: isFunction, returnType: returnType);
+  }
+
+  void _skipToSemicolon() {
+    var depth = 0;
+    while (!_isAtEnd()) {
+      if (_check(TokType.punct, '(')) {
+        depth++;
+      } else if (_check(TokType.punct, ')')) {
+        if (depth > 0) depth--;
+      } else if (depth == 0 && _check(TokType.punct, ';')) {
+        _advance();
+        return;
+      }
+      _advance();
     }
-    return CreateProcedureStmt(
-      StoredRoutine(name, params, block,
-          isFunction: isFunction, returnType: returnType),
-      orReplace: orReplace,
-    );
   }
 
   /// Consume a SQL type (`INT`, `VARCHAR(50)`, `DECIMAL(10,2)` …) and return its
@@ -1555,7 +1669,11 @@ class Parser {
   // ---- CALL ---------------------------------------------------------------
   CallStmt _parseCall() {
     _expectWord('CALL');
-    final name = _expectIdent().text;
+    var name = _expectIdent().text;
+    // Qualified `CALL pkg.proc(args)`.
+    if (_match(TokType.punct, '.')) {
+      name = '$name.${_expectName()}';
+    }
     final args = <Expr>[];
     if (_match(TokType.punct, '(')) {
       if (!_check(TokType.punct, ')')) {
@@ -3371,6 +3489,16 @@ class Parser {
         final cu = col.toUpperCase();
         if (cu == 'NEXTVAL' || cu == 'CURRVAL') {
           return SequenceExpr(t.text, isCurrval: cu == 'CURRVAL');
+        }
+        // Qualified call `pkg.func(args)` — an Oracle package function. Guard
+        // against the Oracle `(+)` outer-join marker, which also starts with
+        // `(` but is handled by _maybeOuterJoin.
+        if (_check(TokType.punct, '(') &&
+            !(_peek(1).type == TokType.op &&
+                _peek(1).text == '+' &&
+                _peek(2).type == TokType.punct &&
+                _peek(2).text == ')')) {
+          return _parseFunctionCall('${t.text}.$col');
         }
         return _maybeOuterJoin(ColumnExpr(col, table: t.text));
       }

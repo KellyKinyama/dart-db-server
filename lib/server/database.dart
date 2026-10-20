@@ -2408,6 +2408,10 @@ class Database implements SequenceProvider {
         result = _createProcedure(stmt);
       } else if (stmt is DropProcedureStmt) {
         result = _dropProcedure(stmt);
+      } else if (stmt is CreatePackageStmt) {
+        result = _createPackage(stmt);
+      } else if (stmt is DropPackageStmt) {
+        result = _dropPackage(stmt);
       } else if (stmt is MergeStmt) {
         result = _merge(stmt);
       } else if (stmt is InsertAllStmt) {
@@ -2499,6 +2503,8 @@ class Database implements SequenceProvider {
       s is DropSequenceStmt ||
       s is CreateProcedureStmt ||
       s is DropProcedureStmt ||
+      s is CreatePackageStmt ||
+      s is DropPackageStmt ||
       s is MergeStmt ||
       s is InsertAllStmt ||
       s is InsertStmt ||
@@ -4888,6 +4894,31 @@ class Database implements SequenceProvider {
     }
     _routines.remove(key);
     return QueryResult.message('$kind ${s.name} dropped');
+  }
+
+  /// Register an Oracle package. The spec is accepted as a no-op; the body's
+  /// member routines are stored under qualified `PKG.MEMBER` keys (replacing any
+  /// previously-registered members of the same package).
+  QueryResult _createPackage(CreatePackageStmt s) {
+    if (!s.isBody) {
+      return QueryResult.message('Package ${s.name} created');
+    }
+    final prefix = '${s.name.toUpperCase()}.';
+    _routines.removeWhere((k, _) => k.startsWith(prefix));
+    for (final r in s.routines) {
+      _routines[r.name.toUpperCase()] = r;
+    }
+    return QueryResult.message('Package body ${s.name} created');
+  }
+
+  QueryResult _dropPackage(DropPackageStmt s) {
+    final prefix = '${s.name.toUpperCase()}.';
+    final had = _routines.keys.any((k) => k.startsWith(prefix));
+    if (!had && !s.ifExists) {
+      throw StateError('No such package: ${s.name}');
+    }
+    _routines.removeWhere((k, _) => k.startsWith(prefix));
+    return QueryResult.message('Package ${s.name} dropped');
   }
 
   /// Execute `CALL name(args)` on the top-level (async) path so the routine's

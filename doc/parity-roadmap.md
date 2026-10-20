@@ -163,8 +163,11 @@ Sequenced sub-phases so value lands incrementally:
    projection `f(col)`, `WHERE f(col) > …`, and nested `f(g(x))`). Bodies run
    synchronously through a `SyncRoutineRunner` that dispatches embedded SQL
    in-line, so functions may themselves query the database (`SELECT … INTO`).
-   (`CREATE PACKAGE`/`BODY`, `OUT`-param `@var` writeback, and ref-cursor
-   returns deferred.)
+   Oracle **packages** are supported: `CREATE [OR REPLACE] PACKAGE` (spec
+   accepted as a no-op) and `PACKAGE BODY` register member routines under
+   qualified `pkg.member` names, callable as `pkg.func(args)` in expressions and
+   `CALL pkg.proc(args)`; `DROP PACKAGE` removes the member set. (OUT-param
+   `@var` writeback and ref-cursor returns deferred.)
 - **Risk:** high — new execution model, transaction/savepoint interaction,
   error-mapping to each protocol's error packets, and recursion/termination
   guards.
