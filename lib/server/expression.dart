@@ -172,6 +172,14 @@ class ColumnExpr extends Expr {
       if (scope.containsKey(name)) return scope[name];
       if (scope.containsKey(lower)) return scope[lower];
     }
+    // Qualified `rec.col` from a cursor FOR-loop record in the routine scope.
+    if (table != null && routineScopes.isNotEmpty) {
+      final scope = routineScopes.last;
+      final q = '$table.$name';
+      if (scope.containsKey(q)) return scope[q];
+      final ql = q.toLowerCase();
+      if (scope.containsKey(ql)) return scope[ql];
+    }
     throw StateError(
       'Unknown column: ${table == null ? name : '$table.$name'}',
     );

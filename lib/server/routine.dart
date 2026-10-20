@@ -144,6 +144,15 @@ class RoutineRaise extends RoutineStmt {
   RoutineRaise(this.name);
 }
 
+/// `FOR rec IN (<select>) LOOP … END LOOP` — iterate the query's rows, exposing
+/// each column as `rec.col` (via [ColumnExpr.routineScopes]) inside the body.
+class RoutineForCursor extends RoutineStmt {
+  final String varName;
+  final String sql;
+  final List<RoutineStmt> body;
+  RoutineForCursor(this.varName, this.sql, this.body);
+}
+
 /// Direction of a stored-routine parameter.
 enum RoutineParamMode { inParam, outParam, inOutParam }
 
@@ -339,6 +348,18 @@ class RoutineInterpreter {
           throw _currentException ?? _PlsqlError('OTHERS');
         }
         throw _PlsqlError(r.name!.toUpperCase());
+      case RoutineForCursor fc:
+        final res = await _exec(fc.sql);
+        try {
+          for (final row in res.rows) {
+            for (var i = 0; i < res.columns.length; i++) {
+              vars['${fc.varName}.${res.columns[i]}'] = row[i];
+            }
+            await _runStmts(fc.body);
+          }
+        } on _ExitSignal {
+          // loop exited
+        }
     }
   }
 
@@ -517,6 +538,18 @@ class SyncRoutineRunner {
           throw _currentException ?? _PlsqlError('OTHERS');
         }
         throw _PlsqlError(r.name!.toUpperCase());
+      case RoutineForCursor fc:
+        final res = exec(fc.sql, vars);
+        try {
+          for (final row in res.rows) {
+            for (var i = 0; i < res.columns.length; i++) {
+              vars['${fc.varName}.${res.columns[i]}'] = row[i];
+            }
+            _runStmts(fc.body);
+          }
+        } on _ExitSignal {
+          // loop exited
+        }
     }
   }
 

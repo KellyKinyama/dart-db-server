@@ -1904,6 +1904,31 @@ class Parser {
   RoutineStmt _parsePlsqlFor() {
     final varName = _expectIdent().text;
     _expectWord('IN');
+    // Cursor FOR loop over a subquery: `FOR rec IN (SELECT …) LOOP`.
+    if (_check(TokType.punct, '(')) {
+      _advance(); // (
+      final startOff = _peek().offset;
+      var depth = 1;
+      while (!_isAtEnd() && depth > 0) {
+        final t = _peek();
+        if (t.type == TokType.punct && t.text == '(') {
+          depth++;
+        } else if (t.type == TokType.punct && t.text == ')') {
+          depth--;
+          if (depth == 0) break;
+        }
+        _advance();
+      }
+      final sql = _sliceRoutine(startOff, _peek().offset);
+      _expect(TokType.punct, ')');
+      _expectWord('LOOP');
+      final body = _parsePlsqlStmtsUntil({'END'});
+      _expectWord('END');
+      _expectWord('LOOP');
+      if (_check(TokType.ident)) _advance();
+      _match(TokType.punct, ';');
+      return RoutineForCursor(varName, sql, body);
+    }
     final reverse = _matchWord('REVERSE');
     final lower = _captureRoutineExpr(const {}); // stops at the `..` op
     _expect(TokType.op, '..');
