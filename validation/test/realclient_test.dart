@@ -259,6 +259,35 @@ void main() {
     expect(r.rows[0][0], v);
   });
 
+  test('a vector similarity (KNN) query returns nearest neighbours by L2',
+      () async {
+    final db = await Database.open(null);
+    final server = await _startServer(db);
+    addTearDown(() async => server.stop());
+
+    final conn = await OracleConnection.connect(
+      '127.0.0.1:${server.boundPort}/DARTDB',
+      user: 'testuser',
+      password: 'testpassword',
+    );
+    addTearDown(() async => conn.close());
+
+    await conn.execute('CREATE TABLE docs (id INTEGER PRIMARY KEY, emb VECTOR)');
+    await conn.execute('INSERT INTO docs VALUES (:1, :2)',
+        [1, Float32List.fromList([1, 0, 0])]);
+    await conn.execute('INSERT INTO docs VALUES (:1, :2)',
+        [2, Float32List.fromList([0, 1, 0])]);
+    await conn.execute('INSERT INTO docs VALUES (:1, :2)',
+        [3, Float32List.fromList([0.9, 0.1, 0])]);
+
+    // Bind the query vector and rank rows by L2 distance; the engine scans the
+    // stored vectors and the two closest to [1,0,0] are rows 1 then 3.
+    final query = Float32List.fromList([1, 0, 0]);
+    final r = await conn.execute(
+        'SELECT id FROM docs ORDER BY VEC_L2(emb, :1) LIMIT 2', [query]);
+    expect(r.rows.map((row) => row[0]).toList(), [1, 3]);
+  });
+
   test('a JSON document binds and reads back as OSON', () async {
     final db = await Database.open(null);
     final server = await _startServer(db);

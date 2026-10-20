@@ -398,6 +398,45 @@ void main() {
       expect(sel.rows[0][0], bits);
     });
 
+    test('a bound query vector ranks rows by VEC_L2 (KNN)', () async {
+      final db = await Database.open(null);
+      final server = OracleServer(db, port: 0, users: {
+        'testuser': 'testpassword',
+      });
+      await server.start();
+      addTearDown(() async => server.stop());
+
+      final socket = await Socket.connect(
+        InternetAddress.loopbackIPv4,
+        server.boundPort,
+      );
+      addTearDown(() async => socket.close());
+      final frames = FrameReader(socket);
+      await handshakeAndLogin(socket, frames,
+          username: 'testuser', password: 'testpassword');
+
+      socket.add(wrapData(buildExecuteRequest(
+          'CREATE TABLE docs (id INTEGER PRIMARY KEY, emb VECTOR)')));
+      await frames.next();
+      for (final (id, vec) in [
+        (1, [1.0, 0.0, 0.0]),
+        (2, [0.0, 1.0, 0.0]),
+        (3, [0.9, 0.1, 0.0]),
+      ]) {
+        socket.add(wrapData(buildExecuteRequest(
+            'INSERT INTO docs VALUES (:1, :2)',
+            binds: [id, VectorBind(vec)])));
+        await frames.next();
+      }
+
+      socket.add(wrapData(buildExecuteRequest(
+          'SELECT id FROM docs ORDER BY VEC_L2(emb, :1) LIMIT 2',
+          isQuery: true,
+          binds: [VectorBind([1.0, 0.0, 0.0])])));
+      final sel = await readExecuteResponse(frames, isQuery: true);
+      expect(sel.rows.map((r) => r[0]).toList(), [1, 3]);
+    });
+
     test('JSON binds and columns round-trip (OSON)', () async {
       final db = await Database.open(null);
       final server = OracleServer(db, port: 0, users: {
