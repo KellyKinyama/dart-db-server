@@ -170,4 +170,40 @@ void main() {
     final r = await conn.execute('SELECT at FROM events');
     expect(r.rows[0][0], '2025-03-14 09:26:53');
   });
+
+  test('INTERVAL binds round-trip as signed literal values', () async {
+    final db = await Database.open(null);
+    final server = await _startServer(db);
+    addTearDown(() async => server.stop());
+
+    final conn = await OracleConnection.connect(
+      '127.0.0.1:${server.boundPort}/DARTDB',
+      user: 'testuser',
+      password: 'testpassword',
+    );
+    addTearDown(() async => conn.close());
+
+    await conn.execute(
+        'CREATE TABLE spans (id INTEGER PRIMARY KEY, ym TEXT, ds TEXT)');
+
+    // The client infers INTERVAL YEAR TO MONTH / DAY TO SECOND from the
+    // wrapper value; the server decodes each to a signed literal string.
+    await conn.execute('INSERT INTO spans VALUES (:1, :2, :3)', [
+      1,
+      OracleIntervalYM(years: 2, months: 6),
+      OracleIntervalDS(days: 3, hours: 4, minutes: 5, seconds: 6, fseconds: 123456789),
+    ]);
+    await conn.execute('INSERT INTO spans VALUES (:1, :2, :3)', [
+      2,
+      OracleIntervalYM(years: -1, months: -3),
+      OracleIntervalDS(days: -2, hours: -1, minutes: -2, seconds: -3, fseconds: -500000000),
+    ]);
+
+    final r = await conn.execute('SELECT ym, ds FROM spans ORDER BY id');
+    expect(r.rows.length, 2);
+    expect(r.rows[0][0], '+2-06');
+    expect(r.rows[0][1], '+3 04:05:06.123456789');
+    expect(r.rows[1][0], '-1-03');
+    expect(r.rows[1][1], '-2 01:02:03.500000000');
+  });
 }

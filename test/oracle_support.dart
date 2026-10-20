@@ -354,6 +354,7 @@ Uint8List buildExecuteRequest(String sql,
 
 int _bindOraType(Object? v) {
   if (v == null) return 1; // VARCHAR (null)
+  if (v is RawBind) return v.oraType;
   if (v is num) return 2; // NUMBER
   if (v is Uint8List) return 23; // RAW
   return 1; // VARCHAR / STRING
@@ -378,6 +379,8 @@ void _writeBindMeta(WriteBuffer b, int oraType) {
 void _writeBindValue(WriteBuffer b, Object? v) {
   if (v == null) {
     b.writeUint8(0); // zero-length NULL indicator
+  } else if (v is RawBind) {
+    b.writeBytesWithLength(v.bytes);
   } else if (v is num) {
     b.writeBytesWithLength(encodeOracleNumber(v));
   } else if (v is Uint8List) {
@@ -385,6 +388,38 @@ void _writeBindValue(WriteBuffer b, Object? v) {
   } else {
     b.writeBytesWithLength(Uint8List.fromList(utf8.encode(v.toString())));
   }
+}
+
+/// A bind value with an explicit Oracle wire type and pre-encoded bytes, for
+/// binding types [buildExecuteRequest]'s value inference does not cover (e.g.
+/// INTERVAL). Mirrors how the real client encodes typed binds.
+class RawBind {
+  RawBind(this.oraType, this.bytes);
+  final int oraType;
+  final Uint8List bytes;
+}
+
+/// Encodes an `INTERVAL YEAR TO MONTH` (type 182) wire value: bytes 0-3 years
+/// + 0x80000000 (big-endian), byte 4 months + 60.
+RawBind intervalYMBind(int years, int months) {
+  final d = ByteData(5)
+    ..setUint32(0, years + 0x80000000)
+    ..setUint8(4, months + 60);
+  return RawBind(182, d.buffer.asUint8List());
+}
+
+/// Encodes an `INTERVAL DAY TO SECOND` (type 183) wire value: bytes 0-3 days +
+/// 0x80000000, byte 4 hours + 60, byte 5 minutes + 60, byte 6 seconds + 60,
+/// bytes 7-10 nanoseconds + 0x80000000 (all big-endian).
+RawBind intervalDSBind(
+    int days, int hours, int minutes, int seconds, int fseconds) {
+  final d = ByteData(11)
+    ..setUint32(0, days + 0x80000000)
+    ..setUint8(4, hours + 60)
+    ..setUint8(5, minutes + 60)
+    ..setUint8(6, seconds + 60)
+    ..setUint32(7, fseconds + 0x80000000);
+  return RawBind(183, d.buffer.asUint8List());
 }
 
 /// Builds a close-cursors piggyback body (prepended before a real message).

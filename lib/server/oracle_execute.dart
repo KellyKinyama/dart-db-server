@@ -180,8 +180,9 @@ List<Object?> _decodeBinds(ReadBuffer body, int numParams, int fv) {
 }
 
 /// Decodes one IN bind value. Supported: NUMBER, VARCHAR2/CHAR, RAW, DATE /
-/// TIMESTAMP (decoded to an ISO-8601 string the engine stores as text), and
-/// NULL (a zero-length value). Other types are not yet handled.
+/// TIMESTAMP (decoded to an ISO-8601 string the engine stores as text),
+/// INTERVAL YEAR TO MONTH / DAY TO SECOND (decoded to a signed literal
+/// string), and NULL (a zero-length value). Other types are not yet handled.
 Object? _decodeBindValue(ReadBuffer body, int oraType) {
   final bytes = body.readBytesWithLength();
   if (bytes.isEmpty) return null; // NULL (also an empty string in Oracle)
@@ -202,9 +203,65 @@ Object? _decodeBindValue(ReadBuffer body, int oraType) {
     case 181: // TIMESTAMP WITH TIME ZONE
     case 231: // TIMESTAMP WITH LOCAL TIME ZONE
       return _decodeOracleDateTime(bytes);
+    case 182: // INTERVAL YEAR TO MONTH
+      return _decodeIntervalYM(Uint8List.fromList(bytes));
+    case 183: // INTERVAL DAY TO SECOND
+      return _decodeIntervalDS(Uint8List.fromList(bytes));
     default:
       throw FormatException('unsupported bind type $oraType');
   }
+}
+
+/// Bias added to the 32-bit day / fractional-second / year fields of an
+/// INTERVAL wire value (client `TNS_DURATION_MID`).
+const int _durationMid = 0x80000000;
+
+/// Bias added to the one-byte hour / minute / second / month fields of an
+/// INTERVAL wire value (client `TNS_DURATION_OFFSET`).
+const int _durationOffset = 60;
+
+/// Decodes the 5-byte Oracle `INTERVAL YEAR TO MONTH` wire value (type 182)
+/// into a signed `[+|-]Y-MM` literal the engine stores as text. Inverts the
+/// client's `encodeIntervalYM` (bytes 0-3: years + 0x80000000 big-endian;
+/// byte 4: months + 60).
+String _decodeIntervalYM(Uint8List b) {
+  if (b.length != 5) {
+    throw FormatException(
+        'INTERVAL YEAR TO MONTH field has ${b.length} bytes (expected 5)');
+  }
+  final data = ByteData.sublistView(b);
+  final years = data.getUint32(0) - _durationMid;
+  final months = data.getUint8(4) - _durationOffset;
+  final negative = years < 0 || months < 0;
+  return '${negative ? '-' : '+'}${years.abs()}-'
+      '${months.abs().toString().padLeft(2, '0')}';
+}
+
+/// Decodes the 11-byte Oracle `INTERVAL DAY TO SECOND` wire value (type 183)
+/// into a signed `[+|-]D HH:MM:SS.fffffffff` literal the engine stores as
+/// text. Inverts the client's `encodeIntervalDS` (bytes 0-3: days +
+/// 0x80000000; byte 4: hours + 60; byte 5: minutes + 60; byte 6: seconds + 60;
+/// bytes 7-10: nanoseconds + 0x80000000, all big-endian).
+String _decodeIntervalDS(Uint8List b) {
+  if (b.length != 11) {
+    throw FormatException(
+        'INTERVAL DAY TO SECOND field has ${b.length} bytes (expected 11)');
+  }
+  final data = ByteData.sublistView(b);
+  final days = data.getUint32(0) - _durationMid;
+  final hours = data.getUint8(4) - _durationOffset;
+  final minutes = data.getUint8(5) - _durationOffset;
+  final seconds = data.getUint8(6) - _durationOffset;
+  final fseconds = data.getUint32(7) - _durationMid;
+  final negative = days < 0 ||
+      hours < 0 ||
+      minutes < 0 ||
+      seconds < 0 ||
+      fseconds < 0;
+  String two(int v) => v.abs().toString().padLeft(2, '0');
+  final fraction = fseconds.abs().toString().padLeft(9, '0');
+  return '${negative ? '-' : '+'}${days.abs()} '
+      '${two(hours)}:${two(minutes)}:${two(seconds)}.$fraction';
 }
 
 /// Decodes an Oracle DATE (7 bytes) / TIMESTAMP (11) / TIMESTAMP-with-zone (13)

@@ -273,5 +273,58 @@ void main() {
       expect(sel.rows.last[0], rows - 1);
       expect(sel.rows[200][1], pad);
     });
+
+    test('INTERVAL YEAR TO MONTH and DAY TO SECOND binds round-trip',
+        () async {
+      final db = await Database.open(null);
+      final server = OracleServer(db, port: 0, users: {
+        'testuser': 'testpassword',
+      });
+      await server.start();
+      addTearDown(() async => server.stop());
+
+      final socket = await Socket.connect(
+        InternetAddress.loopbackIPv4,
+        server.boundPort,
+      );
+      addTearDown(() async => socket.close());
+      final frames = FrameReader(socket);
+      await handshakeAndLogin(socket, frames,
+          username: 'testuser', password: 'testpassword');
+
+      socket.add(wrapData(buildExecuteRequest(
+          'CREATE TABLE spans (id INTEGER PRIMARY KEY, ym TEXT, ds TEXT)')));
+      await frames.next();
+
+      // INTERVAL YEAR TO MONTH '+2-06', INTERVAL DAY TO SECOND
+      // '+3 04:05:06.123456789'.
+      socket.add(wrapData(buildExecuteRequest(
+          'INSERT INTO spans VALUES (:1, :2, :3)',
+          binds: [
+            1,
+            intervalYMBind(2, 6),
+            intervalDSBind(3, 4, 5, 6, 123456789),
+          ])));
+      expect(
+          decodeExecuteResponse(ttcBody(await frames.next())).rowsAffected, 1);
+
+      // A negative interval keeps a single sign across its components.
+      socket.add(wrapData(buildExecuteRequest(
+          'INSERT INTO spans VALUES (:1, :2, :3)',
+          binds: [
+            2,
+            intervalYMBind(-1, -3),
+            intervalDSBind(-2, -1, -2, -3, -500000000),
+          ])));
+      await frames.next();
+
+      socket.add(wrapData(buildExecuteRequest(
+          'SELECT ym, ds FROM spans ORDER BY id', isQuery: true)));
+      final sel = await readExecuteResponse(frames, isQuery: true);
+      expect(sel.rows, [
+        ['+2-06', '+3 04:05:06.123456789'],
+        ['-1-03', '-2 01:02:03.500000000'],
+      ]);
+    });
   });
 }

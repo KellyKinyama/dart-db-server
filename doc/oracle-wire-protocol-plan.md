@@ -398,7 +398,7 @@ ordered by value ÷ effort.
 ```
 1. Large-SDU framing ─┬─► prerequisite for FAST_AUTH (needs version ≥ 318)  ✅ done
                       └─► lets single packets exceed 64 KB
-2. INTERVAL codecs      (easy — mirrors the DATE work already shipped)
+2. INTERVAL codecs      (easy — mirrors the DATE work already shipped)  ✅ done
 3. VECTOR codecs        (engine has native vectors → full round-trip)
 4. JSON codecs          (text fallback easy; native OSON hard)
 5. 12c PBKDF2 verifier  (independent — broadens client compatibility)
@@ -423,9 +423,14 @@ ordered by value ÷ effort.
 - **Inverted:** `transport/packet.dart` `readTnsPacketLength` / `encodeTnsPacket`
   with `useLargeSdu` — the length moves to bytes 0–3 for DATA packets.
 
-### 1. INTERVAL codecs (Phase 5) — type 182 / 183
+### 1. INTERVAL codecs (Phase 5) — type 182 / 183 — ✅ done
 
-- **Invert:** `oracle_interval.dart` + `data_types.dart`. `INTERVAL YEAR TO
+- **Status:** shipped. `_decodeBindValue` now handles type **182** (`INTERVAL
+  YEAR TO MONTH`) and **183** (`INTERVAL DAY TO SECOND`), decoding each wire
+  value to a signed literal string (`+2-06`, `+3 04:05:06.123456789`) the
+  engine stores as text. Verified by a self-contained mirror test and a real
+  `oracledb` client test binding `OracleIntervalYM` / `OracleIntervalDS`.
+- **Inverted:** `oracle_interval.dart` + `data_types.dart`. `INTERVAL YEAR TO
   MONTH` (type **182**, 5 bytes: 4-byte years + 1-byte months, offset-encoded);
   `INTERVAL DAY TO SECOND` (type **183**, 11 bytes: 4-byte days, hour, minute,
   second, 4-byte fractional seconds, all offset-encoded).
