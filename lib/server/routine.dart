@@ -11,6 +11,7 @@
 library;
 
 import 'database.dart';
+import 'expression.dart' show ColumnExpr;
 import 'result.dart';
 
 /// Base type for a procedural statement. Sealed so the interpreter's dispatch
@@ -109,13 +110,44 @@ class RoutinePrint extends RoutineStmt {
   RoutinePrint(this.exprSql);
 }
 
+/// A bare `SELECT …` in a routine body (no `INTO`): its result set is collected
+/// and returned to the caller (MySQL procedures can return result sets).
+class RoutineSelect extends RoutineStmt {
+  final String sql;
+  RoutineSelect(this.sql);
+}
+
+/// Direction of a stored-routine parameter.
+enum RoutineParamMode { inParam, outParam, inOutParam }
+
+/// One stored-routine parameter: `[IN|OUT|INOUT] name <type>`.
+class RoutineParam {
+  final String name;
+  final RoutineParamMode mode;
+  final String typeText;
+  RoutineParam(this.name, this.mode, this.typeText);
+}
+
+/// A named stored routine (MySQL `CREATE PROCEDURE` / `CREATE FUNCTION`).
+class StoredRoutine {
+  final String name;
+  final List<RoutineParam> params;
+  final RoutineBlock block;
+  final bool isFunction;
+  final String? returnType;
+  StoredRoutine(this.name, this.params, this.block,
+      {this.isFunction = false, this.returnType});
+}
+
 /// The outcome of running a routine: its RETURN value (for functions), the
-/// collected output lines, and the final local-variable scope.
+/// collected output lines, the final local-variable scope, and any result sets
+/// produced by bare `SELECT`s in the body.
 class RoutineResult {
   final Object? returnValue;
   final List<String> output;
   final Map<String, Object?> variables;
-  RoutineResult(this.returnValue, this.output, this.variables);
+  final List<QueryResult> resultSets;
+  RoutineResult(this.returnValue, this.output, this.variables, this.resultSets);
 }
 
 /// Control-flow signals, thrown to unwind nested statement lists.
@@ -133,6 +165,7 @@ class RoutineInterpreter {
   final Database db;
   final Map<String, Object?> vars;
   final List<String> output = [];
+  final List<QueryResult> resultSets = [];
 
   RoutineInterpreter(this.db, {Map<String, Object?>? initialVars})
       : vars = {...?initialVars};
@@ -144,7 +177,7 @@ class RoutineInterpreter {
     } on _ReturnSignal catch (s) {
       returnValue = s.value;
     }
-    return RoutineResult(returnValue, output, vars);
+    return RoutineResult(returnValue, output, vars, resultSets);
   }
 
   Future<void> _runBlock(RoutineBlock b) async {
@@ -225,6 +258,8 @@ class RoutineInterpreter {
         }
       case RoutinePrint p:
         output.add((await _eval(p.exprSql))?.toString() ?? '');
+      case RoutineSelect q:
+        resultSets.add(await _exec(q.sql));
     }
   }
 
@@ -234,17 +269,24 @@ class RoutineInterpreter {
     return res.rows.isEmpty ? null : res.rows.first.first;
   }
 
-  /// Run an embedded SQL statement, binding only the local variables the SQL
-  /// actually references as named parameters (binding unreferenced names is
-  /// rejected by the prepared-statement layer).
-  Future<QueryResult> _exec(String sql) {
+  /// Run an embedded SQL statement. Local variables are available two ways:
+  /// `:name` named binds (used by the dialect-neutral AST) and bare identifiers
+  /// in value position (used by MySQL routine bodies), the latter resolved via
+  /// [ColumnExpr.routineScopes]. Only the named binds the SQL actually
+  /// references are supplied (the prepared-statement layer rejects extras).
+  Future<QueryResult> _exec(String sql) async {
     final ps = db.prepare(sql);
     final named = <String, Object?>{};
     for (final spelling in ps.namedParams) {
       final name = spelling.replaceFirst(RegExp(r'^[:@$]'), '');
       if (vars.containsKey(name)) named[name] = vars[name];
     }
-    return ps.execute(named: named);
+    ColumnExpr.routineScopes.add(vars);
+    try {
+      return await ps.execute(named: named);
+    } finally {
+      ColumnExpr.routineScopes.removeLast();
+    }
   }
 
   static bool _truthy(Object? v) {

@@ -4,6 +4,7 @@ library;
 
 import 'expression.dart';
 import 'lexer.dart';
+import 'routine.dart';
 import 'schema.dart';
 import 'statement.dart';
 
@@ -298,6 +299,14 @@ class Parser {
       }
     }
     if (_checkWord('MERGE')) return _parseMerge();
+    if (_checkWord('CALL')) return _parseCall();
+    if (_checkWord('DELIMITER')) {
+      // Client-side framing directive; accept and ignore the rest of the line.
+      while (!_isAtEnd()) {
+        _advance();
+      }
+      return SetSessionStmt('DELIMITER');
+    }
     throw FormatException('Unsupported statement starting with "${t.text}"');
   }
 
@@ -439,6 +448,8 @@ class Parser {
     if (_matchKw('VIEW')) return _parseCreateViewTail();
     if (_matchKw('TRIGGER')) return _parseCreateTriggerTail();
     if (_matchWord('SEQUENCE')) return _parseCreateSequenceTail();
+    if (_matchWord('PROCEDURE')) return _parseCreateRoutine(false);
+    if (_matchWord('FUNCTION')) return _parseCreateRoutine(true);
     throw FormatException(
       'Expected TABLE, INDEX, VIEW or TRIGGER after CREATE',
     );
@@ -1092,6 +1103,16 @@ class Parser {
       }
       return DropSequenceStmt(_expectIdent().text, ifExists: ifExists);
     }
+    if (_matchWord('PROCEDURE') || _matchWord('FUNCTION')) {
+      final isFunction = _tokens[_pos - 1].upper == 'FUNCTION';
+      bool ifExists = false;
+      if (_matchKw('IF')) {
+        _expectKw('EXISTS');
+        ifExists = true;
+      }
+      return DropProcedureStmt(_expectIdent().text,
+          isFunction: isFunction, ifExists: ifExists);
+    }
     throw FormatException('Expected TABLE, INDEX, VIEW or TRIGGER after DROP');
   }
 
@@ -1160,6 +1181,342 @@ class Parser {
     }
     final n = int.parse(_expect(TokType.number).text);
     return negative ? -n : n;
+  }
+
+  // ---- CREATE PROCEDURE / FUNCTION (MySQL stored routines) ----------------
+  CreateProcedureStmt _parseCreateRoutine(bool isFunction) {
+    final name = _expectIdent().text;
+    final params = <RoutineParam>[];
+    if (_match(TokType.punct, '(')) {
+      if (!_check(TokType.punct, ')')) {
+        do {
+          var mode = RoutineParamMode.inParam;
+          if (_matchWord('INOUT')) {
+            mode = RoutineParamMode.inOutParam;
+          } else if (_matchWord('OUT')) {
+            mode = RoutineParamMode.outParam;
+          } else {
+            _matchWord('IN');
+          }
+          final pname = _expectIdent().text;
+          final type = _consumeRoutineType();
+          params.add(RoutineParam(pname, mode, type));
+        } while (_match(TokType.punct, ','));
+      }
+      _expect(TokType.punct, ')');
+    }
+    String? returnType;
+    if (isFunction) {
+      _expectWord('RETURNS');
+      returnType = _consumeRoutineType();
+    }
+    _consumeRoutineCharacteristics();
+    final block = _parseRoutineBody();
+    return CreateProcedureStmt(
+      StoredRoutine(name, params, block,
+          isFunction: isFunction, returnType: returnType),
+    );
+  }
+
+  /// Consume a SQL type (`INT`, `VARCHAR(50)`, `DECIMAL(10,2)` …) and return its
+  /// text. Only used for metadata; the engine does not enforce routine types.
+  String _consumeRoutineType() {
+    final start = _peek().offset;
+    _advance(); // base type word
+    if (_check(TokType.punct, '(')) {
+      var depth = 0;
+      do {
+        final t = _advance();
+        if (t.type == TokType.punct && t.text == '(') depth++;
+        if (t.type == TokType.punct && t.text == ')') depth--;
+      } while (depth > 0 && !_isAtEnd());
+    }
+    while (_matchWord('UNSIGNED') ||
+        _matchWord('ZEROFILL') ||
+        _matchWord('PRECISION')) {}
+    return _sliceSource(start, _peek().offset).trim();
+  }
+
+  /// Skip MySQL routine characteristics (DETERMINISTIC, SQL SECURITY, …) that
+  /// may appear between the signature and the body.
+  void _consumeRoutineCharacteristics() {
+    while (true) {
+      if (_matchKw('NOT')) {
+        _matchWord('DETERMINISTIC');
+        continue;
+      }
+      if (_matchWord('DETERMINISTIC')) continue;
+      if (_matchWord('CONTAINS') || _matchWord('LANGUAGE')) {
+        _matchWord('SQL');
+        continue;
+      }
+      if (_matchWord('NO')) {
+        _matchWord('SQL');
+        continue;
+      }
+      if (_matchWord('READS') || _matchWord('MODIFIES')) {
+        _matchWord('SQL');
+        _matchWord('DATA');
+        continue;
+      }
+      if (_matchWord('SQL')) {
+        _matchWord('SECURITY');
+        _matchWord('DEFINER') || _matchWord('INVOKER');
+        continue;
+      }
+      if (_matchWord('COMMENT')) {
+        _expect(TokType.string);
+        continue;
+      }
+      break;
+    }
+  }
+
+  RoutineBlock _parseRoutineBody() {
+    if (_matchWord('BEGIN')) {
+      final decls = <RoutineDecl>[];
+      final body = <RoutineStmt>[];
+      while (!_checkWord('END') && !_isAtEnd()) {
+        final s = _parseRoutineStmt(decls);
+        if (s != null) body.add(s);
+      }
+      _expectWord('END');
+      if (_check(TokType.ident)) _advance(); // optional end label
+      _match(TokType.punct, ';');
+      return RoutineBlock(body, declarations: decls);
+    }
+    final decls = <RoutineDecl>[];
+    final s = _parseRoutineStmt(decls);
+    return RoutineBlock(s == null ? const [] : [s], declarations: decls);
+  }
+
+  RoutineStmt? _parseRoutineStmt(List<RoutineDecl> decls) {
+    // Optional statement label: `name: LOOP|WHILE|REPEAT`.
+    if (_check(TokType.ident) &&
+        _peek(1).type == TokType.punct &&
+        _peek(1).text == ':') {
+      _advance();
+      _advance();
+    }
+    if (_checkWord('BEGIN')) return _parseRoutineBody();
+    if (_matchWord('DECLARE')) {
+      _parseRoutineDeclare(decls);
+      return null;
+    }
+    if (_matchWord('SET')) return _parseRoutineSet();
+    if (_checkWord('IF')) return _parseRoutineIf();
+    if (_checkWord('WHILE')) return _parseRoutineWhile();
+    if (_checkWord('LOOP')) return _parseRoutineLoop();
+    if (_checkWord('REPEAT')) return _parseRoutineRepeat();
+    if (_matchWord('LEAVE')) {
+      if (_check(TokType.ident)) _advance(); // label
+      _match(TokType.punct, ';');
+      return RoutineExit();
+    }
+    if (_matchWord('ITERATE')) {
+      if (_check(TokType.ident)) _advance();
+      _match(TokType.punct, ';');
+      return null; // ITERATE not yet supported — treated as a no-op
+    }
+    if (_matchWord('RETURN')) {
+      if (_match(TokType.punct, ';')) return RoutineReturn();
+      final e = _captureRoutineExpr(const {});
+      _match(TokType.punct, ';');
+      return RoutineReturn(exprSql: e);
+    }
+    return _parseRoutineEmbedded();
+  }
+
+  void _parseRoutineDeclare(List<RoutineDecl> decls) {
+    final names = <String>[_expectIdent().text];
+    while (_match(TokType.punct, ',')) {
+      names.add(_expectIdent().text);
+    }
+    _consumeRoutineType();
+    String? init;
+    if (_matchKw('DEFAULT')) {
+      init = _captureRoutineExpr(const {});
+    }
+    _match(TokType.punct, ';');
+    for (final n in names) {
+      decls.add(RoutineDecl(n, initSql: init));
+    }
+  }
+
+  RoutineStmt _parseRoutineSet() {
+    final assigns = <RoutineStmt>[];
+    do {
+      final target = _expectIdent().text;
+      _expect(TokType.op, '=');
+      assigns.add(RoutineAssign(target, _captureRoutineExpr(const {})));
+    } while (_match(TokType.punct, ','));
+    _match(TokType.punct, ';');
+    return assigns.length == 1 ? assigns.first : RoutineBlock(assigns);
+  }
+
+  RoutineStmt _parseRoutineIf() {
+    _expectWord('IF');
+    final branches = <RoutineBranch>[
+      RoutineBranch(_captureRoutineExpr({'THEN'}), _thenBody())
+    ];
+    while (_matchWord('ELSEIF')) {
+      branches.add(RoutineBranch(_captureRoutineExpr({'THEN'}), _thenBody()));
+    }
+    var elseBody = const <RoutineStmt>[];
+    if (_matchWord('ELSE')) {
+      elseBody = _parseRoutineStmtsUntil({'END'});
+    }
+    _expectWord('END');
+    _expectWord('IF');
+    _match(TokType.punct, ';');
+    return RoutineIf(branches, elseBody: elseBody);
+  }
+
+  List<RoutineStmt> _thenBody() {
+    _expectWord('THEN');
+    return _parseRoutineStmtsUntil({'ELSEIF', 'ELSE', 'END'});
+  }
+
+  RoutineStmt _parseRoutineWhile() {
+    _expectWord('WHILE');
+    final cond = _captureRoutineExpr({'DO'});
+    _expectWord('DO');
+    final body = _parseRoutineStmtsUntil({'END'});
+    _expectWord('END');
+    _expectWord('WHILE');
+    if (_check(TokType.ident)) _advance();
+    _match(TokType.punct, ';');
+    return RoutineWhile(cond, body);
+  }
+
+  RoutineStmt _parseRoutineLoop() {
+    _expectWord('LOOP');
+    final body = _parseRoutineStmtsUntil({'END'});
+    _expectWord('END');
+    _expectWord('LOOP');
+    if (_check(TokType.ident)) _advance();
+    _match(TokType.punct, ';');
+    return RoutineLoop(body);
+  }
+
+  RoutineStmt _parseRoutineRepeat() {
+    _expectWord('REPEAT');
+    final body = _parseRoutineStmtsUntil({'UNTIL'});
+    _expectWord('UNTIL');
+    final cond = _captureRoutineExpr({'END'});
+    _expectWord('END');
+    _expectWord('REPEAT');
+    if (_check(TokType.ident)) _advance();
+    _match(TokType.punct, ';');
+    // REPEAT runs the body then exits once UNTIL is true.
+    return RoutineLoop([...body, RoutineExit(whenSql: cond)]);
+  }
+
+  List<RoutineStmt> _parseRoutineStmtsUntil(Set<String> stops) {
+    final out = <RoutineStmt>[];
+    final decls = <RoutineDecl>[];
+    while (!_isAtEnd() && !stops.contains(_peek().upper)) {
+      final s = _parseRoutineStmt(decls);
+      if (s != null) out.add(s);
+    }
+    return out;
+  }
+
+  /// Parse an embedded SQL statement inside a routine, up to the next top-level
+  /// `;`. A `SELECT … INTO vars …` becomes a [RoutineSelectInto]; a bare SELECT
+  /// becomes a result-producing [RoutineSelect]; anything else is [RoutineSql].
+  RoutineStmt _parseRoutineEmbedded() {
+    final startOff = _peek().offset;
+    final isSelect = _checkWord('SELECT');
+    var depth = 0;
+    int? intoTokIdx;
+    int? fromTokIdx;
+    while (!_isAtEnd() && !(depth == 0 && _check(TokType.punct, ';'))) {
+      final t = _peek();
+      if (t.type == TokType.punct && t.text == '(') {
+        depth++;
+      } else if (t.type == TokType.punct && t.text == ')') {
+        depth--;
+      } else if (depth == 0 && isSelect) {
+        if (intoTokIdx == null && t.upper == 'INTO') intoTokIdx = _pos;
+        if (fromTokIdx == null && t.upper == 'FROM') fromTokIdx = _pos;
+      }
+      _advance();
+    }
+    final endOff = _peek().offset;
+    _match(TokType.punct, ';');
+
+    if (isSelect && intoTokIdx != null) {
+      final intoTok = _tokens[intoTokIdx];
+      final fromTok = fromTokIdx != null ? _tokens[fromTokIdx] : null;
+      final q1 = _sliceRoutine(startOff, intoTok.offset);
+      final q2 =
+          fromTok != null ? ' ${_sliceRoutine(fromTok.offset, endOff)}' : '';
+      final intoVars = <String>[];
+      final varEnd = fromTokIdx ?? _tokenIndexAtOffset(endOff);
+      for (var i = intoTokIdx + 1; i < varEnd; i++) {
+        final t = _tokens[i];
+        if (t.type == TokType.ident) intoVars.add(t.text);
+      }
+      return RoutineSelectInto('$q1$q2', intoVars);
+    }
+    final sql = _sliceRoutine(startOff, endOff);
+    return isSelect ? RoutineSelect(sql) : RoutineSql(sql);
+  }
+
+  int _tokenIndexAtOffset(int offset) {
+    for (var i = 0; i < _tokens.length; i++) {
+      if (_tokens[i].offset >= offset) return i;
+    }
+    return _tokens.length;
+  }
+
+  /// Capture a routine expression (with locals rewritten to `:name`) from the
+  /// current position up to a top-level `;`, `,`, or any word in [stopUpper].
+  String _captureRoutineExpr(Set<String> stopUpper) {
+    final startOff = _peek().offset;
+    var depth = 0;
+    while (!_isAtEnd()) {
+      final t = _peek();
+      if (t.type == TokType.punct && t.text == '(') {
+        depth++;
+      } else if (t.type == TokType.punct && t.text == ')') {
+        if (depth == 0) break;
+        depth--;
+      } else if (depth == 0) {
+        if (t.type == TokType.punct && (t.text == ';' || t.text == ',')) break;
+        if ((t.type == TokType.keyword || t.type == TokType.ident) &&
+            stopUpper.contains(t.upper)) {
+          break;
+        }
+      }
+      _advance();
+    }
+    return _sliceRoutine(startOff, _peek().offset);
+  }
+
+  /// Reconstruct a routine SQL fragment from its tokens, verbatim. Local
+  /// variables are left as bare identifiers; the interpreter resolves them at
+  /// run time via [ColumnExpr.routineScopes], so value-position references
+  /// become variables while column-position identifiers stay columns.
+  String _sliceRoutine(int startOffset, int endOffset) =>
+      _sliceSource(startOffset, endOffset);
+
+  // ---- CALL ---------------------------------------------------------------
+  CallStmt _parseCall() {
+    _expectWord('CALL');
+    final name = _expectIdent().text;
+    final args = <Expr>[];
+    if (_match(TokType.punct, '(')) {
+      if (!_check(TokType.punct, ')')) {
+        args.add(_parseExpr());
+        while (_match(TokType.punct, ',')) {
+          args.add(_parseExpr());
+        }
+      }
+      _expect(TokType.punct, ')');
+    }
+    return CallStmt(name, args);
   }
 
   // ---- ALTER --------------------------------------------------------------

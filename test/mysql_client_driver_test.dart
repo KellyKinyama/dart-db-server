@@ -59,6 +59,38 @@ void main() {
       ]);
     });
 
+    test('a stored procedure runs via CALL through the driver', () async {
+      await conn.execute('''
+        CREATE PROCEDURE bump(IN start_id INT, IN cnt INT)
+        BEGIN
+          DECLARE i INT DEFAULT 0;
+          WHILE i < cnt DO
+            INSERT INTO t VALUES (start_id + i, 'gen' || (start_id + i));
+            SET i = i + 1;
+          END WHILE;
+        END
+      ''');
+      await conn.execute('CALL bump(10, 2)');
+      final r =
+          await conn.execute('SELECT id, name FROM t WHERE id >= 10 ORDER BY id');
+      final rows = r.rows.map((row) => [row.colAt(0), row.colAt(1)]).toList();
+      expect(rows, [
+        ['10', 'gen10'],
+        ['11', 'gen11'],
+      ]);
+    });
+
+    test('a procedure can return a result set to the driver', () async {
+      await conn.execute('''
+        CREATE PROCEDURE all_names()
+        BEGIN
+          SELECT name FROM t ORDER BY id;
+        END
+      ''');
+      final r = await conn.execute('CALL all_names()');
+      expect(r.rows.map((row) => row.colAt(0)).toList(), ['alice', 'bob']);
+    });
+
     test('COM_QUERY INSERT reports affectedRows', () async {
       final r = await conn.execute(
         "INSERT INTO t VALUES (3, 'carol'), (4, 'dave')",

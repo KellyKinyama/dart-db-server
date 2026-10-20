@@ -499,6 +499,9 @@ class Lexer {
         _pos++;
       }
       if (ns == _pos) {
+        // A bare ':' with no following name is a punctuator (MySQL statement
+        // labels `label:`, etc.); the other sigils still require a name.
+        if (c == ':') return Token(TokType.punct, ':', start);
         throw FormatException(
           'Empty named-parameter at $start (expected $c<name>)',
         );

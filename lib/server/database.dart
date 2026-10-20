@@ -117,6 +117,10 @@ class Database implements SequenceProvider {
   /// harmless (it just falls back to advancing per reference).
   int _seqEpoch = 0;
   void _beginSeqRow() => _seqEpoch++;
+
+  /// Stored procedures/functions (MySQL CREATE PROCEDURE/FUNCTION), keyed by
+  /// uppercased name.
+  final Map<String, StoredRoutine> _routines = <String, StoredRoutine>{};
   final String? path;
 
   /// When true, [_persist] writes the database as a real SQLite-format
@@ -2193,6 +2197,9 @@ class Database implements SequenceProvider {
   }
 
   Future<QueryResult> executeStmt(Statement stmt) async {
+    // CALL runs the procedural interpreter, whose embedded statements each
+    // take the lock themselves — so it must not run inside an outer lock.
+    if (stmt is CallStmt) return _call(stmt);
     // Statements that span a transaction boundary always need exclusive
     // access; otherwise SELECT-ish statements take the shared arm.
     final wantsWrite = inTransaction ||
@@ -2393,6 +2400,10 @@ class Database implements SequenceProvider {
         result = _createSequence(stmt);
       } else if (stmt is DropSequenceStmt) {
         result = _dropSequence(stmt);
+      } else if (stmt is CreateProcedureStmt) {
+        result = _createProcedure(stmt);
+      } else if (stmt is DropProcedureStmt) {
+        result = _dropProcedure(stmt);
       } else if (stmt is MergeStmt) {
         result = _merge(stmt);
       } else if (stmt is InsertAllStmt) {
@@ -2481,6 +2492,8 @@ class Database implements SequenceProvider {
       s is DropViewStmt ||
       s is CreateSequenceStmt ||
       s is DropSequenceStmt ||
+      s is CreateProcedureStmt ||
+      s is DropProcedureStmt ||
       s is MergeStmt ||
       s is InsertAllStmt ||
       s is InsertStmt ||
@@ -4844,6 +4857,57 @@ class Database implements SequenceProvider {
 
   @override
   int sequenceCurrval(String name) => _lookupSequence(name).current(name);
+
+  // ---------------------------------------------------------------------------
+  // Stored procedures / functions (MySQL CREATE PROCEDURE/FUNCTION, CALL)
+  // ---------------------------------------------------------------------------
+
+  QueryResult _createProcedure(CreateProcedureStmt s) {
+    final key = s.routine.name.toUpperCase();
+    final kind = s.routine.isFunction ? 'Function' : 'Procedure';
+    if (_routines.containsKey(key) && !s.orReplace) {
+      throw StateError('$kind ${s.routine.name} already exists');
+    }
+    _routines[key] = s.routine;
+    return QueryResult.message('$kind ${s.routine.name} created');
+  }
+
+  QueryResult _dropProcedure(DropProcedureStmt s) {
+    final key = s.name.toUpperCase();
+    final kind = s.isFunction ? 'Function' : 'Procedure';
+    if (!_routines.containsKey(key)) {
+      if (s.ifExists) {
+        return QueryResult.message('$kind ${s.name} did not exist');
+      }
+      throw StateError('No such ${kind.toLowerCase()}: ${s.name}');
+    }
+    _routines.remove(key);
+    return QueryResult.message('$kind ${s.name} dropped');
+  }
+
+  /// Execute `CALL name(args)` on the top-level (async) path so the routine's
+  /// embedded statements can take the lock themselves. Argument values seed the
+  /// routine scope; a bare SELECT in the body becomes the CALL's result set.
+  Future<QueryResult> _call(CallStmt s) async {
+    final routine = _routines[s.name.toUpperCase()];
+    if (routine == null) throw StateError('No such procedure: ${s.name}');
+    final argValues = <Object?>[];
+    if (s.args.isNotEmpty) {
+      final sel = SelectStmt(
+        projection: [for (final e in s.args) SelectItem.expr(e)],
+      );
+      final res = await executeStmt(sel);
+      if (res.rows.isNotEmpty) argValues.addAll(res.rows.first);
+    }
+    final scope = <String, Object?>{};
+    for (var i = 0; i < routine.params.length; i++) {
+      scope[routine.params[i].name] =
+          i < argValues.length ? argValues[i] : null;
+    }
+    final out = await runRoutine(routine.block, args: scope);
+    if (out.resultSets.isNotEmpty) return out.resultSets.last;
+    return QueryResult.message('CALL ${s.name}');
+  }
 
   // ---------------------------------------------------------------------------
   // MERGE

@@ -2,6 +2,7 @@
 library;
 
 import 'expression.dart';
+import 'routine.dart';
 import 'schema.dart';
 
 abstract class Statement {}
@@ -159,6 +160,29 @@ class DropSequenceStmt extends Statement {
   final String name;
   final bool ifExists;
   DropSequenceStmt(this.name, {this.ifExists = false});
+}
+
+/// `CREATE PROCEDURE` / `CREATE FUNCTION` — stores a procedural routine.
+class CreateProcedureStmt extends Statement {
+  final StoredRoutine routine;
+  final bool orReplace;
+  CreateProcedureStmt(this.routine, {this.orReplace = false});
+}
+
+/// `DROP PROCEDURE|FUNCTION [IF EXISTS] name`.
+class DropProcedureStmt extends Statement {
+  final String name;
+  final bool isFunction;
+  final bool ifExists;
+  DropProcedureStmt(this.name,
+      {this.isFunction = false, this.ifExists = false});
+}
+
+/// `CALL name(args)` — invoke a stored procedure.
+class CallStmt extends Statement {
+  final String name;
+  final List<Expr> args;
+  CallStmt(this.name, this.args);
 }
 
 /// `MERGE INTO target [alias] USING {table|(subquery)} [alias] ON (cond)

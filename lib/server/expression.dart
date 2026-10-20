@@ -124,6 +124,14 @@ class ColumnExpr extends Expr {
   final String? table; // optional qualifier (table.column)
   final String name;
   ColumnExpr(this.name, {this.table});
+
+  /// Ambient fallback scopes for bare identifiers that aren't columns of the
+  /// current row — the local variables of a running stored routine. Pushed by
+  /// the routine interpreter around each embedded statement so an unqualified
+  /// reference in value position (e.g. `VALUES (id)`) resolves to the variable,
+  /// while the same name used as a column identifier is unaffected.
+  static final List<Map<String, Object?>> routineScopes = [];
+
   @override
   Object? eval(Map<String, Object?> row) {
     if (table != null) {
@@ -140,6 +148,11 @@ class ColumnExpr extends Expr {
     final lower = name.toLowerCase();
     if (row.containsKey(upper)) return row[upper];
     if (row.containsKey(lower)) return row[lower];
+    if (table == null && routineScopes.isNotEmpty) {
+      final scope = routineScopes.last;
+      if (scope.containsKey(name)) return scope[name];
+      if (scope.containsKey(lower)) return scope[lower];
+    }
     throw StateError(
       'Unknown column: ${table == null ? name : '$table.$name'}',
     );
