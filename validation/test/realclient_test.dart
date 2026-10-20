@@ -198,6 +198,40 @@ void main() {
         (await conn.execute('SELECT id, v FROM hi')).rows[0].toList(), [2, 50]);
   });
 
+  test('a PL/SQL anonymous block runs for a real client', () async {
+    final db = await Database.open(null);
+    await db.execute('CREATE TABLE plt (id INTEGER PRIMARY KEY, v INTEGER)');
+    final server = await _startServer(db);
+    addTearDown(() async => server.stop());
+
+    final conn = await OracleConnection.connect(
+      '127.0.0.1:${server.boundPort}/DARTDB',
+      user: 'testuser',
+      password: 'testpassword',
+    );
+    addTearDown(() async => conn.close());
+
+    await conn.execute('''
+      DECLARE
+        total NUMBER := 0;
+      BEGIN
+        FOR i IN 1..4 LOOP
+          INSERT INTO plt VALUES (i, i * 10);
+          total := total + i;
+        END LOOP;
+        INSERT INTO plt VALUES (99, total);
+      END;
+    ''');
+    final r = await conn.execute('SELECT id, v FROM plt ORDER BY id');
+    expect(r.rows.map((row) => row.toList()).toList(), [
+      [1, 10],
+      [2, 20],
+      [3, 30],
+      [4, 40],
+      [99, 10],
+    ]);
+  });
+
   test('data-dictionary views work for a real client', () async {
     final db = await Database.open(null);
     await db.execute('CREATE TABLE products ('

@@ -2200,6 +2200,7 @@ class Database implements SequenceProvider {
     // CALL runs the procedural interpreter, whose embedded statements each
     // take the lock themselves — so it must not run inside an outer lock.
     if (stmt is CallStmt) return _call(stmt);
+    if (stmt is PlsqlBlockStmt) return _runPlsqlBlock(stmt);
     // Statements that span a transaction boundary always need exclusive
     // access; otherwise SELECT-ish statements take the shared arm.
     final wantsWrite = inTransaction ||
@@ -4907,6 +4908,15 @@ class Database implements SequenceProvider {
     final out = await runRoutine(routine.block, args: scope);
     if (out.resultSets.isNotEmpty) return out.resultSets.last;
     return QueryResult.message('CALL ${s.name}');
+  }
+
+  /// Run an Oracle PL/SQL anonymous block on the top-level (async) path. A bare
+  /// SELECT in the block becomes the result set; otherwise a success message is
+  /// returned (DBMS_OUTPUT lines are captured but not yet surfaced to clients).
+  Future<QueryResult> _runPlsqlBlock(PlsqlBlockStmt s) async {
+    final out = await runRoutine(s.block);
+    if (out.resultSets.isNotEmpty) return out.resultSets.last;
+    return QueryResult.message('PL/SQL block executed');
   }
 
   // ---------------------------------------------------------------------------

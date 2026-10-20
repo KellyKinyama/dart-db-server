@@ -398,7 +398,7 @@ class Lexer {
         _pos++;
         continue;
       }
-      if (c == '.' && !dotSeen) {
+      if (c == '.' && !dotSeen && _isDigit(_peek(1) ?? '')) {
         dotSeen = true;
         _pos++;
         continue;
@@ -425,6 +425,14 @@ class Lexer {
     final start = _pos;
     final c = src[_pos];
     // multi-char operators
+    if (c == ':' && _peek(1) == '=') {
+      _pos += 2;
+      return Token(TokType.op, ':=', start); // PL/SQL assignment
+    }
+    if (c == '.' && _peek(1) == '.') {
+      _pos += 2;
+      return Token(TokType.op, '..', start); // PL/SQL FOR range
+    }
     if (c == '<' && _peek(1) == '=') {
       _pos += 2;
       return Token(TokType.op, '<=', start);

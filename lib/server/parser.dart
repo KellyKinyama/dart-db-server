@@ -200,9 +200,20 @@ class Parser {
         case 'TRUNCATE':
           return _parseTruncate();
         case 'BEGIN':
-          _advance();
-          _matchKw('TRANSACTION');
-          return BeginStmt();
+          {
+            // `BEGIN` / `BEGIN TRANSACTION` starts a transaction; `BEGIN <stmt>
+            // … END` is a PL/SQL anonymous block.
+            final nxt = _peek(1);
+            final isTxn = nxt.type == TokType.eof ||
+                (nxt.type == TokType.punct && nxt.text == ';') ||
+                (nxt.type == TokType.keyword && nxt.upper == 'TRANSACTION');
+            if (isTxn) {
+              _advance();
+              _matchKw('TRANSACTION');
+              return BeginStmt();
+            }
+            return _parsePlsqlBlock();
+          }
         case 'COMMIT':
           _advance();
           _matchKw('TRANSACTION');
@@ -300,6 +311,7 @@ class Parser {
     }
     if (_checkWord('MERGE')) return _parseMerge();
     if (_checkWord('CALL')) return _parseCall();
+    if (_checkWord('DECLARE')) return _parsePlsqlBlock();
     if (_checkWord('DELIMITER')) {
       // Client-side framing directive; accept and ignore the rest of the line.
       while (!_isAtEnd()) {
@@ -428,6 +440,12 @@ class Parser {
   // ---- CREATE -------------------------------------------------------------
   Statement _parseCreate() {
     _expectKw('CREATE');
+    // Oracle `CREATE OR REPLACE PROCEDURE|FUNCTION …`.
+    var orReplace = false;
+    if (_matchKw('OR')) {
+      _expectWord('REPLACE');
+      orReplace = true;
+    }
     // Accept TEMP / TEMPORARY before TABLE/VIEW/TRIGGER/INDEX. We don't
     // model temp scope; the modifier is parsed and ignored so that the
     // CREATE statement is recognised.
@@ -448,8 +466,12 @@ class Parser {
     if (_matchKw('VIEW')) return _parseCreateViewTail();
     if (_matchKw('TRIGGER')) return _parseCreateTriggerTail();
     if (_matchWord('SEQUENCE')) return _parseCreateSequenceTail();
-    if (_matchWord('PROCEDURE')) return _parseCreateRoutine(false);
-    if (_matchWord('FUNCTION')) return _parseCreateRoutine(true);
+    if (_matchWord('PROCEDURE')) {
+      return _parseCreateRoutine(false, orReplace: orReplace);
+    }
+    if (_matchWord('FUNCTION')) {
+      return _parseCreateRoutine(true, orReplace: orReplace);
+    }
     throw FormatException(
       'Expected TABLE, INDEX, VIEW or TRIGGER after CREATE',
     );
@@ -1183,22 +1205,39 @@ class Parser {
     return negative ? -n : n;
   }
 
-  // ---- CREATE PROCEDURE / FUNCTION (MySQL stored routines) ----------------
-  CreateProcedureStmt _parseCreateRoutine(bool isFunction) {
+  // ---- CREATE PROCEDURE / FUNCTION (MySQL + Oracle stored routines) -------
+  CreateProcedureStmt _parseCreateRoutine(bool isFunction,
+      {bool orReplace = false}) {
     final name = _expectIdent().text;
     final params = <RoutineParam>[];
     if (_match(TokType.punct, '(')) {
       if (!_check(TokType.punct, ')')) {
         do {
           var mode = RoutineParamMode.inParam;
-          if (_matchWord('INOUT')) {
-            mode = RoutineParamMode.inOutParam;
-          } else if (_matchWord('OUT')) {
-            mode = RoutineParamMode.outParam;
+          final String pname;
+          // MySQL writes the mode before the name (`IN x INT`); Oracle writes
+          // it after (`x IN NUMBER`). Detect a leading mode keyword only when a
+          // parameter name follows it.
+          if ((_checkWord('IN') || _checkWord('OUT') || _checkWord('INOUT')) &&
+              _peek(1).type == TokType.ident) {
+            if (_matchWord('INOUT')) {
+              mode = RoutineParamMode.inOutParam;
+            } else if (_matchWord('OUT')) {
+              mode = RoutineParamMode.outParam;
+            } else {
+              _matchWord('IN');
+            }
+            pname = _expectIdent().text;
           } else {
-            _matchWord('IN');
+            pname = _expectIdent().text;
+            if (_matchWord('INOUT')) {
+              mode = RoutineParamMode.inOutParam;
+            } else if (_matchWord('OUT')) {
+              mode = RoutineParamMode.outParam;
+            } else {
+              _matchWord('IN');
+            }
           }
-          final pname = _expectIdent().text;
           final type = _consumeRoutineType();
           params.add(RoutineParam(pname, mode, type));
         } while (_match(TokType.punct, ','));
@@ -1207,14 +1246,24 @@ class Parser {
     }
     String? returnType;
     if (isFunction) {
-      _expectWord('RETURNS');
+      // MySQL `RETURNS t`; Oracle `RETURN t`.
+      if (!_matchWord('RETURNS')) _matchWord('RETURN');
       returnType = _consumeRoutineType();
     }
-    _consumeRoutineCharacteristics();
-    final block = _parseRoutineBody();
+    final RoutineBlock block;
+    if (_matchWord('IS') || _matchWord('AS')) {
+      // Oracle PL/SQL: declarations between IS/AS and BEGIN, then the body.
+      final decls = _parsePlsqlDeclarations();
+      block = _parsePlsqlBody(decls);
+    } else {
+      // MySQL: optional characteristics, then a BEGIN … END block.
+      _consumeRoutineCharacteristics();
+      block = _parseRoutineBody();
+    }
     return CreateProcedureStmt(
       StoredRoutine(name, params, block,
           isFunction: isFunction, returnType: returnType),
+      orReplace: orReplace,
     );
   }
 
@@ -1485,6 +1534,7 @@ class Parser {
         depth--;
       } else if (depth == 0) {
         if (t.type == TokType.punct && (t.text == ';' || t.text == ',')) break;
+        if (t.type == TokType.op && t.text == '..') break; // PL/SQL FOR range
         if ((t.type == TokType.keyword || t.type == TokType.ident) &&
             stopUpper.contains(t.upper)) {
           break;
@@ -1517,6 +1567,202 @@ class Parser {
       _expect(TokType.punct, ')');
     }
     return CallStmt(name, args);
+  }
+
+  // ---- PL/SQL (Oracle anonymous blocks & routine bodies) ------------------
+  PlsqlBlockStmt _parsePlsqlBlock() {
+    final decls = <RoutineDecl>[];
+    if (_matchWord('DECLARE')) decls.addAll(_parsePlsqlDeclarations());
+    final block = _parsePlsqlBody(decls);
+    return PlsqlBlockStmt(block);
+  }
+
+  /// Parse PL/SQL declarations (`name [CONSTANT] type [:= expr | DEFAULT expr];`)
+  /// up to the `BEGIN` that opens the executable section.
+  List<RoutineDecl> _parsePlsqlDeclarations() {
+    final decls = <RoutineDecl>[];
+    while (!_checkWord('BEGIN') && !_isAtEnd()) {
+      final name = _expectIdent().text;
+      _matchWord('CONSTANT');
+      _consumeRoutineType();
+      _matchKw('NOT') && _matchKw('NULL'); // tolerated, not enforced
+      String? init;
+      if (_check(TokType.op, ':=')) {
+        _advance();
+        init = _captureRoutineExpr(const {});
+      } else if (_matchKw('DEFAULT')) {
+        init = _captureRoutineExpr(const {});
+      }
+      _match(TokType.punct, ';');
+      decls.add(RoutineDecl(name, initSql: init));
+    }
+    return decls;
+  }
+
+  RoutineBlock _parsePlsqlBody(List<RoutineDecl> decls) {
+    _expectWord('BEGIN');
+    final body = <RoutineStmt>[];
+    while (!_checkWord('END') && !_checkWord('EXCEPTION') && !_isAtEnd()) {
+      final s = _parsePlsqlStmt();
+      if (s != null) body.add(s);
+    }
+    if (_matchWord('EXCEPTION')) {
+      // Exception handlers are not yet executed; skip to the block END.
+      var depth = 0;
+      while (!_isAtEnd()) {
+        if (_checkWord('BEGIN') || _checkWord('CASE')) depth++;
+        if (_checkWord('END')) {
+          if (depth == 0) break;
+          depth--;
+        }
+        _advance();
+      }
+    }
+    _expectWord('END');
+    if (_check(TokType.ident)) _advance(); // optional end name
+    _match(TokType.punct, ';');
+    return RoutineBlock(body, declarations: decls);
+  }
+
+  RoutineStmt? _parsePlsqlStmt() {
+    if (_checkWord('DECLARE') || _checkWord('BEGIN')) {
+      final nested = <RoutineDecl>[];
+      if (_matchWord('DECLARE')) nested.addAll(_parsePlsqlDeclarations());
+      return _parsePlsqlBody(nested);
+    }
+    if (_matchWord('NULL')) {
+      _match(TokType.punct, ';');
+      return null;
+    }
+    if (_matchWord('IF')) return _parsePlsqlIf();
+    if (_matchWord('WHILE')) return _parsePlsqlWhile();
+    if (_matchWord('FOR')) return _parsePlsqlFor();
+    if (_matchWord('LOOP')) {
+      final body = _parsePlsqlStmtsUntil({'END'});
+      _expectWord('END');
+      _expectWord('LOOP');
+      if (_check(TokType.ident)) _advance();
+      _match(TokType.punct, ';');
+      return RoutineLoop(body);
+    }
+    if (_matchWord('EXIT')) {
+      if (_check(TokType.ident) && !_checkWord('WHEN')) _advance(); // label
+      String? when;
+      if (_matchWord('WHEN')) when = _captureRoutineExpr(const {});
+      _match(TokType.punct, ';');
+      return RoutineExit(whenSql: when);
+    }
+    if (_matchWord('RETURN')) {
+      if (_match(TokType.punct, ';')) return RoutineReturn();
+      final e = _captureRoutineExpr(const {});
+      _match(TokType.punct, ';');
+      return RoutineReturn(exprSql: e);
+    }
+    // Assignment: `name := expr;`.
+    if (_check(TokType.ident) &&
+        _peek(1).type == TokType.op &&
+        _peek(1).text == ':=') {
+      final target = _advance().text;
+      _advance(); // :=
+      final e = _captureRoutineExpr(const {});
+      _match(TokType.punct, ';');
+      return RoutineAssign(target, e);
+    }
+    // DBMS_OUTPUT.PUT_LINE(expr);
+    if (_check(TokType.ident) &&
+        _peek().upper == 'DBMS_OUTPUT' &&
+        _peek(1).type == TokType.punct &&
+        _peek(1).text == '.') {
+      _advance(); // DBMS_OUTPUT
+      _advance(); // .
+      _advance(); // PUT_LINE (or PUT)
+      _expect(TokType.punct, '(');
+      final arg = _captureRoutineExpr(const {});
+      _expect(TokType.punct, ')');
+      _match(TokType.punct, ';');
+      return RoutinePrint(arg);
+    }
+    if (_checkWord('SELECT') ||
+        _checkWord('INSERT') ||
+        _checkWord('UPDATE') ||
+        _checkWord('DELETE') ||
+        _checkWord('MERGE')) {
+      return _parseRoutineEmbedded();
+    }
+    // Otherwise a procedure call: `proc(args);` or `proc;`.
+    return _parsePlsqlCall();
+  }
+
+  RoutineStmt _parsePlsqlIf() {
+    final branches = <RoutineBranch>[
+      RoutineBranch(_captureRoutineExpr({'THEN'}), _plsqlThen())
+    ];
+    while (_matchWord('ELSIF')) {
+      branches.add(RoutineBranch(_captureRoutineExpr({'THEN'}), _plsqlThen()));
+    }
+    var elseBody = const <RoutineStmt>[];
+    if (_matchWord('ELSE')) {
+      elseBody = _parsePlsqlStmtsUntil({'END'});
+    }
+    _expectWord('END');
+    _expectWord('IF');
+    _match(TokType.punct, ';');
+    return RoutineIf(branches, elseBody: elseBody);
+  }
+
+  List<RoutineStmt> _plsqlThen() {
+    _expectWord('THEN');
+    return _parsePlsqlStmtsUntil({'ELSIF', 'ELSE', 'END'});
+  }
+
+  RoutineStmt _parsePlsqlWhile() {
+    final cond = _captureRoutineExpr({'LOOP'});
+    _expectWord('LOOP');
+    final body = _parsePlsqlStmtsUntil({'END'});
+    _expectWord('END');
+    _expectWord('LOOP');
+    if (_check(TokType.ident)) _advance();
+    _match(TokType.punct, ';');
+    return RoutineWhile(cond, body);
+  }
+
+  RoutineStmt _parsePlsqlFor() {
+    final varName = _expectIdent().text;
+    _expectWord('IN');
+    final reverse = _matchWord('REVERSE');
+    final lower = _captureRoutineExpr(const {}); // stops at the `..` op
+    _expect(TokType.op, '..');
+    final upper = _captureRoutineExpr({'LOOP'});
+    _expectWord('LOOP');
+    final body = _parsePlsqlStmtsUntil({'END'});
+    _expectWord('END');
+    _expectWord('LOOP');
+    if (_check(TokType.ident)) _advance();
+    _match(TokType.punct, ';');
+    return RoutineForNumeric(varName, lower, upper, body, reverse: reverse);
+  }
+
+  RoutineStmt _parsePlsqlCall() {
+    final startOff = _peek().offset;
+    var depth = 0;
+    while (!_isAtEnd() && !(depth == 0 && _check(TokType.punct, ';'))) {
+      final t = _peek();
+      if (t.type == TokType.punct && t.text == '(') depth++;
+      if (t.type == TokType.punct && t.text == ')') depth--;
+      _advance();
+    }
+    final sql = _sliceRoutine(startOff, _peek().offset);
+    _match(TokType.punct, ';');
+    return RoutineSql('CALL $sql');
+  }
+
+  List<RoutineStmt> _parsePlsqlStmtsUntil(Set<String> stops) {
+    final out = <RoutineStmt>[];
+    while (!_isAtEnd() && !stops.contains(_peek().upper)) {
+      final s = _parsePlsqlStmt();
+      if (s != null) out.add(s);
+    }
+    return out;
   }
 
   // ---- ALTER --------------------------------------------------------------

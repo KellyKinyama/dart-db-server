@@ -185,6 +185,12 @@ class CallStmt extends Statement {
   CallStmt(this.name, this.args);
 }
 
+/// An Oracle PL/SQL anonymous block: `[DECLARE …] BEGIN … END;`.
+class PlsqlBlockStmt extends Statement {
+  final RoutineBlock block;
+  PlsqlBlockStmt(this.block);
+}
+
 /// `MERGE INTO target [alias] USING {table|(subquery)} [alias] ON (cond)
 /// [WHEN MATCHED THEN UPDATE SET ... [WHERE c]]
 /// [WHEN NOT MATCHED THEN INSERT (cols) VALUES (exprs) [WHERE c]]`.
