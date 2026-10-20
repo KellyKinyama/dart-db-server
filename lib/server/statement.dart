@@ -161,6 +161,44 @@ class DropSequenceStmt extends Statement {
   DropSequenceStmt(this.name, {this.ifExists = false});
 }
 
+/// `MERGE INTO target [alias] USING {table|(subquery)} [alias] ON (cond)
+/// [WHEN MATCHED THEN UPDATE SET ... [WHERE c]]
+/// [WHEN NOT MATCHED THEN INSERT (cols) VALUES (exprs) [WHERE c]]`.
+class MergeStmt extends Statement {
+  final String targetTable;
+  final String? targetAlias;
+
+  /// Exactly one of [sourceTable] / [sourceSubquery] is non-null.
+  final String? sourceTable;
+  final SelectStmt? sourceSubquery;
+  final String? sourceAlias;
+  final Expr onCondition;
+
+  /// WHEN MATCHED THEN UPDATE SET ... (null when the clause is absent).
+  final Map<String, Expr>? matchedAssignments;
+  final Expr? matchedWhere;
+
+  /// WHEN NOT MATCHED THEN INSERT ... (null when the clause is absent).
+  /// [insertColumns] may be null to mean "all target columns in order".
+  final List<String>? insertColumns;
+  final List<Expr>? insertValues;
+  final Expr? notMatchedWhere;
+
+  MergeStmt({
+    required this.targetTable,
+    this.targetAlias,
+    this.sourceTable,
+    this.sourceSubquery,
+    this.sourceAlias,
+    required this.onCondition,
+    this.matchedAssignments,
+    this.matchedWhere,
+    this.insertColumns,
+    this.insertValues,
+    this.notMatchedWhere,
+  });
+}
+
 /// Conflict-resolution mode for INSERT.
 enum InsertMode { normal, orReplace, orIgnore }
 

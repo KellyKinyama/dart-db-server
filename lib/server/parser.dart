@@ -96,6 +96,16 @@ class Parser {
   /// alias in `FROM t FETCH FIRST ...`.
   bool _isClauseStartWord() => _checkWord('FETCH');
 
+  /// Like [_expect] but for a bareword matched by uppercased text (keyword or
+  /// identifier), e.g. the non-reserved words in MERGE (USING, MATCHED, ...).
+  Token _expectWord(String upper) {
+    if (_checkWord(upper)) return _advance();
+    final got = _peek();
+    throw FormatException(
+      'Expected $upper but got "${got.text}" at offset ${got.offset}',
+    );
+  }
+
   Token _expect(TokType t, [String? text]) {
     if (_check(t, text)) return _advance();
     final got = _peek();
@@ -282,6 +292,7 @@ class Parser {
           return DetachDatabaseStmt(_expectName());
       }
     }
+    if (_checkWord('MERGE')) return _parseMerge();
     throw FormatException('Unsupported statement starting with "${t.text}"');
   }
 
@@ -1382,6 +1393,101 @@ class Parser {
   }
 
   // ---- UPDATE -------------------------------------------------------------
+  // ---- MERGE --------------------------------------------------------------
+  MergeStmt _parseMerge() {
+    _expectWord('MERGE');
+    _expectKw('INTO');
+    final target = _expectIdent().text;
+    String? targetAlias;
+    if (_matchKw('AS')) {
+      targetAlias = _expectName();
+    } else if (_check(TokType.ident) && !_checkKw('USING')) {
+      targetAlias = _advance().text;
+    }
+    _expectWord('USING');
+    String? sourceTable;
+    SelectStmt? sourceSub;
+    if (_match(TokType.punct, '(')) {
+      sourceSub = _parseSelect();
+      _expect(TokType.punct, ')');
+    } else {
+      sourceTable = _parseQualifiedTableName();
+    }
+    String? sourceAlias;
+    if (_matchKw('AS')) {
+      sourceAlias = _expectName();
+    } else if (_check(TokType.ident) && !_checkKw('ON')) {
+      sourceAlias = _advance().text;
+    }
+    _expectKw('ON');
+    // ON condition is typically parenthesised; accept both.
+    final Expr on;
+    if (_match(TokType.punct, '(')) {
+      on = _parseExpr();
+      _expect(TokType.punct, ')');
+    } else {
+      on = _parseExpr();
+    }
+
+    Map<String, Expr>? matchedAssignments;
+    Expr? matchedWhere;
+    List<String>? insertColumns;
+    List<Expr>? insertValues;
+    Expr? notMatchedWhere;
+
+    while (_matchKw('WHEN')) {
+      final notMatched = _matchKw('NOT');
+      _expectWord('MATCHED');
+      _expectKw('THEN');
+      if (notMatched) {
+        _expectWord('INSERT');
+        if (_match(TokType.punct, '(')) {
+          insertColumns = <String>[_expectName()];
+          while (_match(TokType.punct, ',')) {
+            insertColumns.add(_expectName());
+          }
+          _expect(TokType.punct, ')');
+        }
+        _expectKw('VALUES');
+        _expect(TokType.punct, '(');
+        insertValues = <Expr>[_parseExpr()];
+        while (_match(TokType.punct, ',')) {
+          insertValues.add(_parseExpr());
+        }
+        _expect(TokType.punct, ')');
+        if (_matchKw('WHERE')) notMatchedWhere = _parseExpr();
+      } else {
+        _expectKw('UPDATE');
+        _expectKw('SET');
+        matchedAssignments = <String, Expr>{};
+        do {
+          final col = _expectIdent().text;
+          _expect(TokType.op, '=');
+          matchedAssignments[col] = _parseExpr();
+        } while (_match(TokType.punct, ','));
+        if (_matchKw('WHERE')) matchedWhere = _parseExpr();
+      }
+    }
+    if (matchedAssignments == null && insertValues == null) {
+      throw const FormatException(
+        'MERGE requires at least one WHEN MATCHED or WHEN NOT MATCHED clause',
+      );
+    }
+    return MergeStmt(
+      targetTable: target,
+      targetAlias: targetAlias,
+      sourceTable: sourceTable,
+      sourceSubquery: sourceSub,
+      sourceAlias: sourceAlias,
+      onCondition: on,
+      matchedAssignments: matchedAssignments,
+      matchedWhere: matchedWhere,
+      insertColumns: insertColumns,
+      insertValues: insertValues,
+      notMatchedWhere: notMatchedWhere,
+    );
+  }
+
   UpdateStmt _parseUpdate() {
     _expectKw('UPDATE');
     final table = _expectIdent().text;

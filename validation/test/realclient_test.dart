@@ -131,6 +131,39 @@ void main() {
     expect(r.rows[0][1], 'a');
   });
 
+  test('MERGE upserts for a real client', () async {
+    final db = await Database.open(null);
+    await db.execute(
+      'CREATE TABLE accounts (id INTEGER PRIMARY KEY, bal INTEGER)',
+    );
+    await db.execute('INSERT INTO accounts VALUES (1, 100)');
+    await db.execute(
+      'CREATE TABLE deltas (id INTEGER PRIMARY KEY, bal INTEGER)',
+    );
+    await db.execute('INSERT INTO deltas VALUES (1, 50)');
+    await db.execute('INSERT INTO deltas VALUES (2, 70)');
+    final server = await _startServer(db);
+    addTearDown(() async => server.stop());
+
+    final conn = await OracleConnection.connect(
+      '127.0.0.1:${server.boundPort}/DARTDB',
+      user: 'testuser',
+      password: 'testpassword',
+    );
+    addTearDown(() async => conn.close());
+
+    await conn.execute('''
+      MERGE INTO accounts a USING deltas d ON (a.id = d.id)
+      WHEN MATCHED THEN UPDATE SET bal = a.bal + d.bal
+      WHEN NOT MATCHED THEN INSERT (id, bal) VALUES (d.id, d.bal)
+    ''');
+    final r = await conn.execute('SELECT id, bal FROM accounts ORDER BY id');
+    expect(r.rows.map((row) => row.toList()).toList(), [
+      [1, 150],
+      [2, 70],
+    ]);
+  });
+
   test('a wrong password is rejected', () async {
     final db = await Database.open(null);
     final server = await _startServer(db);

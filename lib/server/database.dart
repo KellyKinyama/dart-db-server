@@ -2373,6 +2373,8 @@ class Database implements SequenceProvider {
         result = _createSequence(stmt);
       } else if (stmt is DropSequenceStmt) {
         result = _dropSequence(stmt);
+      } else if (stmt is MergeStmt) {
+        result = _merge(stmt);
       } else if (stmt is InsertStmt) {
         result = _insert(stmt);
       } else if (stmt is SelectStmt) {
@@ -2457,6 +2459,7 @@ class Database implements SequenceProvider {
       s is DropViewStmt ||
       s is CreateSequenceStmt ||
       s is DropSequenceStmt ||
+      s is MergeStmt ||
       s is InsertStmt ||
       s is UpdateStmt ||
       s is DeleteStmt ||
@@ -4817,6 +4820,141 @@ class Database implements SequenceProvider {
 
   @override
   int sequenceCurrval(String name) => _lookupSequence(name).current(name);
+
+  // ---------------------------------------------------------------------------
+  // MERGE
+  // ---------------------------------------------------------------------------
+
+  QueryResult _merge(MergeStmt s) {
+    final t = _requireTable(s.targetTable);
+
+    // Materialize the source rows as maps keyed by both the bare column name
+    // and the source alias (so the ON condition and SET/INSERT expressions can
+    // reference either).
+    final List<Map<String, Object?>> sourceRows;
+    if (s.sourceSubquery != null) {
+      final res = _selectTopLevel(s.sourceSubquery!);
+      sourceRows = [
+        for (final row in res.rows)
+          {
+            for (var i = 0; i < res.columns.length; i++) ...{
+              res.columns[i]: row[i],
+              if (s.sourceAlias != null)
+                '${s.sourceAlias}.${res.columns[i]}': row[i],
+            },
+          },
+      ];
+    } else {
+      sourceRows = _materializeRelation(s.sourceTable!, s.sourceAlias);
+    }
+
+    final on = _bindExpr(s.onCondition);
+    final matchedWhere =
+        s.matchedWhere == null ? null : _bindExpr(s.matchedWhere!);
+    final notMatchedWhere =
+        s.notMatchedWhere == null ? null : _bindExpr(s.notMatchedWhere!);
+    final boundAssignments = s.matchedAssignments?.map(
+      (col, expr) => MapEntry(col, _bindExpr(expr)),
+    );
+
+    var updated = 0;
+    var inserted = 0;
+
+    // Rows to insert are accumulated and applied after the matched pass so
+    // newly inserted rows can't match a later source row (Oracle semantics).
+    final toInsert = <List<Object?>>[];
+
+    for (final srow in sourceRows) {
+      // Find the first target row satisfying ON, building a combined view of
+      // target columns (bare, real-name- and alias-qualified) plus the source
+      // columns already present in [srow].
+      int? matchIdx;
+      Map<String, Object?>? matchedView;
+      for (var ri = 0; ri < t.rows.length; ri++) {
+        final view = <String, Object?>{
+          ...srow,
+          ...t.rowToMap(t.rows[ri], alias: s.targetAlias),
+        };
+        if (evalPredicate(on, view)) {
+          matchIdx = ri;
+          matchedView = view;
+          break;
+        }
+      }
+
+      if (matchIdx != null) {
+        if (boundAssignments == null) continue; // no WHEN MATCHED clause
+        if (matchedWhere != null &&
+            !evalPredicate(matchedWhere, matchedView!)) {
+          continue;
+        }
+        final row = t.rows[matchIdx];
+        final old = List<Object?>.from(row);
+        _fireTriggers(t.name, 'UPDATE', 'BEFORE',
+            oldRow: old, newRow: row, sourceTable: t);
+        boundAssignments.forEach((col, expr) {
+          final colIdx = t.columnIndex(col);
+          if (t.columns[colIdx].generatedExprSql != null) {
+            throw StateError(
+              'cannot UPDATE generated column "${t.columns[colIdx].name}"',
+            );
+          }
+          row[colIdx] = coerceForColumn(
+            _evalScalar(expr, matchedView!),
+            t.columns[colIdx],
+            strict: t.strict,
+          );
+        });
+        _captureVectorRowUpdate(t.name, matchIdx);
+        _evaluateGenerated(t, row);
+        _enforceChecks(t, row);
+        _enforceVectorDims(t, row);
+        _enforceForeignKeysOnInsert(t, row);
+        _cascadeOnUpdate(t, old, row);
+        _fireTriggers(t.name, 'UPDATE', 'AFTER',
+            oldRow: old, newRow: row, sourceTable: t);
+        _recordChange(t, 'UPDATE', old, row);
+        updated++;
+      } else if (s.insertValues != null) {
+        if (notMatchedWhere != null && !evalPredicate(notMatchedWhere, srow)) {
+          continue;
+        }
+        // Map the INSERT column list (or all target columns) to evaluated
+        // source-row values, filling defaults for unlisted columns.
+        final cols = s.insertColumns ?? [for (final c in t.columns) c.name];
+        final built = <String, Object?>{};
+        for (var i = 0; i < cols.length; i++) {
+          built[cols[i]] = _evalScalar(_bindExpr(s.insertValues![i]), srow);
+        }
+        final newRow = <Object?>[];
+        for (final c in t.columns) {
+          newRow.add(built.containsKey(c.name) ? built[c.name] : null);
+        }
+        toInsert.add(newRow);
+      }
+    }
+
+    // Apply the collected inserts through the normal INSERT path so all
+    // constraints, indexes, defaults and triggers are enforced.
+    for (final values in toInsert) {
+      final insert = InsertStmt(
+        s.targetTable,
+        [for (final c in t.columns) c.name],
+        [
+          [for (final v in values) LiteralExpr(v)],
+        ],
+      );
+      _insert(insert);
+      inserted++;
+    }
+
+    if (updated > 0) _rebuildIndexes(t);
+    final affected = updated + inserted;
+    return QueryResult.message(
+      '$affected row(s) merged ($updated updated, $inserted inserted)',
+      affected: affected,
+    );
+  }
 
   // ---------------------------------------------------------------------------
   // INSERT / REPLACE
