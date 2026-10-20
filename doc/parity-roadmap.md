@@ -28,8 +28,8 @@ Effort is relative, not calendar-based:
 | --- | --- | --- | --- | --- | --- |
 | G1 | `ROWNUM` nested in a scalar expression | Oracle/engine | S | low | ✅ done |
 | G2 | `seq.NEXTVAL` once-per-row guarantee | Oracle/engine | S | low | ✅ done |
-| G3 | Stale `mysql_wire.dart` header comment | MySQL/docs | S | none | ◻ |
-| G4 | `NCLOB` (UTF-16 CLOB) | Oracle wire | M | low | ◻ |
+| G3 | Stale `mysql_wire.dart` header comment | MySQL/docs | S | none | ✅ done |
+| G4 | `NCLOB` (UTF-16 CLOB) | Oracle wire | M | low | ✅ done |
 | G5 | `INSERT ALL` / `INSERT FIRST` (multi-table insert) | Oracle | M | low | ✅ done |
 | G6 | `CONNECT BY` hierarchical queries | Oracle | M | medium | ✅ done |
 | G7 | Catalog / data-dictionary views (`INFORMATION_SCHEMA`, `USER_*`/`ALL_*`) | both | M | low | ◻ |
@@ -65,13 +65,13 @@ Oracle guarantees one advance per row.
   boundary in the INSERT/SELECT executors.
 - **Done when:** `SELECT s.NEXTVAL, s.NEXTVAL FROM dual` yields two equal values.
 
-### G3 · Correct the `mysql_wire.dart` header comment — **S**
+### G3 · Correct the `mysql_wire.dart` header comment — **S** — ✅ done
 The doc comment still lists prepared statements, TLS, and
 `caching_sha2_password` as TODO, though all three are implemented and tested.
 - **Done when:** the comment reflects the real scope and lists only compression
   + X protocol as remaining gaps.
 
-### G4 · `NCLOB` — **M**
+### G4 · `NCLOB` — **M** — ✅ done
 Completes the LOB story (`CLOB`/`BLOB` already work).
 - **Sketch:** thread the character-set-form (`csfrm = NChar`) through
   describe/bind/fetch in [`oracle_execute.dart`](../lib/server/oracle_execute.dart)

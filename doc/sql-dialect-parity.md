@@ -64,8 +64,8 @@ standard / Oracle 12c+), and `WHERE ROWNUM <= n` (Oracle legacy).
 | `MERGE INTO … USING … ON …` | ✅ | `WHEN MATCHED THEN UPDATE [WHERE]`, `WHEN NOT MATCHED THEN INSERT [WHERE]`, table or subquery source |
 | `(+)` outer-join operator | ✅ | comma joins → CROSS; `(+)` rewrites to LEFT/RIGHT (3+-table chains best-effort) |
 | `FETCH FIRST … ROWS ONLY` / `OFFSET … ROWS` | ✅ | `WITH TIES` ≈ `ONLY` |
-| `CONNECT BY` hierarchical queries | ❌ | not supported |
-| `INSERT ALL` / multi-table insert | ❌ | not supported |
+| `CONNECT BY` hierarchical queries | ✅ | `PRIOR`, `LEVEL`, `CONNECT_BY_ISLEAF`, `START WITH`, `ORDER SIBLINGS BY`, cycle guard (`SYS_CONNECT_BY_PATH` / `CONNECT_BY_ROOT` deferred) |
+| `INSERT ALL` / `INSERT FIRST` multi-table insert | ✅ | unconditional, conditional `WHEN`/`ELSE`, `INTO` without `VALUES` |
 
 ### Scalar idioms & functions
 `SYSDATE`, `SYSTIMESTAMP`, `TO_CHAR` (format model accepted, not interpreted),
@@ -83,7 +83,7 @@ typed literals `DATE '…'` / `TIMESTAMP '…'`.
 | `CLOB` / `BLOB` | ✅ (temp-LOB locator) | ✅ (column locator + inline prefetch) |
 | `JSON` (native OSON, 21c+/23ai) | ✅ | ✅ (rich scalars: date/bytes, v3 long names) |
 | `VECTOR` (23ai) — dense / binary / sparse | ✅ | ✅ (dense via wire; binary/sparse in-memory) |
-| `NCLOB` | ❌ | ❌ (UTF-16 CLOB — deferred) |
+| `NCLOB` (national-charset CLOB) | ✅ (UTF-16BE) | ✅ (csfrm=2 + national locator flag) |
 
 ---
 
@@ -123,14 +123,12 @@ The engine ships capabilities neither stock Oracle nor MySQL expose the same way
 
 ## 6. Known gaps & non-goals
 
-- **Oracle:** `CONNECT BY`, `INSERT ALL`, `NCLOB`, PL/SQL blocks, real-client
-  TLS (client-SDK bug, not server).
+- **Oracle:** PL/SQL blocks; `SYS_CONNECT_BY_PATH` / `CONNECT_BY_ROOT` (the rest
+  of `CONNECT BY` is supported); real-client TLS (client-SDK bug, not server).
 - **MySQL:** X protocol, wire compression, stored procedures, full
   `INFORMATION_SCHEMA`.
-- **Engine quirks:** `ROWNUM` nested inside a larger scalar expression (e.g.
-  `'r' || ROWNUM`) is unsupported (window calls only evaluate at the top level
-  of a projection item); multiple `seq.NEXTVAL` references in one row advance
-  per reference rather than once per row.
+- **Engine quirks:** `(+)` RIGHT joins on 3+-table chains null the whole
+  accumulated left side (best-effort vs Oracle's per-table semantics).
 
 ---
 
