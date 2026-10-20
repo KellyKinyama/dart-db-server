@@ -12,9 +12,10 @@
 ///     `COM_STATISTICS`, `COM_FIELD_LIST`.
 ///   * `COM_STMT_PREPARE/EXECUTE/CLOSE/RESET` (binary-protocol result sets).
 ///   * `CLIENT_MULTI_STATEMENTS` (one result set per statement).
+///   * `CLIENT_COMPRESS` (zlib) compressed-packet framing.
 ///
 /// Not yet supported (clients that demand these get an ERR packet):
-///   * Protocol compression (`CLIENT_COMPRESS`, zstd).
+///   * `zstd` compression (only zlib is advertised).
 ///   * The X protocol (DevAPI, port 33060).
 library;
 
@@ -40,6 +41,7 @@ class _Cap {
   static const foundRows = 0x00000002;
   static const longFlag = 0x00000004;
   static const connectWithDb = 0x00000008;
+  static const compress = 0x00000020;
   static const protocol41 = 0x00000200;
   static const transactions = 0x00002000;
   static const secureConnection = 0x00008000;
@@ -163,6 +165,19 @@ class _Conn {
   bool _tlsActive = false;
   int _clientCaps = 0;
 
+  /// zlib compression (`CLIENT_COMPRESS`) negotiated in the handshake. Once
+  /// active, every exchange is wrapped in a compressed-packet frame (7-byte
+  /// header) and reply packets are buffered into [_out] until the current
+  /// command is fully handled, then emitted as one or more compressed packets.
+  bool _compress = false;
+  int _compressedSeq = 0;
+  final BytesBuilder _compIn = BytesBuilder(copy: false);
+  final BytesBuilder _out = BytesBuilder(copy: false);
+
+  /// Payloads shorter than this are stored uncompressed (`uncompLen == 0`),
+  /// matching the MySQL server's compression threshold.
+  static const int _minCompressLen = 50;
+
   bool get _deprecateEof => (_clientCaps & _Cap.deprecateEof) != 0;
 
   /// Did the client negotiate CLIENT_MULTI_STATEMENTS? When set, a single
@@ -193,20 +208,105 @@ class _Conn {
   }
 
   Future<void> close() async {
+    if (_compress) _flushCompressed();
     await _sub?.cancel();
     await socket.close();
     server._conns.remove(this);
   }
 
   void _onData(List<int> chunk) {
-    _in.add(chunk);
+    if (_compress) {
+      _compIn.add(chunk);
+    } else {
+      _in.add(chunk);
+    }
     // Try to consume as many full packets as available.
     while (true) {
+      if (_compress && !_drainCompressed()) return;
       final pkt = _tryReadPacket();
       if (pkt == null) return;
+      final wasCompressed = _compress;
       // unawaited; errors are reported as ERR packets inside.
       _handlePacket(pkt);
+      // If compression was just negotiated while handling this packet, any
+      // bytes still buffered as plain packets are actually compressed frames
+      // (a client that pipelined its first command): move them across.
+      if (!wasCompressed && _compress && _in.length > 0) {
+        final leftover = _in.toBytes();
+        _in.clear();
+        _compIn.add(leftover);
+      }
     }
+  }
+
+  /// Decompresses whole compressed-packet frames from [_compIn] into the plain
+  /// [_in] buffer. Returns false only if more raw bytes are still needed.
+  bool _drainCompressed() {
+    while (true) {
+      final buf = _compIn.toBytes();
+      if (buf.length < 7) return true;
+      final compLen = buf[0] | (buf[1] << 8) | (buf[2] << 16);
+      final compSeq = buf[3];
+      final uncompLen = buf[4] | (buf[5] << 8) | (buf[6] << 16);
+      if (buf.length < 7 + compLen) return true;
+      final body = Uint8List.sublistView(buf, 7, 7 + compLen);
+      final rest = buf.length > 7 + compLen
+          ? Uint8List.fromList(Uint8List.sublistView(buf, 7 + compLen))
+          : null;
+      _compIn.clear();
+      if (rest != null) _compIn.add(rest);
+      // uncompLen == 0 means the body was stored uncompressed.
+      final inner = uncompLen == 0
+          ? Uint8List.fromList(body)
+          : Uint8List.fromList(zlib.decode(body));
+      _in.add(inner);
+      // The next compressed packet we send continues from the client's seq.
+      _compressedSeq = (compSeq + 1) & 0xff;
+    }
+  }
+
+  /// Wraps the buffered reply packets in [_out] into one or more compressed
+  /// packets and writes them to the socket.
+  void _flushCompressed() {
+    final inner = _out.toBytes();
+    _out.clear();
+    if (inner.isEmpty) return;
+    const maxChunk = 0xffffff;
+    var off = 0;
+    while (off < inner.length) {
+      final end = (off + maxChunk < inner.length) ? off + maxChunk : inner.length;
+      _emitCompressed(Uint8List.sublistView(inner, off, end));
+      off = end;
+    }
+  }
+
+  void _emitCompressed(Uint8List inner) {
+    Uint8List body;
+    int uncompLen;
+    if (inner.length < _minCompressLen) {
+      body = inner;
+      uncompLen = 0;
+    } else {
+      final deflated = Uint8List.fromList(zlib.encode(inner));
+      if (deflated.length < inner.length) {
+        body = deflated;
+        uncompLen = inner.length;
+      } else {
+        body = inner;
+        uncompLen = 0;
+      }
+    }
+    final header = Uint8List(7);
+    header[0] = body.length & 0xff;
+    header[1] = (body.length >> 8) & 0xff;
+    header[2] = (body.length >> 16) & 0xff;
+    header[3] = _compressedSeq & 0xff;
+    _compressedSeq = (_compressedSeq + 1) & 0xff;
+    header[4] = uncompLen & 0xff;
+    header[5] = (uncompLen >> 8) & 0xff;
+    header[6] = (uncompLen >> 16) & 0xff;
+    socket.add(header);
+    socket.add(body);
   }
 
   ({Uint8List payload, int seq})? _tryReadPacket() {
@@ -248,6 +348,7 @@ class _Conn {
     } catch (e) {
       _sendErr(1064, '42000', e.toString());
     }
+    if (_compress) _flushCompressed();
   }
 
   /// An SSLRequest packet is a HandshakeResponse41 truncated after the
@@ -307,6 +408,7 @@ class _Conn {
         _Cap.foundRows |
         _Cap.longFlag |
         _Cap.connectWithDb |
+        _Cap.compress |
         _Cap.protocol41 |
         _Cap.transactions |
         _Cap.secureConnection |
@@ -333,6 +435,9 @@ class _Conn {
     final p = _PacketReader(payload);
     final clientCaps = p.u32();
     _clientCaps = clientCaps;
+    // Enable zlib compression now (before the auth result) so the OK/ERR and
+    // every subsequent packet are wrapped in compressed frames.
+    _compress = (clientCaps & _Cap.compress) != 0;
     p.u32(); // max packet
     p.u8(); // charset
     p.skip(23);
@@ -916,8 +1021,13 @@ class _Conn {
     header[1] = (len >> 8) & 0xff;
     header[2] = (len >> 16) & 0xff;
     header[3] = s & 0xff;
-    socket.add(header);
-    socket.add(payload);
+    if (_compress) {
+      _out.add(header);
+      _out.add(payload);
+    } else {
+      socket.add(header);
+      socket.add(payload);
+    }
   }
 
   static final _rng = Random.secure();

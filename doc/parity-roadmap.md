@@ -177,13 +177,19 @@ Sequenced sub-phases so value lands incrementally:
 ## Phase 4 — Protocol depth
 
 ### G9 · MySQL wire compression — **M**
-`CLIENT_COMPRESS` (zlib) and the modern `zstd` compression capability.
-- **Sketch:** wrap the packet reader/writer in
-  [`mysql_wire.dart`](../lib/server/mysql_wire.dart) with a compressed-packet
-  framing layer (3-byte compressed length, seq, 3-byte uncompressed length)
-  negotiated from the client capability flags; `package:archive` for zlib.
-- **Done when:** a client connecting with compression enabled round-trips large
-  result sets; uncompressed clients are unaffected.
+`CLIENT_COMPRESS` (zlib) ✅ done — the packet reader/writer in
+[`mysql_wire.dart`](../lib/server/mysql_wire.dart) negotiates `CLIENT_COMPRESS`
+from the handshake and, once active, wraps every exchange in the compressed
+7-byte frame (3-byte compressed length, seq, 3-byte uncompressed length). Reply
+packets for a command are buffered and emitted as one or more compressed frames;
+payloads under 50 bytes (or that don't shrink) are stored uncompressed
+(`uncompLen == 0`), and the inbound stream is inflated before the normal packet
+parser runs. Uncompressed clients are unaffected. `zstd` is **not** advertised
+(no pure-Dart zstd); clients fall back to zlib or no compression.
+- **Done when:** ~~a client connecting with compression enabled round-trips large
+  result sets; uncompressed clients are unaffected.~~ ✅ validated in
+  [`mysql_wire_test.dart`](../test/mysql_wire_test.dart) (compressed handshake +
+  COM_QUERY round-trip, asserting at least one reply frame is zlib-deflated).
 
 ### G10 · Real-client Oracle TLS — **M, partly external**
 Server-side TLS exists; the real `oracledb` thin client's `upgradeToTls` uses

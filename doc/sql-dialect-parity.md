@@ -29,7 +29,7 @@ dialects disagree on syntax, the parser accepts all of the common spellings.
 | Large-SDU framing | ✅ (TNS ≥ 315, 4-byte DATA length) | n/a |
 | LOB streaming | ✅ temp LOBs, chunked transfer, `ttcLobOp` | n/a (values inline) |
 | Multi-statement | n/a | ✅ `CLIENT_MULTI_STATEMENTS` |
-| Compression | ❌ | ❌ |
+| Compression | ❌ | ✅ `CLIENT_COMPRESS` (zlib); `zstd` not advertised |
 | Proprietary extras | — | ❌ X protocol (DevAPI, port 33060) |
 | Real third-party driver test | ✅ `oracledb` (Node) over the wire | ✅ `package:mysql_client` (Dart) |
 
@@ -128,7 +128,7 @@ The engine ships capabilities neither stock Oracle nor MySQL expose the same way
   `%ROWTYPE`/`%FOUND`) — the rest of PL/SQL (blocks, procedures, functions,
   control flow, `SELECT INTO`) is supported; `SYS_CONNECT_BY_PATH` /
   `CONNECT_BY_ROOT`; real-client TLS (client-SDK bug, not server).
-- **MySQL:** X protocol, wire compression, stored procedures, and the rest of
+- **MySQL:** X protocol and the rest of
   `INFORMATION_SCHEMA` (`TABLES`/`COLUMNS`/`SCHEMATA`/`VIEWS` are supported;
   `KEY_COLUMN_USAGE` / `STATISTICS` / constraint views are not yet).
 - **Engine quirks:** `(+)` RIGHT joins on 3+-table chains null the whole
