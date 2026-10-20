@@ -140,10 +140,11 @@ that into a real control-flow interpreter.
 
 Sequenced sub-phases so value lands incrementally:
 
-1. **3a — Procedural core (L).** A block interpreter: local variables,
-   assignment, `IF/ELSIF/ELSE`, `WHILE`/`LOOP`/`FOR`, `RETURN`, and calling the
-   existing `Database.execute` for embedded SQL. Shared AST under a new
-   `routine.dart`.
+1. **3a — Procedural core (L).** ✅ done — a block interpreter: local variables,
+   assignment, `IF/ELSIF/ELSE`, `WHILE`/`LOOP`/`FOR`, `EXIT`, `RETURN`, embedded
+   SQL and `SELECT INTO`, plus an output buffer. Dialect-neutral AST + interpreter
+   in `routine.dart`; `Database.runRoutine` entry point. Expressions/statements
+   are SQL strings with `:name` binds for locals.
 2. **3b — MySQL routines (M).** `DELIMITER` handling in the MySQL front-end,
    `CREATE PROCEDURE`/`CREATE FUNCTION`, `CALL`, `IN`/`OUT`/`INOUT` params,
    `DECLARE`, result-set passthrough. Store routines in a `_routines` catalog.
