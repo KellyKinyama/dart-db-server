@@ -151,10 +151,12 @@ Sequenced sub-phases so value lands incrementally:
    result-set passthrough, `DROP PROCEDURE|FUNCTION`, and `DELIMITER` (no-op).
    Routines live in a `_routines` catalog. (Stored FUNCTIONS in expressions and
    OUT-param `@var` writeback deferred.)
-3. **3c — Oracle PL/SQL (L).** Anonymous `BEGIN … END;` blocks, `CREATE
-   PROCEDURE`/`FUNCTION`, cursors (`OPEN`/`FETCH`/`CLOSE`, `%ROWTYPE`,
-   `%FOUND`), `EXCEPTION … WHEN`, and `DBMS_OUTPUT` capture. Route via the TTC
-   execute path.
+3. **3c — Oracle PL/SQL (L).** ✅ done (blocks + routines) — anonymous
+   `[DECLARE …] BEGIN … END;` blocks and `CREATE [OR REPLACE] PROCEDURE/FUNCTION`
+   (Oracle `IS|AS` form + `name IN|OUT type` params), with `:=`, `IF/ELSIF/ELSE`,
+   `WHILE LOOP`, `FOR i IN [REVERSE] lo..hi LOOP`, `LOOP`+`EXIT [WHEN]`, `RETURN`,
+   `SELECT INTO`, `DBMS_OUTPUT.PUT_LINE` (captured), and nested proc calls.
+   (`EXCEPTION` handlers and cursors `OPEN`/`FETCH`/`CLOSE` deferred.)
 4. **3d — Packages & bind-out (M).** `CREATE PACKAGE`/`BODY`, `OUT` binds over
    both wires, ref-cursor returns from functions (the wire already supports ref
    cursors).

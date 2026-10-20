@@ -65,6 +65,7 @@ standard / Oracle 12c+), and `WHERE ROWNUM <= n` (Oracle legacy).
 | `(+)` outer-join operator | ✅ | comma joins → CROSS; `(+)` rewrites to LEFT/RIGHT (3+-table chains best-effort) |
 | `FETCH FIRST … ROWS ONLY` / `OFFSET … ROWS` | ✅ | `WITH TIES` ≈ `ONLY` |
 | `CONNECT BY` hierarchical queries | ✅ | `PRIOR`, `LEVEL`, `CONNECT_BY_ISLEAF`, `START WITH`, `ORDER SIBLINGS BY`, cycle guard (`SYS_CONNECT_BY_PATH` / `CONNECT_BY_ROOT` deferred) |
+| PL/SQL anonymous blocks + `CREATE PROCEDURE`/`FUNCTION` | ✅ | `DECLARE`/`:=`/`IF`-`ELSIF`/`WHILE`/`FOR lo..hi`/`LOOP`+`EXIT`/`SELECT INTO`/`DBMS_OUTPUT`; `EXCEPTION` + cursors deferred |
 | `INSERT ALL` / `INSERT FIRST` multi-table insert | ✅ | unconditional, conditional `WHEN`/`ELSE`, `INTO` without `VALUES` |
 
 ### Scalar idioms & functions
@@ -123,8 +124,10 @@ The engine ships capabilities neither stock Oracle nor MySQL expose the same way
 
 ## 6. Known gaps & non-goals
 
-- **Oracle:** PL/SQL blocks; `SYS_CONNECT_BY_PATH` / `CONNECT_BY_ROOT` (the rest
-  of `CONNECT BY` is supported); real-client TLS (client-SDK bug, not server).
+- **Oracle:** PL/SQL `EXCEPTION` handlers and cursors (`OPEN`/`FETCH`/`CLOSE`,
+  `%ROWTYPE`/`%FOUND`) — the rest of PL/SQL (blocks, procedures, functions,
+  control flow, `SELECT INTO`) is supported; `SYS_CONNECT_BY_PATH` /
+  `CONNECT_BY_ROOT`; real-client TLS (client-SDK bug, not server).
 - **MySQL:** X protocol, wire compression, stored procedures, and the rest of
   `INFORMATION_SCHEMA` (`TABLES`/`COLUMNS`/`SCHEMATA`/`VIEWS` are supported;
   `KEY_COLUMN_USAGE` / `STATISTICS` / constraint views are not yet).
