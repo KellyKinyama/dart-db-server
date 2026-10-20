@@ -69,6 +69,32 @@ void main() {
     expect(sysdate, matches(r'^\d{4}-\d{2}-\d{2} '));
   });
 
+  test('WHERE ROWNUM <= n limits rows for a real client', () async {
+    final db = await Database.open(null);
+    await db.execute('CREATE TABLE nums (n INTEGER PRIMARY KEY)');
+    for (var i = 1; i <= 10; i++) {
+      await db.execute('INSERT INTO nums VALUES ($i)');
+    }
+    final server = await _startServer(db);
+    addTearDown(() async => server.stop());
+
+    final conn = await OracleConnection.connect(
+      '127.0.0.1:${server.boundPort}/DARTDB',
+      user: 'testuser',
+      password: 'testpassword',
+    );
+    addTearDown(() async => conn.close());
+
+    final r = await conn.execute('SELECT n FROM nums WHERE ROWNUM <= 3');
+    expect(r.rows.map((row) => row[0]).toList(), [1, 2, 3]);
+
+    // Top-N idiom: order in a subquery, cap with ROWNUM.
+    final topN = await conn.execute(
+      'SELECT n FROM (SELECT n FROM nums ORDER BY n DESC) WHERE ROWNUM <= 2',
+    );
+    expect(topN.rows.map((row) => row[0]).toList(), [10, 9]);
+  });
+
   test('a wrong password is rejected', () async {
     final db = await Database.open(null);
     final server = await _startServer(db);

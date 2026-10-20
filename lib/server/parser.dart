@@ -91,6 +91,11 @@ class Parser {
     return false;
   }
 
+  /// True when the current token is a non-reserved word that introduces a
+  /// trailing clause (e.g. `FETCH`) and so must not be mistaken for a table
+  /// alias in `FROM t FETCH FIRST ...`.
+  bool _isClauseStartWord() => _checkWord('FETCH');
+
   Token _expect(TokType t, [String? text]) {
     if (_check(t, text)) return _advance();
     final got = _peek();
@@ -1653,10 +1658,10 @@ class Parser {
           fromTable = _parseQualifiedTableName();
         }
       }
-      if (_check(TokType.ident)) {
-        fromAlias = _advance().text;
-      } else if (_matchKw('AS')) {
+      if (_matchKw('AS')) {
         fromAlias = _expectName();
+      } else if (_check(TokType.ident) && !_isClauseStartWord()) {
+        fromAlias = _advance().text;
       }
       fromIndexHint = _consumeIndexedHint();
       while (true) {
@@ -1859,6 +1864,16 @@ class Parser {
       }
       limit = count;
     }
+    // Oracle ROWNUM pseudo-column used as a row limiter in the WHERE clause,
+    // e.g. `WHERE ROWNUM <= 10`. Rewrite such top-level conjuncts into an
+    // equivalent LIMIT so they flow through the normal row-limit machinery
+    // (which, combined with ORDER BY / a subquery, matches the common
+    // top-N / pagination idioms).
+    if (where != null) {
+      final rr = _rewriteRownumWhere(where, limit);
+      where = rr.$1;
+      limit = rr.$2;
+    }
     return SelectStmt(
       projection: projection,
       fromTable: fromTable,
@@ -1877,6 +1892,95 @@ class Parser {
       indexedBy: fromIndexHint,
       groupingSets: groupingSets,
     );
+  }
+
+  /// Extracts top-level `ROWNUM <op> n` conjuncts from a WHERE expression and
+  /// folds them into an equivalent row limit. Returns the residual WHERE (with
+  /// the ROWNUM conjuncts removed, or null if none remain) and the effective
+  /// limit (the tightest of [existingLimit] and any ROWNUM-implied limit).
+  (Expr?, int?) _rewriteRownumWhere(Expr where, int? existingLimit) {
+    var limit = existingLimit;
+    void tighten(int implied) {
+      final v = implied < 0 ? 0 : implied;
+      limit = (limit == null) ? v : (v < limit! ? v : limit);
+    }
+
+    // Returns the replacement for a single (sub)expression, or `_keep` if it
+    // is not a ROWNUM predicate and should be preserved unchanged.
+    Expr? visit(Expr e) {
+      if (e is BinaryExpr && e.op == 'AND') {
+        final l = visit(e.left);
+        final r = visit(e.right);
+        if (l == null) return r;
+        if (r == null) return l;
+        return BinaryExpr('AND', l, r);
+      }
+      if (e is BinaryExpr) {
+        // Normalise `n <op> ROWNUM` to `ROWNUM <flip> n`.
+        String op = e.op;
+        Expr lhs = e.left, rhs = e.right;
+        if (_isRownum(rhs) && _intLiteral(lhs) != null) {
+          final tmp = lhs;
+          lhs = rhs;
+          rhs = tmp;
+          op = _flipComparison(op);
+        }
+        if (_isRownum(lhs)) {
+          final n = _intLiteral(rhs);
+          if (n != null) {
+            switch (op) {
+              case '<=':
+                tighten(n);
+                return null;
+              case '<':
+                tighten(n - 1);
+                return null;
+              case '=':
+                tighten(n == 1 ? 1 : 0);
+                return null;
+              case '>':
+              case '>=':
+                // ROWNUM > n (n >= 1) is unsatisfiable; ROWNUM >= 1 / > 0 is
+                // always true and simply drops out.
+                final alwaysTrue = (op == '>=' && n <= 1) || (op == '>' && n < 1);
+                if (!alwaysTrue) tighten(0);
+                return null;
+            }
+          }
+        }
+      }
+      return e;
+    }
+
+    final residual = visit(where);
+    return (residual, limit);
+  }
+
+  bool _isRownum(Expr e) =>
+      e is ColumnExpr && e.table == null && e.name.toUpperCase() == 'ROWNUM';
+
+  int? _intLiteral(Expr e) {
+    if (e is LiteralExpr) {
+      final v = e.value;
+      if (v is int) return v;
+      if (v is num && v == v.toInt()) return v.toInt();
+    }
+    return null;
+  }
+
+  String _flipComparison(String op) {
+    switch (op) {
+      case '<':
+        return '>';
+      case '<=':
+        return '>=';
+      case '>':
+        return '<';
+      case '>=':
+        return '<=';
+      default:
+        return op; // '=' is symmetric
+    }
   }
 
   SelectItem _parseSelectItem() {
