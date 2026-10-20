@@ -378,6 +378,32 @@ class Parser {
   Statement _parseSetSession() {
     final start = _peek().offset;
     _expectKw('SET');
+    // MySQL user-variable assignment: `SET @x = expr [, @y = expr]`. Only when
+    // every comma item is an `@var` assignment; otherwise fall through to the
+    // generic no-op (SET SESSION/GLOBAL/NAMES/autocommit/...).
+    final first = _peek();
+    if (first.type == TokType.param &&
+        first.text.startsWith('@') &&
+        !first.text.startsWith('@@')) {
+      final assignments = <(String, Expr)>[];
+      var allUserVars = true;
+      do {
+        final t = _peek();
+        if (t.type != TokType.param ||
+            !t.text.startsWith('@') ||
+            t.text.startsWith('@@')) {
+          allUserVars = false;
+          break;
+        }
+        _advance();
+        final varName = t.text.substring(1);
+        if (!_match(TokType.op, ':=')) _expect(TokType.op, '=');
+        assignments.add((varName, _parseExpr()));
+      } while (_match(TokType.punct, ','));
+      if (allUserVars && assignments.isNotEmpty) {
+        return SetUserVarStmt(assignments);
+      }
+    }
     // Consume tokens until end of statement / semicolon to stay in sync.
     while (!_isAtEnd() && !(_check(TokType.punct, ';'))) {
       _advance();

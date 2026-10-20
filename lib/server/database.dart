@@ -121,6 +121,11 @@ class Database implements SequenceProvider {
   /// Stored procedures/functions (MySQL CREATE PROCEDURE/FUNCTION), keyed by
   /// uppercased name.
   final Map<String, StoredRoutine> _routines = <String, StoredRoutine>{};
+
+  /// Default MySQL session user-variable store (`@name` → value), used when a
+  /// caller does not supply its own per-connection map. The wire layer passes a
+  /// connection-scoped map instead so variables don't leak between clients.
+  final Map<String, Object?> _userVars = <String, Object?>{};
   final String? path;
 
   /// When true, [_persist] writes the database as a real SQLite-format
@@ -2140,16 +2145,17 @@ class Database implements SequenceProvider {
   // ---------------------------------------------------------------------------
   // Public API
   // ---------------------------------------------------------------------------
-  Future<QueryResult> execute(String sql) async {
+  Future<QueryResult> execute(String sql, {Map<String, Object?>? userVars}) async {
     final stmt = Parser.fromString(sql).parseStatement();
-    return executeStmt(stmt);
+    return executeStmt(stmt, userVars: userVars);
   }
 
-  Future<List<QueryResult>> executeScript(String sql) async {
+  Future<List<QueryResult>> executeScript(String sql,
+      {Map<String, Object?>? userVars}) async {
     final stmts = Parser.fromString(sql).parseScript();
     final results = <QueryResult>[];
     for (final s in stmts) {
-      results.add(await executeStmt(s));
+      results.add(await executeStmt(s, userVars: userVars));
     }
     return results;
   }
@@ -2196,10 +2202,11 @@ class Database implements SequenceProvider {
     return RoutineInterpreter(this, initialVars: args).run(block);
   }
 
-  Future<QueryResult> executeStmt(Statement stmt) async {
+  Future<QueryResult> executeStmt(Statement stmt,
+      {Map<String, Object?>? userVars}) async {
     // CALL runs the procedural interpreter, whose embedded statements each
     // take the lock themselves — so it must not run inside an outer lock.
-    if (stmt is CallStmt) return _call(stmt);
+    if (stmt is CallStmt) return _call(stmt, userVars);
     if (stmt is PlsqlBlockStmt) return _runPlsqlBlock(stmt);
     // Statements that span a transaction boundary always need exclusive
     // access; otherwise SELECT-ish statements take the shared arm.
@@ -2260,7 +2267,7 @@ class Database implements SequenceProvider {
           if (asyncPragma != null) {
             result = asyncPragma;
           } else {
-            result = _dispatch(stmt);
+            result = _dispatch(stmt, userVars);
           }
         }
       } finally {
@@ -2366,7 +2373,7 @@ class Database implements SequenceProvider {
   }
 
   /// Synchronous dispatch \u2014 used directly by trigger bodies (which must run\n  /// in-line with their host INSERT/UPDATE/DELETE).
-  QueryResult _dispatch(Statement stmt) {
+  QueryResult _dispatch(Statement stmt, [Map<String, Object?>? userVars]) {
     // Reset per-statement observability state.
     _lastCteHints = const {};
     QueryResult result;
@@ -2377,6 +2384,9 @@ class Database implements SequenceProvider {
     // Resolve user-defined functions against this database for the duration.
     final prevFnResolver = FunctionCallExpr.storedFunctionResolver;
     FunctionCallExpr.storedFunctionResolver = _invokeStoredFunctionSync;
+    // Expose the session user-variable store to `@name` references.
+    final effUserVars = userVars ?? _userVars;
+    BindParamExpr.userVarStack.add(effUserVars);
     try {
       if (stmt is CreateTableStmt) {
         result = _createTable(stmt);
@@ -2451,6 +2461,11 @@ class Database implements SequenceProvider {
         result = QueryResult.message('Database changed');
       } else if (stmt is SetSessionStmt) {
         result = QueryResult.message('OK');
+      } else if (stmt is SetUserVarStmt) {
+        for (final (name, expr) in stmt.assignments) {
+          effUserVars[name] = expr.eval(const {});
+        }
+        result = QueryResult.message('OK');
       } else if (stmt is ExplainStmt) {
         result = _explain(stmt);
       } else if (stmt is PragmaStmt) {
@@ -2483,6 +2498,7 @@ class Database implements SequenceProvider {
     } finally {
       SequenceExpr.providerStack.removeLast();
       FunctionCallExpr.storedFunctionResolver = prevFnResolver;
+      BindParamExpr.userVarStack.removeLast();
     }
     return result;
   }
@@ -4924,7 +4940,8 @@ class Database implements SequenceProvider {
   /// Execute `CALL name(args)` on the top-level (async) path so the routine's
   /// embedded statements can take the lock themselves. Argument values seed the
   /// routine scope; a bare SELECT in the body becomes the CALL's result set.
-  Future<QueryResult> _call(CallStmt s) async {
+  Future<QueryResult> _call(CallStmt s,
+      [Map<String, Object?>? userVars]) async {
     final routine = _routines[s.name.toUpperCase()];
     if (routine == null) throw StateError('No such procedure: ${s.name}');
     final argValues = <Object?>[];
@@ -4932,7 +4949,7 @@ class Database implements SequenceProvider {
       final sel = SelectStmt(
         projection: [for (final e in s.args) SelectItem.expr(e)],
       );
-      final res = await executeStmt(sel);
+      final res = await executeStmt(sel, userVars: userVars);
       if (res.rows.isNotEmpty) argValues.addAll(res.rows.first);
     }
     final scope = <String, Object?>{};
@@ -4941,6 +4958,21 @@ class Database implements SequenceProvider {
           i < argValues.length ? argValues[i] : null;
     }
     final out = await runRoutine(routine.block, args: scope);
+    // Write OUT / INOUT parameters back to any `@var` passed as that argument.
+    final target = userVars ?? _userVars;
+    for (var i = 0;
+        i < routine.params.length && i < s.args.length;
+        i++) {
+      final p = routine.params[i];
+      if (p.mode == RoutineParamMode.inParam) continue;
+      final arg = s.args[i];
+      if (arg is BindParamExpr &&
+          arg.name != null &&
+          arg.spelling.startsWith('@') &&
+          !arg.spelling.startsWith('@@')) {
+        target[arg.name!] = out.variables[p.name];
+      }
+    }
     if (out.resultSets.isNotEmpty) return out.resultSets.last;
     return QueryResult.message('CALL ${s.name}');
   }

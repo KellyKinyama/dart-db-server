@@ -614,6 +614,13 @@ class SetSessionStmt extends Statement {
   SetSessionStmt(this.raw);
 }
 
+/// MySQL `SET @x = expr [, @y = expr]` — assigns session user-variables,
+/// which persist for the connection and can be read back as `@x`.
+class SetUserVarStmt extends Statement {
+  final List<(String name, Expr value)> assignments;
+  SetUserVarStmt(this.assignments);
+}
+
 class CreateVirtualTableStmt extends Statement {
   final String name;
   final String module; // e.g. fts5, rtree

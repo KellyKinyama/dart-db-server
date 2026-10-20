@@ -91,6 +91,24 @@ void main() {
       expect(r.rows.map((row) => row.colAt(0)).toList(), ['alice', 'bob']);
     });
 
+    test('session user-variables persist across statements', () async {
+      await conn.execute('SET @greeting = \'hi\'');
+      final r = await conn.execute('SELECT @greeting');
+      expect(r.rows.first.colAt(0), 'hi');
+    });
+
+    test('CALL OUT parameter writes back to a @var', () async {
+      await conn.execute('''
+        CREATE PROCEDURE row_count(OUT c INT)
+        BEGIN
+          SELECT COUNT(*) INTO c FROM t;
+        END
+      ''');
+      await conn.execute('CALL row_count(@n)');
+      final r = await conn.execute('SELECT @n');
+      expect(r.rows.first.colAt(0), '2');
+    });
+
     test('COM_QUERY INSERT reports affectedRows', () async {
       final r = await conn.execute(
         "INSERT INTO t VALUES (3, 'carol'), (4, 'dave')",

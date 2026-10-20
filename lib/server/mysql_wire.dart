@@ -190,6 +190,10 @@ class _Conn {
   final Map<int, _Prepared> _prepared = <int, _Prepared>{};
   int _nextStmtId = 1;
 
+  /// Per-connection MySQL session user-variables (`@name` → value), isolated
+  /// from other connections and persisting for the life of this connection.
+  final Map<String, Object?> _userVars = <String, Object?>{};
+
   _Conn(this.server, this.socket, this.threadId);
 
   void start() {
@@ -609,8 +613,8 @@ class _Conn {
     List<QueryResult> results;
     try {
       results = _multiStatements
-          ? await server.db.executeScript(sql)
-          : <QueryResult>[await server.db.execute(sql)];
+          ? await server.db.executeScript(sql, userVars: _userVars)
+          : <QueryResult>[await server.db.execute(sql, userVars: _userVars)];
     } catch (e) {
       _sendErr(1064, '42000', e.toString());
       return;

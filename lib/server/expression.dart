@@ -48,8 +48,25 @@ class BindParamExpr extends Expr {
 
   static final List<BindScope> scopeStack = <BindScope>[];
 
+  /// Ambient per-connection MySQL session user-variable store, pushed by
+  /// `Database` while dispatching. A `@name` reference reads from here when it
+  /// is not shadowed by an explicit binding; an unset variable reads as NULL.
+  static final List<Map<String, Object?>> userVarStack =
+      <Map<String, Object?>>[];
+
+  /// True for a MySQL session user-variable spelling (`@name`, not `@@sysvar`).
+  bool get _isUserVar =>
+      name != null && spelling.startsWith('@') && !spelling.startsWith('@@');
+
   @override
   Object? eval(Map<String, Object?> row) {
+    if (_isUserVar) {
+      // An explicit binding (rare for `@`) shadows the session variable.
+      if (scopeStack.isNotEmpty && scopeStack.last.hasNamed(name!)) {
+        return scopeStack.last.lookupNamed(name!, spelling);
+      }
+      return userVarStack.isEmpty ? null : userVarStack.last[name!];
+    }
     if (scopeStack.isEmpty) {
       throw StateError(
         'Bind parameter $spelling used but no bindings are active. '
@@ -68,6 +85,8 @@ class BindScope {
   final Map<String, Object?> named;
 
   BindScope({this.positional = const [], this.named = const {}});
+
+  bool hasNamed(String name) => named.containsKey(name);
 
   Object? lookupPositional(int index, String spelling) {
     if (index < 1 || index > positional.length) {

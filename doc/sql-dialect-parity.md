@@ -103,7 +103,8 @@ typed literals `DATE '…'` / `TIMESTAMP '…'`.
 | String functions (`CONCAT`, `CONCAT_WS`, `SUBSTRING`, `LEFT`/`RIGHT`, `LPAD`/`RPAD`, `REPLACE`, `REVERSE`, `SOUNDEX`, …) | ✅ |
 | `JSON_*` / `JSONB_*` function family | ✅ |
 | `INFORMATION_SCHEMA` views | ✅ `TABLES` / `COLUMNS` / `SCHEMATA` / `VIEWS` (sqlite_master-backed; no `KEY_COLUMN_USAGE` / `STATISTICS` yet) |
-| Stored procedures / `DELIMITER` | ✅ `CREATE`/`DROP PROCEDURE`, `CALL` (IN params, result passthrough); `DELIMITER` no-op. Stored FUNCTIONS callable in expressions (`SELECT f(x)`, projection, `WHERE`, nested, DB-reading via `SELECT … INTO`); OUT-param `@var` writeback not yet |
+| Stored procedures / `DELIMITER` | ✅ `CREATE`/`DROP PROCEDURE`, `CALL` (IN params, result passthrough, `OUT`/`INOUT` writeback to `@vars`); `DELIMITER` no-op. Stored FUNCTIONS callable in expressions (`SELECT f(x)`, projection, `WHERE`, nested, DB-reading via `SELECT … INTO`) |
+| Session user-variables (`SET @x`, `SELECT @x`) | ✅ per-connection; `SET @x = expr` / `:=`, read in any expression (unset → NULL); isolated between connections |
 
 ---
 
