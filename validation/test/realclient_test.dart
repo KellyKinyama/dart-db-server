@@ -169,6 +169,35 @@ void main() {
     ]);
   });
 
+  test('INSERT ALL multi-table insert works for a real client', () async {
+    final db = await Database.open(null);
+    await db.execute('CREATE TABLE lo (id INTEGER PRIMARY KEY, v INTEGER)');
+    await db.execute('CREATE TABLE hi (id INTEGER PRIMARY KEY, v INTEGER)');
+    await db.execute('CREATE TABLE src (id INTEGER PRIMARY KEY, v INTEGER)');
+    await db.execute('INSERT INTO src VALUES (1, 5)');
+    await db.execute('INSERT INTO src VALUES (2, 50)');
+    final server = await _startServer(db);
+    addTearDown(() async => server.stop());
+
+    final conn = await OracleConnection.connect(
+      '127.0.0.1:${server.boundPort}/DARTDB',
+      user: 'testuser',
+      password: 'testpassword',
+    );
+    addTearDown(() async => conn.close());
+
+    await conn.execute('''
+      INSERT ALL
+        WHEN v < 10 THEN INTO lo (id, v) VALUES (id, v)
+        ELSE INTO hi (id, v) VALUES (id, v)
+      SELECT id, v FROM src
+    ''');
+    expect(
+        (await conn.execute('SELECT id, v FROM lo')).rows[0].toList(), [1, 5]);
+    expect(
+        (await conn.execute('SELECT id, v FROM hi')).rows[0].toList(), [2, 50]);
+  });
+
   test('Oracle (+) outer join works for a real client', () async {
     final db = await Database.open(null);
     await db.execute(

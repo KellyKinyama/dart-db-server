@@ -202,6 +202,35 @@ class MergeStmt extends Statement {
 /// Conflict-resolution mode for INSERT.
 enum InsertMode { normal, orReplace, orIgnore }
 
+/// One `INTO target [(cols)] VALUES (exprs)` target of a multi-table insert.
+/// When [values] is null the driving subquery's selected row is used
+/// positionally for [columns] (or all target columns).
+class InsertAllInto {
+  final String table;
+  final List<String>? columns;
+  final List<Expr>? values;
+  InsertAllInto(this.table, this.columns, this.values);
+}
+
+/// One arm of a conditional multi-table insert. [when] is null for the
+/// unconditional form and for the trailing `ELSE`.
+class InsertAllClause {
+  final Expr? when;
+  final bool isElse;
+  final List<InsertAllInto> intos;
+  InsertAllClause(this.when, this.isElse, this.intos);
+}
+
+/// Oracle `INSERT ALL` / `INSERT FIRST` multi-table insert driven by a
+/// subquery. `FIRST` stops at the first matching `WHEN` per source row;
+/// `ALL` applies every matching arm. `ELSE` arms fire when no `WHEN` matched.
+class InsertAllStmt extends Statement {
+  final bool first;
+  final List<InsertAllClause> clauses;
+  final SelectStmt select;
+  InsertAllStmt(this.first, this.clauses, this.select);
+}
+
 /// `ON CONFLICT (cols) DO {NOTHING | UPDATE SET ... [WHERE ...]}` clause
 /// attached to an INSERT to form an UPSERT.
 class OnConflictClause {

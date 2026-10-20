@@ -178,6 +178,9 @@ class Parser {
         case 'VALUES':
           return _parseValuesAsSelect();
         case 'INSERT':
+          if (_peek(1).upper == 'ALL' || _peek(1).upper == 'FIRST') {
+            return _parseInsertAll();
+          }
           return _parseInsert();
         case 'REPLACE':
           return _parseReplace();
@@ -1257,6 +1260,57 @@ class Parser {
   InsertStmt _parseReplace() {
     _expectKw('REPLACE');
     return _parseInsertTail(InsertMode.orReplace);
+  }
+
+  // ---- INSERT ALL / INSERT FIRST (Oracle multi-table insert) --------------
+  InsertAllStmt _parseInsertAll() {
+    _expectKw('INSERT');
+    final first = _matchWord('FIRST');
+    if (!first) _expectWord('ALL');
+    final clauses = <InsertAllClause>[];
+    if (_checkKw('WHEN')) {
+      while (_matchKw('WHEN')) {
+        final cond = _parseExpr();
+        _expectKw('THEN');
+        clauses.add(InsertAllClause(cond, false, _parseInsertAllIntos()));
+      }
+      if (_matchKw('ELSE')) {
+        clauses.add(InsertAllClause(null, true, _parseInsertAllIntos()));
+      }
+    } else {
+      clauses.add(InsertAllClause(null, false, _parseInsertAllIntos()));
+    }
+    final select = _parseSelect();
+    return InsertAllStmt(first, clauses, select);
+  }
+
+  List<InsertAllInto> _parseInsertAllIntos() {
+    final intos = <InsertAllInto>[];
+    while (_matchKw('INTO')) {
+      final table = _parseQualifiedTableName();
+      List<String>? cols;
+      if (_match(TokType.punct, '(')) {
+        cols = <String>[_expectName()];
+        while (_match(TokType.punct, ',')) {
+          cols.add(_expectName());
+        }
+        _expect(TokType.punct, ')');
+      }
+      List<Expr>? values;
+      if (_matchKw('VALUES')) {
+        _expect(TokType.punct, '(');
+        values = <Expr>[_parseExpr()];
+        while (_match(TokType.punct, ',')) {
+          values.add(_parseExpr());
+        }
+        _expect(TokType.punct, ')');
+      }
+      intos.add(InsertAllInto(table, cols, values));
+    }
+    if (intos.isEmpty) {
+      throw const FormatException('Expected INTO in INSERT ALL/FIRST');
+    }
+    return intos;
   }
 
   InsertStmt _parseInsertTail(InsertMode mode) {

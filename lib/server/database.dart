@@ -2383,6 +2383,8 @@ class Database implements SequenceProvider {
         result = _dropSequence(stmt);
       } else if (stmt is MergeStmt) {
         result = _merge(stmt);
+      } else if (stmt is InsertAllStmt) {
+        result = _insertAll(stmt);
       } else if (stmt is InsertStmt) {
         result = _insert(stmt);
       } else if (stmt is SelectStmt) {
@@ -2468,6 +2470,7 @@ class Database implements SequenceProvider {
       s is CreateSequenceStmt ||
       s is DropSequenceStmt ||
       s is MergeStmt ||
+      s is InsertAllStmt ||
       s is InsertStmt ||
       s is UpdateStmt ||
       s is DeleteStmt ||
@@ -4824,7 +4827,8 @@ class Database implements SequenceProvider {
   }
 
   @override
-  int sequenceNextval(String name) => _lookupSequence(name).next(name, _seqEpoch);
+  int sequenceNextval(String name) =>
+      _lookupSequence(name).next(name, _seqEpoch);
 
   @override
   int sequenceCurrval(String name) => _lookupSequence(name).current(name);
@@ -4963,6 +4967,68 @@ class Database implements SequenceProvider {
       '$affected row(s) merged ($updated updated, $inserted inserted)',
       affected: affected,
     );
+  }
+
+  // ---------------------------------------------------------------------------
+  // INSERT ALL / INSERT FIRST (Oracle multi-table insert)
+  // ---------------------------------------------------------------------------
+
+  QueryResult _insertAll(InsertAllStmt s) {
+    final res = _selectTopLevel(s.select);
+    var inserted = 0;
+
+    void applyInto(
+        InsertAllInto into, Map<String, Object?> srow, List<Object?> rowVals) {
+      final t = _requireTable(into.table);
+      // Target columns: explicit list, else all columns in order.
+      final cols = into.columns ?? [for (final c in t.columns) c.name];
+      // Values: explicit VALUES exprs evaluated against the source row, else
+      // the driving subquery's selected row taken positionally.
+      final List<Object?> vals;
+      if (into.values != null) {
+        vals = [for (final e in into.values!) _evalScalar(_bindExpr(e), srow)];
+      } else {
+        vals = rowVals;
+      }
+      if (vals.length != cols.length) {
+        throw StateError(
+          'INSERT ALL INTO ${into.table}: ${cols.length} columns but '
+          '${vals.length} values',
+        );
+      }
+      _insert(InsertStmt(
+        into.table,
+        cols,
+        [
+          [for (final v in vals) LiteralExpr(v)],
+        ],
+      ));
+      inserted++;
+    }
+
+    for (final rowVals in res.rows) {
+      _beginSeqRow();
+      // Scope for WHEN / VALUES: driving columns by bare name.
+      final srow = <String, Object?>{
+        for (var i = 0; i < res.columns.length; i++) res.columns[i]: rowVals[i],
+      };
+      var matchedAny = false;
+      for (final clause in s.clauses) {
+        if (clause.isElse) {
+          if (matchedAny) continue; // ELSE fires only when no WHEN matched
+        } else if (clause.when != null) {
+          if (!evalPredicate(_bindExpr(clause.when!), srow)) continue;
+          matchedAny = true;
+        }
+        for (final into in clause.intos) {
+          applyInto(into, srow, rowVals);
+        }
+        // INSERT FIRST: stop after the first matching conditional arm.
+        if (s.first && clause.when != null) break;
+      }
+    }
+
+    return QueryResult.message('$inserted row(s) inserted', affected: inserted);
   }
 
   // ---------------------------------------------------------------------------
