@@ -38,12 +38,10 @@ const int tnsVersionMinLargeSdu = 315; // 4-byte SDU/TDU fields present
 const int tnsVersionMinDataFlags = 318; // flag2 (accept flags) present
 const int tnsVersionMinEndOfResponse = 319; // end-of-request/response markers
 
-/// Highest version this server negotiates. Pinned to 314 — one below
-/// [tnsVersionMinLargeSdu] (315) — so the client keeps the classic 2-byte
-/// packet-length framing on DATA packets instead of switching to the 4-byte
-/// large-SDU header. Large-SDU framing (and >64 KB packets / multi-packet
-/// results) is a later phase.
-const int tnsServerVersion = 314;
+/// Highest version this server negotiates. 318 enables the 4-byte large-SDU
+/// packet framing and the accept-flag word (a FAST_AUTH prerequisite) while
+/// staying below the 319 end-of-request/response marker protocol.
+const int tnsServerVersion = 318;
 
 const int tnsDefaultSdu = 8192;
 const int tnsDefaultTdu = 32767;
@@ -92,16 +90,23 @@ class TnsPacket {
   }
 
   /// Decodes exactly one TNS frame from [data], which must contain at least a
-  /// full packet (see [frameLength]).
-  static TnsPacket decode(Uint8List data) {
+  /// full packet (see [frameLength]). When [largeSdu] is set the packet length
+  /// is a 4-byte field at bytes 0-3 (version >= 315) instead of the classic
+  /// 2-byte length + 2-byte checksum.
+  static TnsPacket decode(Uint8List data, {bool largeSdu = false}) {
     if (data.length < tnsHeaderSize) {
       throw TnsException(
         'short header: ${data.length} < $tnsHeaderSize',
       );
     }
     final r = ReadBuffer(data);
-    final packetLength = r.readUint16BE();
-    r.readUint16BE(); // checksum
+    final int packetLength;
+    if (largeSdu) {
+      packetLength = r.readUint32BE();
+    } else {
+      packetLength = r.readUint16BE();
+      r.readUint16BE(); // checksum
+    }
     final type = r.readUint8();
     r.readUint8(); // marker
     r.readUint16BE(); // header checksum
@@ -134,18 +139,30 @@ class TnsPacket {
   }
 
   /// Returns the full frame length declared in [data]'s header, or null if
-  /// fewer than [tnsHeaderSize] bytes are present yet.
-  static int? frameLength(Uint8List data, int available) {
+  /// fewer than [tnsHeaderSize] bytes are present yet. Reads a 4-byte length
+  /// when [largeSdu] is set.
+  static int? frameLength(Uint8List data, int available,
+      {bool largeSdu = false}) {
     if (available < tnsHeaderSize) return null;
+    if (largeSdu) {
+      return (data[0] << 24) | (data[1] << 16) | (data[2] << 8) | data[3];
+    }
     return (data[0] << 8) | data[1];
   }
 }
 
-/// Builds a DATA packet wrapping [payload] (the TTC bytes).
-Uint8List buildDataPacket(Uint8List payload, {int flags = 0}) {
+/// Builds a DATA packet wrapping [payload] (the TTC bytes). Uses the 4-byte
+/// large-SDU length header when [largeSdu] is set.
+Uint8List buildDataPacket(Uint8List payload,
+    {int flags = 0, bool largeSdu = false}) {
   final b = WriteBuffer();
-  b.writeUint16BE(tnsHeaderSize + 2 + payload.length);
-  b.writeUint16BE(0); // checksum
+  final total = tnsHeaderSize + 2 + payload.length;
+  if (largeSdu) {
+    b.writeUint32BE(total);
+  } else {
+    b.writeUint16BE(total);
+    b.writeUint16BE(0); // checksum
+  }
   b.writeUint8(tnsPacketData);
   b.writeUint8(0); // marker
   b.writeUint16BE(0); // header checksum

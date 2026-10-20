@@ -127,6 +127,10 @@ class OracleConnection {
   /// responses are split across packets of at most this size.
   int _sdu = tnsDefaultSdu;
 
+  /// Whether post-ACCEPT packets use the 4-byte large-SDU length header
+  /// (negotiated version >= 315). CONNECT/ACCEPT always use 2-byte framing.
+  bool _useLargeSdu = false;
+
   void _start() {
     server._log('conn $id connected from '
         '${socket.remoteAddress.address}:${socket.remotePort}');
@@ -176,7 +180,8 @@ class OracleConnection {
   /// Consumes as many whole TNS frames as the buffer currently holds.
   void _drain() {
     while (true) {
-      final frameLen = TnsPacket.frameLength(_buffered, _buffered.length);
+      final frameLen = TnsPacket.frameLength(_buffered, _buffered.length,
+          largeSdu: _useLargeSdu);
       if (frameLen == null || _buffered.length < frameLen) return;
       final raw = Uint8List.sublistView(_buffered, 0, frameLen);
       _buffered = Uint8List.sublistView(_buffered, frameLen);
@@ -191,7 +196,7 @@ class OracleConnection {
   }
 
   void _handleFrame(Uint8List raw) {
-    final packet = TnsPacket.decode(raw);
+    final packet = TnsPacket.decode(raw, largeSdu: _useLargeSdu);
     switch (packet.type) {
       case tnsPacketConnect:
         _handleConnect(raw);
@@ -217,6 +222,8 @@ class OracleConnection {
     final req = ConnectRequest.parse(raw);
     _version = negotiateVersion(req);
     _sdu = req.sdu == 0 ? tnsDefaultSdu : req.sdu;
+    // Post-ACCEPT DATA packets switch to 4-byte large-SDU framing at v >= 315.
+    _useLargeSdu = _version >= tnsVersionMinLargeSdu;
     server._log(
       'conn $id CONNECT v=${req.versionDesired}/${req.versionMinimum} '
       'sdu=${req.sdu} -> negotiated v=$_version'
@@ -500,14 +507,15 @@ class OracleConnection {
   void _sendTtc(Uint8List ttcBody) {
     final maxPayload = _sdu - tnsHeaderSize - 2; // header + 2 data-flag bytes
     if (ttcBody.length <= maxPayload) {
-      _send(buildDataPacket(ttcBody));
+      _send(buildDataPacket(ttcBody, largeSdu: _useLargeSdu));
       return;
     }
     for (var offset = 0; offset < ttcBody.length; offset += maxPayload) {
       final end = (offset + maxPayload < ttcBody.length)
           ? offset + maxPayload
           : ttcBody.length;
-      _send(buildDataPacket(Uint8List.sublistView(ttcBody, offset, end)));
+      _send(buildDataPacket(Uint8List.sublistView(ttcBody, offset, end),
+          largeSdu: _useLargeSdu));
     }
   }
 

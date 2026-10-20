@@ -213,11 +213,11 @@ Uint8List _dataTypesRequestBody() {
   return b.toBytes();
 }
 
-/// Wraps a TTC body in a TNS DATA packet (header + 2 data-flag bytes + body).
+/// Wraps a TTC body in a TNS DATA packet (4-byte large-SDU length header).
 Uint8List _wrapData(Uint8List ttcBody) {
   final out = BytesBuilder();
   final header = ByteData(tnsHeaderSize);
-  header.setUint16(0, tnsHeaderSize + 2 + ttcBody.length);
+  header.setUint32(0, tnsHeaderSize + 2 + ttcBody.length);
   header.setUint8(4, tnsPacketData);
   out.add(header.buffer.asUint8List());
   out.add([0, 0]); // data flags
@@ -244,15 +244,19 @@ class _FrameReader {
 
   late final StreamSubscription<Uint8List> _sub;
   Uint8List _buf = Uint8List(0);
+  bool _largeSdu = false;
   final _queue = <Uint8List>[];
   final _waiters = <Completer<Uint8List>>[];
 
   void _drain() {
-    while (_buf.length >= 2) {
-      final len = (_buf[0] << 8) | _buf[1];
+    while (_buf.length >= (_largeSdu ? 8 : 2)) {
+      final len = _largeSdu
+          ? (_buf[0] << 24) | (_buf[1] << 16) | (_buf[2] << 8) | _buf[3]
+          : (_buf[0] << 8) | _buf[1];
       if (_buf.length < len) break;
       final frame = Uint8List.sublistView(_buf, 0, len);
       _buf = Uint8List.fromList(Uint8List.sublistView(_buf, len));
+      _largeSdu = true; // the ACCEPT is the only 2-byte reply
       if (_waiters.isNotEmpty) {
         _waiters.removeAt(0).complete(frame);
       } else {

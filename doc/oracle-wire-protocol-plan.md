@@ -35,10 +35,11 @@ socket round-trips). See the per-phase **Landed** notes below for detail.
 > rejected. Harness: `validation/` (separate project pulling both the server
 > and the `oracledb` client via path) — `validation/test/realclient_test.dart`
 > and `validation/bin/validate.dart`. Two real-world fixes fell out of this:
-> the server now negotiates TNS version **314** (one below large-SDU framing,
-> so the client keeps 2-byte packet lengths — >64 KB packets are a later
-> phase), and it answers the client's `nls_database_parameters` charset probe
-> with a synthetic `AL32UTF8` / `AL16UTF16` result.
+> the server now negotiates TNS version **318** with **large-SDU (4-byte)
+> DATA framing** (see "Closing the remaining work" item 1 below — CONNECT and
+> ACCEPT stay 2-byte; only post-ACCEPT DATA packets use the 4-byte length),
+> and it answers the client's `nls_database_parameters` charset probe with a
+> synthetic `AL32UTF8` / `AL16UTF16` result.
 
 ## Why this is tractable (we are not starting from zero)
 
@@ -395,7 +396,7 @@ ordered by value ÷ effort.
 ### Priority & dependencies
 
 ```
-1. Large-SDU framing ─┬─► prerequisite for FAST_AUTH (needs version ≥ 318)
+1. Large-SDU framing ─┬─► prerequisite for FAST_AUTH (needs version ≥ 318)  ✅ done
                       └─► lets single packets exceed 64 KB
 2. INTERVAL codecs      (easy — mirrors the DATE work already shipped)
 3. VECTOR codecs        (engine has native vectors → full round-trip)
@@ -406,20 +407,21 @@ ordered by value ÷ effort.
 8. LOB locators + ttcLobOp streaming   (largest — a server LOB store)
 ```
 
-### 0. Large-SDU framing (foundational)
+### 0. Large-SDU framing (foundational) — ✅ done
 
-- **Why:** the server pins TNS version **314** so DATA packets keep the
-  classic 2-byte length header. Version ≥ 315 switches to a **4-byte**
+- **Status:** shipped. The server negotiates TNS version **318** with a
+  per-connection `_useLargeSdu` (set when the negotiated version ≥ 315).
+  `TnsPacket.decode` / `frameLength` / `buildDataPacket` read & write a 4-byte
+  DATA length when large SDU is active; CONNECT and ACCEPT stay on 2-byte
+  framing. Verified by the full self-contained suite **and** the real
+  `oracledb` client (which now drives 4-byte DATA framing end-to-end).
+- **Why:** the server previously pinned TNS version **314** so DATA packets kept
+  the classic 2-byte length header. Version ≥ 315 switches to a **4-byte**
   packet length, which unlocks the accept-flag word (≥ 318, needed for
   FAST_AUTH) and >64 KB single packets. Multi-packet already removes the
   *result-size* cap, so this is only needed for FAST_AUTH and larger SDUs.
-- **Invert:** `transport/packet.dart` `readTnsPacketLength` / `encodeTnsPacket`
+- **Inverted:** `transport/packet.dart` `readTnsPacketLength` / `encodeTnsPacket`
   with `useLargeSdu` — the length moves to bytes 0–3 for DATA packets.
-- **Do:** add a per-connection `_useLargeSdu` (set when negotiated version ≥
-  315); make `TnsPacket.frameLength` / DATA decode and `buildDataPacket` read
-  /write a 4-byte length when set; keep CONNECT/ACCEPT on 2-byte framing. Then
-  raise `tnsServerVersion` to 318.
-- **Validate:** existing suites + real client must still pass at version 318.
 
 ### 1. INTERVAL codecs (Phase 5) — type 182 / 183
 
