@@ -14,15 +14,15 @@
 ///
 /// Implemented:
 ///   * `Connection.CapabilitiesGet/Set` (advertises auth mechanisms; TLS off).
-///   * `Session.AuthenticateStart/Continue` with `MYSQL41` (challenge-response)
-///     and `PLAIN` mechanisms.
+///   * `Session.AuthenticateStart/Continue` with `MYSQL41` / `SHA256_MEMORY`
+///     (challenge-response) and `PLAIN` mechanisms.
 ///   * `Sql.StmtExecute` (namespace `sql`) → `Resultset.ColumnMetaData` / `Row`
 ///     / `FetchDone` / `StmtExecuteOk`, with a `rows_affected` notice for DML.
 ///   * `Session.Reset`, `Session.Close`, `Connection.Close`.
 ///
 /// Not yet supported (clients asking for these get an `Error`):
 ///   * CRUD document/table ops (`Crud.Find/Insert/Update/Delete`).
-///   * X-protocol TLS (`CapabilitiesSet tls=1`) and `SHA256_MEMORY` auth.
+///   * X-protocol TLS (`CapabilitiesSet tls=1`).
 library;
 
 import 'dart:async';
@@ -137,7 +137,8 @@ class _XConn {
   final BytesBuilder _in = BytesBuilder(copy: false);
   StreamSubscription<Uint8List>? _sub;
   _XPhase _phase = _XPhase.preAuth;
-  Uint8List? _salt; // MYSQL41 challenge nonce
+  Uint8List? _salt; // MYSQL41 / SHA256_MEMORY challenge nonce
+  String _authMech = ''; // the mechanism of an in-progress challenge
 
   _XConn(this.server, this.socket, this.id);
 
@@ -273,8 +274,10 @@ class _XConn {
     }
     switch (mech.toUpperCase()) {
       case 'MYSQL41':
+      case 'SHA256_MEMORY':
         final salt = _randomSalt();
         _salt = salt;
+        _authMech = mech.toUpperCase();
         _phase = _XPhase.authContinue;
         _writeMessage(
           _ServerMsg.authenticateContinue,
@@ -291,7 +294,7 @@ class _XConn {
           1251,
           'HY000',
           'Invalid authentication method $mech '
-              '(use MYSQL41 or PLAIN)',
+              '(use MYSQL41, SHA256_MEMORY or PLAIN)',
         );
     }
   }
@@ -312,7 +315,10 @@ class _XConn {
         r.skip(wire);
       }
     }
-    if (_verifyMysql41(authData)) {
+    final ok = _authMech == 'SHA256_MEMORY'
+        ? _verifySha256Memory(authData)
+        : _verifyMysql41(authData);
+    if (ok) {
       _authSucceeded();
     } else {
       _sendError(1045, 'HY000', 'Access denied');
@@ -322,6 +328,7 @@ class _XConn {
   void _authSucceeded() {
     _phase = _XPhase.ready;
     _salt = null;
+    _authMech = '';
     _writeMessage(_ServerMsg.authenticateOk, _Pb().build());
   }
 
@@ -344,6 +351,26 @@ class _XConn {
         .join()
         .toUpperCase();
     return response.substring(1).toUpperCase() == expected;
+  }
+
+  /// SHA256_MEMORY response: `schema\0user\0HEX64` where the hash is
+  /// `SHA256(pwd) XOR SHA256(SHA256(SHA256(pwd)) + salt)`.
+  bool _verifySha256Memory(Uint8List authData) {
+    final pwd = server.password;
+    final parts = _splitNul(authData);
+    if (pwd == null || pwd.isEmpty) return true;
+    if (parts.length < 3) return false;
+    final response = parts[2];
+    final salt = _salt ?? Uint8List(0);
+    final h1 = sha256.convert(utf8.encode(pwd)).bytes;
+    final h2 = sha256.convert(h1).bytes;
+    final t = sha256.convert([...h2, ...salt]).bytes;
+    final token = <int>[for (var i = 0; i < 32; i++) h1[i] ^ t[i]];
+    final expected = token
+        .map((b) => b.toRadixString(16).padLeft(2, '0'))
+        .join()
+        .toUpperCase();
+    return response.toUpperCase() == expected;
   }
 
   /// PLAIN response: `authzid\0authcid\0password`.
@@ -553,7 +580,7 @@ class _XConn {
       1,
       _capability(
         'authentication.mechanisms',
-        _anyStringArray(const ['MYSQL41', 'PLAIN']),
+        _anyStringArray(const ['MYSQL41', 'PLAIN', 'SHA256_MEMORY']),
       ),
     );
     pb.message(1, _capability('tls', _anyBool(false)));

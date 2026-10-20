@@ -150,6 +150,31 @@ void main() {
       expect(m.type, _sAuthOk);
     });
 
+    test('SHA256_MEMORY auth with correct password', () async {
+      await connect(password: 'secret');
+      x.send(_cAuthStart, (_PbW()..str(1, 'SHA256_MEMORY')).build());
+      final cont = await x.next();
+      expect(cont.type, _sAuthContinue);
+      final salt = _PbR(cont.payload).readBytesField(1)!;
+      final resp = _sha256MemoryResponse('secret', salt);
+      final authData = <int>[0, ...utf8.encode('root'), 0, ...utf8.encode(resp)];
+      x.send(_cAuthContinue, (_PbW()..bytes(1, authData)).build());
+      final m = await x.next();
+      expect(m.type, _sAuthOk);
+    });
+
+    test('SHA256_MEMORY auth with wrong password is rejected', () async {
+      await connect(password: 'secret');
+      x.send(_cAuthStart, (_PbW()..str(1, 'SHA256_MEMORY')).build());
+      final cont = await x.next();
+      final salt = _PbR(cont.payload).readBytesField(1)!;
+      final resp = _sha256MemoryResponse('nope', salt);
+      final authData = <int>[0, ...utf8.encode('root'), 0, ...utf8.encode(resp)];
+      x.send(_cAuthContinue, (_PbW()..bytes(1, authData)).build());
+      final m = await x.next();
+      expect(m.type, _sError);
+    });
+
     test('NULL and string values decode correctly', () async {
       await connect();
       await authMysql41('root');
@@ -181,6 +206,17 @@ String _mysql41Response(String password, Uint8List salt) {
   final t = sha1.convert([...salt, ...h2]).bytes;
   final token = <int>[for (var i = 0; i < 20; i++) h1[i] ^ t[i]];
   return '*${token.map((b) => b.toRadixString(16).padLeft(2, '0')).join().toUpperCase()}';
+}
+
+String _sha256MemoryResponse(String password, Uint8List salt) {
+  final h1 = sha256.convert(utf8.encode(password)).bytes;
+  final h2 = sha256.convert(h1).bytes;
+  final t = sha256.convert([...h2, ...salt]).bytes;
+  final token = <int>[for (var i = 0; i < 32; i++) h1[i] ^ t[i]];
+  return token
+      .map((b) => b.toRadixString(16).padLeft(2, '0'))
+      .join()
+      .toUpperCase();
 }
 
 // ---------------------------------------------------------------------------
