@@ -169,8 +169,11 @@ Sequenced sub-phases so value lands incrementally:
    `CALL pkg.proc(args)`; `DROP PACKAGE` removes the member set. MySQL **session
    user-variables** work: `SET @x = expr [, …]` (and `:=`) persist per
    connection, `@x` reads back in any expression (unset → NULL), and `CALL
-   p(@out)` writes `OUT`/`INOUT` parameters back to the passed `@var`.
-   (Ref-cursor returns deferred.)
+   p(@out)` writes `OUT`/`INOUT` parameters back to the passed `@var`. Oracle
+   **ref cursors** are supported: `SYS_REFCURSOR` variables with `OPEN cur FOR
+   <select>`, surfaced to the caller as a result set via an `OUT SYS_REFCURSOR`
+   parameter, a function `RETURN`, or an anonymous block. (Cursor `FETCH`/`CLOSE`
+   and package-level state deferred.)
 - **Risk:** high — new execution model, transaction/savepoint interaction,
   error-mapping to each protocol's error packets, and recursion/termination
   guards.

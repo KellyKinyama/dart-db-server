@@ -68,6 +68,7 @@ standard / Oracle 12c+), and `WHERE ROWNUM <= n` (Oracle legacy).
 | `CONNECT BY` hierarchical queries | ✅ | `PRIOR`, `LEVEL`, `CONNECT_BY_ISLEAF`, `START WITH`, `ORDER SIBLINGS BY`, cycle guard (`SYS_CONNECT_BY_PATH` / `CONNECT_BY_ROOT` deferred) |
 | PL/SQL anonymous blocks + `CREATE PROCEDURE`/`FUNCTION` | ✅ | `DECLARE`/`:=`/`IF`-`ELSIF`/`WHILE`/`FOR lo..hi`/`LOOP`+`EXIT`/`SELECT INTO`/`DBMS_OUTPUT`; stored FUNCTIONs callable in expressions (`SELECT f(x)`, `WHERE`, nested); `EXCEPTION` + cursors deferred |
 | `CREATE PACKAGE` / `PACKAGE BODY` | ✅ | spec accepted; body members callable as `pkg.func(args)` / `CALL pkg.proc(args)`; `DROP PACKAGE`; package-level state + ref-cursor returns deferred |
+| Ref cursors (`SYS_REFCURSOR`, `OPEN … FOR`) | ✅ | surfaced as a result set via `OUT SYS_REFCURSOR`, function `RETURN`, or anonymous block; `FETCH`/`CLOSE` deferred |
 | `INSERT ALL` / `INSERT FIRST` multi-table insert | ✅ | unconditional, conditional `WHEN`/`ELSE`, `INTO` without `VALUES` |
 
 ### Scalar idioms & functions
@@ -127,11 +128,11 @@ The engine ships capabilities neither stock Oracle nor MySQL expose the same way
 
 ## 6. Known gaps & non-goals
 
-- **Oracle:** PL/SQL `EXCEPTION` handlers and cursors (`OPEN`/`FETCH`/`CLOSE`,
-  `%ROWTYPE`/`%FOUND`) — the rest of PL/SQL (blocks, procedures, functions,
-  packages, control flow, `SELECT INTO`) is supported; package-level state and
-  ref-cursor returns; `SYS_CONNECT_BY_PATH` / `CONNECT_BY_ROOT`; real-client TLS
-  (client-SDK bug, not server).
+- **Oracle:** PL/SQL `EXCEPTION` handlers and explicit cursors
+  (`FETCH`/`CLOSE`, `%ROWTYPE`/`%FOUND`) — the rest of PL/SQL (blocks,
+  procedures, functions, packages, control flow, `SELECT INTO`, `SYS_REFCURSOR`
+  via `OPEN … FOR`) is supported; package-level state; `SYS_CONNECT_BY_PATH` /
+  `CONNECT_BY_ROOT`; real-client TLS (client-SDK bug, not server).
 - **MySQL:** X-protocol CRUD document ops (`Crud.Find/Insert/Update/Delete`;
   SQL via `Sql.StmtExecute` is supported) and the rest of
   `INFORMATION_SCHEMA` (`TABLES`/`COLUMNS`/`SCHEMATA`/`VIEWS` are supported;

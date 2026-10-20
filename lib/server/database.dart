@@ -4958,21 +4958,32 @@ class Database implements SequenceProvider {
           i < argValues.length ? argValues[i] : null;
     }
     final out = await runRoutine(routine.block, args: scope);
-    // Write OUT / INOUT parameters back to any `@var` passed as that argument.
+    // Surface any ref-cursor (`OUT SYS_REFCURSOR` or function RETURN) as the
+    // CALL's result set; write other OUT/INOUT values back to their `@var`.
+    final cursors = <QueryResult>[];
+    if (out.returnValue is CursorValue) {
+      cursors.add((out.returnValue as CursorValue).result);
+    }
     final target = userVars ?? _userVars;
     for (var i = 0;
         i < routine.params.length && i < s.args.length;
         i++) {
       final p = routine.params[i];
       if (p.mode == RoutineParamMode.inParam) continue;
+      final v = out.variables[p.name];
+      if (v is CursorValue) {
+        cursors.add(v.result);
+        continue;
+      }
       final arg = s.args[i];
       if (arg is BindParamExpr &&
           arg.name != null &&
           arg.spelling.startsWith('@') &&
           !arg.spelling.startsWith('@@')) {
-        target[arg.name!] = out.variables[p.name];
+        target[arg.name!] = v;
       }
     }
+    if (cursors.isNotEmpty) return cursors.first;
     if (out.resultSets.isNotEmpty) return out.resultSets.last;
     return QueryResult.message('CALL ${s.name}');
   }
@@ -4982,6 +4993,9 @@ class Database implements SequenceProvider {
   /// returned (DBMS_OUTPUT lines are captured but not yet surfaced to clients).
   Future<QueryResult> _runPlsqlBlock(PlsqlBlockStmt s) async {
     final out = await runRoutine(s.block);
+    if (out.returnValue is CursorValue) {
+      return (out.returnValue as CursorValue).result;
+    }
     if (out.resultSets.isNotEmpty) return out.resultSets.last;
     return QueryResult.message('PL/SQL block executed');
   }

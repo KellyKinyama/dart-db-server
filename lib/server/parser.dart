@@ -1802,6 +1802,7 @@ class Parser {
       _match(TokType.punct, ';');
       return RoutineReturn(exprSql: e);
     }
+    if (_matchWord('OPEN')) return _parsePlsqlOpen();
     // Assignment: `name := expr;`.
     if (_check(TokType.ident) &&
         _peek(1).type == TokType.op &&
@@ -1835,6 +1836,26 @@ class Parser {
     }
     // Otherwise a procedure call: `proc(args);` or `proc;`.
     return _parsePlsqlCall();
+  }
+
+  /// `OPEN cur FOR <select>;` — bind a ref cursor to the query's result set.
+  RoutineStmt _parsePlsqlOpen() {
+    final name = _expectIdent().text;
+    _expectWord('FOR');
+    final startOff = _peek().offset;
+    var depth = 0;
+    while (!_isAtEnd() && !(depth == 0 && _check(TokType.punct, ';'))) {
+      final t = _peek();
+      if (t.type == TokType.punct && t.text == '(') {
+        depth++;
+      } else if (t.type == TokType.punct && t.text == ')') {
+        depth--;
+      }
+      _advance();
+    }
+    final sql = _sliceRoutine(startOff, _peek().offset);
+    _match(TokType.punct, ';');
+    return RoutineOpen(name, sql);
   }
 
   RoutineStmt _parsePlsqlIf() {

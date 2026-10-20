@@ -44,3 +44,11 @@ class QueryResult {
         if (message != null) 'message': message,
       };
 }
+
+/// A materialized ref-cursor value: the result of `OPEN cur FOR <select>` in
+/// PL/SQL. Carried as a routine variable, function RETURN value, or OUT
+/// parameter and surfaced to the caller as a [result] set.
+class CursorValue {
+  final QueryResult result;
+  const CursorValue(this.result);
+}

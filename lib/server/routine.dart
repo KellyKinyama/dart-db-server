@@ -117,6 +117,14 @@ class RoutineSelect extends RoutineStmt {
   RoutineSelect(this.sql);
 }
 
+/// `OPEN cur FOR <select>` — runs the SELECT and binds its result set to the
+/// cursor variable [varName] as a [CursorValue] (Oracle `SYS_REFCURSOR`).
+class RoutineOpen extends RoutineStmt {
+  final String varName;
+  final String sql;
+  RoutineOpen(this.varName, this.sql);
+}
+
 /// Direction of a stored-routine parameter.
 enum RoutineParamMode { inParam, outParam, inOutParam }
 
@@ -260,6 +268,8 @@ class RoutineInterpreter {
         output.add((await _eval(p.exprSql))?.toString() ?? '');
       case RoutineSelect q:
         resultSets.add(await _exec(q.sql));
+      case RoutineOpen o:
+        vars[o.varName] = CursorValue(await _exec(o.sql));
     }
   }
 
@@ -401,6 +411,8 @@ class SyncRoutineRunner {
         break; // DBMS_OUTPUT inside a function is ignored
       case RoutineSelect q:
         exec(q.sql, vars);
+      case RoutineOpen o:
+        vars[o.varName] = CursorValue(exec(o.sql, vars));
     }
   }
 
