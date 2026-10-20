@@ -40,12 +40,19 @@ class OracleServer {
     InternetAddress? address,
     this.port = 1521,
     Map<String, String> users = const <String, String>{},
+    this.securityContext,
   })  : address = address ?? InternetAddress.loopbackIPv4,
         userStore = _buildUserStore(users);
 
   final Database db;
   final InternetAddress address;
   final int port;
+
+  /// When set, the listener binds a [SecureServerSocket] so clients connect
+  /// over TLS (`tcps://host:port/service`). TLS wraps the whole connection
+  /// from the first byte; the TNS/TTC layers above the socket are unchanged.
+  /// When null, the listener is plain TCP (`tcp://`).
+  final SecurityContext? securityContext;
 
   /// Registered database users (verifier side). Add more with
   /// [OracleUserStore.addUser].
@@ -75,7 +82,9 @@ class OracleServer {
 
   Future<void> start() async {
     _socket = await ServerSocket.bind(address, port);
-    _log('listening on ${address.address}:${_socket!.port} (oracle wire)');
+    final tls = securityContext != null;
+    _log('listening on ${address.address}:${_socket!.port} '
+        '(oracle wire${tls ? ', TLS' : ''})');
     _socket!.listen(_accept);
   }
 
@@ -90,6 +99,23 @@ class OracleServer {
   }
 
   void _accept(Socket socket) {
+    final ctx = securityContext;
+    if (ctx == null) {
+      _register(socket);
+      return;
+    }
+    // Oracle TCPS: upgrade the raw socket to TLS before any TNS bytes, the
+    // server mirror of the client's `SecureSocket.secure` on connect.
+    unawaited(SecureSocket.secureServer(socket, ctx).then(
+      _register,
+      onError: (Object e) {
+        _log('TLS handshake failed: $e');
+        socket.destroy();
+      },
+    ));
+  }
+
+  void _register(Socket socket) {
     final conn = OracleConnection(this, socket, _nextId++);
     _conns.add(conn);
     conn._start();

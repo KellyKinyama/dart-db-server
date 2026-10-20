@@ -402,7 +402,7 @@ ordered by value ÷ effort.
 3. VECTOR codecs        (engine has native vectors → full round-trip)  ✅ done (dense)
 4. JSON codecs          (text fallback easy; native OSON hard)  ✅ done (standard JSON)
 5. 12c PBKDF2 verifier  (independent — broadens client compatibility)  ✅ done
-6. TLS / TCPS           (independent — SecureServerSocket)
+6. TLS / TCPS           (independent — SecureServerSocket)  ✅ done (server side)
 7. FAST_AUTH            (after #1; a round-trip optimization, not a gap)  ✅ done
 8. LOB locators + ttcLobOp streaming   (largest — a server LOB store)
 ```
@@ -501,16 +501,22 @@ ordered by value ÷ effort.
 - **Validated:** real client with a 12c-verifier user (accept + reject) and all
   existing tests now running over the FAST_AUTH handshake.
 
-### 5. TLS / TCPS (Phase 6)
+### 5. TLS / TCPS (Phase 6) — ✅ done (server side)
 
-- **Invert:** `transport/tls.dart`; mirror `mysql_wire.dart`'s `tlsContext`.
-- **Do:** add an optional `SecurityContext` to `OracleServer`; when set, bind
-  with `SecureServerSocket` so the client connects via `tcps://host:port/svc`.
-  The TNS/TTC layers are unchanged above the socket. (Oracle **Native Network
-  Encryption** — in-band TNS-negotiated crypto — is a separate, harder item;
-  defer it.)
-- **Validate:** real client over `tcps` with a self-signed test cert (as the
-  MySQL TLS tests already do).
+- **Status:** `OracleServer` now takes an optional `SecurityContext`; when set,
+  each accepted socket is upgraded with `SecureSocket.secureServer` before any
+  TNS bytes (Oracle TCPS is whole-connection TLS, the server mirror of the
+  client's `SecureSocket.secure`). The TNS/TTC layers above are unchanged.
+  Proven end-to-end by `test/oracle_tls_test.dart` — a standard
+  `SecureSocket.connect` client runs the full handshake + a query over TLS.
+- **Client caveat:** a real-`oracledb`-client TCPS test is intentionally
+  omitted. The client's `OracleSocket.upgradeToTls` calls `cancel()` on its raw
+  socket subscription before `SecureSocket.secure`, which closes the socket's
+  read side and fails the TLS handshake against any Dart `SecureSocket` server
+  (reproduced against a vanilla `SecureServerSocket`) — a client-side
+  limitation on this Dart SDK, not a server defect.
+- **Deferred:** Oracle **Native Network Encryption** (in-band TNS-negotiated
+  crypto) remains a separate, harder item.
 
 ### 6. LOB locators + `ttcLobOp` streaming (Phase 5) — type 112 / 113
 

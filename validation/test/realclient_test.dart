@@ -299,4 +299,13 @@ void main() {
       throwsA(isA<Object>()),
     );
   });
+
+  // NOTE: TLS (TCPS) is implemented and validated server-side by the
+  // self-contained test/oracle_tls_test.dart (a standard SecureSocket client).
+  // A real-`oracledb`-client TLS test is intentionally omitted: the client's
+  // `OracleSocket.upgradeToTls` cancels its raw-socket subscription before
+  // `SecureSocket.secure`, which closes the socket's read side and fails the
+  // handshake against any Dart `SecureSocket` server (reproduced against a
+  // vanilla `SecureServerSocket`) — a client-side limitation on this SDK, not a
+  // server defect.
 }
