@@ -12,6 +12,7 @@ For a runnable walkthrough, see
 | Doc | What it covers |
 | --- | --- |
 | [sql-dialect-parity.md](sql-dialect-parity.md) | How the engine lines up against Oracle and MySQL — wire protocols, statements, functions, types, and known gaps. |
+| [parity-roadmap.md](parity-roadmap.md) | The ordered plan to close the remaining Oracle/MySQL gaps — scope, implementation sketch, effort, and dependencies per item. |
 
 ## Recipes
 
