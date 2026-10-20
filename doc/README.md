@@ -7,6 +7,12 @@ running `Database`, or lift the Dart snippets into your app.
 For a runnable walkthrough, see
 [`example/vector_semantic_search.dart`](../example/vector_semantic_search.dart).
 
+## Reference
+
+| Doc | What it covers |
+| --- | --- |
+| [sql-dialect-parity.md](sql-dialect-parity.md) | How the engine lines up against Oracle and MySQL — wire protocols, statements, functions, types, and known gaps. |
+
 ## Recipes
 
 | Doc | When to reach for it |
