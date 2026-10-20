@@ -133,6 +133,34 @@ class DropViewStmt extends Statement {
   DropViewStmt(this.name, {this.ifExists = false});
 }
 
+/// `CREATE SEQUENCE name [START WITH n] [INCREMENT BY n] [MINVALUE n|NOMINVALUE]
+/// [MAXVALUE n|NOMAXVALUE] [CYCLE|NOCYCLE] [CACHE n|NOCACHE]`. Only the value
+/// generation is modelled; CACHE is parsed and ignored.
+class CreateSequenceStmt extends Statement {
+  final String name;
+  final int startWith;
+  final int incrementBy;
+  final int? minValue;
+  final int? maxValue;
+  final bool cycle;
+  final bool ifNotExists;
+  CreateSequenceStmt(
+    this.name, {
+    this.startWith = 1,
+    this.incrementBy = 1,
+    this.minValue,
+    this.maxValue,
+    this.cycle = false,
+    this.ifNotExists = false,
+  });
+}
+
+class DropSequenceStmt extends Statement {
+  final String name;
+  final bool ifExists;
+  DropSequenceStmt(this.name, {this.ifExists = false});
+}
+
 /// Conflict-resolution mode for INSERT.
 enum InsertMode { normal, orReplace, orIgnore }
 

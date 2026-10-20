@@ -78,7 +78,7 @@ class _VectorIndexBinding {
   _VectorIndexBinding(this.spec);
 }
 
-class Database {
+class Database implements SequenceProvider {
   final Map<String, Table> _tables = <String, Table>{};
 
   /// Cache of parsed expressions keyed by source SQL. Used to avoid
@@ -104,6 +104,11 @@ class Database {
   /// Original SELECT SQL text for each view, keyed by view name.
   /// Used to persist views faithfully through save/reload cycles.
   final Map<String, String> _viewSql = <String, String>{};
+
+  /// Named sequences (Oracle CREATE SEQUENCE). Sequence value generation is
+  /// intentionally non-transactional (NEXTVAL is not rolled back), matching
+  /// Oracle, so this map is not snapshotted by transactions.
+  final Map<String, _SequenceState> _sequences = <String, _SequenceState>{};
   final String? path;
 
   /// When true, [_persist] writes the database as a real SQLite-format
@@ -2338,91 +2343,102 @@ class Database {
     // Reset per-statement observability state.
     _lastCteHints = const {};
     QueryResult result;
-    if (stmt is CreateTableStmt) {
-      result = _createTable(stmt);
-    } else if (stmt is DropTableStmt) {
-      result = _dropTable(stmt);
-    } else if (stmt is TruncateTableStmt) {
-      result = _truncate(stmt);
-    } else if (stmt is AlterTableAddColumnStmt) {
-      result = _alterAddColumn(stmt);
-    } else if (stmt is AlterTableDropColumnStmt) {
-      result = _alterDropColumn(stmt);
-    } else if (stmt is AlterTableRenameColumnStmt) {
-      result = _alterRenameColumn(stmt);
-    } else if (stmt is AlterTableRenameStmt) {
-      result = _alterRenameTable(stmt);
-    } else if (stmt is CreateIndexStmt) {
-      result = _createIndex(stmt);
-    } else if (stmt is DropIndexStmt) {
-      result = _dropIndex(stmt);
-    } else if (stmt is CreateViewStmt) {
-      result = _createView(stmt);
-    } else if (stmt is DropViewStmt) {
-      result = _dropView(stmt);
-    } else if (stmt is InsertStmt) {
-      result = _insert(stmt);
-    } else if (stmt is SelectStmt) {
-      result = _attachColumnTypes(stmt, _selectTopLevel(stmt));
-    } else if (stmt is UpdateStmt) {
-      result = _update(stmt);
-    } else if (stmt is DeleteStmt) {
-      result = _delete(stmt);
-    } else if (stmt is BeginStmt) {
-      result = _begin();
-    } else if (stmt is CommitStmt) {
-      result = _commit();
-    } else if (stmt is RollbackStmt) {
-      result = _rollback();
-    } else if (stmt is ShowTablesStmt) {
-      result = _showTables();
-    } else if (stmt is DescribeStmt) {
-      result = _describe(stmt);
-    } else if (stmt is ShowDatabasesStmt) {
-      result = _showDatabases();
-    } else if (stmt is ShowColumnsStmt) {
-      result = _describe(DescribeStmt(stmt.table));
-    } else if (stmt is ShowCreateTableStmt) {
-      result = _showCreateTable(stmt.table);
-    } else if (stmt is ShowVariablesStmt) {
-      result = _showVariables(stmt.likePattern);
-    } else if (stmt is ShowStatusStmt) {
-      result = QueryResult(
-        columns: const ['Variable_name', 'Value'],
-        rows: const [],
-      );
-    } else if (stmt is UseDatabaseStmt) {
-      result = QueryResult.message('Database changed');
-    } else if (stmt is SetSessionStmt) {
-      result = QueryResult.message('OK');
-    } else if (stmt is ExplainStmt) {
-      result = _explain(stmt);
-    } else if (stmt is PragmaStmt) {
-      result = _pragma(stmt);
-    } else if (stmt is CreateTriggerStmt) {
-      result = _createTrigger(stmt);
-    } else if (stmt is DropTriggerStmt) {
-      result = _dropTrigger(stmt);
-    } else if (stmt is SavepointStmt) {
-      result = _savepoint(stmt);
-    } else if (stmt is ReleaseSavepointStmt) {
-      result = _releaseSavepoint(stmt);
-    } else if (stmt is RollbackToSavepointStmt) {
-      result = _rollbackToSavepoint(stmt);
-    } else if (stmt is AttachDatabaseStmt) {
-      result = _attachDatabase(stmt);
-    } else if (stmt is DetachDatabaseStmt) {
-      result = _detachDatabase(stmt);
-    } else if (stmt is VacuumStmt) {
-      result = _vacuum(stmt);
-    } else if (stmt is AnalyzeStmt) {
-      result = _analyze(stmt);
-    } else if (stmt is ReindexStmt) {
-      result = _reindex(stmt);
-    } else if (stmt is CreateVirtualTableStmt) {
-      result = _createVirtualTable(stmt);
-    } else {
-      throw StateError('Unknown statement: $stmt');
+    // Make this database the sequence provider for NEXTVAL/CURRVAL evaluated
+    // while running the statement (nested trigger dispatch re-pushes safely).
+    SequenceExpr.providerStack.add(this);
+    try {
+      if (stmt is CreateTableStmt) {
+        result = _createTable(stmt);
+      } else if (stmt is DropTableStmt) {
+        result = _dropTable(stmt);
+      } else if (stmt is TruncateTableStmt) {
+        result = _truncate(stmt);
+      } else if (stmt is AlterTableAddColumnStmt) {
+        result = _alterAddColumn(stmt);
+      } else if (stmt is AlterTableDropColumnStmt) {
+        result = _alterDropColumn(stmt);
+      } else if (stmt is AlterTableRenameColumnStmt) {
+        result = _alterRenameColumn(stmt);
+      } else if (stmt is AlterTableRenameStmt) {
+        result = _alterRenameTable(stmt);
+      } else if (stmt is CreateIndexStmt) {
+        result = _createIndex(stmt);
+      } else if (stmt is DropIndexStmt) {
+        result = _dropIndex(stmt);
+      } else if (stmt is CreateViewStmt) {
+        result = _createView(stmt);
+      } else if (stmt is DropViewStmt) {
+        result = _dropView(stmt);
+      } else if (stmt is CreateSequenceStmt) {
+        result = _createSequence(stmt);
+      } else if (stmt is DropSequenceStmt) {
+        result = _dropSequence(stmt);
+      } else if (stmt is InsertStmt) {
+        result = _insert(stmt);
+      } else if (stmt is SelectStmt) {
+        result = _attachColumnTypes(stmt, _selectTopLevel(stmt));
+      } else if (stmt is UpdateStmt) {
+        result = _update(stmt);
+      } else if (stmt is DeleteStmt) {
+        result = _delete(stmt);
+      } else if (stmt is BeginStmt) {
+        result = _begin();
+      } else if (stmt is CommitStmt) {
+        result = _commit();
+      } else if (stmt is RollbackStmt) {
+        result = _rollback();
+      } else if (stmt is ShowTablesStmt) {
+        result = _showTables();
+      } else if (stmt is DescribeStmt) {
+        result = _describe(stmt);
+      } else if (stmt is ShowDatabasesStmt) {
+        result = _showDatabases();
+      } else if (stmt is ShowColumnsStmt) {
+        result = _describe(DescribeStmt(stmt.table));
+      } else if (stmt is ShowCreateTableStmt) {
+        result = _showCreateTable(stmt.table);
+      } else if (stmt is ShowVariablesStmt) {
+        result = _showVariables(stmt.likePattern);
+      } else if (stmt is ShowStatusStmt) {
+        result = QueryResult(
+          columns: const ['Variable_name', 'Value'],
+          rows: const [],
+        );
+      } else if (stmt is UseDatabaseStmt) {
+        result = QueryResult.message('Database changed');
+      } else if (stmt is SetSessionStmt) {
+        result = QueryResult.message('OK');
+      } else if (stmt is ExplainStmt) {
+        result = _explain(stmt);
+      } else if (stmt is PragmaStmt) {
+        result = _pragma(stmt);
+      } else if (stmt is CreateTriggerStmt) {
+        result = _createTrigger(stmt);
+      } else if (stmt is DropTriggerStmt) {
+        result = _dropTrigger(stmt);
+      } else if (stmt is SavepointStmt) {
+        result = _savepoint(stmt);
+      } else if (stmt is ReleaseSavepointStmt) {
+        result = _releaseSavepoint(stmt);
+      } else if (stmt is RollbackToSavepointStmt) {
+        result = _rollbackToSavepoint(stmt);
+      } else if (stmt is AttachDatabaseStmt) {
+        result = _attachDatabase(stmt);
+      } else if (stmt is DetachDatabaseStmt) {
+        result = _detachDatabase(stmt);
+      } else if (stmt is VacuumStmt) {
+        result = _vacuum(stmt);
+      } else if (stmt is AnalyzeStmt) {
+        result = _analyze(stmt);
+      } else if (stmt is ReindexStmt) {
+        result = _reindex(stmt);
+      } else if (stmt is CreateVirtualTableStmt) {
+        result = _createVirtualTable(stmt);
+      } else {
+        throw StateError('Unknown statement: $stmt');
+      }
+    } finally {
+      SequenceExpr.providerStack.removeLast();
     }
     return result;
   }
@@ -2439,6 +2455,8 @@ class Database {
       s is DropIndexStmt ||
       s is CreateViewStmt ||
       s is DropViewStmt ||
+      s is CreateSequenceStmt ||
+      s is DropSequenceStmt ||
       s is InsertStmt ||
       s is UpdateStmt ||
       s is DeleteStmt ||
@@ -4753,6 +4771,52 @@ class Database {
     _viewSql.remove(s.name);
     return QueryResult.message('View ${s.name} dropped');
   }
+
+  // ---------------------------------------------------------------------------
+  // CREATE / DROP SEQUENCE
+  // ---------------------------------------------------------------------------
+
+  QueryResult _createSequence(CreateSequenceStmt s) {
+    if (_sequences.containsKey(s.name)) {
+      if (s.ifNotExists) {
+        return QueryResult.message('Sequence ${s.name} already exists');
+      }
+      throw StateError('Sequence ${s.name} already exists');
+    }
+    _sequences[s.name] = _SequenceState(
+      startWith: s.startWith,
+      incrementBy: s.incrementBy,
+      minValue: s.minValue,
+      maxValue: s.maxValue,
+      cycle: s.cycle,
+    );
+    return QueryResult.message('Sequence ${s.name} created');
+  }
+
+  QueryResult _dropSequence(DropSequenceStmt s) {
+    if (!_sequences.containsKey(s.name)) {
+      if (s.ifExists) {
+        return QueryResult.message('Sequence ${s.name} did not exist');
+      }
+      throw StateError('No such sequence: ${s.name}');
+    }
+    _sequences.remove(s.name);
+    return QueryResult.message('Sequence ${s.name} dropped');
+  }
+
+  _SequenceState _lookupSequence(String name) {
+    final seq = _sequences[name] ??
+        _sequences[name.toUpperCase()] ??
+        _sequences[name.toLowerCase()];
+    if (seq == null) throw StateError('No such sequence: $name');
+    return seq;
+  }
+
+  @override
+  int sequenceNextval(String name) => _lookupSequence(name).next(name);
+
+  @override
+  int sequenceCurrval(String name) => _lookupSequence(name).current(name);
 
   // ---------------------------------------------------------------------------
   // INSERT / REPLACE
@@ -17066,6 +17130,59 @@ class _Savepoint {
   final Map<String, Table> tables;
   final Map<String, SelectStmt> views;
   _Savepoint(this.name, this.tables, this.views);
+}
+
+/// Mutable state backing a named sequence (CREATE SEQUENCE).
+class _SequenceState {
+  final int startWith;
+  final int incrementBy;
+  final int? minValue;
+  final int? maxValue;
+  final bool cycle;
+
+  /// Last value issued by NEXTVAL, or null before the first NEXTVAL.
+  int? _last;
+
+  _SequenceState({
+    required this.startWith,
+    required this.incrementBy,
+    this.minValue,
+    this.maxValue,
+    required this.cycle,
+  });
+
+  int next(String name) {
+    if (_last == null) {
+      _last = startWith;
+      return _last!;
+    }
+    var candidate = _last! + incrementBy;
+    final ascending = incrementBy >= 0;
+    if (ascending && maxValue != null && candidate > maxValue!) {
+      if (!cycle) {
+        throw StateError('Sequence $name exceeded MAXVALUE ($maxValue)');
+      }
+      candidate = minValue ?? startWith;
+    } else if (!ascending && minValue != null && candidate < minValue!) {
+      if (!cycle) {
+        throw StateError('Sequence $name went below MINVALUE ($minValue)');
+      }
+      candidate = maxValue ?? startWith;
+    }
+    _last = candidate;
+    return candidate;
+  }
+
+  int current(String name) {
+    final v = _last;
+    if (v == null) {
+      throw StateError(
+        'CURRVAL of $name is not yet defined in this session '
+        '(call NEXTVAL first)',
+      );
+    }
+    return v;
+  }
 }
 
 /// Per-table planner statistics. Populated by `ANALYZE`.

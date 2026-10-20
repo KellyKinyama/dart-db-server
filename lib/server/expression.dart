@@ -87,6 +87,39 @@ class BindScope {
   }
 }
 
+/// Supplies sequence values to [SequenceExpr] during evaluation. Implemented
+/// by `Database`, which pushes itself onto [SequenceExpr.providerStack] while
+/// dispatching a statement (mirrors the bind-scope mechanism above).
+abstract class SequenceProvider {
+  int sequenceNextval(String name);
+  int sequenceCurrval(String name);
+}
+
+/// `seq.NEXTVAL` / `seq.CURRVAL`. NEXTVAL advances the sequence each time it is
+/// evaluated (i.e. once per row for a multi-row INSERT ... SELECT), matching
+/// Oracle; CURRVAL returns the value last issued to the current session.
+class SequenceExpr extends Expr {
+  final String sequence;
+  final bool isCurrval;
+  SequenceExpr(this.sequence, {this.isCurrval = false});
+
+  static final List<SequenceProvider> providerStack = <SequenceProvider>[];
+
+  @override
+  Object? eval(Map<String, Object?> row) {
+    if (providerStack.isEmpty) {
+      throw StateError(
+        'Sequence ${isCurrval ? 'CURRVAL' : 'NEXTVAL'} on "$sequence" used '
+        'outside an active database',
+      );
+    }
+    final p = providerStack.last;
+    return isCurrval
+        ? p.sequenceCurrval(sequence)
+        : p.sequenceNextval(sequence);
+  }
+}
+
 class ColumnExpr extends Expr {
   final String? table; // optional qualifier (table.column)
   final String name;

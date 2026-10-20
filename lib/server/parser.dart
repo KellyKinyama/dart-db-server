@@ -422,6 +422,7 @@ class Parser {
     if (_matchKw('INDEX')) return _parseCreateIndexTail(unique: isUnique);
     if (_matchKw('VIEW')) return _parseCreateViewTail();
     if (_matchKw('TRIGGER')) return _parseCreateTriggerTail();
+    if (_matchWord('SEQUENCE')) return _parseCreateSequenceTail();
     throw FormatException(
       'Expected TABLE, INDEX, VIEW or TRIGGER after CREATE',
     );
@@ -1067,7 +1068,82 @@ class Parser {
       }
       return DropTriggerStmt(_expectIdent().text, ifExists: ifExists);
     }
+    if (_matchWord('SEQUENCE')) {
+      bool ifExists = false;
+      if (_matchKw('IF')) {
+        _expectKw('EXISTS');
+        ifExists = true;
+      }
+      return DropSequenceStmt(_expectIdent().text, ifExists: ifExists);
+    }
     throw FormatException('Expected TABLE, INDEX, VIEW or TRIGGER after DROP');
+  }
+
+  // ---- CREATE SEQUENCE ----------------------------------------------------
+  CreateSequenceStmt _parseCreateSequenceTail() {
+    bool ifNotExists = false;
+    if (_matchKw('IF')) {
+      _expectKw('NOT');
+      _expectKw('EXISTS');
+      ifNotExists = true;
+    }
+    final name = _expectIdent().text;
+    int startWith = 1;
+    int incrementBy = 1;
+    int? minValue;
+    int? maxValue;
+    bool cycle = false;
+    // Options may appear in any order and repeat; last one wins (Oracle-ish).
+    while (true) {
+      if (_matchWord('START')) {
+        _matchKw('WITH');
+        startWith = _parseSignedInt();
+      } else if (_matchWord('INCREMENT')) {
+        _matchKw('BY');
+        incrementBy = _parseSignedInt();
+      } else if (_matchWord('MINVALUE')) {
+        minValue = _parseSignedInt();
+      } else if (_matchWord('NOMINVALUE')) {
+        minValue = null;
+      } else if (_matchWord('MAXVALUE')) {
+        maxValue = _parseSignedInt();
+      } else if (_matchWord('NOMAXVALUE')) {
+        maxValue = null;
+      } else if (_matchWord('CYCLE')) {
+        cycle = true;
+      } else if (_matchWord('NOCYCLE')) {
+        cycle = false;
+      } else if (_matchWord('CACHE')) {
+        _parseSignedInt(); // accepted and ignored
+      } else if (_matchWord('NOCACHE') ||
+          _matchWord('ORDER') ||
+          _matchWord('NOORDER')) {
+        // accepted and ignored
+      } else {
+        break;
+      }
+    }
+    return CreateSequenceStmt(
+      name,
+      startWith: startWith,
+      incrementBy: incrementBy,
+      minValue: minValue,
+      maxValue: maxValue,
+      cycle: cycle,
+      ifNotExists: ifNotExists,
+    );
+  }
+
+  int _parseSignedInt() {
+    var negative = false;
+    if (_check(TokType.op, '-')) {
+      _advance();
+      negative = true;
+    } else if (_check(TokType.op, '+')) {
+      _advance();
+    }
+    final n = int.parse(_expect(TokType.number).text);
+    return negative ? -n : n;
   }
 
   // ---- ALTER --------------------------------------------------------------
@@ -1942,7 +2018,8 @@ class Parser {
               case '>=':
                 // ROWNUM > n (n >= 1) is unsatisfiable; ROWNUM >= 1 / > 0 is
                 // always true and simply drops out.
-                final alwaysTrue = (op == '>=' && n <= 1) || (op == '>' && n < 1);
+                final alwaysTrue =
+                    (op == '>=' && n <= 1) || (op == '>' && n < 1);
                 if (!alwaysTrue) tighten(0);
                 return null;
             }
@@ -2340,6 +2417,11 @@ class Parser {
       if (_check(TokType.punct, '.')) {
         _advance();
         final col = _expectName();
+        // Oracle sequence pseudo-columns seq.NEXTVAL / seq.CURRVAL.
+        final cu = col.toUpperCase();
+        if (cu == 'NEXTVAL' || cu == 'CURRVAL') {
+          return SequenceExpr(t.text, isCurrval: cu == 'CURRVAL');
+        }
         return ColumnExpr(col, table: t.text);
       }
       // Special bare-word datetime literals (no parentheses).

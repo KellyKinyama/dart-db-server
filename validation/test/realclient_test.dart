@@ -104,6 +104,33 @@ void main() {
     ]);
   });
 
+  test('sequence NEXTVAL drives a primary key for a real client', () async {
+    final db = await Database.open(null);
+    await db.execute('CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)');
+    await db.execute('CREATE SEQUENCE item_seq START WITH 1 INCREMENT BY 1');
+    final server = await _startServer(db);
+    addTearDown(() async => server.stop());
+
+    final conn = await OracleConnection.connect(
+      '127.0.0.1:${server.boundPort}/DARTDB',
+      user: 'testuser',
+      password: 'testpassword',
+    );
+    addTearDown(() async => conn.close());
+
+    expect(
+        (await conn.execute('SELECT item_seq.NEXTVAL FROM DUAL')).rows[0][0], 1);
+    expect(
+        (await conn.execute('SELECT item_seq.NEXTVAL FROM DUAL')).rows[0][0], 2);
+    expect(
+        (await conn.execute('SELECT item_seq.CURRVAL FROM DUAL')).rows[0][0], 2);
+
+    await conn.execute("INSERT INTO items VALUES (item_seq.NEXTVAL, 'a')");
+    final r = await conn.execute('SELECT id, name FROM items');
+    expect(r.rows[0][0], 3);
+    expect(r.rows[0][1], 'a');
+  });
+
   test('a wrong password is rejected', () async {
     final db = await Database.open(null);
     final server = await _startServer(db);
