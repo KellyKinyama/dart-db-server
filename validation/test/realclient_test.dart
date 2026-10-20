@@ -47,6 +47,28 @@ void main() {
     expect(sel.rows[1][1], 'bob');
   });
 
+  test('SELECT ... FROM DUAL and common Oracle scalars work', () async {
+    final db = await Database.open(null);
+    final server = await _startServer(db);
+    addTearDown(() async => server.stop());
+
+    final conn = await OracleConnection.connect(
+      '127.0.0.1:${server.boundPort}/DARTDB',
+      user: 'testuser',
+      password: 'testpassword',
+    );
+    addTearDown(() async => conn.close());
+
+    expect((await conn.execute('SELECT 1 FROM DUAL')).rows[0][0], 1);
+    expect((await conn.execute("SELECT NVL(NULL, 'd') FROM DUAL")).rows[0][0],
+        'd');
+    expect((await conn.execute('SELECT TO_CHAR(42) FROM DUAL')).rows[0][0],
+        '42');
+    final sysdate = (await conn.execute('SELECT SYSDATE FROM DUAL')).rows[0][0]
+        as String;
+    expect(sysdate, matches(r'^\d{4}-\d{2}-\d{2} '));
+  });
+
   test('a wrong password is rejected', () async {
     final db = await Database.open(null);
     final server = await _startServer(db);

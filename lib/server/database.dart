@@ -10245,6 +10245,18 @@ class Database {
       }
       return out;
     }
+    // Oracle's synthetic one-row table: `SELECT <expr> FROM DUAL`. Only
+    // synthesized when no real table/view named DUAL exists.
+    if (name.toUpperCase() == 'DUAL') {
+      final m = <String, Object?>{...outer, 'DUMMY': 'X', 'dummy': 'X'};
+      m['$name.DUMMY'] = 'X';
+      m['$name.dummy'] = 'X';
+      if (alias != null) {
+        m['$alias.DUMMY'] = 'X';
+        m['$alias.dummy'] = 'X';
+      }
+      return [m];
+    }
     throw StateError('No such table or view: $name');
   }
 

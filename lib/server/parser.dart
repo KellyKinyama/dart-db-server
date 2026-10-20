@@ -2213,7 +2213,13 @@ class Parser {
         return ColumnExpr(col, table: t.text);
       }
       // Special bare-word datetime literals (no parentheses).
-      const bareFns = {'CURRENT_TIMESTAMP', 'CURRENT_DATE', 'CURRENT_TIME'};
+      const bareFns = {
+        'CURRENT_TIMESTAMP',
+        'CURRENT_DATE',
+        'CURRENT_TIME',
+        'SYSDATE',
+        'SYSTIMESTAMP',
+      };
       if (bareFns.contains(t.upper)) {
         return FunctionCallExpr(t.upper, const []);
       }

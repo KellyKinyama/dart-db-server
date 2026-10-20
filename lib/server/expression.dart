@@ -1860,6 +1860,22 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
   // --- MySQL datetime aliases ----------------------------------------
   'NOW': (a) => _fmtDateTime(DateTime.now().toUtc(), full: true),
   'SYSDATE': (a) => _fmtDateTime(DateTime.now().toUtc(), full: true),
+  'SYSTIMESTAMP': (a) => _fmtDateTime(DateTime.now().toUtc(), full: true),
+  // Oracle conversion functions. TO_CHAR returns a value's canonical text; a
+  // format model (second arg) is accepted but not interpreted. TO_NUMBER
+  // parses a numeric string.
+  'TO_CHAR': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final v = a[0];
+    return v is String ? v : v.toString();
+  },
+  'TO_NUMBER': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final v = a[0];
+    if (v is num) return v;
+    if (v is String) return num.tryParse(v.trim());
+    return null;
+  },
   'CURDATE': (a) => _fmtDate(DateTime.now().toUtc()),
   'CURTIME': (a) => _fmtTime(DateTime.now().toUtc()),
   'UTC_TIMESTAMP': (a) => _fmtDateTime(DateTime.now().toUtc(), full: true),
