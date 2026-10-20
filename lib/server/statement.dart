@@ -193,8 +193,13 @@ class CreatePackageStmt extends Statement {
   final bool isBody;
   final bool orReplace;
   final List<StoredRoutine> routines;
+
+  /// Body-level variable/constant declarations backing persistent package state.
+  final List<RoutineDecl> packageVars;
   CreatePackageStmt(this.name, this.routines,
-      {this.isBody = false, this.orReplace = false});
+      {this.isBody = false,
+      this.orReplace = false,
+      this.packageVars = const []});
 }
 
 /// `DROP PACKAGE [BODY] [IF EXISTS] name` — drops every member routine.

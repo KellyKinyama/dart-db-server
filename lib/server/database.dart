@@ -126,6 +126,12 @@ class Database implements SequenceProvider {
   /// caller does not supply its own per-connection map. The wire layer passes a
   /// connection-scoped map instead so variables don't leak between clients.
   final Map<String, Object?> _userVars = <String, Object?>{};
+
+  /// Persistent Oracle package state: `PKG` → {var → value}. Body-declared
+  /// package variables live here across member calls (process-wide, a
+  /// simplification of Oracle's per-session package state).
+  final Map<String, Map<String, Object?>> _packageState =
+      <String, Map<String, Object?>>{};
   final String? path;
 
   /// When true, [_persist] writes the database as a real SQLite-format
@@ -4914,17 +4920,37 @@ class Database implements SequenceProvider {
 
   /// Register an Oracle package. The spec is accepted as a no-op; the body's
   /// member routines are stored under qualified `PKG.MEMBER` keys (replacing any
-  /// previously-registered members of the same package).
+  /// previously-registered members of the same package), and its package-level
+  /// variables seed the persistent package state.
   QueryResult _createPackage(CreatePackageStmt s) {
     if (!s.isBody) {
       return QueryResult.message('Package ${s.name} created');
     }
-    final prefix = '${s.name.toUpperCase()}.';
+    final key = s.name.toUpperCase();
+    final prefix = '$key.';
     _routines.removeWhere((k, _) => k.startsWith(prefix));
     for (final r in s.routines) {
       _routines[r.name.toUpperCase()] = r;
     }
+    final state = <String, Object?>{};
+    for (final d in s.packageVars) {
+      state[d.name] = d.initSql == null ? null : _evalPackageInit(d.initSql!);
+    }
+    _packageState[key] = state;
     return QueryResult.message('Package body ${s.name} created');
+  }
+
+  /// Evaluate a package-variable initializer expression to a scalar.
+  Object? _evalPackageInit(String expr) {
+    final stmt = Parser.fromString('SELECT $expr').parseStatement();
+    final res = _dispatch(stmt);
+    return res.rows.isEmpty ? null : res.rows.first.first;
+  }
+
+  /// The package name of a qualified `PKG.MEMBER` routine, or null.
+  String? _packageOf(String name) {
+    final i = name.indexOf('.');
+    return i < 0 ? null : name.substring(0, i).toUpperCase();
   }
 
   QueryResult _dropPackage(DropPackageStmt s) {
@@ -4934,6 +4960,7 @@ class Database implements SequenceProvider {
       throw StateError('No such package: ${s.name}');
     }
     _routines.removeWhere((k, _) => k.startsWith(prefix));
+    _packageState.remove(s.name.toUpperCase());
     return QueryResult.message('Package ${s.name} dropped');
   }
 
@@ -4953,11 +4980,14 @@ class Database implements SequenceProvider {
       if (res.rows.isNotEmpty) argValues.addAll(res.rows.first);
     }
     final scope = <String, Object?>{};
+    final pkgState = _packageStateFor(s.name);
+    if (pkgState != null) scope.addAll(pkgState);
     for (var i = 0; i < routine.params.length; i++) {
       scope[routine.params[i].name] =
           i < argValues.length ? argValues[i] : null;
     }
     final out = await runRoutine(routine.block, args: scope);
+    _writeBackPackageState(pkgState, out.variables);
     // Surface any ref-cursor (`OUT SYS_REFCURSOR` or function RETURN) as the
     // CALL's result set; write other OUT/INOUT values back to their `@var`.
     final cursors = <QueryResult>[];
@@ -5009,6 +5039,8 @@ class Database implements SequenceProvider {
       throw StateError('Unknown function: $name');
     }
     final scope = <String, Object?>{};
+    final pkgState = _packageStateFor(name);
+    if (pkgState != null) scope.addAll(pkgState);
     for (var i = 0; i < r.params.length; i++) {
       scope[r.params[i].name] = i < args.length ? args[i] : null;
     }
@@ -5024,7 +5056,24 @@ class Database implements SequenceProvider {
       },
       initialVars: scope,
     );
-    return runner.run(r.block);
+    final result = runner.run(r.block);
+    _writeBackPackageState(pkgState, runner.vars);
+    return result;
+  }
+
+  /// The persistent state map for the package owning [routineName], or null.
+  Map<String, Object?>? _packageStateFor(String routineName) {
+    final pkg = _packageOf(routineName);
+    return pkg == null ? null : _packageState[pkg];
+  }
+
+  /// Copy a member's final package-variable values back into [pkgState].
+  void _writeBackPackageState(
+      Map<String, Object?>? pkgState, Map<String, Object?> finalVars) {
+    if (pkgState == null) return;
+    for (final k in pkgState.keys.toList()) {
+      if (finalVars.containsKey(k)) pkgState[k] = finalVars[k];
+    }
   }
 
   // ---------------------------------------------------------------------------

@@ -1329,9 +1329,10 @@ class Parser {
       return CreatePackageStmt(pkgName, const [],
           isBody: false, orReplace: orReplace);
     }
-    final routines = _parsePackageBodyMembers(pkgName);
+    final packageVars = <RoutineDecl>[];
+    final routines = _parsePackageBodyMembers(pkgName, packageVars);
     return CreatePackageStmt(pkgName, routines,
-        isBody: true, orReplace: orReplace);
+        isBody: true, orReplace: orReplace, packageVars: packageVars);
   }
 
   /// Skip a package spec body (procedure/function/variable declarations) up to
@@ -1354,9 +1355,11 @@ class Parser {
   }
 
   /// Parse the member routines of a package body, returning them with
-  /// qualified `pkg.member` names. Package-level declarations and an optional
-  /// initialization block are tolerated (parsed and discarded).
-  List<StoredRoutine> _parsePackageBodyMembers(String pkgName) {
+  /// qualified `pkg.member` names. Package-level variable/constant declarations
+  /// are collected into [packageVars] (for persistent package state); types,
+  /// cursors and an optional init block are tolerated (parsed and discarded).
+  List<StoredRoutine> _parsePackageBodyMembers(
+      String pkgName, List<RoutineDecl> packageVars) {
     final members = <StoredRoutine>[];
     while (!_checkWord('END') && !_isAtEnd()) {
       if (_matchWord('PROCEDURE')) {
@@ -1366,9 +1369,27 @@ class Parser {
       } else if (_checkWord('BEGIN')) {
         // Package initialization block — not executed; parse and discard.
         _parsePlsqlBody(const []);
-      } else {
-        // Package-level declaration (var/const/type/cursor) — skip to ';'.
+      } else if (_checkWord('TYPE') ||
+          _checkWord('SUBTYPE') ||
+          _checkWord('CURSOR') ||
+          _checkWord('PRAGMA')) {
+        // Non-variable declaration — not modelled; skip to ';'.
         _skipToSemicolon();
+      } else {
+        // Package-level variable/constant: `name [CONSTANT] type [:= expr];`.
+        final name = _expectIdent().text;
+        _matchWord('CONSTANT');
+        _consumeRoutineType();
+        _matchKw('NOT') && _matchKw('NULL');
+        String? init;
+        if (_check(TokType.op, ':=')) {
+          _advance();
+          init = _captureRoutineExpr(const {});
+        } else if (_matchKw('DEFAULT')) {
+          init = _captureRoutineExpr(const {});
+        }
+        _match(TokType.punct, ';');
+        packageVars.add(RoutineDecl(name, initSql: init));
       }
     }
     _expectWord('END');
