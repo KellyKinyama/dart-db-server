@@ -286,6 +286,35 @@ void main() {
     final r = await conn.execute(
         'SELECT id FROM docs ORDER BY VEC_L2(emb, :1) LIMIT 2', [query]);
     expect(r.rows.map((row) => row[0]).toList(), [1, 3]);
+
+    // The Oracle-idiomatic form uses FETCH FIRST k ROWS ONLY.
+    final r2 = await conn.execute(
+        'SELECT id FROM docs ORDER BY VEC_L2(emb, :1) '
+        'FETCH FIRST 2 ROWS ONLY',
+        [query]);
+    expect(r2.rows.map((row) => row[0]).toList(), [1, 3]);
+  });
+
+  test('OFFSET .. ROWS FETCH NEXT .. ROWS ONLY paginates (Oracle syntax)',
+      () async {
+    final db = await Database.open(null);
+    final server = await _startServer(db);
+    addTearDown(() async => server.stop());
+
+    final conn = await OracleConnection.connect(
+      '127.0.0.1:${server.boundPort}/DARTDB',
+      user: 'testuser',
+      password: 'testpassword',
+    );
+    addTearDown(() async => conn.close());
+
+    await conn.execute('CREATE TABLE p (id INTEGER PRIMARY KEY, label TEXT)');
+    for (var i = 1; i <= 5; i++) {
+      await conn.execute("INSERT INTO p VALUES ($i, 'row$i')");
+    }
+    final r = await conn.execute(
+        'SELECT id FROM p ORDER BY id OFFSET 1 ROWS FETCH NEXT 2 ROWS ONLY');
+    expect(r.rows.map((row) => row[0]).toList(), [2, 3]);
   });
 
   test('a JSON document binds and reads back as OSON', () async {

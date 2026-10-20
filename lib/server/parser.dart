@@ -74,6 +74,23 @@ class Parser {
   bool _checkKw(String kw, [int offset = 0]) =>
       _peek(offset).type == TokType.keyword && _peek(offset).upper == kw;
 
+  /// Matches a bareword by its uppercased text whether it lexed as a keyword or
+  /// an identifier — for non-reserved words (FETCH, NEXT, ONLY) used only in
+  /// specific clauses, so they stay usable as identifiers elsewhere.
+  bool _checkWord(String upper) {
+    final t = _peek();
+    return (t.type == TokType.keyword || t.type == TokType.ident) &&
+        t.upper == upper;
+  }
+
+  bool _matchWord(String upper) {
+    if (_checkWord(upper)) {
+      _advance();
+      return true;
+    }
+    return false;
+  }
+
   Token _expect(TokType t, [String? text]) {
     if (_check(t, text)) return _advance();
     final got = _peek();
@@ -1820,6 +1837,27 @@ class Parser {
     }
     if (_matchKw('OFFSET')) {
       offset = int.parse(_expect(TokType.number).text);
+      // Oracle / SQL-standard: OFFSET n { ROW | ROWS }.
+      if (_matchKw('ROW') || _matchKw('ROWS')) {}
+    }
+    // Oracle / SQL-standard row-limiting clause:
+    //   FETCH { FIRST | NEXT } [ n ] { ROW | ROWS } { ONLY | WITH TIES }
+    // n defaults to 1; WITH TIES is accepted but behaves like ONLY here.
+    if (_matchWord('FETCH')) {
+      if (!_matchKw('FIRST') && !_matchWord('NEXT')) {
+        final got = _peek();
+        throw FormatException(
+          'Expected FIRST or NEXT after FETCH but got "${got.text}" at '
+          'offset ${got.offset}',
+        );
+      }
+      var count = 1;
+      if (_check(TokType.number)) count = int.parse(_advance().text);
+      if (_matchKw('ROW') || _matchKw('ROWS')) {}
+      if (!_matchWord('ONLY')) {
+        if (_matchKw('WITH')) _expectKw('TIES');
+      }
+      limit = count;
     }
     return SelectStmt(
       projection: projection,
