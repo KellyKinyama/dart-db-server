@@ -545,6 +545,9 @@ class OracleConnection {
     }
     server._log('conn $id EXECUTE [cursor $cursorId] "$sql"'
         '${info.hasBinds ? ' binds=${info.binds}' : ''}');
+    // Free the previous query's fetched column LOBs; the client has already
+    // read them (via ttcLobOp) before issuing this statement.
+    _lobStore.clearColumnLobs();
     final response = await _guarded<Uint8List>(sql, () async {
       try {
         // Serve the client's connect-time data-dictionary probes synthetically;

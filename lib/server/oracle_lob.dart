@@ -59,6 +59,10 @@ class _ServerLob {
 /// Per-connection store of temporary LOBs created via CREATE_TEMP.
 class LobStore {
   final Map<int, _ServerLob> _byId = <int, _ServerLob>{};
+
+  /// Ids of LOBs minted for fetched CLOB/BLOB *columns* (as opposed to
+  /// CREATE_TEMP bind LOBs), so they can be reaped per query.
+  final Set<int> _columnIds = <int>{};
   int _nextId = 1;
 
   _ServerLob _create() {
@@ -87,7 +91,20 @@ class LobStore {
   /// 40-byte locator to embed in the row data.
   Uint8List createColumnLob(List<int> bytes) {
     final lob = _create()..bytes = List<int>.of(bytes);
+    _columnIds.add(lob.id);
     return _locatorFor(lob);
+  }
+
+  /// Frees the LOBs minted for an earlier query's CLOB/BLOB columns; temporary
+  /// (bind) LOBs are untouched. Called at the start of each query so fetched
+  /// column LOBs don't accumulate for the life of the connection. (A client
+  /// that holds a `fetchLobs: true` handle across a later query on the same
+  /// connection must read it before issuing that query.)
+  void clearColumnLobs() {
+    for (final id in _columnIds) {
+      _byId.remove(id);
+    }
+    _columnIds.clear();
   }
 
   Uint8List _locatorFor(_ServerLob lob) {

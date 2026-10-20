@@ -201,4 +201,32 @@ void main() {
         store);
     expect(_readResult(read).data, bytes);
   });
+
+  test('clearColumnLobs reaps fetched column LOBs but keeps temp LOBs', () {
+    final store = LobStore();
+
+    // A temporary (bind) LOB via CREATE_TEMP + WRITE.
+    final created = handleLobOp(
+        ReadBuffer(_lobReq(_opCreateTemp,
+            locator: Uint8List(lobLocatorSize), sourceOffset: 1)),
+        store);
+    final tempLocator = _locatorOf(created);
+    handleLobOp(
+        ReadBuffer(_lobReq(_opWrite,
+            locator: tempLocator,
+            sourceOffset: 1,
+            data: Uint8List.fromList([1, 2, 3]))),
+        store);
+
+    // A fetched column LOB.
+    final colLocator = store.createColumnLob([9, 9, 9]);
+    expect(store.resolve(colLocator), [9, 9, 9]);
+    expect(store.resolve(tempLocator), [1, 2, 3]);
+
+    store.clearColumnLobs();
+
+    // The column LOB is gone; the temp (bind) LOB survives.
+    expect(store.resolve(colLocator), isNull);
+    expect(store.resolve(tempLocator), [1, 2, 3]);
+  });
 }
