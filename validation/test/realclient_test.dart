@@ -198,6 +198,32 @@ void main() {
         (await conn.execute('SELECT id, v FROM hi')).rows[0].toList(), [2, 50]);
   });
 
+  test('data-dictionary views work for a real client', () async {
+    final db = await Database.open(null);
+    await db.execute('CREATE TABLE products ('
+        'id INTEGER PRIMARY KEY, label VARCHAR NOT NULL)');
+    final server = await _startServer(db);
+    addTearDown(() async => server.stop());
+
+    final conn = await OracleConnection.connect(
+      '127.0.0.1:${server.boundPort}/DARTDB',
+      user: 'testuser',
+      password: 'testpassword',
+    );
+    addTearDown(() async => conn.close());
+
+    final tables = await conn.execute(
+        "SELECT table_name FROM user_tables WHERE table_name = 'products'");
+    expect(tables.rows[0][0], 'products');
+
+    final cols = await conn.execute('SELECT column_name, nullable FROM '
+        "user_tab_columns WHERE table_name = 'products' ORDER BY column_id");
+    expect(cols.rows.map((r) => r.toList()).toList(), [
+      ['id', 'N'],
+      ['label', 'N'],
+    ]);
+  });
+
   test('CONNECT BY hierarchy works for a real client', () async {
     final db = await Database.open(null);
     await db.execute(

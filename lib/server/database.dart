@@ -10597,6 +10597,12 @@ class Database implements SequenceProvider {
       }
       return out;
     }
+    // Catalog / data-dictionary views (INFORMATION_SCHEMA.*, USER_*/ALL_*),
+    // checked after real tables/views so a user object of the same name wins.
+    final catalog = _buildCatalogData(name);
+    if (catalog != null) {
+      return _emitSynthRows(name, alias, outer, catalog.$1, catalog.$2);
+    }
     // Oracle's synthetic one-row table: `SELECT <expr> FROM DUAL`. Only
     // synthesized when no real table/view named DUAL exists.
     if (name.toUpperCase() == 'DUAL') {
@@ -10610,6 +10616,246 @@ class Database implements SequenceProvider {
       return [m];
     }
     throw StateError('No such table or view: $name');
+  }
+
+  /// Builds keyed row maps (bare + table-qualified + alias-qualified) from a
+  /// synthesized [columns] / [data] pair, matching how real relations expose
+  /// columns to the evaluator.
+  List<Map<String, Object?>> _emitSynthRows(
+    String name,
+    String? alias,
+    Map<String, Object?> outer,
+    List<String> columns,
+    List<List<Object?>> data,
+  ) {
+    final out = <Map<String, Object?>>[];
+    for (final row in data) {
+      final m = <String, Object?>{...outer};
+      for (var i = 0; i < columns.length; i++) {
+        m[columns[i]] = row[i];
+        m['$name.${columns[i]}'] = row[i];
+        if (alias != null) m['$alias.${columns[i]}'] = row[i];
+      }
+      out.add(m);
+    }
+    return out;
+  }
+
+  /// Catalog / data-dictionary views backing both dialects' schema
+  /// introspection: MySQL `INFORMATION_SCHEMA.{TABLES,COLUMNS,SCHEMATA,VIEWS}`
+  /// and Oracle `USER_*`/`ALL_*` (+ the `TABS`/`COLS` synonyms) for tables,
+  /// columns, views and sequences. Returns the view's `(columns, rows)` or
+  /// null when [name] is not a recognised catalog view (case-insensitive).
+  (List<String>, List<List<Object?>>)? _buildCatalogData(String name) {
+    final u = name.toUpperCase();
+    final tableNames = _tables.keys.toList()..sort();
+    final viewNames = _views.keys.toList()..sort();
+    const schema = 'main'; // matches DATABASE()/SCHEMA()
+
+    String oraType(ColumnDef c) {
+      final d = c.declaredType;
+      if (d != null) return d.toUpperCase();
+      switch (c.type) {
+        case DataType.text:
+          return 'VARCHAR2';
+        case DataType.blob:
+          return 'BLOB';
+        case DataType.real:
+          return 'FLOAT';
+        default:
+          return 'NUMBER';
+      }
+    }
+
+    String myType(ColumnDef c) {
+      final d = c.declaredType?.toLowerCase();
+      if (d != null) {
+        if (d.contains('clob') || d.contains('text')) return 'text';
+        if (d.contains('blob') || d.contains('raw')) return 'blob';
+        if (d.contains('json')) return 'json';
+        if (d.contains('char')) return 'varchar';
+        if (d.contains('int')) return 'int';
+        if (d.contains('float') || d.contains('real') || d.contains('double')) {
+          return 'double';
+        }
+        if (d.contains('num') || d.contains('dec')) return 'decimal';
+        return d;
+      }
+      switch (c.type) {
+        case DataType.text:
+          return 'text';
+        case DataType.blob:
+          return 'blob';
+        case DataType.real:
+          return 'double';
+        case DataType.integer:
+          return 'int';
+        default:
+          return 'decimal';
+      }
+    }
+
+    String colKey(ColumnDef c) =>
+        c.primaryKey ? 'PRI' : (c.unique ? 'UNI' : '');
+
+    switch (u) {
+      case 'INFORMATION_SCHEMA.TABLES':
+        return (
+          [
+            'TABLE_CATALOG',
+            'TABLE_SCHEMA',
+            'TABLE_NAME',
+            'TABLE_TYPE',
+            'ENGINE',
+            'TABLE_ROWS',
+            'TABLE_COLLATION'
+          ],
+          [
+            for (final tn in tableNames)
+              [
+                'def',
+                schema,
+                tn,
+                'BASE TABLE',
+                'InnoDB',
+                _tables[tn]!.rows.length,
+                'utf8mb4_general_ci'
+              ],
+            for (final vn in viewNames)
+              ['def', schema, vn, 'VIEW', null, null, null],
+          ],
+        );
+      case 'INFORMATION_SCHEMA.COLUMNS':
+        final rows = <List<Object?>>[];
+        for (final tn in tableNames) {
+          final t = _tables[tn]!;
+          for (var i = 0; i < t.columns.length; i++) {
+            final c = t.columns[i];
+            rows.add([
+              'def',
+              schema,
+              tn,
+              c.name,
+              i + 1,
+              c.defaultValue,
+              c.notNull ? 'NO' : 'YES',
+              myType(c),
+              myType(c),
+              colKey(c),
+              c.autoIncrement ? 'auto_increment' : ''
+            ]);
+          }
+        }
+        return (
+          [
+            'TABLE_CATALOG',
+            'TABLE_SCHEMA',
+            'TABLE_NAME',
+            'COLUMN_NAME',
+            'ORDINAL_POSITION',
+            'COLUMN_DEFAULT',
+            'IS_NULLABLE',
+            'DATA_TYPE',
+            'COLUMN_TYPE',
+            'COLUMN_KEY',
+            'EXTRA'
+          ],
+          rows,
+        );
+      case 'INFORMATION_SCHEMA.SCHEMATA':
+        return (
+          [
+            'CATALOG_NAME',
+            'SCHEMA_NAME',
+            'DEFAULT_CHARACTER_SET_NAME',
+            'DEFAULT_COLLATION_NAME'
+          ],
+          [
+            ['def', schema, 'utf8mb4', 'utf8mb4_general_ci']
+          ],
+        );
+      case 'INFORMATION_SCHEMA.VIEWS':
+        return (
+          [
+            'TABLE_CATALOG',
+            'TABLE_SCHEMA',
+            'TABLE_NAME',
+            'VIEW_DEFINITION',
+            'CHECK_OPTION',
+            'IS_UPDATABLE'
+          ],
+          [
+            for (final vn in viewNames)
+              ['def', schema, vn, _viewSql[vn] ?? '', 'NONE', 'NO'],
+          ],
+        );
+      case 'USER_TABLES':
+      case 'ALL_TABLES':
+      case 'TABS':
+        return (
+          ['TABLE_NAME', 'TABLESPACE_NAME', 'NUM_ROWS', 'STATUS'],
+          [
+            for (final tn in tableNames)
+              [tn, 'USERS', _tables[tn]!.rows.length, 'VALID'],
+          ],
+        );
+      case 'USER_TAB_COLUMNS':
+      case 'ALL_TAB_COLUMNS':
+      case 'COLS':
+        final rows = <List<Object?>>[];
+        for (final tn in tableNames) {
+          final t = _tables[tn]!;
+          for (var i = 0; i < t.columns.length; i++) {
+            final c = t.columns[i];
+            rows.add([tn, c.name, oraType(c), 0, c.notNull ? 'N' : 'Y', i + 1]);
+          }
+        }
+        return (
+          [
+            'TABLE_NAME',
+            'COLUMN_NAME',
+            'DATA_TYPE',
+            'DATA_LENGTH',
+            'NULLABLE',
+            'COLUMN_ID'
+          ],
+          rows,
+        );
+      case 'USER_VIEWS':
+      case 'ALL_VIEWS':
+        return (
+          ['VIEW_NAME', 'TEXT_LENGTH', 'TEXT'],
+          [
+            for (final vn in viewNames)
+              [vn, (_viewSql[vn] ?? '').length, _viewSql[vn] ?? ''],
+          ],
+        );
+      case 'USER_SEQUENCES':
+      case 'ALL_SEQUENCES':
+        final seqNames = _sequences.keys.toList()..sort();
+        return (
+          [
+            'SEQUENCE_NAME',
+            'MIN_VALUE',
+            'MAX_VALUE',
+            'INCREMENT_BY',
+            'CYCLE_FLAG',
+            'LAST_NUMBER'
+          ],
+          [
+            for (final sn in seqNames)
+              [
+                sn,
+                _sequences[sn]!.minValue,
+                _sequences[sn]!.maxValue,
+                _sequences[sn]!.incrementBy,
+                _sequences[sn]!.cycle ? 'Y' : 'N',
+                _sequences[sn]!._last ?? _sequences[sn]!.startWith
+              ],
+          ],
+        );
+    }
+    return null;
   }
 
   /// Build the schema-introspection rows for `sqlite_master` /
@@ -12847,6 +13093,8 @@ class Database implements SequenceProvider {
       final res = _selectTopLevel(_views[name]!);
       return res.columns;
     }
+    final catalog = _buildCatalogData(name);
+    if (catalog != null) return catalog.$1;
     throw StateError('No such table or view: $name');
   }
 

@@ -43,6 +43,22 @@ void main() {
       ]);
     });
 
+    test('INFORMATION_SCHEMA introspection works through the driver', () async {
+      final tables = await conn.execute(
+          'SELECT table_name FROM information_schema.tables '
+          'WHERE table_schema = DATABASE() AND table_name = \'t\'');
+      expect(tables.rows.first.colAt(0), 't');
+
+      final cols = await conn.execute(
+          'SELECT column_name, is_nullable FROM information_schema.columns '
+          'WHERE table_name = \'t\' ORDER BY ordinal_position');
+      final rows = cols.rows.map((r) => [r.colAt(0), r.colAt(1)]).toList();
+      expect(rows, [
+        ['id', 'NO'],
+        ['name', 'YES'],
+      ]);
+    });
+
     test('COM_QUERY INSERT reports affectedRows', () async {
       final r = await conn.execute(
         "INSERT INTO t VALUES (3, 'carol'), (4, 'dave')",
