@@ -1895,6 +1895,32 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     }
     return _fmtDateTime(dt, full: true);
   },
+  // SQL-standard EXTRACT(field FROM source). The parser rewrites the special
+  // `field FROM expr` grammar into EXTRACT(<field-name-literal>, expr).
+  'EXTRACT': (a) {
+    if (a.length != 2 || a[0] == null) return null;
+    final field = a[0].toString().toUpperCase();
+    final dt = _resolveDateTime([a[1]]);
+    if (dt == null) return null;
+    switch (field) {
+      case 'YEAR':
+        return dt.year;
+      case 'MONTH':
+        return dt.month;
+      case 'DAY':
+        return dt.day;
+      case 'HOUR':
+        return dt.hour;
+      case 'MINUTE':
+        return dt.minute;
+      case 'SECOND':
+        // Oracle EXTRACT(SECOND ...) includes fractional seconds.
+        final frac = dt.millisecond / 1000 + dt.microsecond / 1000000;
+        return frac == 0 ? dt.second : dt.second + frac;
+      default:
+        return null;
+    }
+  },
   'YEAR': (a) {
     final dt = _resolveDateTime(a);
     return dt?.year;

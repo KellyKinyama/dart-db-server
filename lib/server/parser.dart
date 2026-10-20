@@ -2353,6 +2353,19 @@ class Parser {
   Expr _parseFunctionCall(String name) {
     final upper = name.toUpperCase();
     _expect(TokType.punct, '(');
+    // SQL-standard EXTRACT(field FROM source): the field is a bareword
+    // (YEAR, MONTH, DAY, HOUR, MINUTE, SECOND) followed by FROM. Rewrite into
+    // EXTRACT(<field-name-literal>, source) for the scalar implementation.
+    if (upper == 'EXTRACT' &&
+        (_peek().type == TokType.ident || _peek().type == TokType.keyword) &&
+        _peek(1).type == TokType.keyword &&
+        _peek(1).upper == 'FROM') {
+      final field = _advance().text.toUpperCase();
+      _expectKw('FROM');
+      final source = _parseExpr();
+      _expect(TokType.punct, ')');
+      return FunctionCallExpr('EXTRACT', [LiteralExpr(field), source]);
+    }
     bool isStar = false;
     bool distinct = false;
     final args = <Expr>[];
