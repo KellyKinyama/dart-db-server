@@ -24,19 +24,19 @@ Effort is relative, not calendar-based:
 
 ## Gap inventory
 
-| # | Gap | Surface | Size | Risk |
-| --- | --- | --- | --- | --- |
-| G1 | `ROWNUM` nested in a scalar expression | Oracle/engine | S | low |
-| G2 | `seq.NEXTVAL` once-per-row guarantee | Oracle/engine | S | low |
-| G3 | Stale `mysql_wire.dart` header comment | MySQL/docs | S | none |
-| G4 | `NCLOB` (UTF-16 CLOB) | Oracle wire | M | low |
-| G5 | `INSERT ALL` / `INSERT FIRST` (multi-table insert) | Oracle | M | low |
-| G6 | `CONNECT BY` hierarchical queries | Oracle | M | medium |
-| G7 | Catalog / data-dictionary views (`INFORMATION_SCHEMA`, `USER_*`/`ALL_*`) | both | M | low |
-| G8 | Procedural routines — MySQL stored procs + Oracle PL/SQL | both | XL | high |
-| G9 | MySQL wire compression (`CLIENT_COMPRESS`, zstd) | MySQL wire | M | medium |
-| G10 | Real-client **Oracle TLS** | Oracle wire | M | external |
-| G11 | MySQL **X protocol** (DevAPI, port 33060) | MySQL wire | XL | medium |
+| # | Gap | Surface | Size | Risk | Status |
+| --- | --- | --- | --- | --- | --- |
+| G1 | `ROWNUM` nested in a scalar expression | Oracle/engine | S | low | ✅ done |
+| G2 | `seq.NEXTVAL` once-per-row guarantee | Oracle/engine | S | low | ✅ done |
+| G3 | Stale `mysql_wire.dart` header comment | MySQL/docs | S | none | ◻ |
+| G4 | `NCLOB` (UTF-16 CLOB) | Oracle wire | M | low | ◻ |
+| G5 | `INSERT ALL` / `INSERT FIRST` (multi-table insert) | Oracle | M | low | ✅ done |
+| G6 | `CONNECT BY` hierarchical queries | Oracle | M | medium | ✅ done |
+| G7 | Catalog / data-dictionary views (`INFORMATION_SCHEMA`, `USER_*`/`ALL_*`) | both | M | low | ◻ |
+| G8 | Procedural routines — MySQL stored procs + Oracle PL/SQL | both | XL | high | ◻ |
+| G9 | MySQL wire compression (`CLIENT_COMPRESS`, zstd) | MySQL wire | M | medium | ◻ |
+| G10 | Real-client **Oracle TLS** | Oracle wire | M | external | ◻ |
+| G11 | MySQL **X protocol** (DevAPI, port 33060) | MySQL wire | XL | medium | ◻ |
 
 ---
 
@@ -45,7 +45,7 @@ Effort is relative, not calendar-based:
 Small, self-contained, low-risk items that remove the asterisks in the parity
 doc. No shared infrastructure required.
 
-### G1 · `ROWNUM` nested in a scalar expression — **S**
+### G1 · `ROWNUM` nested in a scalar expression — **S** — ✅ done
 Today `ROWNUM` lowers to `ROW_NUMBER() OVER ()` ([`parser.dart`](../lib/server/parser.dart)),
 which the window engine only evaluates at the **top level** of a projection
 item — so `'row ' || ROWNUM` fails with *Unknown function: ROW_NUMBER*.
@@ -57,7 +57,7 @@ item — so `'row ' || ROWNUM` fails with *Unknown function: ROW_NUMBER*.
 - **Done when:** `SELECT 'r'||ROWNUM FROM t` and `SELECT ROWNUM*10 FROM t`
   return the expected values; existing window tests stay green.
 
-### G2 · `NEXTVAL` once-per-row — **S**
+### G2 · `NEXTVAL` once-per-row — **S** — ✅ done
 Multiple `seq.NEXTVAL` references in one row currently advance per reference;
 Oracle guarantees one advance per row.
 - **Sketch:** add a per-row memo keyed by sequence name on the
@@ -80,7 +80,7 @@ Completes the LOB story (`CLOB`/`BLOB` already work).
 - **Done when:** an `NCLOB` column round-trips multibyte text through the real
   `oracledb` client; length is reported in characters.
 
-### G5 · `INSERT ALL` / `INSERT FIRST` — **M**
+### G5 · `INSERT ALL` / `INSERT FIRST` — **M** — ✅ done
 Oracle multi-table insert.
 - **Sketch:** new `InsertAllStmt` AST (list of `INTO target (cols) VALUES
   (exprs)` arms, optional `WHEN cond THEN` guards, a driving `SELECT`); a
@@ -91,7 +91,7 @@ Oracle multi-table insert.
 - **Done when:** unconditional, conditional (`WHEN`), and `FIRST` forms land
   rows in multiple targets; `ELSE` arm handled.
 
-### G6 · `CONNECT BY` hierarchical queries — **M**
+### G6 · `CONNECT BY` hierarchical queries — **M** — ✅ done (core; `SYS_CONNECT_BY_PATH` / `CONNECT_BY_ROOT` deferred)
 `START WITH … CONNECT BY PRIOR …`, plus `LEVEL`, `CONNECT_BY_ROOT`,
 `SYS_CONNECT_BY_PATH`, `CONNECT_BY_ISLEAF`, and `ORDER SIBLINGS BY`.
 - **Sketch:** the engine already has a recursive-CTE executor
