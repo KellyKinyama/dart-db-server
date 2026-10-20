@@ -235,6 +235,30 @@ void main() {
     expect(back, [1.5, -2.5, 3.25]);
   });
 
+  test('a sparse VECTOR binds and column round-trips', () async {
+    final db = await Database.open(null);
+    final server = await _startServer(db);
+    addTearDown(() async => server.stop());
+
+    final conn = await OracleConnection.connect(
+      '127.0.0.1:${server.boundPort}/DARTDB',
+      user: 'testuser',
+      password: 'testpassword',
+    );
+    addTearDown(() async => conn.close());
+
+    await conn.execute('CREATE TABLE sv (id INTEGER PRIMARY KEY, emb VECTOR)');
+    final v = OracleSparseVector(
+      numDimensions: 8,
+      indices: [1, 5],
+      values: Float32List.fromList([1.5, -2.5]),
+    );
+    await conn.execute('INSERT INTO sv VALUES (:1, :2)', [1, v]);
+
+    final r = await conn.execute('SELECT emb FROM sv');
+    expect(r.rows[0][0], v);
+  });
+
   test('a JSON document binds and reads back as OSON', () async {
     final db = await Database.open(null);
     final server = await _startServer(db);

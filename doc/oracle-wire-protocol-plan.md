@@ -399,7 +399,7 @@ ordered by value ÷ effort.
 1. Large-SDU framing ─┬─► prerequisite for FAST_AUTH (needs version ≥ 318)  ✅ done
                       └─► lets single packets exceed 64 KB
 2. INTERVAL codecs      (easy — mirrors the DATE work already shipped)  ✅ done
-3. VECTOR codecs        (engine has native vectors → full round-trip)  ✅ done (dense)
+3. VECTOR codecs        (engine has native vectors → full round-trip)  ✅ done (dense/sparse/binary)
 4. JSON codecs          (text fallback easy; native OSON hard)  ✅ done (standard JSON)
 5. 12c PBKDF2 verifier  (independent — broadens client compatibility)  ✅ done
 6. TLS / TCPS           (independent — SecureServerSocket)  ✅ done (server side)
@@ -440,25 +440,27 @@ ordered by value ÷ effort.
   `_decodeBindValue`.
 - **Validate:** bind an `OracleIntervalDS` / `Duration` from the real client.
 
-### 2. VECTOR codecs (Phase 5) — type 127 — ✅ done (dense)
+### 2. VECTOR codecs (Phase 5) — type 127 — ✅ done (dense, sparse, BINARY)
 
-- **Status:** shipped for dense vectors. A VECTOR bind (type 127) decodes
-  through the 40-byte value-based QLocator + inline image to the engine's
-  native `Vector` (`Float32List`); the engine stores it. On fetch, a column of
-  `Vector` values is described as VECTOR and each value is written in the
+- **Status:** shipped for dense, BINARY and sparse vectors. A VECTOR bind
+  (type 127) decodes through the 40-byte value-based QLocator + inline image: a
+  dense FLOAT32 / FLOAT64 / INT8 vector becomes the engine's native `Vector`
+  (`Float32List`, indexable); a packed BINARY vector becomes an
+  `OracleBinaryVector` and a sparse vector an `OracleSparseVector`, both carried
+  verbatim by the engine (VECTOR columns pass non-dense values through like
+  JSON). On fetch, each is re-encoded to its original VECTOR image in the
   LOB-prefetch inline shape (UB4 marker, UB8 size, UB4 chunk, length-prefixed
-  image, empty locator). FLOAT32 / FLOAT64 / INT8 images decode (to the
-  engine's Float32 storage); the fetch image is dense FLOAT32. Sparse and
-  BINARY images are rejected for now. Verified by a self-contained mirror test
-  and a real `oracledb` client `Float32List` round-trip.
+  image, empty locator). Verified by self-contained mirror tests (dense +
+  BINARY) and real `oracledb` client round-trips (dense `Float32List` and a
+  sparse `OracleSparseVector`). BINARY can't be bound through a plain INSERT by
+  the client (needs a PL/SQL typed bind), so it is covered self-contained.
 - **Inverted:** `oracle_vector.dart` (dense `Float32List`/`Float64List`/
   `Int8List`/`Uint8List` by storage format; sparse `OracleSparseVector`) and
   the describe's 23.4 vector fields (dimensions / format / flags).
-- **Engine fit:** the engine **has native vectors**, so the full
-  bind→store→fetch round-trip works: decode a bound vector to the engine's
-  `Vector`, and on fetch encode a vector column to the VECTOR wire form.
-- **Remaining:** sparse (`OracleSparseVector`) and BINARY vectors, and a real
-  `VECTOR_DISTANCE` query (the engine's similarity path).
+- **Engine fit:** dense vectors use the engine's native `Vector`; BINARY and
+  sparse are stored as opaque carriers (not indexable, in-memory round-trip).
+- **Remaining:** a real `VECTOR_DISTANCE` query over the engine's vector index;
+  persisting non-dense vectors to the file-backed store (in-memory only today).
 
 ### 3. JSON / OSON codecs (Phase 5) — type 119 — ✅ done (standard JSON)
 

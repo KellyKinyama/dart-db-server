@@ -315,6 +315,7 @@ String _decodeOracleDateTime(Uint8List b) {
 /// Magic byte that opens a VECTOR image (client `tnsVectorMagicByte`).
 const int _vectorMagicByte = 0xDB;
 const int _vectorVersionBase = 0;
+const int _vectorVersionWithBinary = 1;
 const int _vectorVersionWithSparse = 2;
 const int _vectorFlagNorm = 0x0002;
 const int _vectorFlagNormSrc = 0x0010;
@@ -326,13 +327,14 @@ const int _vectorFormatBinary = 5;
 const int _vectorImageHeaderLength = 9;
 const int _vectorNormLength = 8;
 
-/// Decodes a VECTOR bind value (type 127) into the engine's [Vector].
+/// Decodes a VECTOR bind value (type 127) into the engine's [Vector] (dense),
+/// an [OracleBinaryVector], or an [OracleSparseVector].
 ///
 /// The client writes a VECTOR bind as a 40-byte value-based QLocator — a UB4
 /// byte count (40) then the length-prefixed locator — followed by the
 /// length-prefixed vector image (client `_writeQLocator` + `encodeVector`). A
 /// NULL arrives as a single zero-length indicator.
-Vector? _decodeVectorBind(ReadBuffer body) {
+Object? _decodeVectorBind(ReadBuffer body) {
   final marker = body.peekUint8();
   if (marker == 0 || marker == 0xFF) {
     body.readUint8(); // zero-length NULL indicator
@@ -372,12 +374,14 @@ Object? _decodeLobBind(ReadBuffer body, int oraType, LobStore? lobStore) {
   return Uint8List.fromList(bytes);
 }
 
-/// Decodes a VECTOR image into the engine's [Vector] (always `Float32List`).
-/// Inverts the client's `encodeVector` for dense FLOAT32 / FLOAT64 / INT8
-/// vectors (the formats the engine's `Float32` storage can represent);
-/// BINARY and sparse images are rejected. FLOAT32 / FLOAT64 elements are read
-/// from Oracle's byte-comparable IEEE form.
-Vector _decodeVectorImage(Uint8List image) {
+/// Decodes a VECTOR image into the engine's dense [Vector] (`Float32List`) for
+/// FLOAT32 / FLOAT64 / INT8, an [OracleBinaryVector] for a packed BINARY
+/// vector, or an [OracleSparseVector] for a sparse one — inverting the client's
+/// `encodeVector`. FLOAT32 / FLOAT64 elements are read from Oracle's
+/// byte-comparable IEEE form. Dense vectors become the engine's indexable
+/// `Float32` type; BINARY and sparse vectors are carried verbatim (the engine
+/// stores them unchanged) and re-encoded on fetch.
+Object _decodeVectorImage(Uint8List image) {
   if (image.length < _vectorImageHeaderLength || image[0] != _vectorMagicByte) {
     throw const FormatException('malformed VECTOR image');
   }
@@ -387,35 +391,88 @@ Vector _decodeVectorImage(Uint8List image) {
     throw FormatException('unsupported VECTOR image version $version');
   }
   final flags = data.getUint16(2);
-  if ((flags & _vectorFlagSparse) != 0) {
-    throw const FormatException('sparse VECTOR binds are not supported');
-  }
   final format = image[4];
-  final count = data.getUint32(5);
+  final numDimensions = data.getUint32(5);
   var pos = _vectorImageHeaderLength;
   if (format == _vectorFormatBinary || (flags & _vectorFlagNorm) != 0) {
     pos += _vectorNormLength; // skip the norm (or its reserved space)
   }
-  final out = Float32List(count);
+  final sparse = (flags & _vectorFlagSparse) != 0;
+  List<int>? indices;
+  var count = numDimensions; // dense element count (dimensions)
+  if (sparse) {
+    final numElements = data.getUint16(pos);
+    pos += 2;
+    indices = <int>[for (var i = 0; i < numElements; i++, pos += 4) data.getUint32(pos)];
+    count = numElements;
+  } else if (format == _vectorFormatBinary) {
+    // A dense BINARY vector packs 8 dimensions per byte.
+    final nbytes = numDimensions ~/ 8;
+    return OracleBinaryVector(
+        numDimensions, Uint8List.fromList(image.sublist(pos, pos + nbytes)));
+  }
+  final values = <num>[];
   switch (format) {
     case _vectorFormatFloat32:
       for (var i = 0; i < count; i++, pos += 4) {
-        out[i] = _readComparableFloat32(data, pos);
+        values.add(_readComparableFloat32(data, pos));
       }
     case _vectorFormatFloat64:
       for (var i = 0; i < count; i++, pos += 8) {
-        out[i] = _readComparableFloat64(data, pos);
+        values.add(_readComparableFloat64(data, pos));
       }
     case _vectorFormatInt8:
       for (var i = 0; i < count; i++, pos += 1) {
         final b = image[pos];
-        out[i] = (b > 127 ? b - 256 : b).toDouble();
+        values.add(b > 127 ? b - 256 : b);
+      }
+    case _vectorFormatBinary:
+      for (var i = 0; i < count; i++, pos += 1) {
+        values.add(image[pos]);
       }
     default:
       throw FormatException('unsupported VECTOR format $format');
   }
-  return Vector(out);
+  if (sparse) {
+    return OracleSparseVector(
+        numDimensions: numDimensions,
+        indices: indices!,
+        values: values,
+        format: format);
+  }
+  // Dense FLOAT32/FLOAT64/INT8 become the engine's indexable Float32 vector.
+  return Vector(Float32List.fromList([for (final v in values) v.toDouble()]));
 }
+
+/// A packed BINARY VECTOR value (8 dimensions per byte) the engine stores
+/// verbatim. [bytes] length × 8 == [numDimensions].
+class OracleBinaryVector {
+  OracleBinaryVector(this.numDimensions, this.bytes);
+  final int numDimensions;
+  final Uint8List bytes;
+}
+
+/// A sparse VECTOR value (only [indices] carry non-zero [values]) in one of the
+/// VECTOR element formats, stored verbatim by the engine.
+class OracleSparseVector {
+  OracleSparseVector({
+    required this.numDimensions,
+    required this.indices,
+    required this.values,
+    required this.format,
+  });
+  final int numDimensions;
+  final List<int> indices;
+  final List<num> values;
+  final int format;
+}
+
+/// Wire element size for a VECTOR format.
+int _vectorElementSize(int format) => switch (format) {
+      _vectorFormatFloat32 => 4,
+      _vectorFormatFloat64 => 8,
+      _ => 1, // INT8 / BINARY
+    };
 
 /// Encodes the engine's [Vector] (a `Float32List`) into a dense FLOAT32
 /// VECTOR image (client `encodeVector` for a `Float32List`): the 9-byte
@@ -435,6 +492,68 @@ Uint8List _encodeVectorImage(Vector vector) {
   for (final v in values) {
     _writeComparableFloat32(data, pos, v);
     pos += 4;
+  }
+  return image;
+}
+
+/// Encodes an [OracleBinaryVector] into a BINARY VECTOR image (client
+/// `encodeVector` for a `Uint8List`): version 1, flags NORMSRC (the norm space
+/// is reserved, never set), element count = bytes × 8, then the packed bytes.
+Uint8List _encodeBinaryVectorImage(OracleBinaryVector v) {
+  final size = _vectorImageHeaderLength + _vectorNormLength + v.bytes.length;
+  final image = Uint8List(size);
+  final data = ByteData.sublistView(image);
+  image[0] = _vectorMagicByte;
+  image[1] = _vectorVersionWithBinary;
+  data.setUint16(2, _vectorFlagNormSrc);
+  image[4] = _vectorFormatBinary;
+  data.setUint32(5, v.bytes.length * 8);
+  image.setRange(_vectorImageHeaderLength + _vectorNormLength,
+      _vectorImageHeaderLength + _vectorNormLength + v.bytes.length, v.bytes);
+  return image;
+}
+
+/// Encodes an [OracleSparseVector] into a sparse VECTOR image (client
+/// `encodeVector` for an `OracleSparseVector`): version 2, [_vectorFlagSparse]
+/// added, element count = the dimension count, then a UInt16 non-zero count,
+/// the UInt32 indices, and the values in the vector's format.
+Uint8List _encodeSparseVectorImage(OracleSparseVector v) {
+  final elementSize = _vectorElementSize(v.format);
+  final size = _vectorImageHeaderLength +
+      _vectorNormLength +
+      2 +
+      v.indices.length * 4 +
+      v.values.length * elementSize;
+  final image = Uint8List(size);
+  final data = ByteData.sublistView(image);
+  image[0] = _vectorMagicByte;
+  image[1] = _vectorVersionWithSparse;
+  var flags = _vectorFlagSparse;
+  if (v.format != _vectorFormatBinary) {
+    flags |= _vectorFlagNormSrc | _vectorFlagNorm;
+  }
+  data.setUint16(2, flags);
+  image[4] = v.format;
+  data.setUint32(5, v.numDimensions);
+  var pos = _vectorImageHeaderLength + _vectorNormLength;
+  data.setUint16(pos, v.indices.length);
+  pos += 2;
+  for (final idx in v.indices) {
+    data.setUint32(pos, idx);
+    pos += 4;
+  }
+  for (final val in v.values) {
+    switch (v.format) {
+      case _vectorFormatFloat32:
+        _writeComparableFloat32(data, pos, val.toDouble());
+        pos += 4;
+      case _vectorFormatFloat64:
+        _writeComparableFloat64(data, pos, val.toDouble());
+        pos += 8;
+      default: // INT8 / BINARY
+        image[pos] = val.toInt() & 0xFF;
+        pos += 1;
+    }
   }
   return image;
 }
@@ -476,6 +595,23 @@ void _writeComparableFloat32(ByteData data, int pos, double value) {
     pos,
     (bits & 0x80000000) == 0 ? bits | 0x80000000 : ~bits & 0xFFFFFFFF,
   );
+}
+
+/// Writes [value] as a FLOAT64 element in Oracle's byte-comparable form
+/// (client `_writeComparableFloat64`).
+void _writeComparableFloat64(ByteData data, int pos, double value) {
+  _floatScratch.setFloat64(0, value);
+  var hi = _floatScratch.getUint32(0);
+  var lo = _floatScratch.getUint32(4);
+  if ((hi & 0x80000000) == 0) {
+    hi |= 0x80000000;
+  } else {
+    hi = ~hi & 0xFFFFFFFF;
+    lo = ~lo & 0xFFFFFFFF;
+  }
+  data
+    ..setUint32(pos, hi)
+    ..setUint32(pos + 4, lo);
 }
 
 /// Builds the response for a query [result]: DESCRIBE_INFO, one ROW_HEADER, a
@@ -544,7 +680,9 @@ int _inferColumnOraType(List<List<Object?>> rows, int colIndex) {
     sawValue = true;
     if (!(v is num && isOracleNumberRepresentable(v))) allNumber = false;
     if (v is! Uint8List) allRaw = false;
-    if (v is! Vector) allVector = false;
+    if (!(v is Vector || v is OracleBinaryVector || v is OracleSparseVector)) {
+      allVector = false;
+    }
     if (!((v is Map || v is List) && v is! Uint8List)) allJson = false;
     if (!allNumber && !allRaw && !allVector && !allJson) return _oraTypeVarchar;
   }
@@ -716,13 +854,21 @@ void _writeLobColumn(
 /// Writes a VECTOR column value in the LOB-prefetch inline shape the client's
 /// VECTOR column decoder reads (client `execute_message` `oraTypeVector`): a
 /// UB4 marker (0 ⇒ SQL NULL), UB8 size and UB4 chunk size (unused), the
-/// length-prefixed vector image, then an empty length-prefixed locator.
+/// length-prefixed vector image, then an empty length-prefixed locator. A dense
+/// [Vector] encodes as FLOAT32; [OracleBinaryVector] / [OracleSparseVector]
+/// re-encode their original format.
 void _writeVectorColumn(WriteBuffer b, Object? cell) {
-  if (cell is! Vector) {
+  final Uint8List? image = cell is Vector
+      ? _encodeVectorImage(cell)
+      : cell is OracleBinaryVector
+          ? _encodeBinaryVectorImage(cell)
+          : cell is OracleSparseVector
+              ? _encodeSparseVectorImage(cell)
+              : null;
+  if (image == null) {
     b.writeUB4(0); // SQL NULL
     return;
   }
-  final image = _encodeVectorImage(cell);
   b.writeUB4(image.length); // marker / locator length (non-zero)
   b.writeUB8(image.length); // size (unused by the client)
   b.writeUB4(0); // chunk size (unused)

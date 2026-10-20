@@ -357,6 +357,7 @@ int _bindOraType(Object? v) {
   if (v == null) return 1; // VARCHAR (null)
   if (v is RawBind) return v.oraType;
   if (v is VectorBind) return 127; // VECTOR
+  if (v is VectorImageBind) return 127; // VECTOR (pre-built image)
   if (v is JsonBind) return 119; // JSON
   if (v is num) return 2; // NUMBER
   if (v is Uint8List) return 23; // RAW
@@ -388,6 +389,9 @@ void _writeBindValue(WriteBuffer b, Object? v) {
     final image = encodeVectorImageF32(v.values);
     _writeQLocator(b, image.length);
     b.writeBytesWithLength(image);
+  } else if (v is VectorImageBind) {
+    _writeQLocator(b, v.image.length);
+    b.writeBytesWithLength(v.image);
   } else if (v is JsonBind) {
     final oson = encodeOson(v.value);
     _writeQLocator(b, oson.length);
@@ -432,6 +436,12 @@ class VectorBind {
   final List<double> values;
 }
 
+/// A VECTOR bind carrying a pre-built image (for BINARY / sparse vectors).
+class VectorImageBind {
+  VectorImageBind(this.image);
+  final Uint8List image;
+}
+
 /// A native JSON bind value, encoded as OSON (as the client does).
 class JsonBind {
   JsonBind(this.value);
@@ -459,6 +469,27 @@ Uint8List encodeVectorImageF32(List<double> values) {
     pos += 4;
   }
   return image;
+}
+
+/// Encodes a BINARY VECTOR image (client `encodeVector` for a `Uint8List`):
+/// version 1, flags NORMSRC, element count = bytes × 8, then the packed bytes.
+Uint8List encodeVectorImageBinary(Uint8List bits) {
+  final image = Uint8List(9 + 8 + bits.length);
+  final data = ByteData.sublistView(image);
+  image[0] = 0xDB; // magic
+  image[1] = 1; // version with binary
+  data.setUint16(2, 0x0010); // NORMSRC (norm reserved)
+  image[4] = 5; // BINARY
+  data.setUint32(5, bits.length * 8);
+  image.setRange(17, 17 + bits.length, bits);
+  return image;
+}
+
+/// Decodes a BINARY VECTOR image back to its packed bytes.
+Uint8List decodeVectorImageBinary(Uint8List image) {
+  final data = ByteData.sublistView(image);
+  final nbytes = data.getUint32(5) ~/ 8;
+  return Uint8List.fromList(image.sublist(17, 17 + nbytes));
 }
 
 /// Decodes a dense FLOAT32 VECTOR image back to a list of doubles.
@@ -675,7 +706,9 @@ void _decodeRowData(ReadBuffer r, ExecuteResponse out) {
       r.readUB4(); // chunk size
       final image = r.readBytesWithLength();
       r.readBytesWithLength(); // locator (unused)
-      row.add(decodeVectorImageF32(image));
+      row.add(image[4] == 5
+          ? decodeVectorImageBinary(image) // BINARY -> packed bytes
+          : decodeVectorImageF32(image)); // dense FLOAT32
       continue;
     }
     if (out.columnTypes[i] == 119) {
