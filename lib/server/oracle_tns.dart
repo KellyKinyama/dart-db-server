@@ -179,6 +179,7 @@ class ConnectRequest {
     required this.sdu,
     required this.tdu,
     required this.connectData,
+    this.connectDataLength = 0,
   });
 
   final int versionDesired;
@@ -189,6 +190,11 @@ class ConnectRequest {
   /// The connect descriptor string (e.g. the `(DESCRIPTION=...)` or EZConnect
   /// data), when it fit inline in the CONNECT packet.
   final String connectData;
+
+  /// The announced descriptor length. When > 0 but [connectData] is empty, the
+  /// client sent the CONNECT header without the descriptor inline (the large
+  /// connect-data flow) and expects a RESEND before resending it in full.
+  final int connectDataLength;
 
   /// Parses a CONNECT packet's raw bytes (header included).
   static ConnectRequest parse(Uint8List raw) {
@@ -225,6 +231,7 @@ class ConnectRequest {
       sdu: sdu,
       tdu: tdu,
       connectData: connectData,
+      connectDataLength: connectDataLength,
     );
   }
 }

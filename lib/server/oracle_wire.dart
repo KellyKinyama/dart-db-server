@@ -162,6 +162,11 @@ class OracleConnection {
   /// (negotiated version >= 315). CONNECT/ACCEPT always use 2-byte framing.
   bool _useLargeSdu = false;
 
+  /// When a CONNECT announces a descriptor that isn't inline, the native client
+  /// follows it with a DATA packet carrying the descriptor; the ACCEPT is held
+  /// until that packet arrives. This is the pre-built ACCEPT to send then.
+  Uint8List? _pendingAccept;
+
   void _start() {
     server._log('conn $id connected from '
         '${socket.remoteAddress.address}:${socket.remotePort}');
@@ -253,8 +258,6 @@ class OracleConnection {
     final req = ConnectRequest.parse(raw);
     _version = negotiateVersion(req);
     _sdu = req.sdu == 0 ? tnsDefaultSdu : req.sdu;
-    // Post-ACCEPT DATA packets switch to 4-byte large-SDU framing at v >= 315.
-    _useLargeSdu = _version >= tnsVersionMinLargeSdu;
     server._log(
       'conn $id CONNECT v=${req.versionDesired}/${req.versionMinimum} '
       'sdu=${req.sdu} -> negotiated v=$_version'
@@ -263,12 +266,23 @@ class OracleConnection {
     final accept = buildAcceptPacket(
       version: _version,
       sdu: _sdu,
-      tdu: req.tdu == 0 ? tnsDefaultTdu : req.tdu,
+      // 0xFFFF is the "real value is in the 32-bit field" sentinel, not a TDU;
+      // never echo it back as the negotiated TDU.
+      tdu: (req.tdu == 0 || req.tdu == 0xffff) ? tnsDefaultTdu : req.tdu,
       // Advertise FAST_AUTH (23ai single-round-trip handshake) once the
       // negotiated version carries the flag2 word; classical PROTOCOL /
       // DATA-TYPES / AUTH still work for clients that ignore it.
       flag2: _version >= tnsVersionMinDataFlags ? tnsAcceptFlagFastAuth : 0,
     );
+    // Native (thick) clients send the connect descriptor in a separate DATA
+    // packet right after the CONNECT; hold the ACCEPT until that packet arrives
+    // and keep 2-byte framing for it. Thin clients send the descriptor inline
+    // and get the ACCEPT immediately.
+    if (req.connectData.isEmpty && req.connectDataLength > 0) {
+      _pendingAccept = accept;
+      return;
+    }
+    _useLargeSdu = _version >= tnsVersionMinLargeSdu;
     _phase = OraclePhase.negotiate;
     _send(accept);
   }
@@ -280,6 +294,17 @@ class OracleConnection {
   }
 
   void _handleData(TnsPacket packet) {
+    // While a CONNECT's ACCEPT is deferred, the first DATA packet carries the
+    // connect descriptor (not TTC). Consume it and release the ACCEPT, then
+    // switch to the negotiated post-ACCEPT framing.
+    final pending = _pendingAccept;
+    if (pending != null) {
+      _pendingAccept = null;
+      _useLargeSdu = _version >= tnsVersionMinLargeSdu;
+      _phase = OraclePhase.negotiate;
+      _send(pending);
+      return;
+    }
     if (packet.payload.isEmpty) return; // no TTC body
     final ttc = ReadBuffer(packet.payload);
     // The client may prepend piggyback control messages (e.g. close-cursors)
