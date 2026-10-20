@@ -18,10 +18,11 @@
 ///     (challenge-response) and `PLAIN` mechanisms.
 ///   * `Sql.StmtExecute` (namespace `sql`) → `Resultset.ColumnMetaData` / `Row`
 ///     / `FetchDone` / `StmtExecuteOk`, with a `rows_affected` notice for DML.
+///   * `Crud.Find/Insert/Update/Delete` (TABLE data model) translated to SQL.
 ///   * `Session.Reset`, `Session.Close`, `Connection.Close`.
 ///
 /// Not yet supported (clients asking for these get an `Error`):
-///   * CRUD document/table ops (`Crud.Find/Insert/Update/Delete`).
+///   * CRUD document (collection) operations and document-path expressions.
 ///   * X-protocol TLS (`CapabilitiesSet tls=1`).
 library;
 
@@ -50,6 +51,10 @@ class _ClientMsg {
   static const sessionReset = 6;
   static const sessionClose = 7;
   static const stmtExecute = 12;
+  static const crudFind = 17;
+  static const crudInsert = 18;
+  static const crudUpdate = 19;
+  static const crudDelete = 20;
 }
 
 /// Server → client message types (`Mysqlx.ServerMessages.Type`).
@@ -230,6 +235,16 @@ class _XConn {
             return;
           }
           await _handleStmtExecute(payload);
+          return;
+        case _ClientMsg.crudFind:
+        case _ClientMsg.crudInsert:
+        case _ClientMsg.crudUpdate:
+        case _ClientMsg.crudDelete:
+          if (_phase != _XPhase.ready) {
+            _sendError(1045, 'HY000', 'Not authenticated');
+            return;
+          }
+          await _handleCrud(type, payload);
           return;
         case _ClientMsg.sessionReset:
           _writeMessage(_ServerMsg.ok, _Pb().build());
@@ -453,6 +468,461 @@ class _XConn {
       _sendRowsAffected(result.affected);
     }
     _writeMessage(_ServerMsg.stmtExecuteOk, _Pb().build());
+  }
+
+  // -------------------------------------------------------------------------
+  // CRUD (Crud.Find / Insert / Update / Delete) — TABLE data model only.
+  // Each message is translated to SQL and run through the shared engine.
+  // -------------------------------------------------------------------------
+
+  Future<void> _handleCrud(int type, Uint8List payload) async {
+    final String sql;
+    try {
+      sql = switch (type) {
+        _ClientMsg.crudFind => _crudFindSql(payload),
+        _ClientMsg.crudInsert => _crudInsertSql(payload),
+        _ClientMsg.crudUpdate => _crudUpdateSql(payload),
+        _ClientMsg.crudDelete => _crudDeleteSql(payload),
+        _ => throw StateError('Unsupported CRUD message $type'),
+      };
+    } catch (e) {
+      _sendError(5014, 'HY000', 'CRUD translation failed: $e');
+      return;
+    }
+    QueryResult result;
+    try {
+      result = await server.db.execute(sql);
+    } catch (e) {
+      _sendError(1064, '42000', e.toString());
+      return;
+    }
+    if (result.columns.isNotEmpty) {
+      _sendResultSet(result);
+    } else {
+      _sendRowsAffected(result.affected);
+    }
+    _writeMessage(_ServerMsg.stmtExecuteOk, _Pb().build());
+  }
+
+  String _crudFindSql(Uint8List payload) {
+    // Find { collection=2; data_model=3; projection=4; criteria=5; limit=6;
+    //        order=7; args=10 }
+    String? table;
+    final projections = <String>[];
+    final orders = <String>[];
+    Uint8List? criteria;
+    int? limit;
+    int? offset;
+    final args = <Object?>[];
+    final r = _PbReader(payload);
+    while (r.hasMore) {
+      final (field, wire) = r.tag();
+      switch (field) {
+        case 2:
+          table = _decodeCollection(r.bytes());
+        case 4:
+          projections.add(_decodeProjection(r.bytes(), args));
+        case 5:
+          criteria = r.bytes();
+        case 6:
+          final (rc, off) = _decodeLimit(r.bytes());
+          limit = rc;
+          offset = off;
+        case 7:
+          orders.add(_decodeOrder(r.bytes(), args));
+        case 10:
+          args.add(_decodeScalar(r.bytes()));
+        default:
+          r.skip(wire);
+      }
+    }
+    final cols = projections.isEmpty ? '*' : projections.join(', ');
+    final sb = StringBuffer('SELECT $cols FROM ${_requireTable(table)}');
+    if (criteria != null) sb.write(' WHERE ${_exprToSql(criteria, args)}');
+    if (orders.isNotEmpty) sb.write(' ORDER BY ${orders.join(', ')}');
+    if (limit != null) {
+      sb.write(' LIMIT $limit');
+      if (offset != null && offset > 0) sb.write(' OFFSET $offset');
+    }
+    return sb.toString();
+  }
+
+  String _crudInsertSql(Uint8List payload) {
+    // Insert { collection=1; data_model=2; projection(Column)=3; row=4; args=5 }
+    String? table;
+    final columns = <String>[];
+    final rows = <Uint8List>[];
+    final args = <Object?>[];
+    final r = _PbReader(payload);
+    while (r.hasMore) {
+      final (field, wire) = r.tag();
+      switch (field) {
+        case 1:
+          table = _decodeCollection(r.bytes());
+        case 3:
+          columns.add(_decodeInsertColumn(r.bytes()));
+        case 4:
+          rows.add(r.bytes());
+        case 5:
+          args.add(_decodeScalar(r.bytes()));
+        default:
+          r.skip(wire);
+      }
+    }
+    final colList = columns.isEmpty ? '' : ' (${columns.join(', ')})';
+    final valueRows = <String>[];
+    for (final row in rows) {
+      // TypedRow { repeated Expr field = 1 }
+      final fields = <String>[];
+      final rr = _PbReader(row);
+      while (rr.hasMore) {
+        final (f, w) = rr.tag();
+        if (f == 1) {
+          fields.add(_exprToSql(rr.bytes(), args));
+        } else {
+          rr.skip(w);
+        }
+      }
+      valueRows.add('(${fields.join(', ')})');
+    }
+    return 'INSERT INTO ${_requireTable(table)}$colList VALUES '
+        '${valueRows.join(', ')}';
+  }
+
+  String _crudUpdateSql(Uint8List payload) {
+    // Update { collection=2; data_model=3; criteria=4; limit=5; order=6;
+    //          operation=7; args=8 }
+    String? table;
+    Uint8List? criteria;
+    final sets = <String>[];
+    final args = <Object?>[];
+    final r = _PbReader(payload);
+    while (r.hasMore) {
+      final (field, wire) = r.tag();
+      switch (field) {
+        case 2:
+          table = _decodeCollection(r.bytes());
+        case 4:
+          criteria = r.bytes();
+        case 7:
+          sets.add(_decodeUpdateOperation(r.bytes(), args));
+        case 8:
+          args.add(_decodeScalar(r.bytes()));
+        default:
+          r.skip(wire);
+      }
+    }
+    final sb = StringBuffer('UPDATE ${_requireTable(table)} SET '
+        '${sets.join(', ')}');
+    if (criteria != null) sb.write(' WHERE ${_exprToSql(criteria, args)}');
+    return sb.toString();
+  }
+
+  String _crudDeleteSql(Uint8List payload) {
+    // Delete { collection=1; data_model=2; criteria=3; limit=4; order=5; args=6 }
+    String? table;
+    Uint8List? criteria;
+    final args = <Object?>[];
+    final r = _PbReader(payload);
+    while (r.hasMore) {
+      final (field, wire) = r.tag();
+      switch (field) {
+        case 1:
+          table = _decodeCollection(r.bytes());
+        case 3:
+          criteria = r.bytes();
+        case 6:
+          args.add(_decodeScalar(r.bytes()));
+        default:
+          r.skip(wire);
+      }
+    }
+    final sb = StringBuffer('DELETE FROM ${_requireTable(table)}');
+    if (criteria != null) sb.write(' WHERE ${_exprToSql(criteria, args)}');
+    return sb.toString();
+  }
+
+  String _requireTable(String? table) {
+    if (table == null || table.isEmpty) {
+      throw StateError('CRUD message has no collection name');
+    }
+    return table;
+  }
+
+  /// Collection { name=1; schema=2 } → `schema.name` or `name`.
+  String _decodeCollection(Uint8List bytes) {
+    final r = _PbReader(bytes);
+    String? name;
+    String? schema;
+    while (r.hasMore) {
+      final (f, w) = r.tag();
+      switch (f) {
+        case 1:
+          name = utf8.decode(r.bytes());
+        case 2:
+          schema = utf8.decode(r.bytes());
+        default:
+          r.skip(w);
+      }
+    }
+    return schema == null || schema.isEmpty ? '$name' : '$schema.$name';
+  }
+
+  /// Projection { source(Expr)=1; alias=2 } → `expr [AS alias]`.
+  String _decodeProjection(Uint8List bytes, List<Object?> args) {
+    final r = _PbReader(bytes);
+    String source = '*';
+    String? alias;
+    while (r.hasMore) {
+      final (f, w) = r.tag();
+      switch (f) {
+        case 1:
+          source = _exprToSql(r.bytes(), args);
+        case 2:
+          alias = utf8.decode(r.bytes());
+        default:
+          r.skip(w);
+      }
+    }
+    return alias == null ? source : '$source AS $alias';
+  }
+
+  /// Order { expr(Expr)=1; direction=2 (ASC=1/DESC=2) } → `expr [DESC]`.
+  String _decodeOrder(Uint8List bytes, List<Object?> args) {
+    final r = _PbReader(bytes);
+    String expr = '';
+    int dir = 1;
+    while (r.hasMore) {
+      final (f, w) = r.tag();
+      switch (f) {
+        case 1:
+          expr = _exprToSql(r.bytes(), args);
+        case 2:
+          dir = r.varint();
+        default:
+          r.skip(w);
+      }
+    }
+    return dir == 2 ? '$expr DESC' : expr;
+  }
+
+  /// Limit { row_count=1; offset=2 }.
+  (int, int?) _decodeLimit(Uint8List bytes) {
+    final r = _PbReader(bytes);
+    int rowCount = 0;
+    int? offset;
+    while (r.hasMore) {
+      final (f, w) = r.tag();
+      switch (f) {
+        case 1:
+          rowCount = r.varint();
+        case 2:
+          offset = r.varint();
+        default:
+          r.skip(w);
+      }
+    }
+    return (rowCount, offset);
+  }
+
+  /// Insert.Column { name=1 } → column name.
+  String _decodeInsertColumn(Uint8List bytes) {
+    final r = _PbReader(bytes);
+    String name = '';
+    while (r.hasMore) {
+      final (f, w) = r.tag();
+      if (f == 1) {
+        name = utf8.decode(r.bytes());
+      } else {
+        r.skip(w);
+      }
+    }
+    return name;
+  }
+
+  /// UpdateOperation { source(ColumnIdentifier)=1; operation=2; value(Expr)=3 }
+  /// → `col = value` (table SET).
+  String _decodeUpdateOperation(Uint8List bytes, List<Object?> args) {
+    final r = _PbReader(bytes);
+    String col = '';
+    String value = 'NULL';
+    while (r.hasMore) {
+      final (f, w) = r.tag();
+      switch (f) {
+        case 1:
+          col = _decodeColumnIdentifier(r.bytes());
+        case 3:
+          value = _exprToSql(r.bytes(), args);
+        default:
+          r.skip(w);
+      }
+    }
+    return '$col = $value';
+  }
+
+  /// Translate a `Mysqlx.Expr.Expr` to a SQL fragment. Supports identifiers,
+  /// literals, placeholders (bound from [args]), operators and function calls.
+  String _exprToSql(Uint8List bytes, List<Object?> args) {
+    // Expr { type=1; identifier=2; literal=4; function_call=5; operator=6;
+    //        position=7 }
+    final r = _PbReader(bytes);
+    int type = 0;
+    Uint8List? identifier;
+    Uint8List? literal;
+    Uint8List? functionCall;
+    Uint8List? operator;
+    int? position;
+    while (r.hasMore) {
+      final (f, w) = r.tag();
+      switch (f) {
+        case 1:
+          type = r.varint();
+        case 2:
+          identifier = r.bytes();
+        case 4:
+          literal = r.bytes();
+        case 5:
+          functionCall = r.bytes();
+        case 6:
+          operator = r.bytes();
+        case 7:
+          position = r.varint();
+        default:
+          r.skip(w);
+      }
+    }
+    switch (type) {
+      case 1: // IDENT
+        return _decodeColumnIdentifier(identifier ?? Uint8List(0));
+      case 2: // LITERAL
+        return _scalarToSql(_decodeScalar(literal ?? Uint8List(0)));
+      case 4: // FUNC_CALL
+        return _decodeFunctionCall(functionCall ?? Uint8List(0), args);
+      case 5: // OPERATOR
+        return _decodeOperator(operator ?? Uint8List(0), args);
+      case 6: // PLACEHOLDER
+        final i = position ?? 0;
+        return _scalarToSql(i < args.length ? args[i] : null);
+      default:
+        return 'NULL';
+    }
+  }
+
+  /// ColumnIdentifier { name=2; table_name=3; schema_name=4 }.
+  String _decodeColumnIdentifier(Uint8List bytes) {
+    final r = _PbReader(bytes);
+    String? name;
+    String? tableName;
+    while (r.hasMore) {
+      final (f, w) = r.tag();
+      switch (f) {
+        case 2:
+          name = utf8.decode(r.bytes());
+        case 3:
+          tableName = utf8.decode(r.bytes());
+        default:
+          r.skip(w);
+      }
+    }
+    if (name == null) return '*';
+    return tableName == null ? name : '$tableName.$name';
+  }
+
+  /// Operator { name=1; param(Expr)=2 }. Infix for binary/logical operators,
+  /// prefix for `not`, special-cased `between`/`in`/`like`.
+  String _decodeOperator(Uint8List bytes, List<Object?> args) {
+    final r = _PbReader(bytes);
+    String name = '';
+    final params = <String>[];
+    while (r.hasMore) {
+      final (f, w) = r.tag();
+      switch (f) {
+        case 1:
+          name = utf8.decode(r.bytes());
+        case 2:
+          params.add(_exprToSql(r.bytes(), args));
+        default:
+          r.skip(w);
+      }
+    }
+    switch (name) {
+      case '==':
+        return '(${params[0]} = ${params[1]})';
+      case '!=':
+        return '(${params[0]} <> ${params[1]})';
+      case '&&':
+        return '(${params.join(' AND ')})';
+      case '||':
+        return '(${params.join(' OR ')})';
+      case 'not':
+        return '(NOT ${params[0]})';
+      case 'like':
+        return '(${params[0]} LIKE ${params[1]})';
+      case 'in':
+        return '(${params[0]} IN (${params.skip(1).join(', ')}))';
+      case 'between':
+        return '(${params[0]} BETWEEN ${params[1]} AND ${params[2]})';
+      case 'is':
+        return '(${params[0]} IS ${params[1]})';
+      case '>':
+      case '>=':
+      case '<':
+      case '<=':
+      case '+':
+      case '-':
+      case '*':
+      case '/':
+      case '%':
+        if (params.length == 1) return '($name${params[0]})';
+        return '(${params[0]} $name ${params[1]})';
+      default:
+        return '($name(${params.join(', ')}))';
+    }
+  }
+
+  /// FunctionCall { name(Identifier)=1; param(Expr)=2 }.
+  String _decodeFunctionCall(Uint8List bytes, List<Object?> args) {
+    final r = _PbReader(bytes);
+    String fname = '';
+    final params = <String>[];
+    while (r.hasMore) {
+      final (f, w) = r.tag();
+      switch (f) {
+        case 1:
+          fname = _decodeIdentifierName(r.bytes());
+        case 2:
+          params.add(_exprToSql(r.bytes(), args));
+        default:
+          r.skip(w);
+      }
+    }
+    return '$fname(${params.join(', ')})';
+  }
+
+  /// Identifier { name=1; schema_name=2 }.
+  String _decodeIdentifierName(Uint8List bytes) {
+    final r = _PbReader(bytes);
+    String name = '';
+    while (r.hasMore) {
+      final (f, w) = r.tag();
+      if (f == 1) {
+        name = utf8.decode(r.bytes());
+      } else {
+        r.skip(w);
+      }
+    }
+    return name;
+  }
+
+  /// Render a Dart value as a SQL literal.
+  String _scalarToSql(Object? v) {
+    if (v == null) return 'NULL';
+    if (v is bool) return v ? '1' : '0';
+    if (v is num) return v.toString();
+    if (v is Uint8List) {
+      return "x'${v.map((b) => b.toRadixString(16).padLeft(2, '0')).join()}'";
+    }
+    return "'${v.toString().replaceAll("'", "''")}'";
   }
 
   void _sendResultSet(QueryResult r) {

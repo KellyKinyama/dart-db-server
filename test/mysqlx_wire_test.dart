@@ -26,6 +26,99 @@ const _cCapabilitiesGet = 1;
 const _cAuthStart = 4;
 const _cAuthContinue = 5;
 const _cStmtExecute = 12;
+const _cCrudFind = 17;
+const _cCrudInsert = 18;
+const _cCrudUpdate = 19;
+const _cCrudDelete = 20;
+
+// ---------------------------------------------------------------------------
+// CRUD protobuf builders (Mysqlx.Crud / Mysqlx.Expr)
+// ---------------------------------------------------------------------------
+
+Uint8List _scInt(int n) => (_PbW()..vint(1, 1)..zig(2, n)).build();
+Uint8List _scStr(String s) =>
+    (_PbW()..vint(1, 8)..msg(8, (_PbW()..bytes(1, utf8.encode(s))).build()))
+        .build();
+
+Uint8List _eIdent(String col) =>
+    (_PbW()..vint(1, 1)..msg(2, (_PbW()..str(2, col)).build())).build();
+Uint8List _eLit(Uint8List scalar) => (_PbW()..vint(1, 2)..msg(4, scalar)).build();
+Uint8List _eOp(String name, List<Uint8List> params) {
+  final op = _PbW()..str(1, name);
+  for (final p in params) {
+    op.msg(2, p);
+  }
+  return (_PbW()..vint(1, 5)..msg(6, op.build())).build();
+}
+
+Uint8List _collection(String table) => (_PbW()..str(1, table)).build();
+
+Uint8List _find({
+  required String table,
+  List<String> cols = const [],
+  Uint8List? criteria,
+  String? orderBy,
+  bool orderDesc = false,
+  int? limit,
+}) {
+  final b = _PbW()..msg(2, _collection(table));
+  for (final c in cols) {
+    b.msg(4, (_PbW()..msg(1, _eIdent(c))).build()); // Projection{source=1}
+  }
+  if (criteria != null) b.msg(5, criteria);
+  if (limit != null) b.msg(6, (_PbW()..vint(1, limit)).build());
+  if (orderBy != null) {
+    final o = _PbW()..msg(1, _eIdent(orderBy));
+    if (orderDesc) o.vint(2, 2);
+    b.msg(7, o.build());
+  }
+  return b.build();
+}
+
+Uint8List _insert({
+  required String table,
+  required List<String> cols,
+  required List<List<Uint8List>> rows,
+}) {
+  final b = _PbW()..msg(1, _collection(table));
+  for (final c in cols) {
+    b.msg(3, (_PbW()..str(1, c)).build()); // Column{name=1}
+  }
+  for (final row in rows) {
+    final tr = _PbW();
+    for (final field in row) {
+      tr.msg(1, field); // TypedRow{field=1}
+    }
+    b.msg(4, tr.build());
+  }
+  return b.build();
+}
+
+Uint8List _delete({required String table, Uint8List? criteria}) {
+  final b = _PbW()..msg(1, _collection(table));
+  if (criteria != null) b.msg(3, criteria);
+  return b.build();
+}
+
+Uint8List _update({
+  required String table,
+  required List<Uint8List> ops,
+  Uint8List? criteria,
+}) {
+  final b = _PbW()..msg(2, _collection(table));
+  if (criteria != null) b.msg(4, criteria);
+  for (final op in ops) {
+    b.msg(7, op);
+  }
+  return b.build();
+}
+
+Uint8List _setOp(String col, Uint8List valueExpr) => (_PbW()
+      ..msg(1, (_PbW()..str(2, col)).build()) // ColumnIdentifier{name=2}
+      ..vint(2, 1) // UpdateType.SET
+      ..msg(3, valueExpr))
+    .build();
+
 
 void main() {
   group('MysqlxServer', () {
@@ -81,6 +174,28 @@ void main() {
           rows.add(_decodeRow(m.payload, cols));
         } else if (m.type == _sFetchDone || m.type == _sNotice) {
           // keep reading until StmtExecuteOk
+        } else if (m.type == _sStmtOk) {
+          break;
+        } else if (m.type == _sError) {
+          throw StateError('X error: ${_decodeError(m.payload)}');
+        }
+      }
+      return rows;
+    }
+
+    // Send a CRUD message and collect any result rows up to StmtExecuteOk.
+    Future<List<List<Object?>>> crud(int type, Uint8List payload) async {
+      x.send(type, payload);
+      final cols = <int>[];
+      final rows = <List<Object?>>[];
+      while (true) {
+        final m = await x.next();
+        if (m.type == _sColumnMeta) {
+          cols.add(_PbR(m.payload).readVarintField(1)!);
+        } else if (m.type == _sRow) {
+          rows.add(_decodeRow(m.payload, cols));
+        } else if (m.type == _sFetchDone || m.type == _sNotice) {
+          // keep reading
         } else if (m.type == _sStmtOk) {
           break;
         } else if (m.type == _sError) {
@@ -185,6 +300,91 @@ void main() {
         [1, 'x'],
         [2, null],
       ]);
+    });
+
+    test('CRUD Insert then Find round-trips', () async {
+      await connect();
+      await authMysql41('root');
+      await query('CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)');
+      await crud(
+        _cCrudInsert,
+        _insert(table: 't', cols: [
+          'id',
+          'name'
+        ], rows: [
+          [_eLit(_scInt(1)), _eLit(_scStr('alice'))],
+          [_eLit(_scInt(2)), _eLit(_scStr('bob'))],
+        ]),
+      );
+      final rows = await crud(
+        _cCrudFind,
+        _find(table: 't', cols: ['id', 'name'], orderBy: 'id'),
+      );
+      expect(rows, [
+        [1, 'alice'],
+        [2, 'bob'],
+      ]);
+    });
+
+    test('CRUD Find with criteria, order and limit', () async {
+      await connect();
+      await authMysql41('root');
+      await query('CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)');
+      await query('INSERT INTO t VALUES (1,10),(2,20),(3,30),(4,40)');
+      final rows = await crud(
+        _cCrudFind,
+        _find(
+          table: 't',
+          cols: ['id'],
+          criteria: _eOp('>', [_eIdent('n'), _eLit(_scInt(15))]),
+          orderBy: 'id',
+          orderDesc: true,
+          limit: 2,
+        ),
+      );
+      expect(rows.map((r) => r.first).toList(), [4, 3]);
+    });
+
+    test('CRUD Update with criteria', () async {
+      await connect();
+      await authMysql41('root');
+      await query('CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)');
+      await query('INSERT INTO t VALUES (1,10),(2,20)');
+      await crud(
+        _cCrudUpdate,
+        _update(
+          table: 't',
+          ops: [_setOp('n', _eLit(_scInt(99)))],
+          criteria: _eOp('==', [_eIdent('id'), _eLit(_scInt(2))]),
+        ),
+      );
+      final rows = await crud(
+        _cCrudFind,
+        _find(table: 't', cols: ['id', 'n'], orderBy: 'id'),
+      );
+      expect(rows, [
+        [1, 10],
+        [2, 99],
+      ]);
+    });
+
+    test('CRUD Delete with criteria', () async {
+      await connect();
+      await authMysql41('root');
+      await query('CREATE TABLE t (id INTEGER PRIMARY KEY)');
+      await query('INSERT INTO t VALUES (1),(2),(3)');
+      await crud(
+        _cCrudDelete,
+        _delete(
+          table: 't',
+          criteria: _eOp('<', [_eIdent('id'), _eLit(_scInt(3))]),
+        ),
+      );
+      final rows = await crud(
+        _cCrudFind,
+        _find(table: 't', cols: ['id'], orderBy: 'id'),
+      );
+      expect(rows.map((r) => r.first).toList(), [3]);
     });
 
     test('StmtExecute before auth is rejected', () async {
@@ -358,6 +558,20 @@ class _PbW {
     _b.add(data);
     return this;
   }
+
+  _PbW vint(int field, int value) {
+    _tag(field, 0);
+    _rawVarint(value);
+    return this;
+  }
+
+  _PbW zig(int field, int value) {
+    _tag(field, 0);
+    _rawVarint((value << 1) ^ (value >> 63));
+    return this;
+  }
+
+  _PbW msg(int field, Uint8List m) => bytes(field, m);
 
   Uint8List build() => _b.toBytes();
 }
