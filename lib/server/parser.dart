@@ -1956,8 +1956,23 @@ class Parser {
     return (residual, limit);
   }
 
-  bool _isRownum(Expr e) =>
-      e is ColumnExpr && e.table == null && e.name.toUpperCase() == 'ROWNUM';
+  bool _isRownum(Expr e) {
+    // ROWNUM is lowered to `ROW_NUMBER() OVER ()` by _parsePrimary; recognise
+    // that exact node (empty window, no args/filter) as the pseudo-column.
+    if (e is! FunctionCallExpr) return false;
+    final w = e.window;
+    return e.name == 'ROW_NUMBER' &&
+        e.args.isEmpty &&
+        !e.isStarArg &&
+        !e.distinct &&
+        e.filterExpr == null &&
+        (e.aggOrderBy == null || e.aggOrderBy!.isEmpty) &&
+        w != null &&
+        w.partitionBy.isEmpty &&
+        w.orderBy.isEmpty &&
+        w.frame == null &&
+        w.baseName == null;
+  }
 
   int? _intLiteral(Expr e) {
     if (e is LiteralExpr) {
@@ -2337,6 +2352,14 @@ class Parser {
       };
       if (bareFns.contains(t.upper)) {
         return FunctionCallExpr(t.upper, const []);
+      }
+      // Oracle ROWNUM pseudo-column. Lower it to ROW_NUMBER() OVER () so it
+      // works anywhere an expression is allowed (projection, ORDER BY, ...),
+      // numbering rows in result order. A top-level `ROWNUM <op> n` in WHERE
+      // is separately folded into a LIMIT by _rewriteRownumWhere (which
+      // recognises this same lowered node).
+      if (t.upper == 'ROWNUM') {
+        return FunctionCallExpr('ROW_NUMBER', const [], window: WindowSpec());
       }
       return ColumnExpr(t.text);
     }

@@ -82,4 +82,46 @@ void main() {
     expect(await ids('SELECT id FROM t FETCH FIRST 2 ROWS ONLY'), [1, 2]);
     expect(await ids('SELECT id FROM t FETCH FIRST 1 ROW ONLY'), [1]);
   });
+
+  test('ROWNUM in the SELECT list numbers output rows', () async {
+    final r = await db.execute('SELECT ROWNUM, name FROM t');
+    expect(r.rows.map((x) => x.toList()).toList(), [
+      [1, 'n1'],
+      [2, 'n2'],
+      [3, 'n3'],
+      [4, 'n4'],
+      [5, 'n5'],
+    ]);
+  });
+
+  test('ROWNUM in the SELECT list can be aliased and limited', () async {
+    final r = await db.execute('SELECT ROWNUM rn, name FROM t WHERE ROWNUM <= 3');
+    expect(r.columns.first, 'rn');
+    expect(r.rows.map((x) => x.toList()).toList(), [
+      [1, 'n1'],
+      [2, 'n2'],
+      [3, 'n3'],
+    ]);
+  });
+
+  test('ROWNUM is assigned before the final ORDER BY (Oracle order)', () async {
+    // Oracle assigns ROWNUM during the scan, before sorting, so after an
+    // ORDER BY the numbers appear in the pre-sort order.
+    final r = await db.execute('SELECT ROWNUM, name FROM t ORDER BY name DESC');
+    expect(r.rows.map((x) => x.toList()).toList(), [
+      [5, 'n5'],
+      [4, 'n4'],
+      [3, 'n3'],
+      [2, 'n2'],
+      [1, 'n1'],
+    ]);
+  });
+
+  test('pagination idiom: ROWNUM in a subquery, filtered in the outer', () async {
+    final r = await db.execute(
+      'SELECT name FROM (SELECT name, ROWNUM rn FROM t) WHERE rn BETWEEN 2 AND 4',
+    );
+    expect(r.rows.map((x) => x.first).toList(), ['n2', 'n3', 'n4']);
+  });
 }
+

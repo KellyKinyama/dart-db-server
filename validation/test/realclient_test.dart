@@ -93,6 +93,15 @@ void main() {
       'SELECT n FROM (SELECT n FROM nums ORDER BY n DESC) WHERE ROWNUM <= 2',
     );
     expect(topN.rows.map((row) => row[0]).toList(), [10, 9]);
+
+    // ROWNUM in the SELECT list numbers the returned rows.
+    final numbered =
+        await conn.execute('SELECT ROWNUM, n FROM nums WHERE ROWNUM <= 3');
+    expect(numbered.rows.map((row) => row.toList()).toList(), [
+      [1, 1],
+      [2, 2],
+      [3, 3],
+    ]);
   });
 
   test('a wrong password is rejected', () async {
