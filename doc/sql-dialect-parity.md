@@ -99,7 +99,7 @@ typed literals `DATE '…'` / `TIMESTAMP '…'`.
 | Date/time functions (`NOW`, `CURDATE`, `DATE_FORMAT`, `STR_TO_DATE`, `DATEDIFF`, `UNIX_TIMESTAMP`, …) | ✅ |
 | String functions (`CONCAT`, `CONCAT_WS`, `SUBSTRING`, `LEFT`/`RIGHT`, `LPAD`/`RPAD`, `REPLACE`, `REVERSE`, `SOUNDEX`, …) | ✅ |
 | `JSON_*` / `JSONB_*` function family | ✅ |
-| `INFORMATION_SCHEMA` views | ⚠️ partial (`sqlite_master`-backed introspection; not a full `INFORMATION_SCHEMA`) |
+| `INFORMATION_SCHEMA` views | ✅ `TABLES` / `COLUMNS` / `SCHEMATA` / `VIEWS` (sqlite_master-backed; no `KEY_COLUMN_USAGE` / `STATISTICS` yet) |
 | Stored procedures / `DELIMITER` | ❌ |
 
 ---
@@ -125,8 +125,9 @@ The engine ships capabilities neither stock Oracle nor MySQL expose the same way
 
 - **Oracle:** PL/SQL blocks; `SYS_CONNECT_BY_PATH` / `CONNECT_BY_ROOT` (the rest
   of `CONNECT BY` is supported); real-client TLS (client-SDK bug, not server).
-- **MySQL:** X protocol, wire compression, stored procedures, full
-  `INFORMATION_SCHEMA`.
+- **MySQL:** X protocol, wire compression, stored procedures, and the rest of
+  `INFORMATION_SCHEMA` (`TABLES`/`COLUMNS`/`SCHEMATA`/`VIEWS` are supported;
+  `KEY_COLUMN_USAGE` / `STATISTICS` / constraint views are not yet).
 - **Engine quirks:** `(+)` RIGHT joins on 3+-table chains null the whole
   accumulated left side (best-effort vs Oracle's per-table semantics).
 

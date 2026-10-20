@@ -32,7 +32,7 @@ Effort is relative, not calendar-based:
 | G4 | `NCLOB` (UTF-16 CLOB) | Oracle wire | M | low | ✅ done |
 | G5 | `INSERT ALL` / `INSERT FIRST` (multi-table insert) | Oracle | M | low | ✅ done |
 | G6 | `CONNECT BY` hierarchical queries | Oracle | M | medium | ✅ done |
-| G7 | Catalog / data-dictionary views (`INFORMATION_SCHEMA`, `USER_*`/`ALL_*`) | both | M | low | ◻ |
+| G7 | Catalog / data-dictionary views (`INFORMATION_SCHEMA`, `USER_*`/`ALL_*`) | both | M | low | ✅ done |
 | G8 | Procedural routines — MySQL stored procs + Oracle PL/SQL | both | XL | high | ◻ |
 | G9 | MySQL wire compression (`CLIENT_COMPRESS`, zstd) | MySQL wire | M | medium | ◻ |
 | G10 | Real-client **Oracle TLS** | Oracle wire | M | external | ◻ |
@@ -110,7 +110,7 @@ Oracle multi-table insert.
 
 ---
 
-## Phase 2 — Catalog / data dictionary (G7) — **M**
+## Phase 2 — Catalog / data dictionary (G7) — **M** — ✅ done
 
 A single catalog layer backs **both** dialects' introspection, so build it once.
 
