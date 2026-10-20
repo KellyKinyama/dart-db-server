@@ -45,4 +45,24 @@ void main() {
         .execute('SELECT id FROM ev WHERE EXTRACT(YEAR FROM ts) = 2024');
     expect(r.rows.map((x) => x.first).toList(), [1]);
   });
+
+  test('typed datetime literals DATE/TIMESTAMP', () async {
+    expect(await one("SELECT DATE '2024-03-15' FROM DUAL"), '2024-03-15');
+    expect(
+      await one("SELECT EXTRACT(MONTH FROM DATE '2024-03-15') FROM DUAL"),
+      3,
+    );
+    expect(
+      await one("SELECT EXTRACT(YEAR FROM "
+          "TIMESTAMP '2024-03-15 09:42:07') FROM DUAL"),
+      2024,
+    );
+  });
+
+  test('typed-literal keyword does not disturb type names or aliases',
+      () async {
+    // DATE as a CAST target type and as a column alias must still parse.
+    expect(await one("SELECT CAST('5' AS DATE) IS NOT NULL FROM DUAL"), true);
+    expect(await one('SELECT ts AS date FROM ev'), '2024-03-15 09:42:07');
+  });
 }

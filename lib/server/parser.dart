@@ -2213,6 +2213,17 @@ class Parser {
 
   Expr _parsePrimary() {
     final t = _peek();
+    // ANSI/Oracle typed datetime literals: DATE '...', TIMESTAMP '...',
+    // TIME '...'. The type keyword directly precedes a string literal. We
+    // keep the string value (the engine represents dates as text), so it
+    // flows through EXTRACT and the date scalar functions unchanged.
+    if ((t.type == TokType.keyword || t.type == TokType.ident) &&
+        (t.upper == 'DATE' || t.upper == 'TIMESTAMP' || t.upper == 'TIME') &&
+        _peek(1).type == TokType.string) {
+      _advance(); // type keyword
+      final lit = _advance(); // string literal
+      return LiteralExpr(lit.text);
+    }
     if (t.type == TokType.param) {
       _advance();
       // Anonymous '?' — auto-number sequentially.
