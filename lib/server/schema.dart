@@ -154,6 +154,13 @@ String dataTypeName(DataType t) {
 class ColumnDef {
   final String name;
   final DataType type;
+
+  /// The raw DDL type token as written (e.g. `CLOB`, `JSON`, `BLOB`,
+  /// `VECTOR`), preserved because [type]'s affinity folds distinct Oracle
+  /// types together (CLOB/VARCHAR → text, JSON → numeric). Null for columns
+  /// with no declared type. Used by the Oracle wire layer to describe a column
+  /// with its true type.
+  final String? declaredType;
   final bool primaryKey;
   final bool notNull;
   final bool unique;
@@ -185,6 +192,7 @@ class ColumnDef {
   const ColumnDef(
     this.name,
     this.type, {
+    this.declaredType,
     this.primaryKey = false,
     this.notNull = false,
     this.unique = false,
@@ -201,6 +209,7 @@ class ColumnDef {
   Map<String, Object?> toJson() => {
         'name': name,
         'type': type.name,
+        if (declaredType != null) 'declaredType': declaredType,
         if (primaryKey) 'primaryKey': true,
         if (notNull) 'notNull': true,
         if (unique) 'unique': true,
@@ -217,6 +226,7 @@ class ColumnDef {
   factory ColumnDef.fromJson(Map<String, Object?> j) => ColumnDef(
         j['name'] as String,
         DataType.values.byName(j['type'] as String),
+        declaredType: j['declaredType'] as String?,
         primaryKey: j['primaryKey'] == true,
         notNull: j['notNull'] == true,
         unique: j['unique'] == true,

@@ -846,6 +846,7 @@ class Parser {
     return ColumnDef(
       name,
       type,
+      declaredType: typeTok.text,
       primaryKey: primaryKey,
       notNull: notNull,
       unique: unique,

@@ -2363,7 +2363,7 @@ class Database {
     } else if (stmt is InsertStmt) {
       result = _insert(stmt);
     } else if (stmt is SelectStmt) {
-      result = _selectTopLevel(stmt);
+      result = _attachColumnTypes(stmt, _selectTopLevel(stmt));
     } else if (stmt is UpdateStmt) {
       result = _update(stmt);
     } else if (stmt is DeleteStmt) {
@@ -5632,6 +5632,56 @@ class Database {
   // ---------------------------------------------------------------------------
   // SELECT (top-level entry — handles UNION chaining)
   // ---------------------------------------------------------------------------
+
+  /// Attaches declared per-column types to a simple single-table SELECT result
+  /// (no joins, no subquery): maps each direct column projection to its source
+  /// [ColumnDef.declaredType] (following aliases), and `*` to every column in
+  /// order. Expression columns get null, and anything more complex leaves
+  /// [QueryResult.columnTypes] null for the consumer to fall back to value
+  /// inference.
+  QueryResult _attachColumnTypes(SelectStmt s, QueryResult res) {
+    if (res.columnTypes != null || res.columns.isEmpty) return res;
+    if (s.joins.isNotEmpty || s.fromSubquery != null) return res;
+    final from = s.fromTable;
+    if (from == null) return res;
+    var table = _tables[from];
+    if (table == null) {
+      for (final e in _tables.entries) {
+        if (e.key.toLowerCase() == from.toLowerCase()) {
+          table = e.value;
+          break;
+        }
+      }
+    }
+    if (table == null) return res;
+    final byName = <String, String?>{
+      for (final c in table.columns) c.name.toLowerCase(): c.declaredType,
+    };
+    final types = <String?>[];
+    for (final p in s.projection) {
+      if (p.isStar) {
+        for (final c in table.columns) {
+          types.add(c.declaredType);
+        }
+        continue;
+      }
+      final e = p.expr;
+      types.add(e is ColumnExpr ? byName[e.name.toLowerCase()] : null);
+    }
+    // A shape mismatch (e.g. `*` that expanded differently) or an all-null
+    // result is not worth attaching.
+    if (types.length != res.columns.length || types.every((e) => e == null)) {
+      return res;
+    }
+    return QueryResult(
+      columns: res.columns,
+      columnTypes: types,
+      rows: res.rows,
+      affected: res.affected,
+      message: res.message,
+    );
+  }
+
   QueryResult _selectTopLevel(
     SelectStmt s, [
     Map<String, Object?> outer = const {},
