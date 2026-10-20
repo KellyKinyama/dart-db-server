@@ -779,6 +779,26 @@ void main() {
     expect(r.rows[0][0], isA<String>());
   });
 
+  test('an NCLOB column fetches as a UTF-16-decoded String', () async {
+    final db = await Database.open(null);
+    await db.execute('CREATE TABLE n (id INTEGER PRIMARY KEY, note NCLOB)');
+    // Multibyte text exercising the national (UTF-16) charset path.
+    await db.execute("INSERT INTO n VALUES (1, 'héllo wörld — café ☕ 日本語')");
+    final server = await _startServer(db);
+    addTearDown(() async => server.stop());
+
+    final conn = await OracleConnection.connect(
+      '127.0.0.1:${server.boundPort}/DARTDB',
+      user: 'testuser',
+      password: 'testpassword',
+    );
+    addTearDown(() async => conn.close());
+
+    final r = await conn.execute('SELECT id, note FROM n');
+    expect(r.rows[0][1], 'héllo wörld — café ☕ 日本語');
+    expect(r.rows[0][1], isA<String>());
+  });
+
   // NOTE: TLS (TCPS) is implemented and validated server-side by the
   // self-contained test/oracle_tls_test.dart (a standard SecureSocket client).
   // A real-`oracledb`-client TLS test is intentionally omitted: the client's

@@ -51,4 +51,13 @@ void main() {
     final r = await db.execute('SELECT TXT, Data FROM t');
     expect(r.columnTypes, ['CLOB', 'BLOB']);
   });
+
+  test('an NCLOB column preserves its declared type and round-trips text',
+      () async {
+    await db.execute('CREATE TABLE n (id INTEGER PRIMARY KEY, note NCLOB)');
+    await db.execute("INSERT INTO n VALUES (1, 'café ☕ 日本語')");
+    final r = await db.execute('SELECT id, note FROM n');
+    expect(r.columnTypes, ['INTEGER', 'NCLOB']);
+    expect(r.rows.first.last, 'café ☕ 日本語');
+  });
 }

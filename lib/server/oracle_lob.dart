@@ -44,6 +44,8 @@ const int _fvTokenNumber = 18;
 // Locator flag offsets the client reads (`tnsLobLocOffset*`).
 const int _flagTempOffset = 7; // tnsLobLocOffsetFlag4
 const int _flagTempBit = 0x01; // tnsLobLocFlagsTemp
+const int _flagVarCharsetOffset = 6; // tnsLobLocOffsetFlag3
+const int _flagVarCharsetBit = 0x80; // tnsLobLocFlagsVarLengthCharset
 
 /// Offset of the embedded LOB id inside the locator (a UB4 big-endian slot
 /// chosen clear of the flag bytes the client inspects).
@@ -54,6 +56,10 @@ class _ServerLob {
   _ServerLob(this.id);
   final int id;
   List<int> bytes = <int>[];
+
+  /// National-charset (NCLOB): the body is UTF-16BE, so one character is two
+  /// bytes — the `ttcLobOp` READ offset/amount (in characters) must be scaled.
+  bool national = false;
 }
 
 /// Per-connection store of temporary LOBs created via CREATE_TEMP.
@@ -88,11 +94,15 @@ class LobStore {
 
   /// Mints a locator for a fetched CLOB/BLOB column value: stores [bytes] in a
   /// fresh server LOB the client reads back with a `ttcLobOp` READ. Returns the
-  /// 40-byte locator to embed in the row data.
-  Uint8List createColumnLob(List<int> bytes) {
-    final lob = _create()..bytes = List<int>.of(bytes);
+  /// 40-byte locator to embed in the row data. When [nationalCharset] is true
+  /// (an NCLOB) the locator carries the variable-length-charset flag so the
+  /// client decodes the read bytes as UTF-16BE instead of UTF-8.
+  Uint8List createColumnLob(List<int> bytes, {bool nationalCharset = false}) {
+    final lob = _create()
+      ..bytes = List<int>.of(bytes)
+      ..national = nationalCharset;
     _columnIds.add(lob.id);
-    return _locatorFor(lob);
+    return _locatorFor(lob, nationalCharset: nationalCharset);
   }
 
   /// Frees the LOBs minted for an earlier query's CLOB/BLOB columns; temporary
@@ -107,9 +117,10 @@ class LobStore {
     _columnIds.clear();
   }
 
-  Uint8List _locatorFor(_ServerLob lob) {
+  Uint8List _locatorFor(_ServerLob lob, {bool nationalCharset = false}) {
     final loc = Uint8List(lobLocatorSize);
     loc[_flagTempOffset] = _flagTempBit; // temporary LOB
+    if (nationalCharset) loc[_flagVarCharsetOffset] |= _flagVarCharsetBit;
     loc[_idOffset] = (lob.id >> 24) & 0xFF;
     loc[_idOffset + 1] = (lob.id >> 16) & 0xFF;
     loc[_idOffset + 2] = (lob.id >> 8) & 0xFF;
@@ -213,7 +224,9 @@ Uint8List handleLobOp(ReadBuffer body, LobStore store,
 
     case _lobOpGetLength:
       final lob = req.locator == null ? null : store._lookup(req.locator!);
-      _writeAmountParameter(b, req.locator, lob?.bytes.length ?? 0);
+      // CLOB/NCLOB length is in characters; a national LOB stores 2 bytes/char.
+      final width = (lob?.national ?? false) ? 2 : 1;
+      _writeAmountParameter(b, req.locator, (lob?.bytes.length ?? 0) ~/ width);
       break;
 
     case _lobOpWrite:
@@ -227,12 +240,15 @@ Uint8List handleLobOp(ReadBuffer body, LobStore store,
     case _lobOpRead:
       final lob = req.locator == null ? null : store._lookup(req.locator!);
       final bytes = lob?.bytes ?? const <int>[];
-      final start = (req.sourceOffset - 1).clamp(0, bytes.length);
-      final end = (start + req.amount).clamp(0, bytes.length);
+      // READ offset/amount are in characters; scale to bytes for a national
+      // (UTF-16BE) LOB, and report the amount back in characters.
+      final width = (lob?.national ?? false) ? 2 : 1;
+      final start = ((req.sourceOffset - 1) * width).clamp(0, bytes.length);
+      final end = (start + req.amount * width).clamp(0, bytes.length);
       final slice = Uint8List.fromList(bytes.sublist(start, end));
       b.writeUint8(ttcMsgTypeLobData);
       b.writeBytesWithLength(slice);
-      _writeAmountParameter(b, req.locator, slice.length);
+      _writeAmountParameter(b, req.locator, slice.length ~/ width);
       break;
 
     case _lobOpTrim:

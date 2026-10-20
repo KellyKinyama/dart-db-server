@@ -170,6 +170,7 @@ ExecuteRequestInfo decodeExecuteRequest(
 List<Object?> _decodeBinds(
     ReadBuffer body, int numParams, int fv, LobStore? lobStore) {
   final oraTypes = <int>[];
+  final csfrms = <int>[];
   for (var i = 0; i < numParams; i++) {
     oraTypes.add(body.readUint8()); // data type
     body.readUint8(); // flag (bind-use indicators)
@@ -181,7 +182,7 @@ List<Object?> _decodeBinds(
     body.readUB4(); // OID
     body.readUB2(); // version
     body.readUB2(); // charset field
-    body.readUint8(); // csfrm
+    csfrms.add(body.readUint8()); // csfrm (2 = NChar for NCLOB)
     body.readUB4(); // LOB prefetch length
     if (fv >= _fv12_2) {
       body.readUB4(); // oaccolid
@@ -191,7 +192,10 @@ List<Object?> _decodeBinds(
     return List<Object?>.filled(numParams, null); // all-NULL / no row data
   }
   body.readUint8(); // ROW_DATA message type (7)
-  return [for (final ot in oraTypes) _decodeBindValue(body, ot, lobStore)];
+  return [
+    for (var i = 0; i < oraTypes.length; i++)
+      _decodeBindValue(body, oraTypes[i], csfrms[i], lobStore),
+  ];
 }
 
 /// Decodes one IN bind value. Supported: NUMBER, VARCHAR2/CHAR, RAW, DATE /
@@ -200,11 +204,12 @@ List<Object?> _decodeBinds(
 /// string), CLOB / BLOB (a bound temporary-LOB locator resolved to its stored
 /// text/bytes via [lobStore]), and NULL (a zero-length value). Other types are
 /// not yet handled.
-Object? _decodeBindValue(ReadBuffer body, int oraType, LobStore? lobStore) {
+Object? _decodeBindValue(
+    ReadBuffer body, int oraType, int csfrm, LobStore? lobStore) {
   if (oraType == _oraTypeVector) return _decodeVectorBind(body);
   if (oraType == _oraTypeJson) return _decodeJsonBind(body);
   if (oraType == _oraTypeClob || oraType == _oraTypeBlob) {
-    return _decodeLobBind(body, oraType, lobStore);
+    return _decodeLobBind(body, oraType, csfrm == 2, lobStore);
   }
   final bytes = body.readBytesWithLength();
   if (bytes.isEmpty) return null; // NULL (also an empty string in Oracle)
@@ -275,11 +280,8 @@ String _decodeIntervalDS(Uint8List b) {
   final minutes = data.getUint8(5) - _durationOffset;
   final seconds = data.getUint8(6) - _durationOffset;
   final fseconds = data.getUint32(7) - _durationMid;
-  final negative = days < 0 ||
-      hours < 0 ||
-      minutes < 0 ||
-      seconds < 0 ||
-      fseconds < 0;
+  final negative =
+      days < 0 || hours < 0 || minutes < 0 || seconds < 0 || fseconds < 0;
   String two(int v) => v.abs().toString().padLeft(2, '0');
   final fraction = fseconds.abs().toString().padLeft(9, '0');
   return '${negative ? '-' : '+'}${days.abs()} '
@@ -361,17 +363,30 @@ Object? _decodeJsonBind(ReadBuffer body) {
 /// Decodes a bound CLOB (112) / BLOB (113) value: the client writes a UB4
 /// locator length then the length-prefixed locator bytes of a temporary LOB it
 /// created via `ttcLobOp` CREATE_TEMP. [lobStore] resolves the locator to its
-/// stored bytes — UTF-8-decoded to a `String` for CLOB (the engine stores text)
-/// or raw `Uint8List` for BLOB. A zero-length locator is SQL NULL.
-Object? _decodeLobBind(ReadBuffer body, int oraType, LobStore? lobStore) {
+/// stored bytes — decoded to a `String` for CLOB (UTF-8) / NCLOB (UTF-16BE, the
+/// engine stores text) or raw `Uint8List` for BLOB. A zero-length locator is
+/// SQL NULL.
+Object? _decodeLobBind(
+    ReadBuffer body, int oraType, bool isNClob, LobStore? lobStore) {
   body.readUB4(); // locator length
   final locator = body.readBytesWithLength();
   if (locator.isEmpty) return null; // SQL NULL
   final bytes = lobStore?.resolve(locator) ?? Uint8List(0);
   if (oraType == _oraTypeClob) {
-    return utf8.decode(bytes, allowMalformed: true);
+    return isNClob
+        ? _decodeUtf16Be(Uint8List.fromList(bytes))
+        : utf8.decode(bytes, allowMalformed: true);
   }
   return Uint8List.fromList(bytes);
+}
+
+/// Decodes UTF-16 big-endian bytes (Oracle national charset AL16UTF16).
+String _decodeUtf16Be(Uint8List bytes) {
+  final units = <int>[];
+  for (var i = 0; i + 1 < bytes.length; i += 2) {
+    units.add((bytes[i] << 8) | bytes[i + 1]);
+  }
+  return String.fromCharCodes(units);
 }
 
 /// Decodes a VECTOR image into the engine's dense [Vector] (`Float32List`) for
@@ -403,7 +418,9 @@ Object _decodeVectorImage(Uint8List image) {
   if (sparse) {
     final numElements = data.getUint16(pos);
     pos += 2;
-    indices = <int>[for (var i = 0; i < numElements; i++, pos += 4) data.getUint32(pos)];
+    indices = <int>[
+      for (var i = 0; i < numElements; i++, pos += 4) data.getUint32(pos)
+    ];
     count = numElements;
   } else if (format == _vectorFormatBinary) {
     // A dense BINARY vector packs 8 dimensions per byte.
@@ -626,10 +643,15 @@ Uint8List buildQueryResponse(QueryResult result,
   final types = [
     for (var i = 0; i < result.columns.length; i++) _columnOraType(result, i),
   ];
-  _writeDescribeInfo(b, result.columns, types);
+  // Parallel flag: NCLOB columns (wire type 112 like CLOB, but national
+  // charset — described with csfrm=2 and sent as UTF-16BE).
+  final nclob = [
+    for (var i = 0; i < result.columns.length; i++) _isNClobColumn(result, i),
+  ];
+  _writeDescribeInfo(b, result.columns, types, nclob);
   _writeRowHeader(b);
   for (final row in result.rows) {
-    _writeRowData(b, row, types, lobStore);
+    _writeRowData(b, row, types, nclob, lobStore);
   }
   _writeErrorBody(b,
       num: _oraNoDataFound,
@@ -641,10 +663,10 @@ Uint8List buildQueryResponse(QueryResult result,
 /// The Oracle wire type for result column [colIndex]: the declared column type
 /// (CLOB/BLOB/JSON/VECTOR) when known, else value inference.
 int _columnOraType(QueryResult result, int colIndex) {
-  final declared = result.columnTypes != null &&
-          colIndex < result.columnTypes!.length
-      ? result.columnTypes![colIndex]
-      : null;
+  final declared =
+      result.columnTypes != null && colIndex < result.columnTypes!.length
+          ? result.columnTypes![colIndex]
+          : null;
   if (declared != null) {
     final t = _oraTypeForDeclared(declared);
     if (t != null) return t;
@@ -661,6 +683,15 @@ int? _oraTypeForDeclared(String declared) {
   if (d.contains('json')) return _oraTypeJson;
   if (d.contains('vector')) return _oraTypeVector;
   return null;
+}
+
+/// True when column [colIndex] is declared `NCLOB` (national-charset CLOB).
+bool _isNClobColumn(QueryResult result, int colIndex) {
+  final declared =
+      result.columnTypes != null && colIndex < result.columnTypes!.length
+          ? result.columnTypes![colIndex]
+          : null;
+  return declared != null && declared.toLowerCase().contains('nclob');
 }
 
 /// Infers the Oracle wire type for column [colIndex]: VECTOR when every
@@ -720,7 +751,8 @@ Uint8List buildStatusOk() {
   return b.toBytes();
 }
 
-void _writeDescribeInfo(WriteBuffer b, List<String> columns, List<int> types) {
+void _writeDescribeInfo(
+    WriteBuffer b, List<String> columns, List<int> types, List<bool> nclob) {
   b.writeUint8(ttcMsgTypeDescribeInfo);
   b.writeBytesWithLength(Uint8List(0)); // version bytes
   b.writeUB4(0); // max row size
@@ -729,7 +761,7 @@ void _writeDescribeInfo(WriteBuffer b, List<String> columns, List<int> types) {
     b.writeUint8(0); // one spare UB1 the client skips
   }
   for (var i = 0; i < columns.length; i++) {
-    _writeColumnInfo(b, columns[i], i + 1, types[i]);
+    _writeColumnInfo(b, columns[i], i + 1, types[i], nclob[i]);
   }
   b.writeUB4(0); // current date bytes
   b.writeUB4(0); // dcbflag
@@ -743,7 +775,8 @@ void _writeDescribeInfo(WriteBuffer b, List<String> columns, List<int> types) {
 /// Writes one column's metadata (NUMBER, RAW, VARCHAR2, VECTOR, JSON, or
 /// CLOB/BLOB), laid out exactly as the client's `_processColumnInfo` reads it
 /// at field version 24.
-void _writeColumnInfo(WriteBuffer b, String name, int position, int oraType) {
+void _writeColumnInfo(
+    WriteBuffer b, String name, int position, int oraType, bool nclob) {
   final maxLen = oraType == _oraTypeNumber
       ? 22
       : oraType == _oraTypeRaw
@@ -766,7 +799,7 @@ void _writeColumnInfo(WriteBuffer b, String name, int position, int oraType) {
   b.writeUB4(0); // oid length
   b.writeUB2(0); // version
   b.writeUB2(0); // charset id
-  b.writeUint8(0); // csfrm (non-national)
+  b.writeUint8(nclob ? 2 : 0); // csfrm (2 = NChar for NCLOB, else implicit)
   b.writeUB4(maxLen); // size
   b.writeUB4(0); // oaccolid (12.2)
   b.writeUint8(1); // nullable
@@ -799,8 +832,8 @@ void _writeRowHeader(WriteBuffer b) {
   b.writeUB4(0); // rxhrid length
 }
 
-void _writeRowData(
-    WriteBuffer b, List<Object?> row, List<int> types, LobStore? lobStore) {
+void _writeRowData(WriteBuffer b, List<Object?> row, List<int> types,
+    List<bool> nclob, LobStore? lobStore) {
   b.writeUint8(ttcMsgTypeRowData);
   for (var i = 0; i < row.length; i++) {
     final cell = row[i];
@@ -810,7 +843,8 @@ void _writeRowData(
     } else if (type == _oraTypeJson) {
       _writeJsonColumn(b, cell);
     } else if (type == _oraTypeClob || type == _oraTypeBlob) {
-      _writeLobColumn(b, cell, type == _oraTypeClob, lobStore);
+      _writeLobColumn(b, cell, type == _oraTypeClob,
+          i < nclob.length && nclob[i], lobStore);
     } else if (cell == null) {
       b.writeBytesWithLength(Uint8List(0)); // 0-length == NULL
     } else if (type == _oraTypeNumber && cell is num) {
@@ -828,8 +862,10 @@ void _writeRowData(
 /// `oraTypeBlob`): a UB4 locator length (0 ⇒ SQL NULL), UB8 LOB length
 /// (characters for CLOB, bytes for BLOB), UB4 chunk size, then the
 /// length-prefixed locator. [lobStore] mints a server LOB holding the value.
-void _writeLobColumn(
-    WriteBuffer b, Object? cell, bool isClob, LobStore? lobStore) {
+/// When [isNClob] the body is stored as UTF-16BE and the locator is flagged
+/// national-charset so the client decodes it as UTF-16.
+void _writeLobColumn(WriteBuffer b, Object? cell, bool isClob, bool isNClob,
+    LobStore? lobStore) {
   if (cell == null || lobStore == null) {
     b.writeUB4(0); // SQL NULL
     return;
@@ -838,17 +874,28 @@ void _writeLobColumn(
   final int lobLength;
   if (isClob) {
     final text = cell is String ? cell : cell.toString();
-    bytes = utf8.encode(text);
+    bytes = isNClob ? _encodeUtf16Be(text) : utf8.encode(text);
     lobLength = text.length; // characters (UTF-16 code units)
   } else {
     bytes = cell is Uint8List ? cell : Uint8List.fromList(const <int>[]);
     lobLength = bytes.length;
   }
-  final locator = lobStore.createColumnLob(bytes);
+  final locator = lobStore.createColumnLob(bytes, nationalCharset: isNClob);
   b.writeUB4(locator.length); // locator length
   b.writeUB8(lobLength); // LOB length (chars for CLOB, bytes for BLOB)
   b.writeUB4(lobChunkSize); // chunk size
   b.writeBytesWithLength(locator);
+}
+
+/// Encodes [s] as UTF-16 big-endian (Oracle national charset AL16UTF16).
+Uint8List _encodeUtf16Be(String s) {
+  final units = s.codeUnits; // UTF-16 code units
+  final out = Uint8List(units.length * 2);
+  for (var i = 0; i < units.length; i++) {
+    out[i * 2] = (units[i] >> 8) & 0xFF;
+    out[i * 2 + 1] = units[i] & 0xFF;
+  }
+  return out;
 }
 
 /// Writes a VECTOR column value in the LOB-prefetch inline shape the client's
