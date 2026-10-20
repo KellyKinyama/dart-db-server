@@ -123,4 +123,51 @@ void main() {
     );
     expect(rep.rows.map((r) => r[0]).toList(), ['alice', 'carol']);
   });
+
+  test('a large result set spans multiple packets', () async {
+    final db = await Database.open(null);
+    final server = await _startServer(db);
+    addTearDown(() async => server.stop());
+
+    final conn = await OracleConnection.connect(
+      '127.0.0.1:${server.boundPort}/DARTDB',
+      user: 'testuser',
+      password: 'testpassword',
+    );
+    addTearDown(() async => conn.close());
+
+    await conn.execute('CREATE TABLE big (id INTEGER PRIMARY KEY, pad TEXT)');
+    const rows = 800; // ~40 KB of result >> the 8 KB SDU -> multi-packet
+    final pad = 'x' * 40;
+    for (var i = 0; i < rows; i++) {
+      await conn.execute('INSERT INTO big VALUES (:1, :2)', [i, pad]);
+    }
+
+    final sel = await conn.execute('SELECT id, pad FROM big ORDER BY id');
+    expect(sel.rows.length, rows);
+    expect(sel.rows.first[0], 0);
+    expect(sel.rows.last[0], rows - 1);
+    expect(sel.rows[123][1], pad);
+  });
+
+  test('a DateTime bind round-trips as an ISO-8601 value', () async {
+    final db = await Database.open(null);
+    final server = await _startServer(db);
+    addTearDown(() async => server.stop());
+
+    final conn = await OracleConnection.connect(
+      '127.0.0.1:${server.boundPort}/DARTDB',
+      user: 'testuser',
+      password: 'testpassword',
+    );
+    addTearDown(() async => conn.close());
+
+    await conn.execute('CREATE TABLE events (id INTEGER, at TEXT)');
+    final at = DateTime(2025, 3, 14, 9, 26, 53);
+    await conn.execute('INSERT INTO events VALUES (:1, :2)', [1, at]);
+
+    // The engine stores dates as ISO-8601 text; the bind decoded correctly.
+    final r = await conn.execute('SELECT at FROM events');
+    expect(r.rows[0][0], '2025-03-14 09:26:53');
+  });
 }

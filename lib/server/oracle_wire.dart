@@ -123,6 +123,10 @@ class OracleConnection {
 
   int _version = tnsServerVersion;
 
+  /// Negotiated Session Data Unit: the max DATA-packet size. Large TTC
+  /// responses are split across packets of at most this size.
+  int _sdu = tnsDefaultSdu;
+
   void _start() {
     server._log('conn $id connected from '
         '${socket.remoteAddress.address}:${socket.remotePort}');
@@ -212,6 +216,7 @@ class OracleConnection {
   void _handleConnect(Uint8List raw) {
     final req = ConnectRequest.parse(raw);
     _version = negotiateVersion(req);
+    _sdu = req.sdu == 0 ? tnsDefaultSdu : req.sdu;
     server._log(
       'conn $id CONNECT v=${req.versionDesired}/${req.versionMinimum} '
       'sdu=${req.sdu} -> negotiated v=$_version'
@@ -219,7 +224,7 @@ class OracleConnection {
     );
     final accept = buildAcceptPacket(
       version: _version,
-      sdu: req.sdu == 0 ? tnsDefaultSdu : req.sdu,
+      sdu: _sdu,
       tdu: req.tdu == 0 ? tnsDefaultTdu : req.tdu,
       // flag2 = 0: classical (non-FAST_AUTH) handshake for now.
     );
@@ -489,8 +494,23 @@ class OracleConnection {
     return server.db.executeWith(sql, positional: positional, named: named);
   }
 
-  /// Wraps a TTC message body in a TNS DATA packet and sends it.
-  void _sendTtc(Uint8List ttcBody) => _send(buildDataPacket(ttcBody));
+  /// Wraps a TTC message body in one or more TNS DATA packets (split at the
+  /// negotiated SDU) and sends them. The client reassembles the packets into a
+  /// single TTC stream, so large result sets are not bounded by one packet.
+  void _sendTtc(Uint8List ttcBody) {
+    final maxPayload = _sdu - tnsHeaderSize - 2; // header + 2 data-flag bytes
+    if (ttcBody.length <= maxPayload) {
+      _send(buildDataPacket(ttcBody));
+      return;
+    }
+    for (var offset = 0; offset < ttcBody.length; offset += maxPayload) {
+      final end = (offset + maxPayload < ttcBody.length)
+          ? offset + maxPayload
+          : ttcBody.length;
+      _send(buildDataPacket(Uint8List.sublistView(ttcBody, offset, end)));
+    }
+  }
+
   void _send(Uint8List bytes) {
     try {
       socket.add(bytes);

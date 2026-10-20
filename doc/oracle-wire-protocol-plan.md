@@ -16,9 +16,9 @@
 | 0 — TNS transport | ✅ | CONNECT parse, version negotiation, ACCEPT, DATA/MARKER framing |
 | 1 — TTC negotiation | ✅ | PROTOCOL + DATA-TYPES exchange (charset, caps, field version 24) |
 | 2 — Authentication | ✅ (SHA512/O5LOGON) | Verifier side: AUTH_PHASE_ONE/TWO, no plaintext storage; PBKDF2/12c + FAST_AUTH pending |
-| 3 — Execute & fetch | ✅ | Decode OALL8, run via the engine, reply DML status / query rows; **positional + named bind variables**; large-result flow a later phase |
+| 3 — Execute & fetch | ✅ | Decode OALL8, run via the engine, reply DML status / query rows; **positional + named bind variables**; **large results split across packets** |
 | 4 — Transactions & lifecycle | ✅ | COMMIT/ROLLBACK drive the engine; PING; statement-cache cursor re-execute; close-cursors piggyback; logoff via socket close; **per-session isolation** (serializable) |
-| 5 — Rich type codecs | ◻ (NUMBER, RAW) | Numeric columns → native NUMBER, byte buffers → RAW; DATE/INTERVAL/LOB/JSON/VECTOR pending |
+| 5 — Rich type codecs | ◻ (NUMBER, RAW, DATE) | Numeric → NUMBER, byte buffers → RAW, DATE/TIMESTAMP binds → ISO text; INTERVAL/LOB/JSON/VECTOR pending |
 | 6 — TLS & robustness | ⬜ | native-net-encryption/TLS, SDU renegotiation, fuzz hardening |
 
 A client can connect from TCP all the way through a real SQL `SELECT`.
@@ -229,6 +229,15 @@ from a stock client.
 > positional List binds, a named `:dept` filter, and a repeated `:x`) plus a
 > self-contained main-suite test.
 
+> **Update (large results / multi-packet):** `_sendTtc` now splits a TTC
+> response larger than the negotiated SDU across multiple DATA packets; the
+> client reassembles them into one TTC stream (its completion probe reads
+> packets until the terminal message decodes), so result sets are no longer
+> capped at one packet. The negotiated SDU is captured at CONNECT and used as
+> the chunk size. Proven against the **real client** (an 800-row, ~40 KB
+> SELECT) and a self-contained main-suite test (400 rows) that reassembles
+> frames via a new `readExecuteResponse` helper.
+
 **Phase 4 — Transactions & statement lifecycle.** `ttcFuncCommit` /
 `ttcFuncRollback`, cursor close (`ttcFuncCloseCursors`), re-execute of
 cached cursors (`ttcFuncReExecute` / `ttcFuncReExecuteAndFetch`),
@@ -332,6 +341,14 @@ inverting the client decoders, each behind a conformance test:
 > form. Per-column inference picks NUMBER / RAW / VARCHAR2 by scanning the
 > values; an empty byte buffer reads back as NULL (indistinguishable on the
 > wire), covered by `test/oracle_execute_test.dart`.
+
+> **Update (DATE / TIMESTAMP binds):** a `DATE` (7-byte), `TIMESTAMP` (11) or
+> timestamp-with-zone (13) **bind value** is decoded (`_decodeOracleDateTime`)
+> to an ISO-8601 `YYYY-MM-DD HH:MM:SS[.ffffff]` string — the text form the
+> engine already stores dates as — so a `DateTime` bound by the real client
+> round-trips (proven in `validation/test/realclient_test.dart`). The fetch
+> side still returns stored dates as VARCHAR2 text (the engine has no native
+> date type), so the round-trip is bind-`DateTime` → fetch-`String`.
 - Native JSON / OSON (`oson.dart`) and VECTOR (`oracle_vector.dart`,
   dense + sparse) for 23ai parity.
 

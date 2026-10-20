@@ -234,5 +234,44 @@ void main() {
         ['alice'],
       ]);
     });
+
+    test('a large result set is split across packets and reassembled',
+        () async {
+      final db = await Database.open(null);
+      final server = OracleServer(db, port: 0, users: {
+        'testuser': 'testpassword',
+      });
+      await server.start();
+      addTearDown(() async => server.stop());
+
+      final socket = await Socket.connect(
+        InternetAddress.loopbackIPv4,
+        server.boundPort,
+      );
+      addTearDown(() async => socket.close());
+      final frames = FrameReader(socket);
+      await handshakeAndLogin(socket, frames,
+          username: 'testuser', password: 'testpassword');
+
+      socket.add(wrapData(buildExecuteRequest(
+          'CREATE TABLE big (id INTEGER PRIMARY KEY, pad TEXT)')));
+      await frames.next();
+
+      const rows = 400; // ~16 KB of result >> the 8 KB SDU -> multi-packet
+      final pad = 'x' * 30;
+      for (var i = 0; i < rows; i++) {
+        socket.add(wrapData(
+            buildExecuteRequest("INSERT INTO big VALUES ($i, '$pad')")));
+        await frames.next();
+      }
+
+      socket.add(wrapData(buildExecuteRequest(
+          'SELECT id, pad FROM big ORDER BY id', isQuery: true)));
+      final sel = await readExecuteResponse(frames, isQuery: true);
+      expect(sel.rows.length, rows);
+      expect(sel.rows.first[0], 0);
+      expect(sel.rows.last[0], rows - 1);
+      expect(sel.rows[200][1], pad);
+    });
   });
 }

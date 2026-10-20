@@ -403,6 +403,26 @@ class ExecuteResponse {
   int cursorId = 0;
   int errorNum = 0;
   String? errorMessage;
+
+  /// Whether a terminal message (ERROR / STATUS) was reached — false means the
+  /// body was a partial, multi-packet response.
+  bool terminated = false;
+}
+
+/// Reads a (possibly multi-packet) EXECUTE response, reassembling DATA frames
+/// until the TTC stream reaches its terminal message.
+Future<ExecuteResponse> readExecuteResponse(FrameReader frames,
+    {bool isQuery = false}) async {
+  final buf = BytesBuilder();
+  while (true) {
+    buf.add(ttcBody(await frames.next()));
+    try {
+      final resp = decodeExecuteResponse(buf.toBytes(), isQuery: isQuery);
+      if (resp.terminated) return resp;
+    } on OracleBufferException {
+      // Partial stream split across packets — wait for the next frame.
+    }
+  }
 }
 
 /// Decodes an EXECUTE response body, mirroring the client's message dispatch
@@ -424,10 +444,12 @@ ExecuteResponse decodeExecuteResponse(Uint8List body, {bool isQuery = false}) {
         break;
       case ttcMsgTypeError:
         _decodeError(r, out, isQuery: isQuery);
+        out.terminated = true;
         return out; // terminal
       case ttcMsgTypeStatus:
         r.readUB4();
         r.readUB2();
+        out.terminated = true;
         return out;
       default:
         throw StateError('unexpected response message type $msgType');

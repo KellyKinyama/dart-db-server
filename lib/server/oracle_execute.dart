@@ -179,8 +179,9 @@ List<Object?> _decodeBinds(ReadBuffer body, int numParams, int fv) {
   return [for (final ot in oraTypes) _decodeBindValue(body, ot)];
 }
 
-/// Decodes one IN bind value. Supported: NUMBER, VARCHAR2/CHAR, RAW, and NULL
-/// (a zero-length value). Other types are not yet handled.
+/// Decodes one IN bind value. Supported: NUMBER, VARCHAR2/CHAR, RAW, DATE /
+/// TIMESTAMP (decoded to an ISO-8601 string the engine stores as text), and
+/// NULL (a zero-length value). Other types are not yet handled.
 Object? _decodeBindValue(ReadBuffer body, int oraType) {
   final bytes = body.readBytesWithLength();
   if (bytes.isEmpty) return null; // NULL (also an empty string in Oracle)
@@ -196,9 +197,36 @@ Object? _decodeBindValue(ReadBuffer body, int oraType) {
       return utf8.decode(bytes, allowMalformed: true);
     case 23: // RAW
       return Uint8List.fromList(bytes);
+    case 12: // DATE
+    case 180: // TIMESTAMP
+    case 181: // TIMESTAMP WITH TIME ZONE
+    case 231: // TIMESTAMP WITH LOCAL TIME ZONE
+      return _decodeOracleDateTime(bytes);
     default:
       throw FormatException('unsupported bind type $oraType');
   }
+}
+
+/// Decodes an Oracle DATE (7 bytes) / TIMESTAMP (11) / TIMESTAMP-with-zone (13)
+/// wire value to an ISO-8601 `YYYY-MM-DD HH:MM:SS[.ffffff]` string — the
+/// text form the engine stores dates as. Any trailing time-zone bytes are
+/// ignored (fields are taken as wall-clock).
+String _decodeOracleDateTime(Uint8List b) {
+  final year = (b[0] - 100) * 100 + (b[1] - 100);
+  final month = b[2];
+  final day = b[3];
+  final hour = b[4] - 1;
+  final minute = b[5] - 1;
+  final second = b[6] - 1;
+  var micros = 0;
+  if (b.length >= 11) {
+    final nanos = (b[7] << 24) | (b[8] << 16) | (b[9] << 8) | b[10];
+    micros = nanos ~/ 1000;
+  }
+  String p2(int v) => v.toString().padLeft(2, '0');
+  final base = '${year.toString().padLeft(4, '0')}-${p2(month)}-${p2(day)} '
+      '${p2(hour)}:${p2(minute)}:${p2(second)}';
+  return micros > 0 ? '$base.${micros.toString().padLeft(6, '0')}' : base;
 }
 
 /// Builds the response for a query [result]: DESCRIBE_INFO, one ROW_HEADER, a
