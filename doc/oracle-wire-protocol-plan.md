@@ -463,19 +463,24 @@ ordered by value ÷ effort.
 ### 3. JSON / OSON codecs (Phase 5) — type 119 — ✅ done (standard JSON)
 
 - **Status:** shipped for standard JSON values (`Map`, `List`, `String`,
-  `num`, `bool`, `null`). A new `oracle_json.dart` ports the OSON encoder and
-  decoder; its output is **byte-identical** to the client's encoder for these
-  node types (cross-checked against the real `oracledb` OSON codec). A JSON
-  bind (type 119) decodes through the QLocator + OSON image to a Dart value the
-  engine stores; on fetch, `Map`/`List` columns are described as JSON (119) and
-  each value is written in the LOB-prefetch inline shape (UB4 marker, UB8 size,
-  UB4 chunk, length-prefixed OSON, empty locator). Verified by a self-contained
-  mirror test and a real-client `Map` round-trip. (Note: `Uint8List` implements
-  `List<int>`, so the fetch inference excludes it from JSON — RAW stays RAW.)
-- **Remaining:** Oracle-specific OSON scalar nodes (DATE / TIMESTAMP /
-  BINARY_FLOAT / interval / VECTOR), OSON version 3 long field names (> 255
-  bytes), and JSON **scalar** columns (a JSON column whose values are bare
-  strings/numbers is currently inferred as VARCHAR2/NUMBER, not JSON).
+  `num`, `bool`, `null`) plus the common Oracle-specific OSON scalars `DateTime`
+  (DATE / TIMESTAMP7 / TIMESTAMP nodes) and `Uint8List` (binary nodes), and
+  OSON **version 3** long field names (> 255 UTF-8 bytes). A new
+  `oracle_json.dart` ports the OSON encoder and decoder; its output is
+  **byte-identical** to the client's encoder for these node types
+  (cross-checked against the real `oracledb` OSON codec). A JSON bind (type
+  119) decodes through the QLocator + OSON image to a Dart value the engine
+  stores; on fetch, `Map`/`List` columns are described as JSON (119) and each
+  value is written in the LOB-prefetch inline shape (UB4 marker, UB8 size, UB4
+  chunk, length-prefixed OSON, empty locator). Verified by self-contained mirror
+  tests and real-client round-trips (a `Map`, one with `DateTime`/`Uint8List`
+  members, and one with a 300-byte key). (Note: `Uint8List` implements
+  `List<int>`, so the fetch inference excludes it from JSON — RAW stays RAW; the
+  server banner reports Release 23 so the client enables OSON v3.)
+- **Remaining:** the remaining Oracle-specific OSON scalar nodes
+  (TIMESTAMP WITH TIME ZONE / BINARY_FLOAT / interval / embedded VECTOR), and
+  JSON **scalar** columns (a JSON column whose values are bare strings/numbers
+  is currently inferred as VARCHAR2/NUMBER, not JSON).
 
 ### 4. 12c PBKDF2 verifier + FAST_AUTH (Phase 2) — ✅ done
 

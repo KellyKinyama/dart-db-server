@@ -264,6 +264,67 @@ void main() {
     expect(r.rows[0][0], doc);
   });
 
+  test('a JSON document with DateTime and byte-array members round-trips',
+      () async {
+    final db = await Database.open(null);
+    final server = await _startServer(db);
+    addTearDown(() async => server.stop());
+
+    final conn = await OracleConnection.connect(
+      '127.0.0.1:${server.boundPort}/DARTDB',
+      user: 'testuser',
+      password: 'testpassword',
+    );
+    addTearDown(() async => conn.close());
+
+    await conn.execute('CREATE TABLE docs (id INTEGER PRIMARY KEY, doc JSON)');
+
+    // A JSON document with Oracle-specific OSON scalars: a local DateTime
+    // (TIMESTAMP7 / TIMESTAMP nodes) and a Uint8List (binary node).
+    final when = DateTime(2025, 3, 14, 9, 26, 53);
+    final precise = DateTime(2025, 1, 1, 0, 0, 0, 123, 456);
+    final doc = {
+      'when': when,
+      'precise': precise,
+      'blob': Uint8List.fromList([1, 2, 3, 250, 255]),
+      'nested': {'ts': when, 'bytes': Uint8List.fromList([0, 128, 255])},
+    };
+    await conn.execute('INSERT INTO docs VALUES (:1, :2)', [1, doc]);
+
+    final r = await conn.execute('SELECT doc FROM docs ORDER BY id');
+    final back = r.rows[0][0] as Map;
+    expect(back['when'], when);
+    expect(back['precise'], precise);
+    expect(back['blob'], [1, 2, 3, 250, 255]);
+    expect((back['nested'] as Map)['ts'], when);
+    expect((back['nested'] as Map)['bytes'], [0, 128, 255]);
+  });
+
+  test('a JSON document with a field name over 255 bytes round-trips (OSON v3)',
+      () async {
+    final db = await Database.open(null);
+    final server = await _startServer(db);
+    addTearDown(() async => server.stop());
+
+    final conn = await OracleConnection.connect(
+      '127.0.0.1:${server.boundPort}/DARTDB',
+      user: 'testuser',
+      password: 'testpassword',
+    );
+    addTearDown(() async => conn.close());
+
+    await conn.execute('CREATE TABLE docs (id INTEGER PRIMARY KEY, doc JSON)');
+
+    final longKey = 'k' * 300; // > 255 UTF-8 bytes → OSON version 3
+    final doc = {longKey: 'long', 'short': 7};
+    await conn.execute('INSERT INTO docs VALUES (:1, :2)', [1, doc]);
+
+    final r = await conn.execute('SELECT doc FROM docs ORDER BY id');
+    final back = r.rows[0][0] as Map;
+    expect(back[longKey], 'long');
+    expect(back['short'], 7);
+  });
+
   test('a 12c PBKDF2-verifier user authenticates', () async {
     final db = await Database.open(null);
     final server = await _startServer(db);

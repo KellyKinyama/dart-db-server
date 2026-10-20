@@ -46,6 +46,11 @@ const int _nodeNumberLenUint8 = 0x34;
 const int _nodeBinaryDouble = 0x36;
 const int _nodeStringLenUint16 = 0x37;
 const int _nodeStringLenUint32 = 0x38;
+const int _nodeTimestamp = 0x39; // 11-byte TIMESTAMP
+const int _nodeBinaryLenUint16 = 0x3a;
+const int _nodeBinaryLenUint32 = 0x3b;
+const int _nodeDate = 0x3c; // 7-byte DATE
+const int _nodeTimestamp7 = 0x7d; // 7-byte TIMESTAMP (zero sub-second)
 const int _nodeObject = 0x84;
 const int _nodeArray = 0xc0;
 
@@ -134,12 +139,8 @@ class _OsonWriteBuffer {
 }
 
 class _OsonFieldName {
-  _OsonFieldName(this.name) : nameBytes = Uint8List.fromList(utf8.encode(name)) {
-    if (nameBytes.length > _maxShortFieldNameBytes) {
-      throw OsonException(
-          'JSON field names over $_maxShortFieldNameBytes UTF-8 bytes are not '
-          'supported (got ${nameBytes.length})');
-    }
+  _OsonFieldName(this.name)
+      : nameBytes = Uint8List.fromList(utf8.encode(name)) {
     hash = _hash(nameBytes);
   }
 
@@ -149,7 +150,13 @@ class _OsonFieldName {
   int offset = 0;
   int fieldId = 0;
 
+  /// A name over 255 UTF-8 bytes lives in the version-3 long segment.
+  bool get isLong => nameBytes.length > _maxShortFieldNameBytes;
+
   int get hashId => hash & 0xff;
+
+  /// Oracle 23ai's 2-byte hash id for a long name: low byte then second byte.
+  int get longHashId => ((hash & 0xff) << 8) | ((hash >> 8) & 0xff);
 
   static int _hash(Uint8List bytes) {
     var h = 0x811C9DC5;
@@ -162,21 +169,25 @@ class _OsonFieldName {
 
 class _OsonEncoder {
   final _fieldNamesMap = <String, _OsonFieldName>{};
-  final _names = <_OsonFieldName>[];
-  final _nameBytes = _OsonWriteBuffer();
+  final _shortNames = <_OsonFieldName>[];
+  final _longNames = <_OsonFieldName>[];
+  final _shortBytes = _OsonWriteBuffer();
+  final _longBytes = _OsonWriteBuffer();
   final _treeSeg = _OsonWriteBuffer();
   int _fieldIdSize = 1;
   final Set<Object> _open = HashSet<Object>.identity();
 
   Uint8List encode(Object? value) {
     final isContainer = (value is Map || value is List);
+    final hasLong = <bool>[];
 
     var flags = _flagInlineLeaf;
     if (isContainer) {
       _examine(value);
       _assignFieldIds();
+      if (_longNames.isNotEmpty) hasLong.add(true);
       flags |= _flagHashIdUint8 | _flagTinyNodesStat;
-      final total = _names.length;
+      final total = _shortNames.length + _longNames.length;
       if (total > 65535) {
         flags |= _flagNumFnamesUint32;
         _fieldIdSize = 4;
@@ -186,7 +197,7 @@ class _OsonEncoder {
       } else {
         _fieldIdSize = 1;
       }
-      if (_nameBytes.pos > 65535) flags |= _flagFnamesSegUint32;
+      if (_shortBytes.pos > 65535) flags |= _flagFnamesSegUint32;
     } else {
       flags |= _flagIsScalar;
     }
@@ -198,11 +209,12 @@ class _OsonEncoder {
       ..writeUint8(_magic1)
       ..writeUint8(_magic2)
       ..writeUint8(_magic3)
-      ..writeUint8(_versionMaxFname255)
+      ..writeUint8(
+          hasLong.isNotEmpty ? _versionMaxFname65535 : _versionMaxFname255)
       ..writeUint16BE(flags);
 
     if (isContainer) {
-      final numShort = _names.length;
+      final numShort = _shortNames.length;
       if (_fieldIdSize == 1) {
         out.writeUint8(numShort);
       } else if (_fieldIdSize == 2) {
@@ -210,10 +222,16 @@ class _OsonEncoder {
       } else {
         out.writeUint32BE(numShort);
       }
-      if (_nameBytes.pos > 65535) {
-        out.writeUint32BE(_nameBytes.pos);
+      if (_shortBytes.pos > 65535) {
+        out.writeUint32BE(_shortBytes.pos);
       } else {
-        out.writeUint16BE(_nameBytes.pos);
+        out.writeUint16BE(_shortBytes.pos);
+      }
+      if (hasLong.isNotEmpty) {
+        out.writeUint16BE(
+            _longBytes.pos > 65535 ? 0 : _flagSecFnamesSegUint16);
+        out.writeUint32BE(_longNames.length);
+        out.writeUint32BE(_longBytes.pos);
       }
     }
 
@@ -225,19 +243,27 @@ class _OsonEncoder {
 
     if (isContainer) {
       out.writeUint16BE(0); // tiny-node count (always zero)
-      // Hash-id array, then the name-offset array, then the packed names.
-      for (final f in _names) {
+      // Short segment: uint8 hash ids, offsets, packed names.
+      for (final f in _shortNames) {
         out.writeUint8(f.hashId);
       }
-      final wide = _nameBytes.pos > 65535;
-      for (final f in _names) {
-        if (wide) {
-          out.writeUint32BE(f.offset);
-        } else {
-          out.writeUint16BE(f.offset);
-        }
+      final shortWide = _shortBytes.pos > 65535;
+      for (final f in _shortNames) {
+        shortWide ? out.writeUint32BE(f.offset) : out.writeUint16BE(f.offset);
       }
-      out.writeBytes(_nameBytes.view());
+      out.writeBytes(_shortBytes.view());
+      // Long segment (version 3): uint16 hash ids, offsets, uint16-prefixed
+      // names.
+      if (hasLong.isNotEmpty) {
+        for (final f in _longNames) {
+          out.writeUint16BE(f.longHashId);
+        }
+        final longWide = _longBytes.pos > 65535;
+        for (final f in _longNames) {
+          longWide ? out.writeUint32BE(f.offset) : out.writeUint16BE(f.offset);
+        }
+        out.writeBytes(_longBytes.view());
+      }
     }
 
     out.writeBytes(_treeSeg.view());
@@ -245,6 +271,7 @@ class _OsonEncoder {
   }
 
   void _examine(Object? value) {
+    if (value is Uint8List) return; // a binary scalar, never an array to walk
     if (value is List) {
       _enter(value);
       for (final e in value) {
@@ -261,11 +288,18 @@ class _OsonEncoder {
         }
         if (!_fieldNamesMap.containsKey(key)) {
           final fn = _OsonFieldName(key);
-          fn.offset = _nameBytes.pos;
-          _nameBytes.writeUint8(fn.nameBytes.length);
-          _nameBytes.writeBytes(fn.nameBytes);
           _fieldNamesMap[key] = fn;
-          _names.add(fn);
+          if (fn.isLong) {
+            fn.offset = _longBytes.pos;
+            _longBytes.writeUint16BE(fn.nameBytes.length);
+            _longBytes.writeBytes(fn.nameBytes);
+            _longNames.add(fn);
+          } else {
+            fn.offset = _shortBytes.pos;
+            _shortBytes.writeUint8(fn.nameBytes.length);
+            _shortBytes.writeBytes(fn.nameBytes);
+            _shortNames.add(fn);
+          }
         }
         _examine(entry.value);
       }
@@ -279,18 +313,32 @@ class _OsonEncoder {
     }
   }
 
-  /// Sorts names by 8-bit hash id, then byte length, then name — the client's
-  /// short-segment order — and numbers them from 1.
+  /// Sorts each segment into the order Oracle writes and searches, then numbers
+  /// short names from 1 and long names after every short name — the client's
+  /// `assignFieldIds`. Short names sort on the 8-bit hash id, long names on the
+  /// 16-bit one, then byte length, then name.
   void _assignFieldIds() {
-    _names.sort((a, b) {
+    _shortNames.sort((a, b) {
       if (a.hashId != b.hashId) return a.hashId.compareTo(b.hashId);
       if (a.nameBytes.length != b.nameBytes.length) {
         return a.nameBytes.length.compareTo(b.nameBytes.length);
       }
       return a.name.compareTo(b.name);
     });
-    for (var i = 0; i < _names.length; i++) {
-      _names[i].fieldId = i + 1;
+    for (var i = 0; i < _shortNames.length; i++) {
+      _shortNames[i].fieldId = i + 1;
+    }
+    _longNames.sort((a, b) {
+      if (a.longHashId != b.longHashId) {
+        return a.longHashId.compareTo(b.longHashId);
+      }
+      if (a.nameBytes.length != b.nameBytes.length) {
+        return a.nameBytes.length.compareTo(b.nameBytes.length);
+      }
+      return a.name.compareTo(b.name);
+    });
+    for (var i = 0; i < _longNames.length; i++) {
+      _longNames[i].fieldId = _shortNames.length + i + 1;
     }
   }
 
@@ -322,6 +370,27 @@ class _OsonEncoder {
         _treeSeg.writeUint32BE(bytes.length);
       }
       if (bytes.isNotEmpty) _treeSeg.writeBytes(bytes);
+    } else if (value is DateTime) {
+      // A local DateTime with zero sub-second is the 7-byte DATE-shaped
+      // TIMESTAMP7 node; anything finer is the 11-byte TIMESTAMP (client
+      // `_encodeNode`). UTC DateTimes (TIMESTAMP WITH TIME ZONE) are not
+      // emitted here.
+      if (value.millisecond == 0 && value.microsecond == 0) {
+        _treeSeg.writeUint8(_nodeTimestamp7);
+        _treeSeg.writeBytes(_encodeOracleDate(value));
+      } else {
+        _treeSeg.writeUint8(_nodeTimestamp);
+        _treeSeg.writeBytes(_encodeOracleTimestamp(value));
+      }
+    } else if (value is Uint8List) {
+      if (value.length < 65536) {
+        _treeSeg.writeUint8(_nodeBinaryLenUint16);
+        _treeSeg.writeUint16BE(value.length);
+      } else {
+        _treeSeg.writeUint8(_nodeBinaryLenUint32);
+        _treeSeg.writeUint32BE(value.length);
+      }
+      _treeSeg.writeBytes(value);
     } else if (value is List) {
       _encodeContainerHeader(_nodeArray, value.length);
       var offsetSlot = _treeSeg.reserve(value.length * 4);
@@ -518,6 +587,15 @@ class _OsonDecoder {
         return len == 0 ? 0 : decodeOracleNumber(ReadBuffer(_buf.readBytes(len)));
       case _nodeBinaryDouble:
         return _decodeBinaryDouble(_buf.readBytes(8));
+      case _nodeDate:
+      case _nodeTimestamp7:
+        return _decodeOracleDate(Uint8List.fromList(_buf.readBytes(7)));
+      case _nodeTimestamp:
+        return _decodeOracleDate(Uint8List.fromList(_buf.readBytes(11)));
+      case _nodeBinaryLenUint16:
+        return Uint8List.fromList(_buf.readBytes(_buf.readUint16BE()));
+      case _nodeBinaryLenUint32:
+        return Uint8List.fromList(_buf.readBytes(_buf.readUint32BE()));
     }
 
     final typeBits = nodeType & 0xf0;
@@ -625,4 +703,42 @@ class _OsonDecoder {
     }
     return ByteData.sublistView(bytes).getFloat64(0, Endian.big);
   }
+}
+
+/// Encodes a local [DateTime] to the 7-byte Oracle DATE form (client
+/// `encodeDate`): century, year, month, day, hour+1, minute+1, second+1.
+Uint8List _encodeOracleDate(DateTime dt) => Uint8List.fromList([
+      (dt.year ~/ 100) + 100,
+      (dt.year % 100) + 100,
+      dt.month,
+      dt.day,
+      dt.hour + 1,
+      dt.minute + 1,
+      dt.second + 1,
+    ]);
+
+/// Encodes a local [DateTime] to the 11-byte Oracle TIMESTAMP form (client
+/// `encodeTimestamp`): the 7 DATE bytes then 4 big-endian nanosecond bytes.
+Uint8List _encodeOracleTimestamp(DateTime dt) {
+  final nanos = (dt.millisecond * 1000 + dt.microsecond) * 1000;
+  return Uint8List.fromList([
+    ..._encodeOracleDate(dt),
+    (nanos >> 24) & 0xFF,
+    (nanos >> 16) & 0xFF,
+    (nanos >> 8) & 0xFF,
+    nanos & 0xFF,
+  ]);
+}
+
+/// Decodes a 7-byte DATE/TIMESTAMP7 or 11-byte TIMESTAMP into a local
+/// [DateTime] (client `decodeDate` / `decodeTimestamp`).
+DateTime _decodeOracleDate(Uint8List b) {
+  final year = (b[0] - 100) * 100 + (b[1] - 100);
+  var micros = 0;
+  if (b.length >= 11) {
+    final nanos = (b[7] << 24) | (b[8] << 16) | (b[9] << 8) | b[10];
+    micros = nanos ~/ 1000;
+  }
+  return DateTime(year, b[2], b[3], b[4] - 1, b[5] - 1, b[6] - 1,
+      micros ~/ 1000, micros % 1000);
 }

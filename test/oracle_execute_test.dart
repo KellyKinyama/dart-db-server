@@ -403,5 +403,48 @@ void main() {
       expect(sel.rows.length, 1);
       expect(sel.rows[0][0], doc);
     });
+
+    test('JSON with DateTime, bytes and a long key round-trips (OSON)',
+        () async {
+      final db = await Database.open(null);
+      final server = OracleServer(db, port: 0, users: {
+        'testuser': 'testpassword',
+      });
+      await server.start();
+      addTearDown(() async => server.stop());
+
+      final socket = await Socket.connect(
+        InternetAddress.loopbackIPv4,
+        server.boundPort,
+      );
+      addTearDown(() async => socket.close());
+      final frames = FrameReader(socket);
+      await handshakeAndLogin(socket, frames,
+          username: 'testuser', password: 'testpassword');
+
+      socket.add(wrapData(buildExecuteRequest(
+          'CREATE TABLE docs (id INTEGER PRIMARY KEY, doc JSON)')));
+      await frames.next();
+
+      final longKey = 'k' * 300; // OSON version 3 long field name
+      final doc = {
+        'when': DateTime(2025, 3, 14, 9, 26, 53),
+        'blob': Uint8List.fromList([1, 2, 3, 255]),
+        longKey: 'long',
+      };
+      socket.add(wrapData(buildExecuteRequest(
+          'INSERT INTO docs VALUES (:1, :2)',
+          binds: [1, JsonBind(doc)])));
+      expect(
+          decodeExecuteResponse(ttcBody(await frames.next())).rowsAffected, 1);
+
+      socket.add(wrapData(buildExecuteRequest(
+          'SELECT doc FROM docs ORDER BY id', isQuery: true)));
+      final sel = await readExecuteResponse(frames, isQuery: true);
+      final back = sel.rows[0][0] as Map;
+      expect(back['when'], DateTime(2025, 3, 14, 9, 26, 53));
+      expect(back['blob'], [1, 2, 3, 255]);
+      expect(back[longKey], 'long');
+    });
   });
 }

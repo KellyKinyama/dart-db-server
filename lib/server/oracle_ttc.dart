@@ -44,10 +44,11 @@ const int charsetAl32Utf8 = 873;
 const int charsetAl16Utf16 = 2000;
 
 /// Default server banner. Includes a `Release NN.` token the client's
-/// `_extractMajorVersion` parses for feature gating; kept at 19 so the
-/// classical (non-FAST_AUTH) negotiation path stays clean.
+/// `_extractMajorVersion` parses for feature gating. Reported as 23 to match
+/// the negotiated 23ai field version (24 / TNS_CCAP_FIELD_VERSION_23_4) and
+/// enable 23ai-only features such as OSON version 3 long field names.
 const String defaultServerBanner =
-    'dart-db-server Release 19.0.0.0.0 - Production';
+    'dart-db-server Release 23.0.0.0.0 - Production';
 
 // Compile-capability indices (TNS_CCAP_*), mirroring the client builder.
 const int _ccapSqlVersion = 0;
