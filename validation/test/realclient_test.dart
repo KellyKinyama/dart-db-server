@@ -234,4 +234,33 @@ void main() {
     final back = r.rows[0][0] as Float32List;
     expect(back, [1.5, -2.5, 3.25]);
   });
+
+  test('a JSON document binds and reads back as OSON', () async {
+    final db = await Database.open(null);
+    final server = await _startServer(db);
+    addTearDown(() async => server.stop());
+
+    final conn = await OracleConnection.connect(
+      '127.0.0.1:${server.boundPort}/DARTDB',
+      user: 'testuser',
+      password: 'testpassword',
+    );
+    addTearDown(() async => conn.close());
+
+    await conn.execute('CREATE TABLE docs (id INTEGER PRIMARY KEY, doc JSON)');
+
+    // A Map binds as a native JSON (OSON) value; the engine stores it and
+    // the server returns OSON the client decodes back to a Map.
+    final doc = {
+      'name': 'alice',
+      'age': 30,
+      'tags': ['x', 'y', 'z'],
+      'nested': {'k': 1, 'active': true, 'note': null},
+    };
+    await conn.execute('INSERT INTO docs VALUES (:1, :2)', [1, doc]);
+
+    final r = await conn.execute('SELECT doc FROM docs ORDER BY id');
+    expect(r.rows.length, 1);
+    expect(r.rows[0][0], doc);
+  });
 }

@@ -363,5 +363,45 @@ void main() {
       expect(sel.rows.length, 1);
       expect(sel.rows[0][0], [1.5, -2.5, 3.25]);
     });
+
+    test('JSON binds and columns round-trip (OSON)', () async {
+      final db = await Database.open(null);
+      final server = OracleServer(db, port: 0, users: {
+        'testuser': 'testpassword',
+      });
+      await server.start();
+      addTearDown(() async => server.stop());
+
+      final socket = await Socket.connect(
+        InternetAddress.loopbackIPv4,
+        server.boundPort,
+      );
+      addTearDown(() async => socket.close());
+      final frames = FrameReader(socket);
+      await handshakeAndLogin(socket, frames,
+          username: 'testuser', password: 'testpassword');
+
+      socket.add(wrapData(buildExecuteRequest(
+          'CREATE TABLE docs (id INTEGER PRIMARY KEY, doc JSON)')));
+      await frames.next();
+
+      final doc = {
+        'name': 'alice',
+        'age': 30,
+        'tags': ['x', 'y'],
+        'nested': {'k': 1},
+      };
+      socket.add(wrapData(buildExecuteRequest(
+          'INSERT INTO docs VALUES (:1, :2)',
+          binds: [1, JsonBind(doc)])));
+      expect(
+          decodeExecuteResponse(ttcBody(await frames.next())).rowsAffected, 1);
+
+      socket.add(wrapData(buildExecuteRequest(
+          'SELECT doc FROM docs ORDER BY id', isQuery: true)));
+      final sel = await readExecuteResponse(frames, isQuery: true);
+      expect(sel.rows.length, 1);
+      expect(sel.rows[0][0], doc);
+    });
   });
 }

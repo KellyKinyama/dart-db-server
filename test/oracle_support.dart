@@ -13,6 +13,7 @@ import 'dart:typed_data';
 
 import 'package:dart_db_server/server/oracle_codec.dart';
 import 'package:dart_db_server/server/oracle_crypto.dart';
+import 'package:dart_db_server/server/oracle_json.dart';
 import 'package:dart_db_server/server/oracle_number.dart';
 import 'package:dart_db_server/server/oracle_ttc.dart';
 
@@ -356,6 +357,7 @@ int _bindOraType(Object? v) {
   if (v == null) return 1; // VARCHAR (null)
   if (v is RawBind) return v.oraType;
   if (v is VectorBind) return 127; // VECTOR
+  if (v is JsonBind) return 119; // JSON
   if (v is num) return 2; // NUMBER
   if (v is Uint8List) return 23; // RAW
   return 1; // VARCHAR / STRING
@@ -386,6 +388,10 @@ void _writeBindValue(WriteBuffer b, Object? v) {
     final image = encodeVectorImageF32(v.values);
     _writeQLocator(b, image.length);
     b.writeBytesWithLength(image);
+  } else if (v is JsonBind) {
+    final oson = encodeOson(v.value);
+    _writeQLocator(b, oson.length);
+    b.writeBytesWithLength(oson);
   } else if (v is num) {
     b.writeBytesWithLength(encodeOracleNumber(v));
   } else if (v is Uint8List) {
@@ -424,6 +430,12 @@ void _writeQLocator(WriteBuffer b, int payloadLength) {
 class VectorBind {
   VectorBind(this.values);
   final List<double> values;
+}
+
+/// A native JSON bind value, encoded as OSON (as the client does).
+class JsonBind {
+  JsonBind(this.value);
+  final Object? value;
 }
 
 /// Encodes a dense FLOAT32 VECTOR image (client `encodeVector` for a
@@ -664,6 +676,20 @@ void _decodeRowData(ReadBuffer r, ExecuteResponse out) {
       final image = r.readBytesWithLength();
       r.readBytesWithLength(); // locator (unused)
       row.add(decodeVectorImageF32(image));
+      continue;
+    }
+    if (out.columnTypes[i] == 119) {
+      // JSON: UB4 marker (0 = NULL), UB8 size, UB4 chunk, OSON, locator.
+      final marker = r.readUB4();
+      if (marker == 0) {
+        row.add(null);
+        continue;
+      }
+      r.readUB8(); // size
+      r.readUB4(); // chunk size
+      final oson = r.readBytesWithLength();
+      r.readBytesWithLength(); // locator (unused)
+      row.add(decodeOson(oson));
       continue;
     }
     final bytes = r.readBytesWithLength();

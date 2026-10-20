@@ -17,6 +17,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import 'oracle_codec.dart';
+import 'oracle_json.dart';
 import 'oracle_number.dart';
 import 'oracle_ttc.dart';
 import 'result.dart';
@@ -44,6 +45,9 @@ const int _oraTypeRaw = 23;
 
 /// Oracle VECTOR data type indicator (Oracle 23ai).
 const int _oraTypeVector = 127;
+
+/// Oracle native JSON data type indicator (Oracle 21c+).
+const int _oraTypeJson = 119;
 
 /// The TTC field version the server negotiates (see `oracle_ttc.dart`).
 const int executeFieldVersion = 24;
@@ -189,6 +193,7 @@ List<Object?> _decodeBinds(ReadBuffer body, int numParams, int fv) {
 /// string), and NULL (a zero-length value). Other types are not yet handled.
 Object? _decodeBindValue(ReadBuffer body, int oraType) {
   if (oraType == _oraTypeVector) return _decodeVectorBind(body);
+  if (oraType == _oraTypeJson) return _decodeJsonBind(body);
   final bytes = body.readBytesWithLength();
   if (bytes.isEmpty) return null; // NULL (also an empty string in Oracle)
   switch (oraType) {
@@ -327,6 +332,18 @@ Vector? _decodeVectorBind(ReadBuffer body) {
   return _decodeVectorImage(image);
 }
 
+/// Decodes a native JSON bind value (type 119) into a Dart value (`Map` /
+/// `List` / `String` / `num` / `bool` / `null`). The client always writes a
+/// JSON bind as the 40-byte value-based QLocator (UB4 byte count then the
+/// length-prefixed locator) followed by the length-prefixed OSON document —
+/// a NULL travels as the OSON scalar null, not a zero-length indicator.
+Object? _decodeJsonBind(ReadBuffer body) {
+  body.readUB4(); // QLocator byte count (40)
+  body.readBytesWithLength(); // 40-byte value-based QLocator (ignored)
+  final oson = body.readBytesWithLength();
+  return decodeOson(oson);
+}
+
 /// Decodes a VECTOR image into the engine's [Vector] (always `Float32List`).
 /// Inverts the client's `encodeVector` for dense FLOAT32 / FLOAT64 / INT8
 /// vectors (the formats the engine's `Float32` storage can represent);
@@ -458,13 +475,15 @@ Uint8List buildQueryResponse(QueryResult result, {int cursorId = 0}) {
 }
 
 /// Infers the Oracle wire type for column [colIndex]: VECTOR when every
-/// non-null value is a [Vector], NUMBER when every non-null value is a
-/// representable number, RAW when every value is a byte buffer, else VARCHAR2.
+/// non-null value is a [Vector], JSON when every non-null value is a `Map` or
+/// `List`, NUMBER when every non-null value is a representable number, RAW
+/// when every value is a byte buffer, else VARCHAR2.
 int _inferColumnOraType(List<List<Object?>> rows, int colIndex) {
   var sawValue = false;
   var allNumber = true;
   var allRaw = true;
   var allVector = true;
+  var allJson = true;
   for (final row in rows) {
     if (colIndex >= row.length) continue;
     final v = row[colIndex];
@@ -473,10 +492,12 @@ int _inferColumnOraType(List<List<Object?>> rows, int colIndex) {
     if (!(v is num && isOracleNumberRepresentable(v))) allNumber = false;
     if (v is! Uint8List) allRaw = false;
     if (v is! Vector) allVector = false;
-    if (!allNumber && !allRaw && !allVector) return _oraTypeVarchar;
+    if (!((v is Map || v is List) && v is! Uint8List)) allJson = false;
+    if (!allNumber && !allRaw && !allVector && !allJson) return _oraTypeVarchar;
   }
   if (!sawValue) return _oraTypeVarchar;
   if (allVector) return _oraTypeVector;
+  if (allJson) return _oraTypeJson;
   if (allNumber) return _oraTypeNumber;
   if (allRaw) return _oraTypeRaw;
   return _oraTypeVarchar;
@@ -536,7 +557,9 @@ void _writeColumnInfo(WriteBuffer b, String name, int position, int oraType) {
           ? 2000
           : oraType == _oraTypeVector
               ? 8200
-              : 4000;
+              : oraType == _oraTypeJson
+                  ? 8200
+                  : 4000;
   final nameBytes = Uint8List.fromList(utf8.encode(name));
   b.writeUint8(oraType); // data type
   b.writeUint8(0); // flags
@@ -588,6 +611,8 @@ void _writeRowData(WriteBuffer b, List<Object?> row, List<int> types) {
     final type = i < types.length ? types[i] : _oraTypeVarchar;
     if (type == _oraTypeVector) {
       _writeVectorColumn(b, cell);
+    } else if (type == _oraTypeJson) {
+      _writeJsonColumn(b, cell);
     } else if (cell == null) {
       b.writeBytesWithLength(Uint8List(0)); // 0-length == NULL
     } else if (type == _oraTypeNumber && cell is num) {
@@ -614,6 +639,23 @@ void _writeVectorColumn(WriteBuffer b, Object? cell) {
   b.writeUB8(image.length); // size (unused by the client)
   b.writeUB4(0); // chunk size (unused)
   b.writeBytesWithLength(image);
+  b.writeBytesWithLength(Uint8List(0)); // locator (unused)
+}
+
+/// Writes a native JSON column value in the LOB-prefetch inline shape the
+/// client's JSON column decoder reads (client `execute_message` `oraTypeJson`):
+/// a UB4 marker (0 ⇒ SQL NULL), UB8 size and UB4 chunk size (unused), the
+/// length-prefixed OSON document, then an empty length-prefixed locator.
+void _writeJsonColumn(WriteBuffer b, Object? cell) {
+  if (cell == null) {
+    b.writeUB4(0); // SQL NULL
+    return;
+  }
+  final oson = encodeOson(cell);
+  b.writeUB4(oson.length); // marker / locator length (non-zero)
+  b.writeUB8(oson.length); // size (unused)
+  b.writeUB4(0); // chunk size (unused)
+  b.writeBytesWithLength(oson);
   b.writeBytesWithLength(Uint8List(0)); // locator (unused)
 }
 
