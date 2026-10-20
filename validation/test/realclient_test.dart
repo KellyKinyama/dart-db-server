@@ -263,4 +263,40 @@ void main() {
     expect(r.rows.length, 1);
     expect(r.rows[0][0], doc);
   });
+
+  test('a 12c PBKDF2-verifier user authenticates', () async {
+    final db = await Database.open(null);
+    final server = await _startServer(db);
+    server.userStore.addPbkdf2User('pbkdfuser', 'pbkdfpass');
+    addTearDown(() async => server.stop());
+
+    final conn = await OracleConnection.connect(
+      '127.0.0.1:${server.boundPort}/DARTDB',
+      user: 'pbkdfuser',
+      password: 'pbkdfpass',
+    );
+    addTearDown(() async => conn.close());
+
+    await conn.execute('CREATE TABLE p (id INTEGER PRIMARY KEY, v TEXT)');
+    await conn.execute("INSERT INTO p VALUES (1, 'ok')");
+    final r = await conn.execute('SELECT v FROM p');
+    expect(r.rows[0][0], 'ok');
+  });
+
+  test('a 12c PBKDF2-verifier user with a wrong password is rejected',
+      () async {
+    final db = await Database.open(null);
+    final server = await _startServer(db);
+    server.userStore.addPbkdf2User('pbkdfuser', 'pbkdfpass');
+    addTearDown(() async => server.stop());
+
+    await expectLater(
+      OracleConnection.connect(
+        '127.0.0.1:${server.boundPort}/DARTDB',
+        user: 'pbkdfuser',
+        password: 'WRONG',
+      ),
+      throwsA(isA<Object>()),
+    );
+  });
 }

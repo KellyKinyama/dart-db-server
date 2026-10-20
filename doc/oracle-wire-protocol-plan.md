@@ -401,9 +401,9 @@ ordered by value ÷ effort.
 2. INTERVAL codecs      (easy — mirrors the DATE work already shipped)  ✅ done
 3. VECTOR codecs        (engine has native vectors → full round-trip)  ✅ done (dense)
 4. JSON codecs          (text fallback easy; native OSON hard)  ✅ done (standard JSON)
-5. 12c PBKDF2 verifier  (independent — broadens client compatibility)
+5. 12c PBKDF2 verifier  (independent — broadens client compatibility)  ✅ done
 6. TLS / TCPS           (independent — SecureServerSocket)
-7. FAST_AUTH            (after #1; a round-trip optimization, not a gap)
+7. FAST_AUTH            (after #1; a round-trip optimization, not a gap)  ✅ done
 8. LOB locators + ttcLobOp streaming   (largest — a server LOB store)
 ```
 
@@ -477,26 +477,29 @@ ordered by value ÷ effort.
   bytes), and JSON **scalar** columns (a JSON column whose values are bare
   strings/numbers is currently inferred as VARCHAR2/NUMBER, not JSON).
 
-### 4. 12c PBKDF2 verifier + FAST_AUTH (Phase 2)
+### 4. 12c PBKDF2 verifier + FAST_AUTH (Phase 2) — ✅ done
 
-- **12c PBKDF2 (type 0x4815):** the server currently advertises the SHA512
-  verifier (0x939), which the real client accepts. To also serve clients that
-  require the 12c verifier, advertise `0x4815` and add the PBKDF2 branch from
-  `crypto/auth.dart`: `passwordKey = PBKDF2(password, salt ‖
-  "AUTH_PBKDF2_SPEEDY_KEY", iterations, 64)`, `passwordHash =
-  SHA512(passwordKey ‖ salt)[0:32]`, plus the `AUTH_PBKDF2_SPEEDY_KEY`
-  validation (decrypt with the combo key → compare `passwordKey`). Send
-  `AUTH_PBKDF2_VGEN_COUNT` / `AUTH_PBKDF2_CSK_SALT` / `AUTH_PBKDF2_SDER_COUNT`
-  in AUTH_PHASE_ONE. Store `{salt, iterations, mixingSalt, mixingIterations,
-  passwordKey}` per user — still no plaintext. `oracle_crypto.dart` already has
-  `pbkdf2Sha512`.
-- **FAST_AUTH (23ai, 1 round trip):** depends on **#0** (advertise the
-  `0x10000000` accept flag, which needs version ≥ 318). Then the client sends
-  one FAST_AUTH envelope batching PROTOCOL + DATA-TYPES + AUTH_PHASE_ONE
-  (`fast_auth_message.dart` / `transport.sendFastAuth`); the server decodes it
-  and replies with all three responses in one packet. A round-trip
-  optimization, not a functional gap.
-- **Validate:** real client with a 12c-verifier user; node-oracledb FAST_AUTH.
+- **Status:** both shipped and validated against the real `oracledb` client.
+- **12c PBKDF2 (type 0x4815):** `OracleVerifier.pbkdf2` / `addPbkdf2User` store
+  `passwordKey = PBKDF2(password, salt ‖ "AUTH_PBKDF2_SPEEDY_KEY", iterations,
+  64)` → `passwordHash = SHA512(passwordKey ‖ salt)[0:32]` (no plaintext). Phase
+  one advertises verifier `0x4815`, encodes the iteration count into
+  `AUTH_VFR_DATA` (salt ‖ 4-byte BE), and sends `AUTH_PBKDF2_CSK_SALT` /
+  `AUTH_PBKDF2_SDER_COUNT` / `AUTH_PBKDF2_VGEN_COUNT`. Phase two derives the
+  combo key with the advertised mixing salt/iterations and re-derives the
+  verifier to compare. SHA512 users still use the zero-salt / one-iteration
+  default.
+- **FAST_AUTH (23ai, 1 round trip):** the ACCEPT now advertises the
+  `0x10000000` flag2 at version ≥ 318. The server decodes the FAST_AUTH
+  envelope (msg type 34) — skipping the embedded PROTOCOL / DATA-TYPES blocks
+  to reach AUTH_PHASE_ONE — and replies with PROTOCOL + DATA-TYPES +
+  AUTH_PHASE_ONE in one packet. The DATA-TYPES reply is shaped so the client's
+  combined-buffer boundary scan lands exactly on the AUTH reply. A FAST_AUTH
+  client prefixes AUTH_PHASE_TWO with a 23ai token number, which the server
+  skips (tracked per connection). Classical clients (the self-contained tests)
+  ignore the flag and keep working.
+- **Validated:** real client with a 12c-verifier user (accept + reject) and all
+  existing tests now running over the FAST_AUTH handshake.
 
 ### 5. TLS / TCPS (Phase 6)
 

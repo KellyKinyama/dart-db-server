@@ -31,6 +31,7 @@ const int ttcMsgTypeParameter = 8; // key-value parameter block
 const int ttcMsgTypeStatus = 9; // terminal call status
 const int ttcMsgTypeDescribeInfo = 16; // query column metadata
 const int ttcMsgTypePiggyback = 17; // piggybacked control message
+const int ttcMsgTypeFastAuth = 34; // 23ai FAST_AUTH combined handshake
 
 /// Server protocol version byte the client stores (Oracle 8.1+ uses 6).
 const int ttcServerVersion = 6;
@@ -164,5 +165,22 @@ Uint8List buildDataTypesResponse() {
   final b = WriteBuffer();
   b.writeUint8(ttcMsgDataTypes);
   b.writeUint16BE(0); // terminator: no data-type mappings
+  return b.toBytes();
+}
+
+/// Builds the DATA-TYPES reply embedded in a FAST_AUTH response. Unlike the
+/// classical reply (read in its own packet), this one is concatenated with the
+/// PROTOCOL and AUTH replies, so the client walks it to find where AUTH begins
+/// (`transport.sendFastAuth`): it skips a 5-byte charset block, two
+/// length-prefixed caps, a `0x0000` data-type-mappings terminator, then scans
+/// for the AUTH parameter message (type 8). A 10-byte all-zero body after the
+/// type byte makes every skip a no-op and lands the scan exactly on the AUTH
+/// reply, while `DataTypesResponse.decode` reads two zero-length caps.
+Uint8List buildDataTypesResponseFastAuth() {
+  final b = WriteBuffer();
+  b.writeUint8(ttcMsgDataTypes);
+  for (var i = 0; i < 9; i++) {
+    b.writeUint8(0);
+  }
   return b.toBytes();
 }

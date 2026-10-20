@@ -31,6 +31,23 @@ const int ttcAuthPhaseTwo = 0x73;
 /// SHA512 (O5LOGON) verifier type advertised in `AUTH_VFR_DATA` flags.
 const int verifierTypeSha512 = 0x939;
 
+/// 12c PBKDF2-SHA512 (O8LOGON) verifier type advertised in `AUTH_VFR_DATA`
+/// flags. The client derives its password key with PBKDF2 and sends an
+/// `AUTH_PBKDF2_SPEEDY_KEY`; the server mixes with `AUTH_PBKDF2_CSK_SALT` /
+/// `AUTH_PBKDF2_SDER_COUNT`.
+const int verifierTypePbkdf2 = 0x4815;
+
+/// PBKDF2 salt suffix the client appends to `AUTH_VFR_DATA` when deriving the
+/// password key (client `crypto/auth.dart`).
+const String _pbkdf2SpeedyKeySalt = 'AUTH_PBKDF2_SPEEDY_KEY';
+
+/// Default PBKDF2 iteration count for a 12c verifier (client default; also
+/// encoded into `AUTH_VFR_DATA` after the salt).
+const int _pbkdf2DefaultIterations = 4096;
+
+/// Default mixing-salt iteration count (`AUTH_PBKDF2_SDER_COUNT`).
+const int _pbkdf2DefaultMixingIterations = 3;
+
 /// ORA-01017: invalid username/password; logon denied.
 const int oraInvalidCredentials = 1017;
 
@@ -47,10 +64,24 @@ Uint8List _randomBytes(int length) {
 /// A stored password verifier: the salt and the derived hash. Never the
 /// password itself.
 class OracleVerifier {
-  OracleVerifier(this.salt, this.passwordHash);
+  OracleVerifier(
+    this.salt,
+    this.passwordHash, {
+    this.verifierType = verifierTypeSha512,
+    this.iterations = 0,
+  });
 
   final Uint8List salt; // 16 bytes
   final Uint8List passwordHash; // 32 bytes (AES-256 key)
+
+  /// Which verifier scheme this user authenticates with — [verifierTypeSha512]
+  /// or [verifierTypePbkdf2].
+  final int verifierType;
+
+  /// PBKDF2 iteration count (0 for the SHA512 verifier).
+  final int iterations;
+
+  bool get isPbkdf2 => verifierType == verifierTypePbkdf2;
 
   /// Derives a SHA512 verifier from a plaintext password (at user-creation
   /// time only). The optional [salt] is for deterministic tests.
@@ -63,6 +94,41 @@ class OracleVerifier {
     final hash = Uint8List.sublistView(sha512(input), 0, 32);
     return OracleVerifier(s, hash);
   }
+
+  /// Derives a 12c PBKDF2-SHA512 verifier from a plaintext password:
+  /// `passwordKey = PBKDF2(password, salt ‖ "AUTH_PBKDF2_SPEEDY_KEY",
+  /// iterations, 64)`, `passwordHash = SHA512(passwordKey ‖ salt)[0:32]`.
+  factory OracleVerifier.pbkdf2(
+    String password, {
+    Uint8List? salt,
+    int iterations = _pbkdf2DefaultIterations,
+  }) {
+    final s = salt ?? _randomBytes(16);
+    final pw = Uint8List.fromList(utf8.encode(password));
+    final hash = _pbkdf2PasswordHash(pw, s, iterations);
+    return OracleVerifier(s, hash,
+        verifierType: verifierTypePbkdf2, iterations: iterations);
+  }
+}
+
+/// `passwordHash = SHA512(PBKDF2(password, salt ‖ "AUTH_PBKDF2_SPEEDY_KEY",
+/// iterations, 64) ‖ salt)[0:32]` — the 12c password-hash derivation shared by
+/// user creation and phase-two re-validation.
+Uint8List _pbkdf2PasswordHash(Uint8List password, Uint8List salt, int iterations) {
+  final suffix = utf8.encode(_pbkdf2SpeedyKeySalt);
+  final combinedSalt = Uint8List(salt.length + suffix.length)
+    ..setRange(0, salt.length, salt)
+    ..setRange(salt.length, salt.length + suffix.length, suffix);
+  final passwordKey = pbkdf2Sha512(
+    password: password,
+    salt: combinedSalt,
+    iterations: iterations,
+    keyLength: 64,
+  );
+  final hashInput = Uint8List(passwordKey.length + salt.length)
+    ..setRange(0, passwordKey.length, passwordKey)
+    ..setRange(passwordKey.length, passwordKey.length + salt.length, salt);
+  return Uint8List.sublistView(sha512(hashInput), 0, 32);
 }
 
 /// In-memory user → verifier store. Oracle identifiers are matched
@@ -71,8 +137,14 @@ class OracleUserStore {
   final Map<String, OracleVerifier> _byUser = <String, OracleVerifier>{};
 
   void addUser(String username, String password) {
+    _byUser[username.toUpperCase()] = OracleVerifier.fromPassword(password);
+  }
+
+  /// Registers a user that authenticates with the 12c PBKDF2 verifier.
+  void addPbkdf2User(String username, String password,
+      {int iterations = _pbkdf2DefaultIterations}) {
     _byUser[username.toUpperCase()] =
-        OracleVerifier.fromPassword(password);
+        OracleVerifier.pbkdf2(password, iterations: iterations);
   }
 
   OracleVerifier? lookup(String username) => _byUser[username.toUpperCase()];
@@ -85,6 +157,16 @@ class AuthPhaseState {
   Uint8List? serverNonce;
   OracleVerifier? verifier;
   String? username;
+
+  /// PBKDF2 combo-key mixing salt (`AUTH_PBKDF2_CSK_SALT`) and iteration count
+  /// (`AUTH_PBKDF2_SDER_COUNT`) — null for the SHA512 verifier, where the
+  /// client defaults to a zero salt and one iteration.
+  Uint8List? mixingSalt;
+  int? mixingIterations;
+
+  /// Whether phase one arrived in a FAST_AUTH envelope — the client then
+  /// prefixes AUTH_PHASE_TWO with a 23ai token-number field.
+  bool viaFastAuth = false;
 }
 
 /// A built TTC response plus whether authentication has now succeeded.
@@ -122,19 +204,48 @@ AuthResponse handleAuthPhaseOne(
     iv: Uint8List(16),
     data: serverNonce,
   ));
-  final vfrData = hexEncodeUpper(verifier.salt);
 
   final b = WriteBuffer();
   b.writeUint8(ttcMsgTypeParameter);
-  b.writeUB2(2); // two parameters
-  _writeKeyValue(b, 'AUTH_VFR_DATA', vfrData, flags: verifierTypeSha512);
-  _writeKeyValue(b, 'AUTH_SESSKEY', authSessKey, flags: 0);
+  if (verifier.isPbkdf2) {
+    // 12c: AUTH_VFR_DATA carries salt ‖ iterations (4-byte BE); the mixing
+    // salt and iteration count seed the combo key.
+    final mixingSalt = _randomBytes(16);
+    const mixingIterations = _pbkdf2DefaultMixingIterations;
+    state
+      ..mixingSalt = mixingSalt
+      ..mixingIterations = mixingIterations;
+    final vfr = Uint8List(verifier.salt.length + 4)
+      ..setRange(0, verifier.salt.length, verifier.salt);
+    final it = verifier.iterations;
+    vfr[verifier.salt.length] = (it >> 24) & 0xFF;
+    vfr[verifier.salt.length + 1] = (it >> 16) & 0xFF;
+    vfr[verifier.salt.length + 2] = (it >> 8) & 0xFF;
+    vfr[verifier.salt.length + 3] = it & 0xFF;
+    b.writeUB2(5); // five parameters
+    _writeKeyValue(b, 'AUTH_VFR_DATA', hexEncodeUpper(vfr),
+        flags: verifierTypePbkdf2);
+    _writeKeyValue(b, 'AUTH_SESSKEY', authSessKey, flags: 0);
+    _writeKeyValue(b, 'AUTH_PBKDF2_CSK_SALT', hexEncodeUpper(mixingSalt));
+    _writeKeyValue(b, 'AUTH_PBKDF2_SDER_COUNT', '$mixingIterations');
+    _writeKeyValue(b, 'AUTH_PBKDF2_VGEN_COUNT', '${verifier.iterations}');
+  } else {
+    final vfrData = hexEncodeUpper(verifier.salt);
+    b.writeUB2(2); // two parameters
+    _writeKeyValue(b, 'AUTH_VFR_DATA', vfrData, flags: verifierTypeSha512);
+    _writeKeyValue(b, 'AUTH_SESSKEY', authSessKey, flags: 0);
+  }
   return AuthResponse(b.toBytes(), authenticated: false);
 }
 
 /// Handles AUTH_PHASE_TWO: validates the client's password proof. [body] is
 /// positioned just past the TTC function header.
 AuthResponse handleAuthPhaseTwo(ReadBuffer body, AuthPhaseState state) {
+  // A FAST_AUTH client prefixes AUTH_PHASE_TWO with a 23ai token number
+  // (UB8, zero) before the request preamble.
+  if (state.viaFastAuth) {
+    body.readUB8(); // token number (unused)
+  }
   final pairs = _parseRequestKeyValues(body);
   final sessKeyHex = pairs['AUTH_SESSKEY'];
   final passwordHex = pairs['AUTH_PASSWORD'];
@@ -163,8 +274,9 @@ AuthResponse handleAuthPhaseTwo(ReadBuffer body, AuthPhaseState state) {
     );
     if (partB.length < 32) return denied;
 
-    // Combo key: PBKDF2 over hex(partB[0:32] || serverNonce[0:32]) with the
-    // client's default mixing salt (zeros) and one iteration.
+    // Combo key: PBKDF2 over hex(partB[0:32] || serverNonce[0:32]). The
+    // SHA512 verifier uses a zero mixing salt and one iteration; a 12c PBKDF2
+    // verifier uses the salt and count the server advertised in phase one.
     final partAB = Uint8List(64)
       ..setRange(0, 32, partB)
       ..setRange(32, 64, serverNonce);
@@ -172,25 +284,23 @@ AuthResponse handleAuthPhaseTwo(ReadBuffer body, AuthPhaseState state) {
         Uint8List.fromList(utf8.encode(hexEncodeUpper(partAB)));
     final comboKey = pbkdf2Sha512(
       password: partABHex,
-      salt: Uint8List(16),
-      iterations: 1,
+      salt: state.mixingSalt ?? Uint8List(16),
+      iterations: state.mixingIterations ?? 1,
       keyLength: 32,
     );
 
     // Decrypt AUTH_PASSWORD, drop the 16-byte random prefix, re-derive the
-    // hash, and compare against the stored verifier.
+    // verifier's hash (SHA512 or PBKDF2), and compare against the stored one.
     final plain = aes256CbcDecryptPkcs7(
       key: comboKey,
       iv: Uint8List(16),
       data: hexDecode(passwordHex),
     );
     if (plain.length < 16) return denied;
-    final password = Uint8List.sublistView(plain, 16);
-    final check = Uint8List(password.length + verifier.salt.length)
-      ..setRange(0, password.length, password)
-      ..setRange(password.length, password.length + verifier.salt.length,
-          verifier.salt);
-    final recomputed = Uint8List.sublistView(sha512(check), 0, 32);
+    final password = Uint8List.fromList(Uint8List.sublistView(plain, 16));
+    final recomputed = verifier.isPbkdf2
+        ? _pbkdf2PasswordHash(password, verifier.salt, verifier.iterations)
+        : _sha512PasswordHash(password, verifier.salt);
     if (constantTimeEquals(recomputed, verifier.passwordHash)) {
       return AuthResponse(buildAuthSuccess(), authenticated: true);
     }
@@ -198,6 +308,15 @@ AuthResponse handleAuthPhaseTwo(ReadBuffer body, AuthPhaseState state) {
   } catch (_) {
     return denied;
   }
+}
+
+/// `passwordHash = SHA512(password ‖ salt)[0:32]` — the SHA512 verifier's
+/// phase-two re-derivation.
+Uint8List _sha512PasswordHash(Uint8List password, Uint8List salt) {
+  final check = Uint8List(password.length + salt.length)
+    ..setRange(0, password.length, password)
+    ..setRange(password.length, password.length + salt.length, salt);
+  return Uint8List.sublistView(sha512(check), 0, 32);
 }
 
 /// Builds a successful AUTH_PHASE_TWO response (a STATUS message, status 0).

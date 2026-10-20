@@ -233,7 +233,10 @@ class OracleConnection {
       version: _version,
       sdu: _sdu,
       tdu: req.tdu == 0 ? tnsDefaultTdu : req.tdu,
-      // flag2 = 0: classical (non-FAST_AUTH) handshake for now.
+      // Advertise FAST_AUTH (23ai single-round-trip handshake) once the
+      // negotiated version carries the flag2 word; classical PROTOCOL /
+      // DATA-TYPES / AUTH still work for clients that ignore it.
+      flag2: _version >= tnsVersionMinDataFlags ? tnsAcceptFlagFastAuth : 0,
     );
     _phase = OraclePhase.negotiate;
     _send(accept);
@@ -291,6 +294,9 @@ class OracleConnection {
         _phase = OraclePhase.auth;
         _sendTtc(buildDataTypesResponse());
         break;
+      case ttcMsgTypeFastAuth:
+        _handleFastAuth(body);
+        break;
       case _ttcFunction:
         _handleFunction(body);
         break;
@@ -300,6 +306,60 @@ class OracleConnection {
     }
     // Execute/fetch responses are implemented in the next phase of
     // doc/oracle-wire-protocol-plan.md.
+  }
+
+  /// Handles the 23ai FAST_AUTH envelope (message type 34): PROTOCOL +
+  /// DATA-TYPES + AUTH_PHASE_ONE batched in one message. Skips the embedded
+  /// protocol and data-types blocks to reach AUTH_PHASE_ONE, then replies with
+  /// all three responses in a single DATA packet (the client reads one packet
+  /// back and parses the three messages sequentially).
+  void _handleFastAuth(ReadBuffer body) {
+    // Envelope header: version, flag1, flag2.
+    body.readUint8(); // fast-auth version
+    body.readUint8(); // flag 1
+    body.readUint8(); // flag 2
+
+    // Embedded PROTOCOL content: type, version, array terminator, then the
+    // null-terminated driver name.
+    body.readUint8(); // ttcMsgProtocol (1)
+    body.readUint8(); // protocol version
+    body.readUint8(); // array terminator
+    while (body.readUint8() != 0) {} // driver name up to its null byte
+
+    // Server charset fields + the FAST_AUTH field version.
+    body.readUint16BE(); // server charset
+    body.readUint8(); // server charset flag
+    body.readUint16BE(); // server national charset
+    body.readUint8(); // field version
+
+    // Embedded DATA-TYPES content: type, two charset slots, encoding flags,
+    // length-prefixed compile + runtime caps, then 8-byte data-type triples
+    // until a zero-dataType terminator.
+    body.readUint8(); // ttcMsgDataTypes (2)
+    body.readUint16LE(); // primary charset
+    body.readUint16LE(); // national charset
+    body.readUint8(); // encoding flags
+    body.skip(body.readUint8()); // compile caps
+    body.skip(body.readUint8()); // runtime caps
+    while (body.readUint16BE() != 0) {
+      body.skip(6); // the rest of this 8-byte data-type entry
+    }
+
+    // Embedded AUTH_PHASE_ONE, with its function header.
+    body.readUint8(); // ttcMsgTypeFunction (3)
+    body.readUint8(); // function code (AUTH_PHASE_ONE)
+    body.readUint8(); // sequence
+    final auth = handleAuthPhaseOne(body, server.userStore, _auth);
+    _phase = OraclePhase.auth;
+    _auth.viaFastAuth = true;
+    server._log('conn $id FAST_AUTH user=${_auth.username ?? '?'}');
+
+    // One DATA packet carrying PROTOCOL + DATA-TYPES + AUTH_PHASE_ONE replies.
+    final combined = WriteBuffer()
+      ..writeBytes(buildProtocolResponse())
+      ..writeBytes(buildDataTypesResponseFastAuth())
+      ..writeBytes(auth.bytes);
+    _sendTtc(combined.toBytes());
   }
 
   /// Dispatches a TTC FUNCTION (message type 3) call by its function code.
