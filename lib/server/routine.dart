@@ -297,3 +297,115 @@ class RoutineInterpreter {
     return true;
   }
 }
+
+/// Synchronous runner for a stored FUNCTION invoked inside expression
+/// evaluation. The caller is already executing inside the database lock, so
+/// embedded SQL runs through [exec] (a synchronous dispatch) rather than the
+/// async, re-locking path used by [RoutineInterpreter]. Returns the function's
+/// RETURN value.
+class SyncRoutineRunner {
+  /// Runs `sql` with [scope] visible as the routine's local variables and
+  /// returns its result set.
+  final QueryResult Function(String sql, Map<String, Object?> scope) exec;
+  final Map<String, Object?> vars;
+
+  SyncRoutineRunner(this.exec, {Map<String, Object?>? initialVars})
+      : vars = {...?initialVars};
+
+  Object? run(RoutineBlock block) {
+    try {
+      _runBlock(block);
+    } on _ReturnSignal catch (s) {
+      return s.value;
+    }
+    return null;
+  }
+
+  void _runBlock(RoutineBlock b) {
+    for (final d in b.declarations) {
+      vars[d.name] = d.initSql == null ? null : _eval(d.initSql!);
+    }
+    _runStmts(b.body);
+  }
+
+  void _runStmts(List<RoutineStmt> stmts) {
+    for (final s in stmts) {
+      _runStmt(s);
+    }
+  }
+
+  void _runStmt(RoutineStmt s) {
+    switch (s) {
+      case RoutineBlock b:
+        _runBlock(b);
+      case RoutineAssign a:
+        vars[a.target] = _eval(a.valueSql);
+      case RoutineIf f:
+        for (final br in f.branches) {
+          if (RoutineInterpreter._truthy(_eval(br.condSql))) {
+            _runStmts(br.body);
+            return;
+          }
+        }
+        _runStmts(f.elseBody);
+      case RoutineWhile w:
+        try {
+          while (RoutineInterpreter._truthy(_eval(w.condSql))) {
+            _runStmts(w.body);
+          }
+        } on _ExitSignal {
+          // loop exited
+        }
+      case RoutineLoop l:
+        try {
+          while (true) {
+            _runStmts(l.body);
+          }
+        } on _ExitSignal {
+          // loop exited
+        }
+      case RoutineForNumeric fr:
+        final lo = (_eval(fr.lowerSql) as num).toInt();
+        final hi = (_eval(fr.upperSql) as num).toInt();
+        try {
+          if (fr.reverse) {
+            for (var i = hi; i >= lo; i--) {
+              vars[fr.varName] = i;
+              _runStmts(fr.body);
+            }
+          } else {
+            for (var i = lo; i <= hi; i++) {
+              vars[fr.varName] = i;
+              _runStmts(fr.body);
+            }
+          }
+        } on _ExitSignal {
+          // loop exited
+        }
+      case RoutineExit e:
+        if (e.whenSql == null || RoutineInterpreter._truthy(_eval(e.whenSql!))) {
+          throw _ExitSignal();
+        }
+      case RoutineReturn r:
+        throw _ReturnSignal(r.exprSql == null ? null : _eval(r.exprSql!));
+      case RoutineSql q:
+        exec(q.sql, vars);
+      case RoutineSelectInto si:
+        final res = exec(si.sql, vars);
+        final row = res.rows.isEmpty ? null : res.rows.first;
+        for (var i = 0; i < si.intoVars.length; i++) {
+          vars[si.intoVars[i]] =
+              (row != null && i < row.length) ? row[i] : null;
+        }
+      case RoutinePrint _:
+        break; // DBMS_OUTPUT inside a function is ignored
+      case RoutineSelect q:
+        exec(q.sql, vars);
+    }
+  }
+
+  Object? _eval(String exprSql) {
+    final res = exec('SELECT $exprSql', vars);
+    return res.rows.isEmpty ? null : res.rows.first.first;
+  }
+}

@@ -675,6 +675,13 @@ class FunctionCallExpr extends Expr {
   /// as an unknown scalar function.
   static Map<FunctionCallExpr, Object?>? windowRowValues;
 
+  /// Resolver for user-defined (stored) functions, set by the active Database
+  /// while dispatching. Invoked synchronously when [name] is not a built-in
+  /// scalar; it runs the stored function and returns its value, or throws if no
+  /// such function exists.
+  static Object? Function(String name, List<Object?> args)?
+      storedFunctionResolver;
+
   @override
   Object? eval(Map<String, Object?> row) {
     if (isWindow) {
@@ -691,6 +698,10 @@ class FunctionCallExpr extends Expr {
     }
     final fn = kScalarFunctions[name];
     if (fn == null) {
+      final resolver = storedFunctionResolver;
+      if (resolver != null) {
+        return resolver(name, args.map((a) => a.eval(row)).toList());
+      }
       throw StateError('Unknown function: $name');
     }
     final values = args.map((a) => a.eval(row)).toList();

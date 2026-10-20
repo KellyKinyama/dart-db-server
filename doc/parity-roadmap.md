@@ -157,9 +157,14 @@ Sequenced sub-phases so value lands incrementally:
    `WHILE LOOP`, `FOR i IN [REVERSE] lo..hi LOOP`, `LOOP`+`EXIT [WHEN]`, `RETURN`,
    `SELECT INTO`, `DBMS_OUTPUT.PUT_LINE` (captured), and nested proc calls.
    (`EXCEPTION` handlers and cursors `OPEN`/`FETCH`/`CLOSE` deferred.)
-4. **3d — Packages & bind-out (M).** `CREATE PACKAGE`/`BODY`, `OUT` binds over
-   both wires, ref-cursor returns from functions (the wire already supports ref
-   cursors).
+4. **3d — Packages & bind-out (M).** ✅ done (stored functions in expressions)
+   — a stored `FUNCTION` (either MySQL `RETURNS` or Oracle `RETURN … IS` form)
+   can now be called anywhere a scalar expression is allowed (`SELECT f(x)`,
+   projection `f(col)`, `WHERE f(col) > …`, and nested `f(g(x))`). Bodies run
+   synchronously through a `SyncRoutineRunner` that dispatches embedded SQL
+   in-line, so functions may themselves query the database (`SELECT … INTO`).
+   (`CREATE PACKAGE`/`BODY`, `OUT`-param `@var` writeback, and ref-cursor
+   returns deferred.)
 - **Risk:** high — new execution model, transaction/savepoint interaction,
   error-mapping to each protocol's error packets, and recursion/termination
   guards.

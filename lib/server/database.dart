@@ -2374,6 +2374,9 @@ class Database implements SequenceProvider {
     // while running the statement (nested trigger dispatch re-pushes safely).
     SequenceExpr.providerStack.add(this);
     _beginSeqRow();
+    // Resolve user-defined functions against this database for the duration.
+    final prevFnResolver = FunctionCallExpr.storedFunctionResolver;
+    FunctionCallExpr.storedFunctionResolver = _invokeStoredFunctionSync;
     try {
       if (stmt is CreateTableStmt) {
         result = _createTable(stmt);
@@ -2475,6 +2478,7 @@ class Database implements SequenceProvider {
       }
     } finally {
       SequenceExpr.providerStack.removeLast();
+      FunctionCallExpr.storedFunctionResolver = prevFnResolver;
     }
     return result;
   }
@@ -4917,6 +4921,33 @@ class Database implements SequenceProvider {
     final out = await runRoutine(s.block);
     if (out.resultSets.isNotEmpty) return out.resultSets.last;
     return QueryResult.message('PL/SQL block executed');
+  }
+
+  /// Synchronously invoke a stored FUNCTION from within expression evaluation
+  /// (the caller already holds the lock, so embedded SQL runs via nested
+  /// [_dispatch]). Throws when [name] is not a defined function.
+  Object? _invokeStoredFunctionSync(String name, List<Object?> args) {
+    final r = _routines[name.toUpperCase()];
+    if (r == null || !r.isFunction) {
+      throw StateError('Unknown function: $name');
+    }
+    final scope = <String, Object?>{};
+    for (var i = 0; i < r.params.length; i++) {
+      scope[r.params[i].name] = i < args.length ? args[i] : null;
+    }
+    final runner = SyncRoutineRunner(
+      (sql, sc) {
+        final stmt = Parser.fromString(sql).parseStatement();
+        ColumnExpr.routineScopes.add(sc);
+        try {
+          return _dispatch(stmt);
+        } finally {
+          ColumnExpr.routineScopes.removeLast();
+        }
+      },
+      initialVars: scope,
+    );
+    return runner.run(r.block);
   }
 
   // ---------------------------------------------------------------------------

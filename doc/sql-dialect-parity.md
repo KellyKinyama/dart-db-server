@@ -65,7 +65,7 @@ standard / Oracle 12c+), and `WHERE ROWNUM <= n` (Oracle legacy).
 | `(+)` outer-join operator | ✅ | comma joins → CROSS; `(+)` rewrites to LEFT/RIGHT (3+-table chains best-effort) |
 | `FETCH FIRST … ROWS ONLY` / `OFFSET … ROWS` | ✅ | `WITH TIES` ≈ `ONLY` |
 | `CONNECT BY` hierarchical queries | ✅ | `PRIOR`, `LEVEL`, `CONNECT_BY_ISLEAF`, `START WITH`, `ORDER SIBLINGS BY`, cycle guard (`SYS_CONNECT_BY_PATH` / `CONNECT_BY_ROOT` deferred) |
-| PL/SQL anonymous blocks + `CREATE PROCEDURE`/`FUNCTION` | ✅ | `DECLARE`/`:=`/`IF`-`ELSIF`/`WHILE`/`FOR lo..hi`/`LOOP`+`EXIT`/`SELECT INTO`/`DBMS_OUTPUT`; `EXCEPTION` + cursors deferred |
+| PL/SQL anonymous blocks + `CREATE PROCEDURE`/`FUNCTION` | ✅ | `DECLARE`/`:=`/`IF`-`ELSIF`/`WHILE`/`FOR lo..hi`/`LOOP`+`EXIT`/`SELECT INTO`/`DBMS_OUTPUT`; stored FUNCTIONs callable in expressions (`SELECT f(x)`, `WHERE`, nested); `EXCEPTION` + cursors deferred |
 | `INSERT ALL` / `INSERT FIRST` multi-table insert | ✅ | unconditional, conditional `WHEN`/`ELSE`, `INTO` without `VALUES` |
 
 ### Scalar idioms & functions
@@ -101,7 +101,7 @@ typed literals `DATE '…'` / `TIMESTAMP '…'`.
 | String functions (`CONCAT`, `CONCAT_WS`, `SUBSTRING`, `LEFT`/`RIGHT`, `LPAD`/`RPAD`, `REPLACE`, `REVERSE`, `SOUNDEX`, …) | ✅ |
 | `JSON_*` / `JSONB_*` function family | ✅ |
 | `INFORMATION_SCHEMA` views | ✅ `TABLES` / `COLUMNS` / `SCHEMATA` / `VIEWS` (sqlite_master-backed; no `KEY_COLUMN_USAGE` / `STATISTICS` yet) |
-| Stored procedures / `DELIMITER` | ✅ `CREATE`/`DROP PROCEDURE`, `CALL` (IN params, result passthrough); `DELIMITER` no-op. Stored FUNCTIONS in expressions + OUT-param `@var` writeback not yet |
+| Stored procedures / `DELIMITER` | ✅ `CREATE`/`DROP PROCEDURE`, `CALL` (IN params, result passthrough); `DELIMITER` no-op. Stored FUNCTIONS callable in expressions (`SELECT f(x)`, projection, `WHERE`, nested, DB-reading via `SELECT … INTO`); OUT-param `@var` writeback not yet |
 
 ---
 
