@@ -1750,22 +1750,22 @@ class Parser {
       final s = _parsePlsqlStmt();
       if (s != null) body.add(s);
     }
+    final handlers = <RoutineExceptionHandler>[];
     if (_matchWord('EXCEPTION')) {
-      // Exception handlers are not yet executed; skip to the block END.
-      var depth = 0;
-      while (!_isAtEnd()) {
-        if (_checkWord('BEGIN') || _checkWord('CASE')) depth++;
-        if (_checkWord('END')) {
-          if (depth == 0) break;
-          depth--;
+      while (_matchWord('WHEN')) {
+        final names = <String>[_expectName().toUpperCase()];
+        while (_matchWord('OR')) {
+          names.add(_expectName().toUpperCase());
         }
-        _advance();
+        _expectWord('THEN');
+        final hbody = _parsePlsqlStmtsUntil({'WHEN', 'END'});
+        handlers.add(RoutineExceptionHandler(names, hbody));
       }
     }
     _expectWord('END');
     if (_check(TokType.ident)) _advance(); // optional end name
     _match(TokType.punct, ';');
-    return RoutineBlock(body, declarations: decls);
+    return RoutineBlock(body, declarations: decls, handlers: handlers);
   }
 
   RoutineStmt? _parsePlsqlStmt() {
@@ -1803,6 +1803,16 @@ class Parser {
       return RoutineReturn(exprSql: e);
     }
     if (_matchWord('OPEN')) return _parsePlsqlOpen();
+    // RAISE exc; or bare RAISE; (re-raise). The SQLite `RAISE(action,...)`
+    // function form has a '(' and is left to expression parsing.
+    if (_checkWord('RAISE') &&
+        !(_peek(1).type == TokType.punct && _peek(1).text == '(')) {
+      _advance();
+      String? name;
+      if (_check(TokType.ident)) name = _advance().text;
+      _match(TokType.punct, ';');
+      return RoutineRaise(name);
+    }
     // Assignment: `name := expr;`.
     if (_check(TokType.ident) &&
         _peek(1).type == TokType.op &&

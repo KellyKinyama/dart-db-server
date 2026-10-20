@@ -22,7 +22,19 @@ sealed class RoutineStmt {}
 class RoutineBlock extends RoutineStmt {
   final List<RoutineDecl> declarations;
   final List<RoutineStmt> body;
-  RoutineBlock(this.body, {this.declarations = const []});
+
+  /// `EXCEPTION WHEN … THEN …` handlers; empty when the block has none.
+  final List<RoutineExceptionHandler> handlers;
+  RoutineBlock(this.body,
+      {this.declarations = const [], this.handlers = const []});
+}
+
+/// One `WHEN exc [OR exc…] THEN <stmts>` arm of an EXCEPTION section. [names]
+/// are upper-cased; `OTHERS` matches any exception.
+class RoutineExceptionHandler {
+  final List<String> names;
+  final List<RoutineStmt> body;
+  RoutineExceptionHandler(this.names, this.body);
 }
 
 /// `DECLARE name [:= <expr>]` — a local variable, optionally initialised.
@@ -125,6 +137,13 @@ class RoutineOpen extends RoutineStmt {
   RoutineOpen(this.varName, this.sql);
 }
 
+/// `RAISE [exc]` — raise a named exception, or (bare `RAISE`) re-raise the
+/// exception currently being handled.
+class RoutineRaise extends RoutineStmt {
+  final String? name; // upper-cased; null = re-raise
+  RoutineRaise(this.name);
+}
+
 /// Direction of a stored-routine parameter.
 enum RoutineParamMode { inParam, outParam, inOutParam }
 
@@ -166,6 +185,21 @@ class _ReturnSignal {
 
 class _ExitSignal {}
 
+/// A PL/SQL exception propagating through the interpreter. [name] is the
+/// upper-cased exception name (`OTHERS` for a wrapped host error); [original]
+/// preserves the underlying error for diagnostics / re-raise.
+class _PlsqlError implements Exception {
+  final String name;
+  final Object? original;
+  _PlsqlError(this.name, {this.original});
+  @override
+  String toString() => original?.toString() ?? 'PL/SQL exception: $name';
+}
+
+/// True when [name] (an exception name) matches one of the handler [names].
+bool _handlerMatches(List<String> names, String name) =>
+    names.contains('OTHERS') || names.contains(name);
+
 /// Executes a [RoutineBlock] against a [Database]. Not re-entrant under the
 /// database write lock — run routines at the top level (each embedded SQL
 /// statement takes the lock on its own).
@@ -174,6 +208,9 @@ class RoutineInterpreter {
   final Map<String, Object?> vars;
   final List<String> output = [];
   final List<QueryResult> resultSets = [];
+
+  /// The exception currently being handled, for a bare `RAISE` re-raise.
+  _PlsqlError? _currentException;
 
   RoutineInterpreter(this.db, {Map<String, Object?>? initialVars})
       : vars = {...?initialVars};
@@ -192,7 +229,34 @@ class RoutineInterpreter {
     for (final d in b.declarations) {
       vars[d.name] = d.initSql == null ? null : await _eval(d.initSql!);
     }
-    await _runStmts(b.body);
+    if (b.handlers.isEmpty) {
+      await _runStmts(b.body);
+      return;
+    }
+    try {
+      await _runStmts(b.body);
+    } on _ReturnSignal {
+      rethrow;
+    } on _ExitSignal {
+      rethrow;
+    } catch (e) {
+      final exc = e is _PlsqlError ? e : _PlsqlError('OTHERS', original: e);
+      RoutineExceptionHandler? handler;
+      for (final h in b.handlers) {
+        if (_handlerMatches(h.names, exc.name)) {
+          handler = h;
+          break;
+        }
+      }
+      if (handler == null) rethrow;
+      final prev = _currentException;
+      _currentException = exc;
+      try {
+        await _runStmts(handler.body);
+      } finally {
+        _currentException = prev;
+      }
+    }
   }
 
   Future<void> _runStmts(List<RoutineStmt> stmts) async {
@@ -270,6 +334,11 @@ class RoutineInterpreter {
         resultSets.add(await _exec(q.sql));
       case RoutineOpen o:
         vars[o.varName] = CursorValue(await _exec(o.sql));
+      case RoutineRaise r:
+        if (r.name == null) {
+          throw _currentException ?? _PlsqlError('OTHERS');
+        }
+        throw _PlsqlError(r.name!.toUpperCase());
     }
   }
 
@@ -319,6 +388,9 @@ class SyncRoutineRunner {
   final QueryResult Function(String sql, Map<String, Object?> scope) exec;
   final Map<String, Object?> vars;
 
+  /// The exception currently being handled, for a bare `RAISE` re-raise.
+  _PlsqlError? _currentException;
+
   SyncRoutineRunner(this.exec, {Map<String, Object?>? initialVars})
       : vars = {...?initialVars};
 
@@ -335,7 +407,34 @@ class SyncRoutineRunner {
     for (final d in b.declarations) {
       vars[d.name] = d.initSql == null ? null : _eval(d.initSql!);
     }
-    _runStmts(b.body);
+    if (b.handlers.isEmpty) {
+      _runStmts(b.body);
+      return;
+    }
+    try {
+      _runStmts(b.body);
+    } on _ReturnSignal {
+      rethrow;
+    } on _ExitSignal {
+      rethrow;
+    } catch (e) {
+      final exc = e is _PlsqlError ? e : _PlsqlError('OTHERS', original: e);
+      RoutineExceptionHandler? handler;
+      for (final h in b.handlers) {
+        if (_handlerMatches(h.names, exc.name)) {
+          handler = h;
+          break;
+        }
+      }
+      if (handler == null) rethrow;
+      final prev = _currentException;
+      _currentException = exc;
+      try {
+        _runStmts(handler.body);
+      } finally {
+        _currentException = prev;
+      }
+    }
   }
 
   void _runStmts(List<RoutineStmt> stmts) {
@@ -413,6 +512,11 @@ class SyncRoutineRunner {
         exec(q.sql, vars);
       case RoutineOpen o:
         vars[o.varName] = CursorValue(exec(o.sql, vars));
+      case RoutineRaise r:
+        if (r.name == null) {
+          throw _currentException ?? _PlsqlError('OTHERS');
+        }
+        throw _PlsqlError(r.name!.toUpperCase());
     }
   }
 
