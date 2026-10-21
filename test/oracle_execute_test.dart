@@ -34,6 +34,30 @@ void main() {
       final info = decodeExecuteRequest(ReadBuffer(req)..skip(3));
       expect(info.sql, sql);
     });
+
+    test('native request recovers trailing text bind values', () {
+      const sql = 'select :a as a, :b as b';
+      final body = <int>[
+        sql.length, ...sql.codeUnits, // U8(len)-prefixed SQL
+        0, 0, 0, 0, // padding / descriptor stand-in
+        0x07, // value-block marker
+        1, 0x37, // ":a" = "7"
+        2, 0x78, 0x79, // ":b" = "xy"
+      ];
+      final info = decodeNativeExecuteRequest(Uint8List.fromList(body));
+      expect(info.sql, sql);
+      expect(info.numParams, 2);
+      expect(info.hasBinds, isTrue);
+      expect(info.binds, ['7', 'xy']);
+    });
+
+    test('native request with no placeholders has no binds', () {
+      const sql = 'select 1 as n';
+      final body = <int>[sql.length, ...sql.codeUnits, 0, 0, 0];
+      final info = decodeNativeExecuteRequest(Uint8List.fromList(body));
+      expect(info.sql, sql);
+      expect(info.hasBinds, isFalse);
+    });
   });
 
   group('response encoding (decoded with client mirrors)', () {

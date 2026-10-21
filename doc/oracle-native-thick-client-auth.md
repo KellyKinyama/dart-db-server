@@ -244,8 +244,22 @@ app`) before DDL/DML capture works.
 answered with the native end-of-call terminal `09 01 00 00 00 00 00 1d`
 (`buildNativeStatusOk`), **not** the thin `buildStatusOk` (`09 00 00`) — the
 short form leaves the client blocked, most visibly as a stalled `oci_close`
-after any statement. Binds and `ALTER SESSION` (which returns an NLS parameter
-block) are the remaining work.
+after any statement.
+
+**Bind variables.** `oci8` keeps the `:name` placeholders in the SQL text and
+appends the bound values at the very end of the OALL8 body as a single `0x07`
+marker followed by one `U8(len) + bytes` value per distinct placeholder — and it
+sends them as **text** (`:v = 42` arrives as the two bytes `34 32`, i.e. `"42"`,
+not an Oracle number). So the whole 300+-byte OCI-RPC bind-descriptor block in
+the middle can be ignored: `decodeNativeExecuteRequest` counts the `:name`
+placeholders in the recovered SQL, then walks the trailing `0x07` block for that
+many length-prefixed values. The existing `_executeWithBinds` already maps those
+positional values onto the placeholders (first-appearance order) and the engine
+substitutes them, so a real `oci8` client round-trips `select :a, :b` and
+`insert into t values (:id, :nm)` with correct results and row counts. Binary
+(non-text) number binds would need the OCI-RPC value section decoded properly;
+the common `oci8` / PDO path binds as text. `ALTER SESSION` (which returns an NLS
+parameter block) is the remaining connect-time gap.
 
 
 

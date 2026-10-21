@@ -170,17 +170,58 @@ ExecuteRequestInfo decodeExecuteRequest(
 ///
 /// The native OALL8 argument list is OCI-RPC marshaled (8-byte `FE FF…` pointer
 /// indicators, 4-byte little-endian scalars) rather than the thin UB layout, so
-/// the fixed header is not walked field-by-field. Instead the SQL text — the
-/// only field needed to run a fresh, no-bind statement — is recovered by
-/// scanning for its inline `U8(len)` length-prefixed byte run. Re-executed
-/// cursors (no inline SQL) and binds are not yet supported on this path.
+/// the fixed header is not walked field-by-field. Instead the SQL text is
+/// recovered by scanning for its inline `U8(len)` length-prefixed byte run, and
+/// any IN bind values from the trailing `0x07`-prefixed value block (oci8
+/// marshals bind values as length-prefixed text after the bind descriptors).
+/// Re-executed cursors (no inline SQL) are not yet supported on this path.
 ExecuteRequestInfo decodeNativeExecuteRequest(Uint8List body) {
+  final sql = _scanNativeSqlText(body);
+  final binds = _scanNativeBindValues(body, sql);
   return ExecuteRequestInfo(
     options: 0,
     cursorId: 0,
-    sql: _scanNativeSqlText(body),
-    numParams: 0,
+    sql: sql,
+    numParams: binds.length,
+    binds: binds,
   );
+}
+
+/// Recovers IN bind values from a native OALL8 body. oci8 keeps the `:name`
+/// placeholders in the SQL and appends the bound values at the very end as a
+/// single `0x07` marker followed by one `U8(len) + bytes` (text) value per
+/// distinct placeholder. Returns the values in wire order, or empty when the
+/// statement has no binds / the block cannot be located.
+List<Object?> _scanNativeBindValues(Uint8List p, String sql) {
+  final names = <String>{};
+  for (final m in RegExp(r':(\w+)').allMatches(sql)) {
+    names.add(m.group(1)!);
+  }
+  final n = names.length;
+  if (n == 0) return const [];
+  // The value block sits at the tail; take the last 0x07 whose n length-
+  // prefixed values consume exactly to the end of the payload.
+  for (var i = p.length - 1; i >= 0; i--) {
+    if (p[i] != 0x07) continue;
+    final values = <Object?>[];
+    var cur = i + 1;
+    var ok = true;
+    for (var k = 0; k < n; k++) {
+      if (cur >= p.length) {
+        ok = false;
+        break;
+      }
+      final len = p[cur++];
+      if (cur + len > p.length) {
+        ok = false;
+        break;
+      }
+      values.add(utf8.decode(p.sublist(cur, cur + len), allowMalformed: true));
+      cur += len;
+    }
+    if (ok && cur == p.length) return values;
+  }
+  return const [];
 }
 
 /// Finds the statement text in a native OALL8 body: the longest `U8(len)`
