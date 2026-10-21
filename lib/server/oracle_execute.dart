@@ -224,10 +224,30 @@ List<Object?> _scanNativeBindValues(Uint8List p, String sql) {
   return const [];
 }
 
-/// Finds the statement text in a native OALL8 body: the longest `U8(len)`
-/// length-prefixed run of printable ASCII that begins with a letter.
+/// The keywords an Oracle statement can lead with, used to tell the SQL text
+/// apart from a (possibly longer) string bind value in a native OALL8 body.
+const Set<String> _sqlLeadingVerbs = {
+  'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'MERGE', 'WITH', 'CREATE', 'DROP',
+  'ALTER', 'TRUNCATE', 'BEGIN', 'DECLARE', 'CALL', 'GRANT', 'REVOKE', 'COMMIT',
+  'ROLLBACK', 'SAVEPOINT', 'SET', 'EXPLAIN', 'LOCK', 'RENAME', 'COMMENT',
+};
+
+/// Whether [s] begins with a SQL statement keyword (its first whitespace- or
+/// paren-delimited word).
+bool _startsWithSqlVerb(String s) {
+  final t = s.trimLeft();
+  final end = t.indexOf(RegExp(r'[\s(]'));
+  final word = (end < 0 ? t : t.substring(0, end)).toUpperCase();
+  return _sqlLeadingVerbs.contains(word);
+}
+
+/// Finds the statement text in a native OALL8 body among the `U8(len)`
+/// length-prefixed runs of printable ASCII. The statement leads with a SQL verb
+/// and, on the wire, precedes the bind-value block, so the first verb-anchored
+/// run is the SQL even when a string bind value is longer. Falls back to the
+/// longest printable run for statement forms not covered by the verb set.
 String _scanNativeSqlText(Uint8List p) {
-  var best = '';
+  var fallback = '';
   for (var i = 0; i + 1 < p.length; i++) {
     final len = p[i];
     if (len < 4 || i + 1 + len > p.length) continue;
@@ -243,11 +263,12 @@ String _scanNativeSqlText(Uint8List p) {
     final first = p[i + 1];
     final startsLetter =
         (first >= 0x41 && first <= 0x5A) || (first >= 0x61 && first <= 0x7A);
-    if (startsLetter && len > best.length) {
-      best = String.fromCharCodes(p, i + 1, i + 1 + len);
-    }
+    if (!startsLetter) continue;
+    final text = String.fromCharCodes(p, i + 1, i + 1 + len);
+    if (_startsWithSqlVerb(text)) return text;
+    if (len > fallback.length) fallback = text;
   }
-  return best;
+  return fallback;
 }
 
 /// Decodes [numParams] bind metadata blocks followed by the single ROW_DATA

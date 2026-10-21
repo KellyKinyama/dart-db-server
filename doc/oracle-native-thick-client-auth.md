@@ -260,6 +260,16 @@ substitutes them, so a real `oci8` client round-trips `select :a, :b` and
 (non-text) number binds would need the OCI-RPC value section decoded properly;
 the common `oci8` / PDO path binds as text.
 
+One sharp edge the first cut got wrong: the SQL text was recovered as the
+*longest* printable run, but a string bind value longer than the statement
+(routine — any `insert … values (:name)` with a long name) would then be picked
+as the SQL and executed verbatim (the server logged `EXECUTE "Christopher
+Alexander Wren the Architect"` and the client hung). Fix: the statement always
+leads with a SQL verb and, on the wire, precedes the bind-value block, so
+`_scanNativeSqlText` now returns the **first verb-anchored** run (SELECT /
+INSERT / UPDATE / … / BEGIN), falling back to longest-printable only for forms
+outside that set.
+
 **`ALTER SESSION` (connect-time NLS).** Drivers — Laravel's `oci8` in
 particular — issue a burst of `alter session set NLS_DATE_FORMAT = …` /
 `NLS_TIMESTAMP_FORMAT` / `NLS_NUMERIC_CHARACTERS` statements right after connect.

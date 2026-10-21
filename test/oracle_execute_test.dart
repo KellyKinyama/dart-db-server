@@ -58,6 +58,19 @@ void main() {
       expect(info.sql, sql);
       expect(info.hasBinds, isFalse);
     });
+
+    test('native SQL scan ignores a string bind value longer than the SQL', () {
+      const sql = 'select :v as n';
+      const value = 'Christopher Alexander Wren the Architect'; // > SQL length
+      final body = <int>[
+        sql.length, ...sql.codeUnits,
+        0, 0, 0,
+        0x07, value.length, ...value.codeUnits,
+      ];
+      final info = decodeNativeExecuteRequest(Uint8List.fromList(body));
+      expect(info.sql, sql); // the verb-anchored run wins over the longer value
+      expect(info.binds, [value]);
+    });
   });
 
   group('response encoding (decoded with client mirrors)', () {
