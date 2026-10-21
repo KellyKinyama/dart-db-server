@@ -41,6 +41,31 @@ socket round-trips). See the per-phase **Landed** notes below for detail.
 > and it answers the client's `nls_database_parameters` charset probe with a
 > synthetic `AL32UTF8` / `AL16UTF16` result.
 
+## Native (thick) OCI/OCCI client support — in progress
+
+Thin clients (above) work end-to-end. The **native** thick client (PHP `oci8`,
+OCCI, Instant Client) is stricter and originally failed at CONNECT with
+`ORA-12592`. By diffing a real Oracle 23ai listener's packets (captured from a
+traced native connect) against ours, the native path now completes the full
+**handshake through DATA-TYPES**:
+
+| Native phase | Status | Notes |
+| ------------ | ------ | ----- |
+| CONNECT / ACCEPT | ✅ | Large connect-descriptor overflow flow tags the session native; ACCEPT echoes the client's service options, uses the real 23ai byte layout, and skips Advanced Networking (ANO/SNS) via zeroed connect flags |
+| Break/reset self-test | ✅ | The native OOB probe is answered: reply to a RESET marker with a RESET marker, swallow break/attention probes |
+| TTC PROTOCOL | ✅ | Byte-exact real-listener response for native clients (full 10-element charset map, 100-byte FDO, real compile/runtime caps) — thin clients keep the lenient response |
+| TTC DATA-TYPES | ✅ | Real 2922-byte type list (`oracle_native_datatypes.dart`); thin clients keep the empty terminator |
+| Authentication | ⬜ | **Blocked here.** The native client marshals AUTH as OCI-RPC (8-byte pointer indicators, little-endian lengths), unlike the thin UB4 key-value form. Needs a **non-ANO** reference capture of the AUTH response to replicate |
+
+Native-vs-thin branching keys off `OracleConnection._nativeClient` (set on the
+overflow flow), so thin clients are unaffected (all thin tests still pass). An
+in-process **emulator** of the native client — `test/oracle_native_client.dart`'s
+`NativeThickClient`, exercised by `test/oracle_native_handshake_test.dart` —
+drives this path without a real Instant Client and includes a native-format
+`buildNativeAuthPhaseOne` for building out authentication next. Resuming native
+auth needs a clean no-ANO server capture (a local Oracle Free container with
+`SQLNET.AUTHENTICATION_SERVICES=(NONE)`); see the repo memory resume note.
+
 ## Why this is tractable (we are not starting from zero)
 
 The hardest part of reverse-engineering a closed protocol — figuring out
