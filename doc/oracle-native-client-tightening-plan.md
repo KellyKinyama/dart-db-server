@@ -53,7 +53,11 @@ Scope: the native path only (`_nativeClient == true`). Thin clients
   the right `ORA-` code, then the connection stays usable for the next
   statement. Add a live-loopback unit test.
 - **Effort:** M (needs a small capture of a real msg-04 error to template).
-- **Status:** TODO
+- **Status:** LANDED (`5e4d90e`). `buildNativeExecuteError` (msg type `0x04`);
+  ORA number as LE32 at byte 11 / 66, `U8(len)+ORA-ddddd text+0x1d`; routed via
+  `_sendExecError`. Verified vs real `oci8` (missing table + syntax error
+  surface, session survives). Follow-up (low): map engine errors to specific ORA
+  codes instead of the generic 900.
 
 ### 2. Row-count status fields wrap past 255 rows
 - **Risk:** In `buildNativeQueryResponse` the multi-row status slots are written
@@ -214,6 +218,8 @@ dart test (Get-ChildItem test -Filter 'oracle*test.dart' | % FullName)
 ```
 
 ## Landed
+- Native error responses (msg-04) — failing statements surface `oci_error`
+  instead of hanging; session survives — `5e4d90e`.
 - Verb-anchored native SQL scan (long string binds no longer mistaken for SQL) —
   `2714087`.
 - `ALTER SESSION` no-op interception — `702414e`.
