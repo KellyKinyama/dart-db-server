@@ -270,20 +270,23 @@ class OracleConnection {
 
   void _handleConnect(Uint8List raw) {
     final req = ConnectRequest.parse(raw);
-    _version = negotiateVersion(req);
+    // Native (thick) OCI/OCCI clients send the connect descriptor in a separate
+    // DATA packet after the CONNECT (the "overflow" flow); thin clients inline
+    // it. They also probe an out-of-band break below version 320, so negotiate
+    // 320 with them (Dart sockets can't service that probe otherwise).
+    final overflow = req.connectData.isEmpty && req.connectDataLength > 0;
+    _nativeClient = overflow;
+    _version = negotiateVersion(req,
+        serverVersion: overflow ? tnsServerVersionNative : tnsServerVersion);
     _sdu = req.sdu == 0 ? tnsDefaultSdu : req.sdu;
     server._log(
       'conn $id CONNECT v=${req.versionDesired}/${req.versionMinimum} '
       'sdu=${req.sdu} -> negotiated v=$_version'
       '${req.connectData.isNotEmpty ? ' desc="${req.connectData}"' : ''}',
     );
-    // Native (thick) OCI/OCCI clients send the connect descriptor in a separate
-    // DATA packet after the CONNECT (the "overflow" flow); thin clients inline
-    // it. A real listener does NOT offer FAST_AUTH to these native clients, and
+    // A real listener does NOT offer FAST_AUTH to these native clients, and
     // doing so makes them reject the ACCEPT, so only advertise it when the
     // descriptor arrives inline.
-    final overflow = req.connectData.isEmpty && req.connectDataLength > 0;
-    _nativeClient = overflow;
     final accept = buildAcceptPacket(
       version: _version,
       sdu: _sdu,
@@ -291,16 +294,21 @@ class OracleConnection {
       // never echo it back as the negotiated TDU.
       tdu: (req.tdu == 0 || req.tdu == 0xffff) ? tnsDefaultTdu : req.tdu,
       // Advertise FAST_AUTH (23ai single-round-trip handshake) only to thin
-      // clients, once the negotiated version carries the flag2 word.
-      flag2: (!overflow && _version >= tnsVersionMinDataFlags)
-          ? tnsAcceptFlagFastAuth
-          : 0,
+      // clients, once the negotiated version carries the flag2 word. Native
+      // clients get the real 23ai v320 flag2 word instead.
+      flag2: overflow
+          ? tnsAcceptFlagsNativeV320
+          : (_version >= tnsVersionMinDataFlags ? tnsAcceptFlagFastAuth : 0),
       // Echo the client's requested service options (native OCI/OCCI clients
-      // validate these), but do NOT echo the connect flags: the 0x41 bits ask
-      // for Advanced Networking (ANO/SNS) negotiation, which this server does
-      // not implement. Returning 0 tells the client no native services are
-      // active, so it proceeds straight to the TTC protocol handshake.
-      serviceOptions: req.serviceOptions,
+      // validate these), but clear PACKET_IO (0x400): a real listener does, and
+      // leaving it set makes the native client pick async I/O, which triggers a
+      // connect-time out-of-band (urgent TCP) break probe that Dart sockets
+      // can't receive — the client then aborts after AUTH_PHASE_ONE. Do NOT
+      // echo the connect flags: the 0x41 bits ask for Advanced Networking
+      // (ANO/SNS), which this server does not implement. Returning 0 tells the
+      // client no native services are active, so it proceeds to the TTC
+      // protocol handshake.
+      serviceOptions: req.serviceOptions & ~0x400,
       connectFlags0: 0,
       connectFlags1: 0,
       // Native clients require the real 23ai listener's ACCEPT byte layout.

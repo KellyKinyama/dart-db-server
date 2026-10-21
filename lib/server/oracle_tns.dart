@@ -48,12 +48,29 @@ const int tnsVersionMinEndOfResponse = 319; // end-of-request/response markers
 /// staying below the 319 end-of-request/response marker protocol.
 const int tnsServerVersion = 318;
 
+/// Version negotiated with native (thick) OCI/OCCI clients. They request a
+/// connect-time out-of-band break probe below 320 (which Dart sockets can't
+/// service); negotiating 320 makes them skip it.
+const int tnsServerVersionNative = 320;
+
 const int tnsDefaultSdu = 8192;
 const int tnsDefaultTdu = 32767;
 
 // Accept-flag (flag2) bits.
 const int tnsAcceptFlagHasEndOfRequest = 0x02000000;
 const int tnsAcceptFlagFastAuth = 0x10000000;
+
+/// flag2 a real 23ai listener returns to a native client at version 320.
+/// We omit FAST_AUTH (0x10000000) so the client runs the classical
+/// PROTOCOL/DATA-TYPES/AUTH exchange this server implements for native clients.
+const int tnsAcceptFlagsNativeV320 = 0x08000000;
+
+/// 16-byte break cookie a version-320 ACCEPT carries (abs 45..60). A native
+/// client stores it for in-band break resynchronization; a fixed value is fine.
+final Uint8List _acceptBreakCookie = Uint8List.fromList(const [
+  0xFE, 0x21, 0xD3, 0x36, 0x8A, 0xB0, 0xC0, 0xC7, //
+  0xC5, 0x65, 0x91, 0x86, 0x06, 0x63, 0xD5, 0xDB, //
+]);
 
 // DATA packet flags (NSPDAxxx).
 const int tnsDataFlagEndOfRequest = 0x2000;
@@ -297,8 +314,11 @@ Uint8List buildAcceptPacket({
   int connectFlags1 = 0,
   bool nativeClient = false,
 }) {
-  // Payload is 37 bytes so the flag2 word lands at absolute offset 41..44.
-  final payload = Uint8List(37);
+  // Version 320 native clients expect a longer ACCEPT: flag2 lands at abs 41
+  // and a 16-byte break cookie follows. Older/thin layouts use a 37-byte
+  // payload with flag2 at abs 40/41.
+  final bool v320 = nativeClient && version >= tnsVersionMinEndOfResponse;
+  final payload = Uint8List(v320 ? 53 : 37);
   final v = ByteData.sublistView(payload);
   // Offsets below are payload-relative (absolute = +8 for the header).
   v.setUint16(0, version); // abs 8  negotiated version
@@ -323,7 +343,11 @@ Uint8List buildAcceptPacket({
   payload[15] = connectFlags1; // abs 23 echo client's connect flag1
   v.setUint32(24, sdu); // abs 32 large SDU
   v.setUint32(28, tdu); // abs 36 large TDU
-  if (nativeClient) {
+  if (v320) {
+    // flag2 at abs 41 (payload 33), then a 16-byte break cookie at abs 45.
+    v.setUint32(33, flag2); // abs 41 accept flag2
+    payload.setRange(37, 53, _acceptBreakCookie); // abs 45..60
+  } else if (nativeClient) {
     // Real layout: flag2 word at payload 32..35, with a trailing 0x01 byte.
     v.setUint32(32, flag2); // abs 40 accept flag2
     payload[36] = 1; // abs 44 trailing marker
@@ -342,10 +366,11 @@ Uint8List buildAcceptPacket({
 }
 
 /// Negotiates the protocol version: the lowest of what the client wants and
-/// what this server supports, floored at the client's stated minimum.
-int negotiateVersion(ConnectRequest req) {
-  final v = req.versionDesired < tnsServerVersion
+/// what this server supports ([serverVersion], default [tnsServerVersion]),
+/// floored at the client's stated minimum.
+int negotiateVersion(ConnectRequest req, {int serverVersion = tnsServerVersion}) {
+  final v = req.versionDesired < serverVersion
       ? req.versionDesired
-      : tnsServerVersion;
+      : serverVersion;
   return v < req.versionMinimum ? req.versionMinimum : v;
 }

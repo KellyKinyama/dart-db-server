@@ -51,16 +51,19 @@ void main() {
     test('ACCEPT echoes the client service options and uses native layout',
         () async {
       final accept = await client.connectAndAccept();
-      // 45-byte ACCEPT: type 2.
-      expect(accept.length, 45);
+      // 61-byte version-320 ACCEPT: type 2.
+      expect(accept.length, 61);
       expect(accept[4], 2);
-      // Global service options (payload offset 2 = packet offset 10) are echoed.
-      expect(accept[10], 0x0C);
+      // Negotiated version 320.
+      expect(accept[8], 0x01);
+      expect(accept[9], 0x40);
+      // Service options are echoed with PACKET_IO (0x400) cleared: 0x0C41 ->
+      // 0x0841 (so the native client doesn't pick async I/O / an OOB probe).
+      expect(accept[10], 0x08);
       expect(accept[11], 0x41);
-      // Native layout: legacy 16-bit SDU/TDU zeroed, trailing marker 0x01.
+      // Native layout: legacy 16-bit SDU/TDU zeroed.
       expect(accept[12], 0); // SDU16 high
       expect(accept[13], 0); // SDU16 low
-      expect(accept[44], 1); // trailing byte
     });
 
     test('break/reset self-test is answered with a RESET marker', () async {
