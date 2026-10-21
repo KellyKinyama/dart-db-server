@@ -117,7 +117,8 @@ Uint8List buildNativeAuthPhaseOneResponse(
       b, 'AUTH_PBKDF2_CSK_SALT', hexEncodeUpper(sealed.mixingSalt), 0);
   _writeNativeKv(b, 'AUTH_PBKDF2_VGEN_COUNT', '${verifier.iterations}', 0);
   _writeNativeKv(b, 'AUTH_PBKDF2_SDER_COUNT', '${sealed.mixingIterations}', 0);
-  _writeNativeKv(b, 'AUTH_GLOBALLY_UNIQUE_DBID',
+  // A real listener null-terminates this key (26 bytes incl. the trailing \0).
+  _writeNativeKv(b, 'AUTH_GLOBALLY_UNIQUE_DBID\u0000',
       'C204CC473D9FBD2252DDF092D37C2A25', 0);
   b.writeBytes(_phaseOneEpilogue);
   return b.toBytes();
