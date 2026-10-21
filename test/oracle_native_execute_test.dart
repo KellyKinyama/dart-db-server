@@ -73,6 +73,32 @@ void main() {
           isFalse);
     });
   });
+
+  group('native DML response encoder', () {
+    test('carries the affected-row count at offsets 42 and 120', () {
+      final r = buildNativeDmlResponse(3);
+      expect(r[0], 0x08); // status message type
+      expect(r[42], 3); // row count (low byte of LE32)
+      expect(r[120], 3); // echoed count
+    });
+
+    test('large counts are written as a little-endian 32-bit value', () {
+      final r = buildNativeDmlResponse(300);
+      expect(r[42], 300 & 0xFF);
+      expect(r[43], (300 >> 8) & 0xFF);
+    });
+
+    test('zero-row / DDL uses the shorter template', () {
+      final r = buildNativeDmlResponse(0);
+      expect(r[0], 0x08);
+      expect(r.length, lessThan(buildNativeDmlResponse(1).length));
+    });
+
+    test('native status terminal is the 8-byte end-of-call OK', () {
+      expect(buildNativeStatusOk(),
+          [0x09, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1d]);
+    });
+  });
 }
 
 bool _contains(Uint8List haystack, List<int> needle) {

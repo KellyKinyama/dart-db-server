@@ -230,8 +230,22 @@ ALL SELECT …` to exercise multi-row paths against the in-memory engine. The on
 field the engine cannot reproduce is a column's **declared** size (e.g.
 `cast(x as varchar2(10))` → size 10); it advertises the widest observed value
 instead, which the client accepts since the describe size is only an upper
-bound. Binds, DML row counts, and `ALTER SESSION` (which returns an NLS
-parameter block) are the remaining work.
+bound.
+
+**DML (INSERT/UPDATE/DELETE/DDL).** Non-query statements get a native status
+reply (`buildNativeDmlResponse`, message type 8) carrying the affected-row count
+that `oci8` surfaces as `oci_num_rows`. The count lives at byte 42 (a 4-byte
+little-endian scalar) and is echoed at byte 120; a statement that changes no
+rows (DDL, or a zero-row DML) uses a shorter template. One gotcha: the `app`
+user needs `CREATE TABLE` + quota (`grant create table, unlimited tablespace to
+app`) before DDL/DML capture works.
+
+**Clean teardown.** A control call with no SQL (commit / close / logoff) must be
+answered with the native end-of-call terminal `09 01 00 00 00 00 00 1d`
+(`buildNativeStatusOk`), **not** the thin `buildStatusOk` (`09 00 00`) — the
+short form leaves the client blocked, most visibly as a stalled `oci_close`
+after any statement. Binds and `ALTER SESSION` (which returns an NLS parameter
+block) are the remaining work.
 
 
 

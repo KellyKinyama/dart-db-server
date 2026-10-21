@@ -655,7 +655,7 @@ class OracleConnection {
   Future<void> _handleNativeCall(Uint8List payload) async {
     final info = decodeNativeExecuteRequest(payload);
     if (info.sql.isEmpty) {
-      _sendTtc(buildStatusOk(), dataFlags: 0x2000);
+      _sendTtc(buildNativeStatusOk(), dataFlags: 0x2000);
       return;
     }
     await _handleExecute(ReadBuffer(payload));
@@ -717,6 +717,9 @@ class OracleConnection {
               ? buildNativeQueryResponse(result)
               : buildExecuteError(900,
                   'ORA-00000: native result shape not yet supported');
+        }
+        if (_nativeClient) {
+          return buildNativeDmlResponse(result.affected);
         }
         return result.columns.isNotEmpty
             ? buildQueryResponse(result, cursorId: cursorId, lobStore: _lobStore)
