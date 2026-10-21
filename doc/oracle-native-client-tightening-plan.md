@@ -183,7 +183,10 @@ Scope: the native path only (`_nativeClient == true`). Thin clients
   confirm or correct the marker, and widen the unit test.
 - **Verify:** `oci8` fetches a 3-col/5-row and 4-col/5-row result intact.
 - **Effort:** S.
-- **Status:** TODO
+- **Status:** LANDED (`5b6fd66`). The 4th byte is an all-columns-present
+  bitmap `(1<<ncols)-1` (1 / 3 / 7 / 15 for 1–4 cols), **not** `2·ncols-1` (which
+  was right only for 1–2 cols by coincidence). Confirmed 3-col hung first;
+  captured `15 03 00 07` / `15 04 00 0f`; now 3- and 4-column multi-row round-trip.
 
 ### 8. NUMBER value encoding coverage (negatives, decimals, large/small)
 - **Risk:** Query row values use `encodeOracleNumber`; the native path has only
@@ -256,6 +259,8 @@ dart test (Get-ChildItem test -Filter 'oracle*test.dart' | % FullName)
 ```
 
 ## Landed
+- Multi-column (3+) inter-row marker — corrected to the all-columns-present
+  bitmap `(1<<ncols)-1`; 3- and 4-column multi-row verified — `5b6fd66`.
 - Lexer-based bind counting — a `:` inside a string literal is no longer
   mistaken for a bind — `5ea552a`.
 - NULL binds (`fd 01` marker) and NULL columns (zero-length) round-trip —
