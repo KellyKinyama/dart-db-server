@@ -22,6 +22,7 @@ import 'oracle_auth.dart';
 import 'oracle_codec.dart';
 import 'oracle_execute.dart';
 import 'oracle_lob.dart';
+import 'oracle_native_datatypes.dart';
 import 'oracle_tns.dart';
 import 'oracle_ttc.dart';
 import 'lexer.dart';
@@ -232,6 +233,13 @@ class OracleConnection {
         server._log('conn $id bad frame: $e');
         unawaited(close());
         return;
+      } catch (e) {
+        // A malformed or unsupported client message (e.g. a native OCI/OCCI
+        // client's AUTH marshaling, which this server does not yet parse) must
+        // not take down the connection handler uncaught.
+        server._log('conn $id frame error: $e');
+        unawaited(close());
+        return;
       }
     }
   }
@@ -382,7 +390,11 @@ class OracleConnection {
       case _ttcDataTypes:
         server._log('conn $id TTC DATA TYPES request -> response');
         _phase = OraclePhase.auth;
-        _sendTtc(buildDataTypesResponse());
+        // Native clients need the full negotiated type-mapping list a real
+        // listener returns; thin clients accept an empty terminator.
+        _sendTtc(_nativeClient
+            ? nativeDataTypesResponse
+            : buildDataTypesResponse());
         break;
       case ttcMsgTypeFastAuth:
         _handleFastAuth(body);
