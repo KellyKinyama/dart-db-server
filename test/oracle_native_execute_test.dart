@@ -118,6 +118,36 @@ void main() {
       expect('ORA-'.allMatches(text).length, 1);
     });
   });
+
+  group('native paginated fetch', () {
+    test('describe + fetch paginate a large result, done terminal last', () {
+      final rows = [
+        for (var i = 1; i <= 250; i++) [i]
+      ];
+      final cursor =
+          NativeResultCursor(QueryResult(columns: const ['N'], rows: rows));
+      final describe = cursor.describe(nativeBatchSize);
+      expect(describe[0], 0x10); // describe-info
+      expect(cursor.hasMore, isTrue);
+
+      final f1 = cursor.fetch(nativeBatchSize);
+      expect(f1[0], 0x06); // row-data message
+      expect(cursor.hasMore, isTrue);
+
+      final f2 = cursor.fetch(nativeBatchSize); // final 50 rows
+      expect(cursor.hasMore, isFalse);
+      final text = String.fromCharCodes(f2.where((b) => b >= 0x20 && b < 0x7f));
+      expect(text, contains('ORA-01403'));
+    });
+
+    test('isNativeFetch and decodeNativeFetchCount read a FETCH call', () {
+      final fetch = Uint8List.fromList(
+          [0x03, 0x05, 0x07, 0x01, 0x09, 0x02, 0, 0, 0, 0x65, 0, 0, 0]);
+      expect(isNativeFetch(fetch), isTrue);
+      expect(decodeNativeFetchCount(fetch), 101);
+      expect(isNativeFetch(Uint8List.fromList([0x11, 0x69, 0x00])), isFalse);
+    });
+  });
 }
 
 bool _contains(Uint8List haystack, List<int> needle) {

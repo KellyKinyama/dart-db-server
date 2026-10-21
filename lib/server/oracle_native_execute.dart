@@ -212,6 +212,183 @@ Uint8List buildNativeQueryResponse(QueryResult result) {
   return b.toBytes();
 }
 
+/// Default rows per native fetch batch (the oci8 client's default prefetch).
+const int nativeBatchSize = 100;
+
+/// Describe "more rows" status (`08 06 00` block without the `ORA-01403`
+/// terminal), captured verbatim. Batch row count at bytes 42 and 106.
+final Uint8List _moreRowsStatus = Uint8List.fromList(<int>[
+  0x08, 0x06, 0x00, 0xa7, 0xa5, 0x23, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, //
+  0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04,
+  0x05, 0x00, 0x01, 0x00, 0x2b, 0x00, 0x64, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x17, 0x00, 0x03, 0x00, 0x20, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x01,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x64, 0x03,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1d,
+]);
+
+/// FETCH response header (TTC message type `0x06`), captured verbatim. Batch
+/// row count at byte 8.
+final Uint8List _msg06Header = Uint8List.fromList(<int>[
+  0x06, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x65, 0x00, 0x00, 0x00, //
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+]);
+
+/// FETCH "more rows" status (`04 05 …` without `ORA-01403`), captured verbatim.
+/// Cumulative row count at bytes 7 and 71.
+final Uint8List _msg06MoreStatus = Uint8List.fromList(<int>[
+  0x04, 0x05, 0x00, 0x00, 0x00, 0x2c, 0x00, 0xc9, 0x00, 0x00, 0x00, 0x00, //
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xc9,
+  0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1d,
+]);
+
+/// FETCH terminal status, ending in `ORA-01403: no data found`, captured
+/// verbatim. Cumulative row count at bytes 7–8.
+final Uint8List _msg06DoneStatus = Uint8List.fromList(<int>[
+  0x04, 0x05, 0x00, 0x00, 0x00, 0x2d, 0x00, 0x2c, 0x01, 0x00, 0x00, 0x7b, //
+  0x05, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7b, 0x05, 0x00, 0x00, 0x02, 0x01,
+  0x2c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x19, 0x4f, 0x52,
+  0x41, 0x2d, 0x30, 0x31, 0x34, 0x30, 0x33, 0x3a, 0x20, 0x6e, 0x6f, 0x20,
+  0x64, 0x61, 0x74, 0x61, 0x20, 0x66, 0x6f, 0x75, 0x6e, 0x64, 0x0a, 0x1d,
+]);
+
+/// True when [payload] is a native FETCH call (TTC call `0x03`, function `0x05`).
+bool isNativeFetch(Uint8List payload) =>
+    payload.length >= 2 && payload[0] == 0x03 && payload[1] == 0x05;
+
+/// The row count a native FETCH requests (LE32 at offset 9), or the default.
+int decodeNativeFetchCount(Uint8List payload) {
+  if (payload.length >= 13) {
+    final c = payload[9] |
+        (payload[10] << 8) |
+        (payload[11] << 16) |
+        (payload[12] << 24);
+    if (c > 0 && c < 0x10000000) return c;
+  }
+  return nativeBatchSize;
+}
+
+/// A FETCH response with no rows and the `ORA-01403` terminal, for a FETCH that
+/// arrives with no active cursor.
+Uint8List buildNativeFetchDone() {
+  final b = WriteBuffer();
+  b.writeBytes(Uint8List.fromList(_msg06Header)..[8] = 0);
+  b.writeBytes(_msg06DoneStatus);
+  return b.toBytes();
+}
+
+/// Holds a native query result across the EXECUTE describe and subsequent FETCH
+/// calls so large result sets are paginated instead of inlined in one response.
+class NativeResultCursor {
+  NativeResultCursor(QueryResult result)
+      : columns = result.columns,
+        _isNumber = [
+          for (var i = 0; i < result.columns.length; i++)
+            _isNumberColumn(result.rows, i)
+        ],
+        _rows = [] {
+    for (final row in result.rows) {
+      _rows.add([
+        for (var i = 0; i < columns.length; i++)
+          _encodeValue(i < row.length ? row[i] : null, _isNumber[i])
+      ]);
+    }
+    _colSize = [
+      for (var i = 0; i < columns.length; i++)
+        _rows.fold<int>(1, (m, r) => r[i].length > m ? r[i].length : m)
+    ];
+  }
+
+  final List<String> columns;
+  final List<bool> _isNumber;
+  final List<List<Uint8List>> _rows;
+  late final List<int> _colSize;
+  int _offset = 0;
+
+  int get _ncols => columns.length;
+  bool get hasMore => _offset < _rows.length;
+
+  /// Describe + the first [batchSize] rows, terminated with a "more rows" status.
+  Uint8List describe(int batchSize) {
+    final n = _rows.length;
+    final end = batchSize < n ? batchSize : n;
+    final b = WriteBuffer();
+    b.writeUint8(0x10);
+    _u32(b, 23);
+    b.writeBytes(Uint8List(16));
+    b.writeBytes(Uint8List.fromList(_date7));
+    _u32(b, _colSize.fold<int>(0, (s, v) => s + v));
+    _u32(b, _ncols);
+    b.writeUint8(0x82);
+    for (var i = 0; i < _ncols; i++) {
+      _writeColumnRecord(b, columns[i], _isNumber[i], _colSize[i], 0x81, i);
+    }
+    final mid = Uint8List.fromList(_midBlock)
+      ..[34] = _ncols
+      ..[20] = 0x64
+      ..[24] = 0xba;
+    b.writeBytes(mid);
+    for (var r = 0; r < end; r++) {
+      if (r >= 2) {
+        b.writeBytes(Uint8List.fromList([0x15, _ncols, 0x00, 2 * _ncols - 1]));
+      }
+      _writeRow(b, _rows[r]);
+    }
+    final st = Uint8List.fromList(_moreRowsStatus)
+      ..[42] = end & 0xFF
+      ..[106] = end & 0xFF;
+    b.writeBytes(st);
+    _offset = end;
+    return b.toBytes();
+  }
+
+  /// The next [count] rows as a FETCH (message type `0x06`) response, ending in
+  /// the `ORA-01403` terminal once the result is exhausted.
+  Uint8List fetch(int count) {
+    final n = _rows.length;
+    final end = (_offset + count < n) ? _offset + count : n;
+    final batch = end - _offset;
+    final b = WriteBuffer();
+    b.writeBytes(Uint8List.fromList(_msg06Header)
+      ..[8] = batch & 0xFF
+      ..[9] = (batch >> 8) & 0xFF);
+    for (var r = _offset; r < end; r++) {
+      _writeRow(b, _rows[r]);
+    }
+    if (end < n) {
+      b.writeBytes(Uint8List.fromList(_msg06MoreStatus)
+        ..[7] = end & 0xFF
+        ..[8] = (end >> 8) & 0xFF
+        ..[71] = end & 0xFF);
+    } else {
+      b.writeBytes(Uint8List.fromList(_msg06DoneStatus)
+        ..[7] = end & 0xFF
+        ..[8] = (end >> 8) & 0xFF);
+    }
+    _offset = end;
+    return b.toBytes();
+  }
+
+  void _writeRow(WriteBuffer b, List<Uint8List> values) {
+    b.writeUint8(0x07); // row-data marker
+    for (final v in values) {
+      b.writeUint8(v.length);
+      b.writeBytes(v);
+    }
+  }
+}
+
 /// The 130-byte native status block a real listener returns for an
 /// INSERT/UPDATE/DELETE, captured verbatim. The affected-row count lives at
 /// byte 42 (as a 4-byte little-endian scalar) and is echoed at byte 120; the

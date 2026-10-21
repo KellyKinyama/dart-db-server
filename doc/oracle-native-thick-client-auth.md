@@ -288,6 +288,21 @@ statement over 253 bytes ran as garbage. `_scanNativeSqlText` now also decodes
 the `0xFE`-chunked form; the `FE FF…` pointer indicators are rejected by the
 1 MiB chunk-size sanity cap.
 
+**Large result sets need FETCH pagination.** The client's prefetch buffer holds
+only ~100 rows (its own default), so inlining every row in the describe
+overflows it and hangs — advertising a bigger prefetch in the describe does
+*not* change the client's buffer. Real Oracle sends the first prefetch batch in
+the EXECUTE describe with a **"more rows"** terminal (an `08 06 00` status
+block *without* `ORA-01403`), then the client pulls each further batch with a
+FETCH call (TTC message `0x03`, function `0x05`, carrying the row count as an
+LE32); each FETCH is answered with a `0x06` row-data message (plain `07`-framed
+rows, no inter-row `15` markers) ending in a "more rows" or `ORA-01403`
+terminal. `NativeResultCursor` keeps the decoded result on the connection across
+the describe and the FETCH calls, so single- and multi-column results of any
+size round-trip (verified at 250/300 rows). The one remaining gap is a statement
+whose text alone exceeds the SDU (~8 KB) — that EXECUTE request spans multiple
+packets, which the native call path does not yet reassemble.
+
 **`ALTER SESSION` (connect-time NLS).** Drivers — Laravel's `oci8` in
 particular — issue a burst of `alter session set NLS_DATE_FORMAT = …` /
 `NLS_TIMESTAMP_FORMAT` / `NLS_NUMERIC_CHARACTERS` statements right after connect.

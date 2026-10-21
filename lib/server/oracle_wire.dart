@@ -171,6 +171,10 @@ class OracleConnection {
   /// listener's byte-exact TTC PROTOCOL response (full charset map + caps).
   bool _nativeClient = false;
 
+  /// An in-progress paginated native query, kept between the EXECUTE describe
+  /// and the client's follow-up FETCH calls for a result larger than one batch.
+  NativeResultCursor? _nativeCursor;
+
   /// When a CONNECT announces a descriptor that isn't inline, the native client
   /// follows it with a DATA packet carrying the descriptor; the ACCEPT is held
   /// until that packet arrives. This is the pre-built ACCEPT to send then.
@@ -653,6 +657,15 @@ class OracleConnection {
   /// statement (OALL8 with inline SQL) it runs as an execute; otherwise it is a
   /// control call (commit / close / logoff) answered with a status terminal.
   Future<void> _handleNativeCall(Uint8List payload) async {
+    if (isNativeFetch(payload)) {
+      final c = _nativeCursor;
+      final resp = c != null
+          ? c.fetch(decodeNativeFetchCount(payload))
+          : buildNativeFetchDone();
+      if (c != null && !c.hasMore) _nativeCursor = null;
+      _sendTtc(resp, dataFlags: 0x2000);
+      return;
+    }
     final info = decodeNativeExecuteRequest(payload);
     if (info.sql.isEmpty) {
       _sendTtc(buildNativeStatusOk(), dataFlags: 0x2000);
@@ -713,10 +726,20 @@ class OracleConnection {
           result = await server.db.execute(sql);
         }
         if (_nativeClient && result.columns.isNotEmpty) {
-          return canEncodeNativeQuery(result)
-              ? buildNativeQueryResponse(result)
-              : buildNativeExecuteError(
-                  900, 'native result shape not yet supported');
+          if (!canEncodeNativeQuery(result)) {
+            return buildNativeExecuteError(
+                900, 'native result shape not yet supported');
+          }
+          // Paginate a result larger than one prefetch batch; the client pulls
+          // the rest with FETCH calls. Smaller results inline in one response.
+          _nativeCursor = null;
+          if (result.rows.length > nativeBatchSize) {
+            final cursor = NativeResultCursor(result);
+            final bytes = cursor.describe(nativeBatchSize);
+            _nativeCursor = cursor;
+            return bytes;
+          }
+          return buildNativeQueryResponse(result);
         }
         if (_nativeClient) {
           return buildNativeDmlResponse(result.affected);
