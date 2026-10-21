@@ -211,8 +211,10 @@ block are **not validated** either (constant blocks captured once are replayed
 for every query). The column-count shows up in three places — `ncols` in the
 header, `0x22,ncols` in the mid block, `ncols+5` in the status block — and each
 column carries its 0-based index in its record; everything else is a fixed
-template. **Multi-row** results (inter-row `0x15 01 00 01` markers), binds, DML
-row counts, and 0-row results are the remaining work.
+template. **Empty (0-row)** results use a truncated mid block (no row-metadata
+tail), no row data, and a distinct status block. **Multi-row** results (inter-row
+`0x15 01 00 01` markers), binds, DML row counts, and `ALTER SESSION` (which
+returns an NLS parameter block) are the remaining work.
 
 
 
