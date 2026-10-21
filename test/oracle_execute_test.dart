@@ -59,6 +59,17 @@ void main() {
       expect(info.hasBinds, isFalse);
     });
 
+    test('a colon in a string literal is not counted as a bind', () {
+      const sql = "select :v as n, '12:34' as t";
+      final body = <int>[
+        sql.length, ...sql.codeUnits, 0, 0, 0,
+        0x07, 0x01, 0x39, // :v = "9"
+      ];
+      final info = decodeNativeExecuteRequest(Uint8List.fromList(body));
+      expect(info.numParams, 1); // the ':34' inside '12:34' is not a bind
+      expect(info.binds, ['9']);
+    });
+
     test('native request decodes NULL (0xFD) bind values in any position', () {
       const sql = 'insert into t (a, b) values (:a, :b)';
       // a = "7", b = NULL (0xFD + 1-byte indicator).

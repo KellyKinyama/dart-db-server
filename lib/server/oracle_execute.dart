@@ -16,6 +16,7 @@ library;
 import 'dart:convert';
 import 'dart:typed_data';
 
+import 'lexer.dart';
 import 'oracle_codec.dart';
 import 'oracle_json.dart';
 import 'oracle_lob.dart';
@@ -194,8 +195,15 @@ ExecuteRequestInfo decodeNativeExecuteRequest(Uint8List body) {
 /// statement has no binds / the block cannot be located.
 List<Object?> _scanNativeBindValues(Uint8List p, String sql) {
   final names = <String>{};
-  for (final m in RegExp(r':(\w+)').allMatches(sql)) {
-    names.add(m.group(1)!);
+  // Count distinct placeholders with the lexer (not a regex) so a ':' inside a
+  // string literal isn't mistaken for a bind — matching how _executeWithBinds
+  // maps the values onto the placeholders.
+  try {
+    for (final tok in Lexer(sql).tokenize()) {
+      if (tok.type == TokType.param) names.add(tok.text);
+    }
+  } catch (_) {
+    return const [];
   }
   final n = names.length;
   if (n == 0) return const [];
