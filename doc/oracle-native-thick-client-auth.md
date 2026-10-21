@@ -274,6 +274,16 @@ are genuine no-ops. With this in place the full
 connect → `ALTER SESSION` → query/DML/bind round-trip works end-to-end — exactly
 the Laravel connection bootstrap.
 
+**End-to-end against Laravel.** Verified through the real
+`yajra/laravel-oci8` + `laravel-pdo-via-oci8` stack (PHP `oci8`, Instant Client
+23.9): `DB::connection('oracle')` connects, yajra emits a **single combined**
+`ALTER SESSION SET NLS_TIME_FORMAT … NLS_NUMERIC_CHARACTERS = '.,'` at connect
+(hence the broad `startsWith('alter session')` match), then a multi-row `select`,
+a named-bind `select :v`, a `create table`, a named-bind `insert`, and a
+`drop table` all return correct results / row counts and the connection tears
+down cleanly. That is the complete native thick-client lifecycle a web app
+exercises.
+
 
 
 
