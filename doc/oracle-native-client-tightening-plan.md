@@ -79,8 +79,24 @@ Scope: the native path only (`_nativeClient == true`). Thin clients
   templates.
 - **Verify:** `oci8` fetches 300 / 1000-row results fully; `oci_close` clean.
 - **Effort:** L (new TTC call + per-cursor state).
-- **Status:** TODO. Until then, results past the first batch hang — treat as a
-  known limit.
+- **Status:** LANDED (`4a52073`). `NativeResultCursor` keeps the decoded
+  result on the connection; the describe sends the first batch with a "more
+  rows" status, and each FETCH (`03 05`) is answered with a `0x06` row-data
+  batch, the last ending in `ORA-01403`. Verified single- and multi-column at
+  250 / 300 rows. Remaining: see item 2c (multi-packet EXECUTE requests).
+
+### 2c. Multi-packet EXECUTE requests (statement text > SDU)
+- **Risk:** A statement whose text alone exceeds the negotiated SDU (~8 KB) is
+  sent across several NS packets. The native call path decodes only the first
+  packet, so the SQL is truncated and mis-parsed (a 600-way `union all` ran as a
+  2-row fragment).
+- **Evidence:** Confirmed at a ~8.4 KB statement.
+- **Approach:** Reassemble consecutive native DATA packets of one call before
+  decoding (the thin path already splits responses at the SDU; mirror it for
+  requests).
+- **Verify:** an 8 KB+ statement round-trips.
+- **Effort:** M.
+- **Status:** TODO.
 
 ### 2b. Long SQL (> 253 bytes) mis-parsed
 - **Status:** LANDED (`327edcb`). The SQL is `U8(len)`-prefixed only up to 253
@@ -232,6 +248,8 @@ dart test (Get-ChildItem test -Filter 'oracle*test.dart' | % FullName)
 ```
 
 ## Landed
+- FETCH pagination — large result sets stream in prefetch batches instead of
+  hanging; single- and multi-column verified at 250/300 rows — `4a52073`.
 - Long SQL (> 253 bytes) via the `0xFE`-chunked long-string form — statements
   over 253 bytes no longer run as a garbage fragment — `327edcb`.
 - Native error responses (msg-04) — failing statements surface `oci_error`
