@@ -165,6 +165,50 @@ ExecuteRequestInfo decodeExecuteRequest(
   );
 }
 
+/// Decodes a *native* (thick OCI/OCCI) OALL8 execute body. [body] holds the
+/// bytes after the TTC function header (message type, function 0x5E, sequence).
+///
+/// The native OALL8 argument list is OCI-RPC marshaled (8-byte `FE FF…` pointer
+/// indicators, 4-byte little-endian scalars) rather than the thin UB layout, so
+/// the fixed header is not walked field-by-field. Instead the SQL text — the
+/// only field needed to run a fresh, no-bind statement — is recovered by
+/// scanning for its inline `U8(len)` length-prefixed byte run. Re-executed
+/// cursors (no inline SQL) and binds are not yet supported on this path.
+ExecuteRequestInfo decodeNativeExecuteRequest(Uint8List body) {
+  return ExecuteRequestInfo(
+    options: 0,
+    cursorId: 0,
+    sql: _scanNativeSqlText(body),
+    numParams: 0,
+  );
+}
+
+/// Finds the statement text in a native OALL8 body: the longest `U8(len)`
+/// length-prefixed run of printable ASCII that begins with a letter.
+String _scanNativeSqlText(Uint8List p) {
+  var best = '';
+  for (var i = 0; i + 1 < p.length; i++) {
+    final len = p[i];
+    if (len < 4 || i + 1 + len > p.length) continue;
+    var printable = true;
+    for (var j = i + 1; j < i + 1 + len; j++) {
+      final c = p[j];
+      if (c < 0x20 || c > 0x7E) {
+        printable = false;
+        break;
+      }
+    }
+    if (!printable) continue;
+    final first = p[i + 1];
+    final startsLetter =
+        (first >= 0x41 && first <= 0x5A) || (first >= 0x61 && first <= 0x7A);
+    if (startsLetter && len > best.length) {
+      best = String.fromCharCodes(p, i + 1, i + 1 + len);
+    }
+  }
+  return best;
+}
+
 /// Decodes [numParams] bind metadata blocks followed by the single ROW_DATA
 /// message carrying the IN bind values, returning the values in wire order.
 List<Object?> _decodeBinds(

@@ -358,6 +358,13 @@ class OracleConnection {
       return;
     }
     if (packet.payload.isEmpty) return; // no TTC body
+    // Native (thick) clients marshal the post-auth call packets (piggybacks +
+    // OALL8) in an OCI-RPC layout the thin piggyback walker can't step over, so
+    // route them to a dedicated handler once authenticated.
+    if (_nativeClient && _phase == OraclePhase.ready) {
+      unawaited(_handleNativeCall(packet.payload));
+      return;
+    }
     final ttc = ReadBuffer(packet.payload);
     // The client may prepend piggyback control messages (e.g. close-cursors)
     // before the real function call; consume them first.
@@ -641,10 +648,24 @@ class OracleConnection {
 
   /// Decodes and runs a TTC EXECUTE (function 94) against the database, then
   /// replies with a query result set or a DML/DDL status.
+  /// Handles a native (thick) client's post-auth call packet. If it carries a
+  /// statement (OALL8 with inline SQL) it runs as an execute; otherwise it is a
+  /// control call (commit / close / logoff) answered with a status terminal.
+  Future<void> _handleNativeCall(Uint8List payload) async {
+    final info = decodeNativeExecuteRequest(payload);
+    if (info.sql.isEmpty) {
+      _sendTtc(buildStatusOk(), dataFlags: 0x2000);
+      return;
+    }
+    await _handleExecute(ReadBuffer(payload));
+  }
+
   Future<void> _handleExecute(ReadBuffer body) async {
     final ExecuteRequestInfo info;
     try {
-      info = decodeExecuteRequest(body, lobStore: _lobStore);
+      info = _nativeClient
+          ? decodeNativeExecuteRequest(body.readBytes(body.remaining))
+          : decodeExecuteRequest(body, lobStore: _lobStore);
     } catch (e) {
       server._log('conn $id EXECUTE decode error: $e');
       _sendTtc(buildExecuteError(600, 'internal error decoding execute'));
@@ -697,7 +718,7 @@ class OracleConnection {
         return buildExecuteError(900, _oraErrorText(e));
       }
     });
-    _sendTtc(response);
+    _sendTtc(response, dataFlags: _nativeClient ? 0x2000 : 0);
   }
 
   /// Binds the wire's positional [binds] to the SQL's placeholders (in

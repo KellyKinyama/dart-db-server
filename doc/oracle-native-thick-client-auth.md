@@ -176,12 +176,33 @@ combo key — i.e. it knew the password — without revealing it. See
 `_buildServerResponse` in `oracle_native_auth.dart`; the combo key is stashed in
 `AuthPhaseState.comboKey` during verification.
 
-### 8. After auth: EXECUTE is a separate frontier
+### 8. After auth: native query execution
 
-Authentication is complete, but the native client's **EXECUTE** marshaling
-differs from thin (the first native query trips
-`OracleBufferException: integer too large`). Running native queries is future
-work; this document (and the emulator) stop at a verified login.
+Authentication is complete; the next frontier is **EXECUTE** (OALL8, RPC
+function `0x5E`). The native call packet is `piggyback(107) + piggyback(176) +
+OALL8`, where the piggybacks and the OALL8 argument list use the OCI-RPC layout
+(8-byte `FE FF…` pointer indicators, 4-byte little-endian scalars) — which the
+thin piggyback walker and `decodeExecuteRequest` can't step over (`integer too
+large`). The server handles the **request** side:
+
+* native post-auth DATA packets are routed to `_handleNativeCall`
+  (`oracle_wire.dart`), bypassing the thin piggyback loop;
+* `decodeNativeExecuteRequest` (`oracle_execute.dart`) recovers the SQL by
+  scanning for its inline `U8(len)` length-prefixed ASCII run, runs it through
+  the engine, and the statement executes (server log: `EXECUTE [cursor 1]
+  "select 1 as v from dual"`). Re-executed cursors and binds are not yet
+  decoded on this path.
+
+What remains is the **response**: the native describe/row format differs from
+thin. A thin `buildQueryResponse` for one NUMBER column is
+`10 00 00 01 01 00 02 …` (117 bytes); a real listener returns
+`10 17 00 00 00 <16-byte describe signature> …` (307 bytes) — message type 16
+(describe-info) but with a different field structure, the column metadata, the
+base-100 NUMBER row value (`C1 02` for `1`), and an `ORA-01403: no data found`
+terminal. The client **hangs** reading the thin shape because it expects more
+fields. Implementing the native describe-info + row-data encoding is the
+remaining work to make native queries round-trip.
+
 
 ## Capturing the wire
 
