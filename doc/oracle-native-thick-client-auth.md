@@ -197,11 +197,20 @@ What remains is the **response**: the native describe/row format differs from
 thin. A thin `buildQueryResponse` for one NUMBER column is
 `10 00 00 01 01 00 02 …` (117 bytes); a real listener returns
 `10 17 00 00 00 <16-byte describe signature> …` (307 bytes) — message type 16
-(describe-info) but with a different field structure, the column metadata, the
-base-100 NUMBER row value (`C1 02` for `1`), and an `ORA-01403: no data found`
-terminal. The client **hangs** reading the thin shape because it expects more
-fields. Implementing the native describe-info + row-data encoding is the
-remaining work to make native queries round-trip.
+(describe-info) but with the native marshaling (4-byte little-endian scalars,
+`U8(len)`-prefixed strings), the column metadata, the base-100 NUMBER row value
+(`C1 02` for `1`), and an `ORA-01403: no data found` terminal.
+
+`buildNativeQueryResponse` (`oracle_native_execute.dart`) now builds this for a
+**single-row, single-column** NUMBER or VARCHAR2 result, and a real `oci8`
+client round-trips `select 1 from dual`, `select 'hello' from dual`, etc. Two
+findings from the capture made it tractable: the 16-byte describe signature is
+**not validated** (zeros work), and the describe timestamp + the per-execute
+sequence counters in the status block are **not validated** either (constant
+blocks captured once are replayed for every query). The mid/status blocks are
+column-count-dependent, so **multi-column and multi-row** results — and binds,
+DML row counts, and re-executed cursors — are the remaining work.
+
 
 
 ## Capturing the wire

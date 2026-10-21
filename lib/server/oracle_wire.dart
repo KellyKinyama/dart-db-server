@@ -24,6 +24,7 @@ import 'oracle_execute.dart';
 import 'oracle_lob.dart';
 import 'oracle_native_auth.dart';
 import 'oracle_native_datatypes.dart';
+import 'oracle_native_execute.dart';
 import 'oracle_native_replay.dart';
 import 'oracle_tns.dart';
 import 'oracle_ttc.dart';
@@ -710,6 +711,12 @@ class OracleConnection {
           result = await _executeWithBinds(sql, info.binds);
         } else {
           result = await server.db.execute(sql);
+        }
+        if (_nativeClient && result.columns.isNotEmpty) {
+          return canEncodeNativeQuery(result)
+              ? buildNativeQueryResponse(result)
+              : buildExecuteError(900,
+                  'ORA-00000: native result shape not yet supported');
         }
         return result.columns.isNotEmpty
             ? buildQueryResponse(result, cursorId: cursorId, lobStore: _lobStore)
