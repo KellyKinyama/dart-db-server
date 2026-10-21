@@ -118,7 +118,10 @@ Scope: the native path only (`_nativeClient == true`). Thin clients
   the row encoder (NULL column → the Oracle NULL indicator the client expects).
 - **Verify:** `oci8` binds a NULL and selects a NULL column; both round-trip.
 - **Effort:** M.
-- **Status:** TODO
+- **Status:** LANDED (`3e28575`). NULL column is already a zero-length
+  field. A NULL bind is the marker `fd 01` (a `0xFD` byte + 1-byte indicator);
+  `_scanNativeBindValues` now reads a `0xFD` length as NULL and skips the
+  indicator. Verified vs real `oci8`: NULL column and NULL bind round-trip.
 
 ---
 
@@ -248,6 +251,8 @@ dart test (Get-ChildItem test -Filter 'oracle*test.dart' | % FullName)
 ```
 
 ## Landed
+- NULL binds (`fd 01` marker) and NULL columns (zero-length) round-trip —
+  `3e28575`.
 - FETCH pagination — large result sets stream in prefetch batches instead of
   hanging; single- and multi-column verified at 250/300 rows — `4a52073`.
 - Long SQL (> 253 bytes) via the `0xFE`-chunked long-string form — statements
