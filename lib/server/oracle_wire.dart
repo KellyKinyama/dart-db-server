@@ -263,22 +263,37 @@ class OracleConnection {
       'sdu=${req.sdu} -> negotiated v=$_version'
       '${req.connectData.isNotEmpty ? ' desc="${req.connectData}"' : ''}',
     );
+    // Native (thick) OCI/OCCI clients send the connect descriptor in a separate
+    // DATA packet after the CONNECT (the "overflow" flow); thin clients inline
+    // it. A real listener does NOT offer FAST_AUTH to these native clients, and
+    // doing so makes them reject the ACCEPT, so only advertise it when the
+    // descriptor arrives inline.
+    final overflow = req.connectData.isEmpty && req.connectDataLength > 0;
     final accept = buildAcceptPacket(
       version: _version,
       sdu: _sdu,
       // 0xFFFF is the "real value is in the 32-bit field" sentinel, not a TDU;
       // never echo it back as the negotiated TDU.
       tdu: (req.tdu == 0 || req.tdu == 0xffff) ? tnsDefaultTdu : req.tdu,
-      // Advertise FAST_AUTH (23ai single-round-trip handshake) once the
-      // negotiated version carries the flag2 word; classical PROTOCOL /
-      // DATA-TYPES / AUTH still work for clients that ignore it.
-      flag2: _version >= tnsVersionMinDataFlags ? tnsAcceptFlagFastAuth : 0,
+      // Advertise FAST_AUTH (23ai single-round-trip handshake) only to thin
+      // clients, once the negotiated version carries the flag2 word.
+      flag2: (!overflow && _version >= tnsVersionMinDataFlags)
+          ? tnsAcceptFlagFastAuth
+          : 0,
+      // Echo the client's requested service options (native OCI/OCCI clients
+      // validate these), but do NOT echo the connect flags: the 0x41 bits ask
+      // for Advanced Networking (ANO/SNS) negotiation, which this server does
+      // not implement. Returning 0 tells the client no native services are
+      // active, so it proceeds straight to the TTC protocol handshake.
+      serviceOptions: req.serviceOptions,
+      connectFlags0: 0,
+      connectFlags1: 0,
+      // Native clients require the real 23ai listener's ACCEPT byte layout.
+      nativeClient: overflow,
     );
-    // Native (thick) clients send the connect descriptor in a separate DATA
-    // packet right after the CONNECT; hold the ACCEPT until that packet arrives
-    // and keep 2-byte framing for it. Thin clients send the descriptor inline
-    // and get the ACCEPT immediately.
-    if (req.connectData.isEmpty && req.connectDataLength > 0) {
+    // Hold the ACCEPT until the descriptor DATA packet arrives (keeping 2-byte
+    // framing for it); thin clients get the ACCEPT immediately.
+    if (overflow) {
       _pendingAccept = accept;
       return;
     }
@@ -288,9 +303,22 @@ class OracleConnection {
   }
 
   void _handleMarker(TnsPacket packet) {
-    // Echo an ATTENTION/MARKER acknowledgement by replying with the same
-    // marker body (break/reset handling is a later phase).
-    _send(TnsPacket(type: tnsPacketMarker, payload: packet.payload).encode());
+    // Oracle marker packets carry a 3-byte body `[0x01, 0x00, type]`. The
+    // native client runs a break/reset OOB self-test during connection setup
+    // (and on real query breaks once ready): it sends a break marker, then a
+    // RESET marker, then blocks until the server sends a RESET marker back.
+    // Reply to the RESET marker only — one marker in, one marker out — so the
+    // stream stays synchronized for the packets that follow. Break/attention
+    // probe markers are consumed without an in-band reply, which would desync
+    // the client's read of the next handshake response.
+    final body = packet.payload;
+    final markerType = body.length >= 3 ? body[2] : (body.isEmpty ? 0 : body.last);
+    if (markerType == tnsMarkerTypeReset) {
+      _send(buildMarkerPacket(
+        const [1, 0, tnsMarkerTypeReset],
+        largeSdu: _useLargeSdu,
+      ));
+    }
   }
 
   void _handleData(TnsPacket packet) {

@@ -30,6 +30,11 @@ const int tnsPacketResend = 11;
 const int tnsPacketMarker = 12;
 const int tnsPacketAttention = 13;
 
+/// Marker-packet body types (3rd byte of a marker's [1, 0, type] body).
+const int tnsMarkerTypeBreak = 1;
+const int tnsMarkerTypeReset = 2;
+const int tnsMarkerTypeInterrupt = 3;
+
 /// Size of the fixed TNS header that prefixes every packet.
 const int tnsHeaderSize = 8;
 
@@ -171,6 +176,25 @@ Uint8List buildDataPacket(Uint8List payload,
   return b.toBytes();
 }
 
+/// Builds a MARKER control packet carrying [body] (e.g. `[1, 0, 2]` for a
+/// RESET marker). Uses the 4-byte large-SDU length header when [largeSdu] is
+/// set, matching the framing of the surrounding DATA packets.
+Uint8List buildMarkerPacket(List<int> body, {bool largeSdu = false}) {
+  final b = WriteBuffer();
+  final total = tnsHeaderSize + body.length;
+  if (largeSdu) {
+    b.writeUint32BE(total);
+  } else {
+    b.writeUint16BE(total);
+    b.writeUint16BE(0); // checksum
+  }
+  b.writeUint8(tnsPacketMarker);
+  b.writeUint8(0); // marker/reserved
+  b.writeUint16BE(0); // header checksum
+  b.writeBytes(Uint8List.fromList(body));
+  return b.toBytes();
+}
+
 /// Parameters a client offers in its CONNECT packet.
 class ConnectRequest {
   const ConnectRequest({
@@ -180,12 +204,22 @@ class ConnectRequest {
     required this.tdu,
     required this.connectData,
     this.connectDataLength = 0,
+    this.serviceOptions = 0,
+    this.connectFlags0 = 0,
+    this.connectFlags1 = 0,
   });
 
   final int versionDesired;
   final int versionMinimum;
   final int sdu;
   final int tdu;
+
+  /// The client's requested global service options and connect flags. A real
+  /// listener echoes these back in the ACCEPT; native (thick) OCI/OCCI clients
+  /// validate that the server agreed to them (thin clients ignore them).
+  final int serviceOptions;
+  final int connectFlags0;
+  final int connectFlags1;
 
   /// The connect descriptor string (e.g. the `(DESCRIPTION=...)` or EZConnect
   /// data), when it fit inline in the CONNECT packet.
@@ -205,7 +239,7 @@ class ConnectRequest {
     r.seek(tnsHeaderSize); // skip header
     final versionDesired = r.readUint16BE(); // +0
     final versionMinimum = r.readUint16BE(); // +2
-    r.readUint16BE(); // +4 options
+    final serviceOptions = r.readUint16BE(); // +4 global service options
     final sdu = r.readUint16BE(); // +6
     final tdu = r.readUint16BE(); // +8
     r.readUint16BE(); // +10 NT characteristics
@@ -213,6 +247,16 @@ class ConnectRequest {
     r.readUint16BE(); // +14 endianness marker
     final connectDataLength = r.readUint16BE(); // +16
     final connectDataOffset = r.readUint16BE(); // +18 (absolute from start)
+
+    // Connect flags 0/1 live at payload offsets +24/+25 (after the 4-byte
+    // maximum-receivable-connect-data field at +20). Present on all modern
+    // CONNECT packets; default to 0 if the packet is unexpectedly short.
+    int connectFlags0 = 0;
+    int connectFlags1 = 0;
+    if (raw.length >= tnsHeaderSize + 26) {
+      connectFlags0 = raw[tnsHeaderSize + 24];
+      connectFlags1 = raw[tnsHeaderSize + 25];
+    }
 
     String connectData = '';
     if (connectDataLength > 0 &&
@@ -232,6 +276,9 @@ class ConnectRequest {
       tdu: tdu,
       connectData: connectData,
       connectDataLength: connectDataLength,
+      serviceOptions: serviceOptions,
+      connectFlags0: connectFlags0,
+      connectFlags1: connectFlags1,
     );
   }
 }
@@ -245,23 +292,44 @@ Uint8List buildAcceptPacket({
   required int sdu,
   required int tdu,
   int flag2 = 0,
+  int serviceOptions = 0,
+  int connectFlags0 = 0,
+  int connectFlags1 = 0,
+  bool nativeClient = false,
 }) {
   // Payload is 37 bytes so the flag2 word lands at absolute offset 41..44.
   final payload = Uint8List(37);
   final v = ByteData.sublistView(payload);
   // Offsets below are payload-relative (absolute = +8 for the header).
   v.setUint16(0, version); // abs 8  negotiated version
-  v.setUint16(2, 0); // abs 10 global service options
-  v.setUint16(4, sdu & 0xFFFF); // abs 12 SDU (legacy 16-bit)
-  v.setUint16(6, tdu & 0xFFFF); // abs 14 TDU (legacy 16-bit)
-  v.setUint16(8, 1); // abs 16 byte-order marker
+  v.setUint16(2, serviceOptions); // abs 10 echo client's global service options
+  if (nativeClient) {
+    // Real 23ai listeners zero the legacy 16-bit SDU/TDU and carry the values
+    // only in the 32-bit fields below; native OCI/OCCI clients require this.
+    v.setUint16(4, 0); // abs 12 SDU (legacy 16-bit)
+    v.setUint16(6, 0); // abs 14 TDU (legacy 16-bit)
+  } else {
+    v.setUint16(4, sdu & 0xFFFF); // abs 12 SDU (legacy 16-bit)
+    v.setUint16(6, tdu & 0xFFFF); // abs 14 TDU (legacy 16-bit)
+  }
+  // "Value of 1 in hardware" endianness marker, written in native (little-
+  // endian) order the way a real Oracle server does: bytes 01 00.
+  v.setUint16(8, 1, Endian.little); // abs 16 byte-order marker
   v.setUint16(10, 0); // abs 18 accept-data length
-  v.setUint16(12, 0); // abs 20 accept-data offset
-  payload[14] = 0; // abs 22 accept flag0
-  payload[15] = 0; // abs 23 accept flag1
+  // Accept-data offset: real listeners point it just past the packet (no accept
+  // data follows); thin clients accept 0.
+  v.setUint16(12, nativeClient ? tnsHeaderSize + payload.length : 0); // abs 20
+  payload[14] = connectFlags0; // abs 22 echo client's connect flag0
+  payload[15] = connectFlags1; // abs 23 echo client's connect flag1
   v.setUint32(24, sdu); // abs 32 large SDU
   v.setUint32(28, tdu); // abs 36 large TDU
-  v.setUint32(33, flag2); // abs 41 accept flag2
+  if (nativeClient) {
+    // Real layout: flag2 word at payload 32..35, with a trailing 0x01 byte.
+    v.setUint32(32, flag2); // abs 40 accept flag2
+    payload[36] = 1; // abs 44 trailing marker
+  } else {
+    v.setUint32(33, flag2); // abs 41 accept flag2 (thin-client layout)
+  }
 
   final b = WriteBuffer();
   b.writeUint16BE(tnsHeaderSize + payload.length);
