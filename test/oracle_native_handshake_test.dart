@@ -96,5 +96,30 @@ void main() {
       expect(_protocolNumElem(client.protocolResponse!), 10);
       expect(client.dataTypesBody, nativeDataTypesResponse);
     });
+
+    test('FAST_AUTH is declined with a protocol-only (type 28) response',
+        () async {
+      await client.connectAndAccept();
+      await client.breakResetProbe();
+      final decline = await client.fastAuthDecline();
+      expect(ttcBody(decline).first, 28);
+    });
+
+    test('native client completes O5LOGON/PBKDF2 authentication', () async {
+      server.userStore.addPbkdf2User('native', 'Secret123');
+      final result =
+          await client.login(username: 'native', password: 'Secret123');
+      expect(result.authenticated, isTrue);
+      // The mutual-auth proof and a session were returned.
+      expect(result.params['AUTH_SVR_RESPONSE'], isNotNull);
+      expect(result.params['AUTH_SESSION_ID'], isNotNull);
+    });
+
+    test('native client with the wrong password is rejected', () async {
+      server.userStore.addPbkdf2User('native', 'Secret123');
+      final result =
+          await client.login(username: 'native', password: 'wrong-password');
+      expect(result.authenticated, isFalse);
+    });
   });
 }

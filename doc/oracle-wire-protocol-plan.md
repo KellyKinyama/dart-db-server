@@ -15,7 +15,7 @@
 | ----- | ------ | ---------- |
 | 0 — TNS transport | ✅ | CONNECT parse, version negotiation, ACCEPT, DATA/MARKER framing |
 | 1 — TTC negotiation | ✅ | PROTOCOL + DATA-TYPES exchange (charset, caps, field version 24) |
-| 2 — Authentication | ✅ (SHA512/O5LOGON) | Verifier side: AUTH_PHASE_ONE/TWO, no plaintext storage; PBKDF2/12c + FAST_AUTH pending |
+| 2 — Authentication | ✅ (SHA512 + PBKDF2/12c) | Verifier side: AUTH_PHASE_ONE/TWO, no plaintext storage. **Native thick clients (OCI/OCCI) authenticate too** — see [oracle-native-thick-client-auth.md](oracle-native-thick-client-auth.md) |
 | 3 — Execute & fetch | ✅ | Decode OALL8, run via the engine, reply DML status / query rows; **positional + named bind variables**; **large results split across packets** |
 | 4 — Transactions & lifecycle | ✅ | COMMIT/ROLLBACK drive the engine; PING; statement-cache cursor re-execute; close-cursors piggyback; logoff via socket close; **per-session isolation** (serializable) |
 | 5 — Rich type codecs | ◻ (NUMBER, RAW, DATE) | Numeric → NUMBER, byte buffers → RAW, DATE/TIMESTAMP binds → ISO text; INTERVAL/LOB/JSON/VECTOR pending |
