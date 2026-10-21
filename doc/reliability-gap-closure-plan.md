@@ -157,7 +157,7 @@ case **1991×**, so this is pervasive, not an edge.
 - **Approach:** in the sort comparator, order by the aggregate first (NULLs last
   for DESC per the engine's NULL-ordering rule), then the group key — don't let a
   NULL group short-circuit the primary key comparison.
-- **Verify:** F13 guard. **Effort:** S. **Status:** TODO.
+- **Verify:** F13 guard. **Effort:** S. **Status:** LANDED (batch 2).
 
 ---
 
@@ -208,3 +208,12 @@ un-skipped guards green; 99 targeted engine unit tests green.
   division (`~/` truncated toward zero and kept the year).
 - **F11** lexer no longer applies C-style `\` escaping in single-quoted
   strings — only `''` escapes a quote (SQL standard).
+
+### Batch 2 — aggregate ORDER BY (`database.dart`)
+Reliability scorecard: 212 pass / 18 skip / 0 fail; 160 group/order/aggregate
+unit tests green.
+- **F13** `ORDER BY <aggregate>` that is **not** projected is now computed per
+  group in `_runAggregate` (stashed as `__orderagg<n>` in the group context)
+  and resolved by the post-aggregation sort — previously the comparator saw a
+  single group row, couldn't recompute the aggregate, treated all groups as
+  tied, and let the secondary key drive the order (NULL group to the front).

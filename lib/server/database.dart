@@ -6821,7 +6821,8 @@ class Database implements SequenceProvider {
           (i) => _Pair(orderingMaps[i], resultRows[i]),
         );
         paired.sort((a, b) {
-          for (final ob in s.orderBy) {
+          for (var oi = 0; oi < s.orderBy.length; oi++) {
+            final ob = s.orderBy[oi];
             // ORDER BY <integer literal> => 1-based projected column position.
             if (ob.expr is LiteralExpr &&
                 (ob.expr as LiteralExpr).value is int) {
@@ -6831,6 +6832,20 @@ class Database implements SequenceProvider {
               }
               final av = a.row[pos];
               final bv = b.row[pos];
+              final nullsFirst = ob.nullsFirst ?? !ob.descending;
+              if (av == null && bv == null) continue;
+              if (av == null) return nullsFirst ? -1 : 1;
+              if (bv == null) return nullsFirst ? 1 : -1;
+              final c = sqlCompare(av, bv);
+              if (c != 0) return ob.descending ? -c : c;
+              continue;
+            }
+            // ORDER BY <aggregate> that is not projected can't be recomputed
+            // from a single group-context row; _runAggregate precomputed it
+            // per group under `__orderagg<oi>`.
+            if (hasAggregates && _containsAggregate(ob.expr)) {
+              final av = a.src['__orderagg$oi'];
+              final bv = b.src['__orderagg$oi'];
               final nullsFirst = ob.nullsFirst ?? !ob.descending;
               if (av == null && bv == null) continue;
               if (av == null) return nullsFirst ? -1 : 1;
@@ -13423,6 +13438,15 @@ class Database implements SequenceProvider {
 
     final outRows = <List<Object?>>[];
     final orderingMaps = <Map<String, Object?>>[];
+    // ORDER BY keys that reference aggregates must be computed per group here
+    // (the post-aggregation sort only sees one group-context row and can't
+    // recompute an aggregate). Bind them once and stash values in the ctx.
+    final boundOrderAgg = <int, Expr>{};
+    for (var oi = 0; oi < s.orderBy.length; oi++) {
+      if (_containsAggregate(s.orderBy[oi].expr)) {
+        boundOrderAgg[oi] = _bindExpr(s.orderBy[oi].expr);
+      }
+    }
     for (final key in groupOrder) {
       final grpRows = groups[key]!;
       // Group context map: columns of an arbitrary row (used by non-aggregate
@@ -13443,6 +13467,10 @@ class Database implements SequenceProvider {
       final row = <Object?>[];
       for (final e in projExprs) {
         row.add(_evalProjectedWithAggregates(e, grpRows, ctx));
+      }
+      for (final entry in boundOrderAgg.entries) {
+        ctx['__orderagg${entry.key}'] =
+            _evalProjectedWithAggregates(entry.value, grpRows, ctx);
       }
       outRows.add(row);
       orderingMaps.add(ctx);
