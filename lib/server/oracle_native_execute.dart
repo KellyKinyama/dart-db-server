@@ -75,14 +75,17 @@ Uint8List _encodeValue(Object? cell, bool isNumber) {
   return Uint8List.fromList(utf8.encode(cell.toString()));
 }
 
-/// Writes a native column describe record for a NUMBER or VARCHAR2 [name].
-void _writeColumnRecord(WriteBuffer b, String name, bool isNumber, int maxLen) {
+/// Writes one column's describe record for a NUMBER or VARCHAR2 [name]. The
+/// shared leading `0x82` byte is emitted once by the caller, before the first
+/// column — not here.
+void _writeColumnRecord(
+    WriteBuffer b, String name, bool isNumber, int maxLen, int colIndex) {
   final nameBytes = Uint8List.fromList(utf8.encode(name));
   if (isNumber) {
-    b.writeBytes(Uint8List.fromList(const [0x82, 0x02, 0x00, 0x00, 0x81, 0x02, 0x00, 0x00]));
+    b.writeBytes(Uint8List.fromList(const [0x02, 0x00, 0x00, 0x81, 0x02, 0x00, 0x00]));
     b.writeBytes(Uint8List(23));
   } else {
-    b.writeBytes(Uint8List.fromList(const [0x82, 0x60, 0x80, 0x00, 0x00]));
+    b.writeBytes(Uint8List.fromList(const [0x60, 0x80, 0x00, 0x00]));
     _u32(b, maxLen);
     b.writeBytes(Uint8List(11));
     b.writeBytes(Uint8List.fromList(const [0x69, 0x03, 0x01])); // charset AL32UTF8
@@ -94,15 +97,14 @@ void _writeColumnRecord(WriteBuffer b, String name, bool isNumber, int maxLen) {
   _u32(b, nameBytes.length);
   b.writeUint8(nameBytes.length);
   b.writeBytes(nameBytes);
-  b.writeBytes(Uint8List(32)); // trailing padding
+  b.writeBytes(Uint8List(32)..[8] = colIndex); // trailing padding; [8] = column index
 }
 
-/// Returns true when [result] is a single-row, single-column set of a NUMBER or
-/// VARCHAR2 value — the shape [buildNativeQueryResponse] can encode. The fixed
-/// describe/status blocks were captured for one column; multi-column and
-/// multi-row results need their own (column-count-dependent) blocks.
+/// Returns true when [result] is a single-row set of NUMBER / VARCHAR2 columns
+/// — the shape [buildNativeQueryResponse] can encode. The fixed describe/status
+/// blocks are column-count-aware but assume a single fetched row.
 bool canEncodeNativeQuery(QueryResult result) =>
-    result.columns.length == 1 && result.rows.length == 1;
+    result.columns.isNotEmpty && result.rows.length == 1;
 
 /// Builds the native describe-info + row + `ORA-01403` response for a
 /// single-row [result]. Call [canEncodeNativeQuery] first.
@@ -123,16 +125,19 @@ Uint8List buildNativeQueryResponse(QueryResult result) {
   b.writeBytes(Uint8List.fromList(_date7));
   _u32(b, rowBytes);
   _u32(b, ncols);
+  b.writeUint8(0x82); // shared describe prefix, once before the columns
   for (var i = 0; i < ncols; i++) {
     _writeColumnRecord(b, result.columns[i], isNumber[i],
-        values[i].isEmpty ? 1 : values[i].length);
+        values[i].isEmpty ? 1 : values[i].length, i);
   }
-  b.writeBytes(_midBlock);
+  final mid = Uint8List.fromList(_midBlock)..[34] = ncols;
+  b.writeBytes(mid);
   b.writeUint8(0x07); // row-data marker
   for (final v in values) {
     b.writeUint8(v.length);
     b.writeBytes(v);
   }
-  b.writeBytes(_statusBlock);
+  final status = Uint8List.fromList(_statusBlock)..[80] = ncols + 5;
+  b.writeBytes(status);
   return b.toBytes();
 }

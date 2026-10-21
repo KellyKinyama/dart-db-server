@@ -202,14 +202,18 @@ thin. A thin `buildQueryResponse` for one NUMBER column is
 (`C1 02` for `1`), and an `ORA-01403: no data found` terminal.
 
 `buildNativeQueryResponse` (`oracle_native_execute.dart`) now builds this for a
-**single-row, single-column** NUMBER or VARCHAR2 result, and a real `oci8`
-client round-trips `select 1 from dual`, `select 'hello' from dual`, etc. Two
-findings from the capture made it tractable: the 16-byte describe signature is
-**not validated** (zeros work), and the describe timestamp + the per-execute
-sequence counters in the status block are **not validated** either (constant
-blocks captured once are replayed for every query). The mid/status blocks are
-column-count-dependent, so **multi-column and multi-row** results — and binds,
-DML row counts, and re-executed cursors — are the remaining work.
+**single-row** result of any number of NUMBER / VARCHAR2 columns, and a real
+`oci8` client round-trips `select 1 from dual`, `select 'AB' c1, 7 c2 from
+dual`, mixed-type multi-column selects, etc. Two findings from the capture made
+it tractable: the 16-byte describe signature is **not validated** (zeros work),
+and the describe timestamp + the per-execute sequence counters in the status
+block are **not validated** either (constant blocks captured once are replayed
+for every query). The column-count shows up in three places — `ncols` in the
+header, `0x22,ncols` in the mid block, `ncols+5` in the status block — and each
+column carries its 0-based index in its record; everything else is a fixed
+template. **Multi-row** results (inter-row `0x15 01 00 01` markers), binds, DML
+row counts, and 0-row results are the remaining work.
+
 
 
 
