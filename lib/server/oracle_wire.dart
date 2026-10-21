@@ -797,6 +797,11 @@ String _oraErrorText(Object e) {
 /// Returns null for anything else so the real engine handles it.
 QueryResult? _systemQueryResult(String sql) {
   final s = sql.toLowerCase();
+  if (s.trimLeft().startsWith('alter session')) {
+    // The engine models no NLS/session state, so a session-parameter change is
+    // acknowledged as a no-op success rather than run through the SQL engine.
+    return const QueryResult(columns: [], rows: []);
+  }
   if (s.contains('nls_database_parameters') ||
       s.contains('nls_session_parameters')) {
     // The driver reads NLS_CHARACTERSET / NLS_NCHAR_CHARACTERSET to pick its

@@ -258,8 +258,21 @@ positional values onto the placeholders (first-appearance order) and the engine
 substitutes them, so a real `oci8` client round-trips `select :a, :b` and
 `insert into t values (:id, :nm)` with correct results and row counts. Binary
 (non-text) number binds would need the OCI-RPC value section decoded properly;
-the common `oci8` / PDO path binds as text. `ALTER SESSION` (which returns an NLS
-parameter block) is the remaining connect-time gap.
+the common `oci8` / PDO path binds as text.
+
+**`ALTER SESSION` (connect-time NLS).** Drivers — Laravel's `oci8` in
+particular — issue a burst of `alter session set NLS_DATE_FORMAT = …` /
+`NLS_TIMESTAMP_FORMAT` / `NLS_NUMERIC_CHARACTERS` statements right after connect.
+The SQLite-like engine rejects that syntax, and the error (sent as a thin error)
+hangs the native client. A real listener answers `ALTER SESSION` with a ~500-byte
+NLS parameter block (message type 8), but — consistent with the leniency seen
+everywhere else — `oci8` does **not** require it: the server intercepts
+`alter session …` in `_systemQueryResult` and acknowledges it as a no-op success
+(empty result → the native DML-zero status), and the client proceeds to run real
+queries on the "configured" session. The server models no NLS state, so these
+are genuine no-ops. With this in place the full
+connect → `ALTER SESSION` → query/DML/bind round-trip works end-to-end — exactly
+the Laravel connection bootstrap.
 
 
 

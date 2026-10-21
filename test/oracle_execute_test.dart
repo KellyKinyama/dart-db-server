@@ -216,6 +216,36 @@ void main() {
       ]);
     });
 
+    test('ALTER SESSION is acknowledged as a no-op success', () async {
+      final db = await Database.open(null);
+      final server = OracleServer(db, port: 0, users: {
+        'testuser': 'testpassword',
+      });
+      await server.start();
+      addTearDown(() async => server.stop());
+
+      final socket = await Socket.connect(
+        InternetAddress.loopbackIPv4,
+        server.boundPort,
+      );
+      addTearDown(() async => socket.close());
+      final frames = FrameReader(socket);
+
+      await handshakeAndLogin(socket, frames,
+          username: 'testuser', password: 'testpassword');
+
+      socket.add(wrapData(buildExecuteRequest(
+          "ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD HH24:MI:SS'")));
+      final alter = decodeExecuteResponse(ttcBody(await frames.next()));
+      expect(alter.errorNum, 0);
+
+      // A real statement still runs cleanly afterwards.
+      socket.add(wrapData(buildExecuteRequest('SELECT 1 AS n', isQuery: true)));
+      final sel = decodeExecuteResponse(ttcBody(await frames.next()),
+          isQuery: true);
+      expect(sel.errorNum, 0);
+    });
+
     test('positional and named bind variables round-trip', () async {
       final db = await Database.open(null);
       final server = OracleServer(db, port: 0, users: {
