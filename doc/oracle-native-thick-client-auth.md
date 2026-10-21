@@ -201,20 +201,37 @@ thin. A thin `buildQueryResponse` for one NUMBER column is
 `U8(len)`-prefixed strings), the column metadata, the base-100 NUMBER row value
 (`C1 02` for `1`), and an `ORA-01403: no data found` terminal.
 
-`buildNativeQueryResponse` (`oracle_native_execute.dart`) now builds this for a
-**single-row** result of any number of NUMBER / VARCHAR2 columns, and a real
-`oci8` client round-trips `select 1 from dual`, `select 'AB' c1, 7 c2 from
-dual`, mixed-type multi-column selects, etc. Two findings from the capture made
-it tractable: the 16-byte describe signature is **not validated** (zeros work),
-and the describe timestamp + the per-execute sequence counters in the status
-block are **not validated** either (constant blocks captured once are replayed
-for every query). The column-count shows up in three places — `ncols` in the
-header, `0x22,ncols` in the mid block, `ncols+5` in the status block — and each
-column carries its 0-based index in its record; everything else is a fixed
-template. **Empty (0-row)** results use a truncated mid block (no row-metadata
-tail), no row data, and a distinct status block. **Multi-row** results (inter-row
-`0x15 01 00 01` markers), binds, DML row counts, and `ALTER SESSION` (which
-returns an NLS parameter block) are the remaining work.
+`buildNativeQueryResponse` (`oracle_native_execute.dart`) now builds this for
+results of any number of NUMBER / VARCHAR2 columns **and any number of rows**,
+and a real `oci8` client round-trips `select 1 from dual`, `select 'AB' c1, 7 c2
+from dual`, single- and multi-column multi-row selects, and empty result sets.
+Two findings from the capture made it tractable: the 16-byte describe signature
+is **not validated** (zeros work), and the describe timestamp + the per-execute
+sequence counters in the status block are **not validated** either (constant
+blocks captured once are replayed for every query). The column-count shows up in
+three places — `ncols` in the header, `0x22,ncols` in the mid block, `ncols+5`
+in the status block — and each column carries its 0-based index in its record;
+everything else is a fixed template.
+
+**Row-count encoding.** Each column record carries its exact value size with the
+`0x81` flag; the header's size field is the sum of the column sizes. The fetched
+row count is echoed into several status-block slots (`[11]`, `[42]`, `[52]`,
+`[106]` = rowCount, `[40]` = 10 + rowCount, `[80]` = rowCount + 4). Rows one and
+two are emitted back-to-back; every row from index 2 on is prefixed with a
+4-byte inter-row marker `15 <ncols> 00 <2·ncols−1>` (so `15 01 00 01` for one
+column, `15 02 00 03` for two). **Empty (0-row)** results use a truncated mid
+block (no row-metadata tail), no row data, and a distinct status block.
+
+A subtlety that cost real debugging time: the in-memory SQL engine is
+SQLite-like and does **not** understand Oracle's `connect by level … / dual`,
+so the natural multi-row probe returned an engine error (not a describe) and the
+client appeared to "hang" — the encoder was never reached. Use `SELECT … UNION
+ALL SELECT …` to exercise multi-row paths against the in-memory engine. The one
+field the engine cannot reproduce is a column's **declared** size (e.g.
+`cast(x as varchar2(10))` → size 10); it advertises the widest observed value
+instead, which the client accepts since the describe size is only an upper
+bound. Binds, DML row counts, and `ALTER SESSION` (which returns an NLS
+parameter block) are the remaining work.
 
 
 

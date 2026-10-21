@@ -102,18 +102,22 @@ Uint8List _encodeValue(Object? cell, bool isNumber) {
 /// Writes one column's describe record for a NUMBER or VARCHAR2 [name]. The
 /// shared leading `0x82` byte is emitted once by the caller, before the first
 /// column — not here.
-void _writeColumnRecord(
-    WriteBuffer b, String name, bool isNumber, int maxLen, int colIndex) {
+void _writeColumnRecord(WriteBuffer b, String name, bool isNumber, int size,
+    int flag, int colIndex) {
   final nameBytes = Uint8List.fromList(utf8.encode(name));
   if (isNumber) {
-    b.writeBytes(Uint8List.fromList(const [0x02, 0x00, 0x00, 0x81, 0x02, 0x00, 0x00]));
+    b.writeBytes(Uint8List.fromList(const [0x02, 0x00, 0x00]));
+    b.writeUint8(flag); // 0x81 = exact single-row size, 0x00 = buffered max
+    b.writeUint8(size & 0xFF);
+    b.writeUint8((size >> 8) & 0xFF);
+    b.writeUint8(0x00);
     b.writeBytes(Uint8List(23));
   } else {
     b.writeBytes(Uint8List.fromList(const [0x60, 0x80, 0x00, 0x00]));
-    _u32(b, maxLen);
+    _u32(b, size);
     b.writeBytes(Uint8List(11));
     b.writeBytes(Uint8List.fromList(const [0x69, 0x03, 0x01])); // charset AL32UTF8
-    _u32(b, maxLen);
+    _u32(b, size);
     b.writeBytes(Uint8List.fromList(const [0xfe, 0x3f, 0x00, 0x00]));
   }
   b.writeUint8(0x01);
@@ -124,50 +128,86 @@ void _writeColumnRecord(
   b.writeBytes(Uint8List(32)..[8] = colIndex); // trailing padding; [8] = column index
 }
 
-/// Returns true when [result] is a 0- or 1-row set of NUMBER / VARCHAR2 columns
-/// — the shape [buildNativeQueryResponse] can encode. The fixed describe/status
-/// blocks are column-count-aware but assume at most one fetched row.
-bool canEncodeNativeQuery(QueryResult result) =>
-    result.columns.isNotEmpty && result.rows.length <= 1;
+/// Returns true when [result] is a shape [buildNativeQueryResponse] can encode:
+/// a non-empty set of NUMBER / VARCHAR2 columns (any row count).
+bool canEncodeNativeQuery(QueryResult result) => result.columns.isNotEmpty;
 
-/// Builds the native describe-info + row + `ORA-01403` response for a 0- or
-/// 1-row [result]. Call [canEncodeNativeQuery] first.
+/// Builds the native describe-info + rows + `ORA-01403` response for [result].
+/// Call [canEncodeNativeQuery] first.
 Uint8List buildNativeQueryResponse(QueryResult result) {
   final ncols = result.columns.length;
-  final empty = result.rows.isEmpty;
-  final row = empty ? const <Object?>[] : result.rows.first;
   final isNumber = [for (var i = 0; i < ncols; i++) _isNumberColumn(result.rows, i)];
-  final values = [
-    for (var i = 0; i < ncols; i++)
-      _encodeValue(i < row.length ? row[i] : null, isNumber[i]),
+  final rows = [
+    for (final row in result.rows)
+      [
+        for (var i = 0; i < ncols; i++)
+          _encodeValue(i < row.length ? row[i] : null, isNumber[i]),
+      ],
   ];
-  final rowBytes = values.fold<int>(0, (s, v) => s + v.length);
+  // Describe size per column: the widest encoded value (min 1). Oracle sends
+  // the exact column size with the 0x81 flag for determinate (literal/typed)
+  // columns, single- or multi-row alike.
+  final maxLen = [
+    for (var i = 0; i < ncols; i++)
+      rows.fold<int>(1, (m, r) => r[i].length > m ? r[i].length : m),
+  ];
+  final multiRow = rows.length > 1;
+  int colSize(int i) =>
+      rows.isEmpty ? (isNumber[i] ? 2 : 1) : maxLen[i];
+  final headerSize = [
+    for (var i = 0; i < ncols; i++) colSize(i)
+  ].fold<int>(0, (s, v) => s + v);
 
   final b = WriteBuffer();
   b.writeUint8(0x10); // message type 16: describe info
   _u32(b, 23);
   b.writeBytes(Uint8List(16)); // describe signature (not validated)
   b.writeBytes(Uint8List.fromList(_date7));
-  _u32(b, rowBytes);
+  _u32(b, headerSize);
   _u32(b, ncols);
   b.writeUint8(0x82); // shared describe prefix, once before the columns
   for (var i = 0; i < ncols; i++) {
-    _writeColumnRecord(b, result.columns[i], isNumber[i],
-        values[i].isEmpty ? 1 : values[i].length, i);
+    _writeColumnRecord(b, result.columns[i], isNumber[i], colSize(i), 0x81, i);
   }
-  if (empty) {
+  if (rows.isEmpty) {
     b.writeBytes(_midBlockEmpty);
     b.writeBytes(_statusBlockEmpty);
     return b.toBytes();
   }
   final mid = Uint8List.fromList(_midBlock)..[34] = ncols;
+  if (multiRow) {
+    // Prefetch-buffer hints a buffered (multi-row) fetch needs non-trivial.
+    mid[20] = 0x64;
+    mid[24] = 0xba;
+  }
   b.writeBytes(mid);
-  b.writeUint8(0x07); // row-data marker
-  for (final v in values) {
-    b.writeUint8(v.length);
-    b.writeBytes(v);
+  for (var r = 0; r < rows.length; r++) {
+    // The listener emits the first two rows back-to-back, then prefixes every
+    // subsequent row with a 4-byte inter-row marker whose fields scale with the
+    // column count.
+    if (r >= 2) {
+      b.writeBytes(
+          Uint8List.fromList([0x15, ncols, 0x00, 2 * ncols - 1]));
+    }
+    b.writeUint8(0x07); // row-data marker
+    for (final v in rows[r]) {
+      b.writeUint8(v.length);
+      b.writeBytes(v);
+    }
   }
   final status = Uint8List.fromList(_statusBlock)..[80] = ncols + 5;
+  if (multiRow) {
+    final n = rows.length;
+    // The status block repeats the fetched row count in several bookkeeping
+    // slots the client reads to size its row array.
+    status[11] = n;
+    status[40] = 10 + n;
+    status[42] = n;
+    status[52] = n;
+    status[54] = 23;
+    status[80] = n + 4;
+    status[106] = n;
+  }
   b.writeBytes(status);
   return b.toBytes();
 }
