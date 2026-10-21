@@ -13,6 +13,7 @@ For a runnable walkthrough, see
 | --- | --- |
 | [sql-dialect-parity.md](sql-dialect-parity.md) | How the engine lines up against Oracle and MySQL — wire protocols, statements, functions, types, and known gaps. |
 | [parity-roadmap.md](parity-roadmap.md) | The ordered plan to close the remaining Oracle/MySQL gaps — scope, implementation sketch, effort, and dependencies per item. |
+| [reliability-gap-closure-plan.md](reliability-gap-closure-plan.md) | Prioritized plan to fix the 18 engine reliability bugs (F1–F18) the reliability harness surfaced — root cause, code location, approach, and effort per item. |
 
 ## Recipes
 

@@ -139,6 +139,11 @@ The engine ships capabilities neither stock Oracle nor MySQL expose the same way
   supported; `KEY_COLUMN_USAGE` / `STATISTICS` / constraint views are not yet).
 - **Engine quirks:** `(+)` RIGHT joins on 3+-table chains null the whole
   accumulated left side (best-effort vs Oracle's per-table semantics).
+- **Reliability bugs (tracked):** the reliability harness confirmed 18 engine
+  correctness/integrity/durability bugs (F1–F18) — three-valued logic, CHECK /
+  UNIQUE / PK enforcement on UPDATE, statement atomicity, crash-atomic
+  persistence, views over joins, and more. They are prioritized with root cause
+  and approach in [reliability-gap-closure-plan.md](reliability-gap-closure-plan.md).
 
 ---
 
