@@ -24,6 +24,7 @@ import 'oracle_execute.dart';
 import 'oracle_lob.dart';
 import 'oracle_native_auth.dart';
 import 'oracle_native_datatypes.dart';
+import 'oracle_native_replay.dart';
 import 'oracle_tns.dart';
 import 'oracle_ttc.dart';
 import 'lexer.dart';
@@ -425,6 +426,10 @@ class OracleConnection {
   /// all three responses in a single DATA packet (the client reads one packet
   /// back and parses the three messages sequentially).
   void _handleFastAuth(ReadBuffer body) {
+    if (_nativeClient) {
+      _handleNativeFastAuth(body);
+      return;
+    }
     // Envelope header: version, flag1, flag2.
     body.readUint8(); // fast-auth version
     body.readUint8(); // flag 1
@@ -473,6 +478,17 @@ class OracleConnection {
     _sendTtc(combined.toBytes());
   }
 
+  /// Handles the native (thick OCI/OCCI) FAST_AUTH envelope. A real 23ai
+  /// listener DECLINES the fast path for these clients: it replies with a
+  /// protocol-only response (message type 28), and the client then runs the
+  /// classical DATA-TYPES + AUTH_PHASE_ONE/TWO exchange. Emulating the decline
+  /// keeps our existing classical native-auth handlers on the hot path.
+  void _handleNativeFastAuth(ReadBuffer body) {
+    _phase = OraclePhase.negotiate;
+    server._log('conn $id native FAST_AUTH declined -> protocol response');
+    _sendTtc(nativeProtocolResponse28);
+  }
+
   /// Dispatches a TTC FUNCTION (message type 3) call by its function code.
   void _handleFunction(ReadBuffer body) {
     final functionCode = body.readUint8();
@@ -507,7 +523,8 @@ class OracleConnection {
             _phase = OraclePhase.ready;
             server._log(
                 'conn $id native authenticated user=${_auth.username ?? '?'}');
-            _sendTtc(buildNativeAuthSuccess(), dataFlags: 0x2000);
+            _sendTtc(buildNativeAuthSuccess(comboKey: _auth.comboKey!),
+                dataFlags: 0x2000);
           } else {
             server._log(
                 'conn $id native auth failed user=${_auth.username ?? '?'}');

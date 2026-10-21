@@ -63,7 +63,7 @@ const int tnsAcceptFlagFastAuth = 0x10000000;
 /// flag2 a real 23ai listener returns to a native client at version 320.
 /// We omit FAST_AUTH (0x10000000) so the client runs the classical
 /// PROTOCOL/DATA-TYPES/AUTH exchange this server implements for native clients.
-const int tnsAcceptFlagsNativeV320 = 0x08000000;
+const int tnsAcceptFlagsNativeV320 = 0x1A000000;
 
 /// 16-byte break cookie a version-320 ACCEPT carries (abs 45..60). A native
 /// client stores it for in-band break resynchronization; a fixed value is fine.

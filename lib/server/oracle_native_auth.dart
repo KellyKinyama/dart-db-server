@@ -11,6 +11,7 @@
 library;
 
 import 'dart:convert';
+import 'dart:math';
 import 'dart:typed_data';
 
 import 'oracle_auth.dart';
@@ -89,16 +90,34 @@ Map<String, String> parseNativeAuthPairs(ReadBuffer body) {
 
   final out = <String, String>{};
   for (var i = 0; i < numPairs && body.hasRemaining; i++) {
-    body.readUint32LE(); // key length (redundant)
-    final keyLen = body.readUint8();
-    final key = utf8.decode(body.readBytes(keyLen));
-    body.readUint32LE(); // value length (redundant)
-    final valLen = body.readUint8();
-    final value = valLen > 0 ? utf8.decode(body.readBytes(valLen)) : '';
+    body.readUint32LE(); // key length (redundant with the inline length prefix)
+    final key = body.readStringWithLength();
+    final value = _readNativeValue(body);
     body.readUint32LE(); // flags
     out[key] = value;
   }
   return out;
+}
+
+/// Reads one native AUTH value: a redundant UB4LE total length, then (when
+/// non-empty) either an inline `U8(len) bytes` run or, for values >= 254 bytes,
+/// the `0xFE` chunked form with 4-byte little-endian chunk sizes terminated by a
+/// zero size. A zero total length has no marker and no data.
+String _readNativeValue(ReadBuffer body) {
+  final declared = body.readUint32LE();
+  if (declared == 0) return '';
+  final marker = body.readUint8();
+  if (marker == 0 || marker == 0xFF) return '';
+  if (marker != 0xFE) {
+    return utf8.decode(body.readBytes(marker));
+  }
+  final bytes = <int>[];
+  while (true) {
+    final size = body.readUint32LE();
+    if (size == 0) break;
+    bytes.addAll(body.readBytes(size));
+  }
+  return utf8.decode(bytes);
 }
 
 /// Builds the native AUTH_PHASE_ONE response (message type 8, six parameters,
@@ -124,13 +143,34 @@ Uint8List buildNativeAuthPhaseOneResponse(
   return b.toBytes();
 }
 
-/// Builds the native AUTH_PHASE_TWO success response: a parameter block of
-/// session attributes the OCI client stores, then the success epilogue.
+/// Seals the AUTH_SVR_RESPONSE mutual-auth proof: `hex(AES-256-CBC(comboKey,
+/// iv=0, PKCS7(random16 ‖ "SERVER_TO_CLIENT")))`. The OCI client decrypts this
+/// with the same combo key and checks bytes [16..32] equal "SERVER_TO_CLIENT",
+/// proving the server also derived the combo key (and therefore knows the
+/// password). Without it the client reports ORA-01017.
+String _buildServerResponse(Uint8List comboKey) {
+  final plain = Uint8List.fromList([
+    ..._randomBytes16(),
+    ...utf8.encode('SERVER_TO_CLIENT'),
+  ]);
+  final sealed =
+      aes256CbcEncryptPkcs7(key: comboKey, iv: Uint8List(16), data: plain);
+  return hexEncodeUpper(sealed);
+}
+
+final _svrRandom = Random.secure();
+
+Uint8List _randomBytes16() =>
+    Uint8List.fromList(List<int>.generate(16, (_) => _svrRandom.nextInt(256)));
+/// [comboKey] seals the AUTH_SVR_RESPONSE mutual-auth proof the OCI client
+/// validates (decrypts and checks for the literal "SERVER_TO_CLIENT").
 Uint8List buildNativeAuthSuccess({
+  required Uint8List comboKey,
   int sessionId = 1,
   int serialNum = 1,
 }) {
   final params = <(String, String)>[
+    ('AUTH_SVR_RESPONSE', _buildServerResponse(comboKey)),
     ('AUTH_VERSION_STRING', 'dart-db-server Release 23.0.0.0.0 - Production'),
     ('AUTH_VERSION_SQL', '26'),
     ('AUTH_XACTION_TRAITS', '3'),

@@ -167,6 +167,10 @@ class AuthPhaseState {
   /// Whether phase one arrived in a FAST_AUTH envelope — the client then
   /// prefixes AUTH_PHASE_TWO with a 23ai token-number field.
   bool viaFastAuth = false;
+
+  /// The derived O5LOGON combo key (set by [verifyO5LogonProof]); the native
+  /// success response seals the AUTH_SVR_RESPONSE mutual-auth proof with it.
+  Uint8List? comboKey;
 }
 
 /// A built TTC response plus whether authentication has now succeeded.
@@ -316,6 +320,7 @@ bool verifyO5LogonProof(
       iterations: state.mixingIterations ?? 1,
       keyLength: 32,
     );
+    state.comboKey = comboKey;
 
     // Decrypt AUTH_PASSWORD, drop the 16-byte random prefix, re-derive the
     // verifier's hash, and compare against the stored one.
