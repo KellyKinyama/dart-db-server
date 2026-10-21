@@ -169,7 +169,10 @@ Scope: the native path only (`_nativeClient == true`). Thin clients
   source of truth for "what is a bind".
 - **Verify:** Unit test with a `'HH:MI'`-style literal plus a real bind.
 - **Effort:** S.
-- **Status:** TODO
+- **Status:** LANDED (`5ea552a`). `_scanNativeBindValues` now counts
+  placeholders with the `Lexer` (skips string literals / comments) instead of a
+  regex. Confirmed bug first: `select :v as n, '12:34' as t` failed (phantom
+  `:34`); now round-trips.
 
 ### 7. Multi-column (3+) inter-row marker formula
 - **Risk:** The inter-row marker `15 <ncols> 00 <2·ncols−1>` was derived from
@@ -192,7 +195,9 @@ Scope: the native path only (`_nativeClient == true`). Thin clients
   differ, fix the encoder or fall back to encoding as text.
 - **Verify:** Values match `oci8`'s read.
 - **Effort:** S.
-- **Status:** TODO
+- **Status:** DONE (verified, no change needed). Live `oci8` read of `-1`, `0`,
+  `3.14`, `-2.5`, `0.001`, `1000000`, `-123456`, `123.456` all match —
+  `encodeOracleNumber` already handles the native path.
 
 ---
 
@@ -251,6 +256,8 @@ dart test (Get-ChildItem test -Filter 'oracle*test.dart' | % FullName)
 ```
 
 ## Landed
+- Lexer-based bind counting — a `:` inside a string literal is no longer
+  mistaken for a bind — `5ea552a`.
 - NULL binds (`fd 01` marker) and NULL columns (zero-length) round-trip —
   `3e28575`.
 - FETCH pagination — large result sets stream in prefetch batches instead of
