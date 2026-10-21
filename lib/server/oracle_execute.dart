@@ -212,6 +212,16 @@ List<Object?> _scanNativeBindValues(Uint8List p, String sql) {
         break;
       }
       final len = p[cur++];
+      if (len == 0xFD) {
+        // NULL bind: a 0xFD marker followed by a 1-byte indicator.
+        if (cur >= p.length) {
+          ok = false;
+          break;
+        }
+        cur += 1;
+        values.add(null);
+        continue;
+      }
       if (cur + len > p.length) {
         ok = false;
         break;

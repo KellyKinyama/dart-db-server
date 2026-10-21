@@ -59,6 +59,24 @@ void main() {
       expect(info.hasBinds, isFalse);
     });
 
+    test('native request decodes NULL (0xFD) bind values in any position', () {
+      const sql = 'insert into t (a, b) values (:a, :b)';
+      // a = "7", b = NULL (0xFD + 1-byte indicator).
+      final trailing = <int>[
+        sql.length, ...sql.codeUnits, 0, 0, 0,
+        0x07, 0x01, 0x37, 0xfd, 0x01,
+      ];
+      expect(decodeNativeExecuteRequest(Uint8List.fromList(trailing)).binds,
+          ['7', null]);
+      // a = NULL, b = "z".
+      final leading = <int>[
+        sql.length, ...sql.codeUnits, 0, 0, 0,
+        0x07, 0xfd, 0x01, 0x01, 0x7a,
+      ];
+      expect(decodeNativeExecuteRequest(Uint8List.fromList(leading)).binds,
+          [null, 'z']);
+    });
+
     test('native SQL scan ignores a string bind value longer than the SQL', () {
       const sql = 'select :v as n';
       const value = 'Christopher Alexander Wren the Architect'; // > SQL length

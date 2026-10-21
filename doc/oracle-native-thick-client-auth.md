@@ -269,6 +269,13 @@ substitutes them, so a real `oci8` client round-trips `select :a, :b` and
 (non-text) number binds would need the OCI-RPC value section decoded properly;
 the common `oci8` / PDO path binds as text.
 
+**NULLs.** A NULL column value in a row is a zero-length field (`00`, no bytes) —
+which the row encoder already produces for a null. A NULL *bind* is the odd one:
+instead of a length-prefixed value it is the marker `fd 01` (a `0xFD` byte plus a
+one-byte indicator), so the bind scanner must treat a `0xFD` length as NULL and
+skip the indicator rather than reading it as a 253-byte value. With that, a
+NULL binds and reads back as NULL in either column position.
+
 One sharp edge the first cut got wrong: the SQL text was recovered as the
 *longest* printable run, but a string bind value longer than the statement
 (routine — any `insert … values (:name)` with a long name) would then be picked

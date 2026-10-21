@@ -64,6 +64,15 @@ void main() {
       expect(_contains(r, 'ORA-01403'.codeUnits), isTrue);
     });
 
+    test('a NULL column value is encoded as a zero-length field', () {
+      final r = buildNativeQueryResponse(
+          const QueryResult(columns: ['a', 'b'], rows: [
+        [1, null]
+      ]));
+      // row marker 07, then a=1 (len 2, c1 02), then b=NULL (len 0).
+      expect(_contains(r, [0x07, 0x02, 0xc1, 0x02, 0x00]), isTrue);
+    });
+
     test('canEncodeNativeQuery accepts any non-empty column set', () {
       expect(
           canEncodeNativeQuery(
