@@ -56,6 +56,17 @@ void main() {
       expect(status[42], 3);
     });
 
+    test('inter-row marker mask is an all-columns-present bitmap', () {
+      // Three columns -> mask (1<<3)-1 = 7 -> marker 15 03 00 07.
+      final r = buildNativeQueryResponse(
+          const QueryResult(columns: ['a', 'b', 'c'], rows: [
+        [1, 'x', 10],
+        [2, 'y', 20],
+        [3, 'z', 30]
+      ]));
+      expect(_contains(r, [0x15, 0x03, 0x00, 0x07]), isTrue);
+    });
+
     test('empty result set has no row data and a distinct status block', () {
       final r = buildNativeQueryResponse(
           const QueryResult(columns: ['N'], rows: []));

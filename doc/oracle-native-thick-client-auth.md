@@ -218,8 +218,10 @@ everything else is a fixed template.
 row count is echoed into several status-block slots (`[11]`, `[42]`, `[52]`,
 `[106]` = rowCount, `[40]` = 10 + rowCount, `[80]` = rowCount + 4). Rows one and
 two are emitted back-to-back; every row from index 2 on is prefixed with a
-4-byte inter-row marker `15 <ncols> 00 <2·ncols−1>` (so `15 01 00 01` for one
-column, `15 02 00 03` for two). **Empty (0-row)** results use a truncated mid
+4-byte inter-row marker `15 <ncols> 00 <mask>`, where `mask` is an
+all-columns-present bitmap `(1<<ncols)−1` (`15 01 00 01` for one column,
+`15 02 00 03` for two, `15 03 00 07` for three, `15 04 00 0f` for four).
+**Empty (0-row)** results use a truncated mid
 block (no row-metadata tail), no row data, and a distinct status block.
 
 A subtlety that cost real debugging time: the in-memory SQL engine is

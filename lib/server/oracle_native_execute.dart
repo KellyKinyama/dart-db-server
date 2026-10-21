@@ -183,11 +183,12 @@ Uint8List buildNativeQueryResponse(QueryResult result) {
   b.writeBytes(mid);
   for (var r = 0; r < rows.length; r++) {
     // The listener emits the first two rows back-to-back, then prefixes every
-    // subsequent row with a 4-byte inter-row marker whose fields scale with the
-    // column count.
+    // subsequent row with `15 <ncols> 00 <mask>`, where mask is an
+    // all-columns-present bitmap ((1<<ncols)-1).
     if (r >= 2) {
+      final mask = (1 << ncols) - 1;
       b.writeBytes(
-          Uint8List.fromList([0x15, ncols, 0x00, 2 * ncols - 1]));
+          Uint8List.fromList([0x15, ncols, (mask >> 8) & 0xFF, mask & 0xFF]));
     }
     b.writeUint8(0x07); // row-data marker
     for (final v in rows[r]) {
@@ -341,7 +342,9 @@ class NativeResultCursor {
     b.writeBytes(mid);
     for (var r = 0; r < end; r++) {
       if (r >= 2) {
-        b.writeBytes(Uint8List.fromList([0x15, _ncols, 0x00, 2 * _ncols - 1]));
+        final mask = (1 << _ncols) - 1; // all-columns-present bitmap
+        b.writeBytes(
+            Uint8List.fromList([0x15, _ncols, (mask >> 8) & 0xFF, mask & 0xFF]));
       }
       _writeRow(b, _rows[r]);
     }
