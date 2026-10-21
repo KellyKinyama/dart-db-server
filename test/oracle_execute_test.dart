@@ -71,6 +71,21 @@ void main() {
       expect(info.sql, sql); // the verb-anchored run wins over the longer value
       expect(info.binds, [value]);
     });
+
+    test('native request recovers a long (0xFE-chunked) SQL statement', () {
+      final sql =
+          'select ${List.filled(60, 'col_x').join(', ')} from a_table'; // > 253 bytes
+      final n = sql.length;
+      final body = <int>[
+        0xFE, // long-string marker
+        n & 0xFF, (n >> 8) & 0xFF, (n >> 16) & 0xFF, (n >> 24) & 0xFF, // LE32 len
+        ...sql.codeUnits,
+        0, 0, 0, 0, // LE32(0) chunk terminator
+      ];
+      final info = decodeNativeExecuteRequest(Uint8List.fromList(body));
+      expect(sql.length, greaterThan(253));
+      expect(info.sql, sql);
+    });
   });
 
   group('response encoding (decoded with client mirrors)', () {

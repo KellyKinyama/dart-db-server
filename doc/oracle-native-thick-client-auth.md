@@ -279,6 +279,15 @@ leads with a SQL verb and, on the wire, precedes the bind-value block, so
 INSERT / UPDATE / … / BEGIN), falling back to longest-printable only for forms
 outside that set.
 
+A second, bigger edge: the SQL is only `U8(len)`-prefixed when it is **≤ 253
+bytes**. A longer statement is sent as a native **long string** — a `0xFE`
+marker, then repeated `LE32(chunkLen) + bytes` terminated by `LE32(0)` (a
+330-byte query marshals as `fe 4a 01 00 00 …330 bytes… 00 00 00 00`). The
+U8-only scan couldn't see it and latched onto an inner fragment, so *any*
+statement over 253 bytes ran as garbage. `_scanNativeSqlText` now also decodes
+the `0xFE`-chunked form; the `FE FF…` pointer indicators are rejected by the
+1 MiB chunk-size sanity cap.
+
 **`ALTER SESSION` (connect-time NLS).** Drivers — Laravel's `oci8` in
 particular — issue a burst of `alter session set NLS_DATE_FORMAT = …` /
 `NLS_TIMESTAMP_FORMAT` / `NLS_NUMERIC_CHARACTERS` statements right after connect.

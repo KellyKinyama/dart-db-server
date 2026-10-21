@@ -241,30 +241,64 @@ bool _startsWithSqlVerb(String s) {
   return _sqlLeadingVerbs.contains(word);
 }
 
-/// Finds the statement text in a native OALL8 body among the `U8(len)`
-/// length-prefixed runs of printable ASCII. The statement leads with a SQL verb
-/// and, on the wire, precedes the bind-value block, so the first verb-anchored
-/// run is the SQL even when a string bind value is longer. Falls back to the
-/// longest printable run for statement forms not covered by the verb set.
+bool _startsWithAsciiLetter(int c) =>
+    (c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A);
+
+/// Returns the ASCII string of [len] bytes at [start] in [p], or null if any
+/// byte is non-printable.
+String? _printableAscii(List<int> p, int start, int len) {
+  for (var j = start; j < start + len; j++) {
+    final c = p[j];
+    if (c < 0x20 || c > 0x7E) return null;
+  }
+  return String.fromCharCodes(p, start, start + len);
+}
+
+/// Reads the native "long" string at [i]: a `0xFE` marker then repeated
+/// `LE32(chunkLen) + bytes`, terminated by `LE32(0)`. Returns the concatenated
+/// bytes, or null if [i] is not a valid long-string header (e.g. an `FE FF…`
+/// pointer indicator). Bounded to 1 MiB as a sanity cap.
+List<int>? _readNativeLongString(Uint8List p, int i) {
+  if (p[i] != 0xFE) return null;
+  final out = <int>[];
+  var cur = i + 1;
+  while (cur + 4 <= p.length) {
+    final clen = p[cur] | (p[cur + 1] << 8) | (p[cur + 2] << 16) | (p[cur + 3] << 24);
+    cur += 4;
+    if (clen == 0) return out.isEmpty ? null : out;
+    if (clen > 0x100000 || cur + clen > p.length) return null;
+    out.addAll(p.sublist(cur, cur + clen));
+    cur += clen;
+  }
+  return null;
+}
+
+/// Finds the statement text in a native OALL8 body. The SQL is marshaled either
+/// as a short `U8(len) + bytes` run (len ≤ 253) or, for longer statements, as a
+/// `0xFE`-chunked long string (`LE32(len) + bytes`, terminated by `LE32(0)`).
+/// The statement leads with a SQL verb and precedes the bind-value block, so the
+/// first verb-anchored run (of either form) is the SQL even when a bind value is
+/// longer. Falls back to the longest printable run for forms outside the verb
+/// set.
 String _scanNativeSqlText(Uint8List p) {
   var fallback = '';
   for (var i = 0; i + 1 < p.length; i++) {
-    final len = p[i];
-    if (len < 4 || i + 1 + len > p.length) continue;
-    var printable = true;
-    for (var j = i + 1; j < i + 1 + len; j++) {
-      final c = p[j];
-      if (c < 0x20 || c > 0x7E) {
-        printable = false;
-        break;
+    if (p[i] == 0xFE) {
+      final bytes = _readNativeLongString(p, i);
+      if (bytes != null && bytes.isNotEmpty && _startsWithAsciiLetter(bytes[0])) {
+        final text = _printableAscii(bytes, 0, bytes.length);
+        if (text != null) {
+          if (_startsWithSqlVerb(text)) return text;
+          if (text.length > fallback.length) fallback = text;
+        }
       }
+      continue;
     }
-    if (!printable) continue;
-    final first = p[i + 1];
-    final startsLetter =
-        (first >= 0x41 && first <= 0x5A) || (first >= 0x61 && first <= 0x7A);
-    if (!startsLetter) continue;
-    final text = String.fromCharCodes(p, i + 1, i + 1 + len);
+    final len = p[i];
+    if (len < 4 || len > 253 || i + 1 + len > p.length) continue;
+    if (!_startsWithAsciiLetter(p[i + 1])) continue;
+    final text = _printableAscii(p, i + 1, len);
+    if (text == null) continue;
     if (_startsWithSqlVerb(text)) return text;
     if (len > fallback.length) fallback = text;
   }
