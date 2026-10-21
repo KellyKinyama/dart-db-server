@@ -162,6 +162,11 @@ class OracleConnection {
   /// (negotiated version >= 315). CONNECT/ACCEPT always use 2-byte framing.
   bool _useLargeSdu = false;
 
+  /// Whether the peer is a native (thick) OCI/OCCI client, detected from the
+  /// large connect-descriptor overflow flow. Native clients need a real 23ai
+  /// listener's byte-exact TTC PROTOCOL response (full charset map + caps).
+  bool _nativeClient = false;
+
   /// When a CONNECT announces a descriptor that isn't inline, the native client
   /// follows it with a DATA packet carrying the descriptor; the ACCEPT is held
   /// until that packet arrives. This is the pre-built ACCEPT to send then.
@@ -269,6 +274,7 @@ class OracleConnection {
     // doing so makes them reject the ACCEPT, so only advertise it when the
     // descriptor arrives inline.
     final overflow = req.connectData.isEmpty && req.connectDataLength > 0;
+    _nativeClient = overflow;
     final accept = buildAcceptPacket(
       version: _version,
       sdu: _sdu,
@@ -371,7 +377,7 @@ class OracleConnection {
       case _ttcProtocol:
         server._log('conn $id TTC PROTOCOL request -> response');
         _phase = OraclePhase.negotiate;
-        _sendTtc(buildProtocolResponse());
+        _sendTtc(buildProtocolResponse(nativeClient: _nativeClient));
         break;
       case _ttcDataTypes:
         server._log('conn $id TTC DATA TYPES request -> response');
