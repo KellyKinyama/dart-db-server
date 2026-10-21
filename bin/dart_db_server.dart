@@ -25,6 +25,7 @@ Future<void> main(List<String> args) async {
   bool repl = false;
   bool memory = false;
   final oracleUsers = <String, String>{};
+  final oraclePbkdf2Users = <String, String>{};
 
   for (var i = 0; i < args.length; i++) {
     final a = args[i];
@@ -46,6 +47,17 @@ Future<void> main(List<String> args) async {
           oracleUsers[spec.substring(0, slash)] = spec.substring(slash + 1);
         } else {
           stderr.writeln('--oracle-user expects user/password');
+          exit(64);
+        }
+        break;
+      case '--oracle-pbkdf2-user':
+        final spec = next();
+        if (spec != null && spec.contains('/')) {
+          final slash = spec.indexOf('/');
+          oraclePbkdf2Users[spec.substring(0, slash)] =
+              spec.substring(slash + 1);
+        } else {
+          stderr.writeln('--oracle-pbkdf2-user expects user/password');
           exit(64);
         }
         break;
@@ -81,6 +93,8 @@ Future<void> main(List<String> args) async {
   if (oraclePort > 0) {
     oracleServer = OracleServer(db,
         address: InternetAddress(host), port: oraclePort, users: oracleUsers);
+    // Native (thick OCI/OCCI) clients require the 12c PBKDF2 verifier.
+    oraclePbkdf2Users.forEach(oracleServer.userStore.addPbkdf2User);
     await oracleServer.start();
   }
 
@@ -115,6 +129,8 @@ Options:
   --port <n>       TCP port to listen on (default: 4555, 0 disables)
   --oracle-port <n> Oracle TNS/TTC wire port (default: 0 disabled, e.g. 1521)
   --oracle-user <u/p> Register an Oracle wire user (repeatable)
+  --oracle-pbkdf2-user <u/p> Register a PBKDF2/12c Oracle user for native
+                   (thick OCI/OCCI) clients (repeatable)
   --host <addr>    Bind address (default: 127.0.0.1)
   --repl           Also start an interactive REPL on stdin
   --memory         Run in-memory only (no persistence)
