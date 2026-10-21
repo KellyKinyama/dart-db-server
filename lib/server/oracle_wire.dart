@@ -22,6 +22,7 @@ import 'oracle_auth.dart';
 import 'oracle_codec.dart';
 import 'oracle_execute.dart';
 import 'oracle_lob.dart';
+import 'oracle_native_auth.dart';
 import 'oracle_native_datatypes.dart';
 import 'oracle_tns.dart';
 import 'oracle_ttc.dart';
@@ -470,11 +471,43 @@ class OracleConnection {
     body.readUint8(); // sequence number
     switch (functionCode) {
       case ttcAuthPhaseOne:
+        if (_nativeClient) {
+          final username = parseNativeAuthUsername(body);
+          _auth.username = username;
+          final verifier = server.userStore.lookup(username);
+          if (verifier == null) {
+            server._log('conn $id native AUTH_PHASE_ONE unknown user=$username');
+            _sendTtc(buildTtcError(oraInvalidCredentials,
+                'invalid username/password; logon denied'));
+          } else {
+            server._log('conn $id native AUTH_PHASE_ONE user=$username');
+            _sendTtc(buildNativeAuthPhaseOneResponse(verifier, _auth),
+                dataFlags: 0x2000);
+          }
+          break;
+        }
         final resp = handleAuthPhaseOne(body, server.userStore, _auth);
         server._log('conn $id AUTH_PHASE_ONE user=${_auth.username ?? '?'}');
         _sendTtc(resp.bytes);
         break;
       case ttcAuthPhaseTwo:
+        if (_nativeClient) {
+          final pairs = parseNativeAuthPairs(body);
+          final ok = verifyO5LogonProof(
+              _auth, pairs['AUTH_SESSKEY'], pairs['AUTH_PASSWORD']);
+          if (ok) {
+            _phase = OraclePhase.ready;
+            server._log(
+                'conn $id native authenticated user=${_auth.username ?? '?'}');
+            _sendTtc(buildNativeAuthSuccess(), dataFlags: 0x2000);
+          } else {
+            server._log(
+                'conn $id native auth failed user=${_auth.username ?? '?'}');
+            _sendTtc(buildTtcError(oraInvalidCredentials,
+                'invalid username/password; logon denied'));
+          }
+          break;
+        }
         final resp = handleAuthPhaseTwo(body, _auth);
         if (resp.authenticated) {
           _phase = OraclePhase.ready;
@@ -672,10 +705,11 @@ class OracleConnection {
   /// Wraps a TTC message body in one or more TNS DATA packets (split at the
   /// negotiated SDU) and sends them. The client reassembles the packets into a
   /// single TTC stream, so large result sets are not bounded by one packet.
-  void _sendTtc(Uint8List ttcBody) {
+  void _sendTtc(Uint8List ttcBody, {int dataFlags = 0}) {
     final maxPayload = _sdu - tnsHeaderSize - 2; // header + 2 data-flag bytes
     if (ttcBody.length <= maxPayload) {
-      _send(buildDataPacket(ttcBody, largeSdu: _useLargeSdu));
+      _send(buildDataPacket(ttcBody,
+          largeSdu: _useLargeSdu, flags: dataFlags));
       return;
     }
     for (var offset = 0; offset < ttcBody.length; offset += maxPayload) {
@@ -683,7 +717,7 @@ class OracleConnection {
           ? offset + maxPayload
           : ttcBody.length;
       _send(buildDataPacket(Uint8List.sublistView(ttcBody, offset, end),
-          largeSdu: _useLargeSdu));
+          largeSdu: _useLargeSdu, flags: dataFlags));
     }
   }
 

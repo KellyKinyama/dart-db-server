@@ -247,23 +247,53 @@ AuthResponse handleAuthPhaseTwo(ReadBuffer body, AuthPhaseState state) {
     body.readUB8(); // token number (unused)
   }
   final pairs = _parseRequestKeyValues(body);
-  final sessKeyHex = pairs['AUTH_SESSKEY'];
-  final passwordHex = pairs['AUTH_PASSWORD'];
-  final verifier = state.verifier;
-  final serverNonce = state.serverNonce;
-
-  final denied = AuthResponse(
+  if (verifyO5LogonProof(
+      state, pairs['AUTH_SESSKEY'], pairs['AUTH_PASSWORD'])) {
+    return AuthResponse(buildAuthSuccess(), authenticated: true);
+  }
+  return AuthResponse(
     buildTtcError(
         oraInvalidCredentials, 'invalid username/password; logon denied'),
     authenticated: false,
   );
+}
+
+/// Seals the AUTH_PHASE_ONE crypto into [state]: mints the server nonce and a
+/// PBKDF2 mixing salt, and returns the AES-sealed `AUTH_SESSKEY` hex plus the
+/// mixing parameters. Shared by the thin and native phase-one builders.
+({String authSessKey, Uint8List mixingSalt, int mixingIterations}) sealPhaseOne(
+    OracleVerifier verifier, AuthPhaseState state, {int nonceLength = 48}) {
+  final serverNonce = _randomBytes(nonceLength);
+  final mixingSalt = _randomBytes(16);
+  const mixingIterations = _pbkdf2DefaultMixingIterations;
+  state
+    ..serverNonce = serverNonce
+    ..verifier = verifier
+    ..mixingSalt = mixingSalt
+    ..mixingIterations = mixingIterations;
+  final authSessKey = hexEncodeUpper(aes256CbcEncryptRaw(
+      key: verifier.passwordHash, iv: Uint8List(16), data: serverNonce));
+  return (
+    authSessKey: authSessKey,
+    mixingSalt: mixingSalt,
+    mixingIterations: mixingIterations,
+  );
+}
+
+/// Verifies the O5LOGON proof from AUTH_PHASE_TWO: recovers the client session
+/// key from [sessKeyHex], derives the combo key, decrypts [passwordHex], and
+/// compares the re-derived verifier hash against the stored one. Shared by the
+/// thin and native auth paths.
+bool verifyO5LogonProof(
+    AuthPhaseState state, String? sessKeyHex, String? passwordHex) {
+  final verifier = state.verifier;
+  final serverNonce = state.serverNonce;
   if (verifier == null ||
       serverNonce == null ||
       sessKeyHex == null ||
       passwordHex == null) {
-    return denied;
+    return false;
   }
-
   try {
     // Recover the client's session-key part B from AUTH_SESSKEY.
     final clientSessKey = hexDecode(sessKeyHex);
@@ -272,11 +302,9 @@ AuthResponse handleAuthPhaseTwo(ReadBuffer body, AuthPhaseState state) {
       iv: Uint8List(16),
       data: clientSessKey,
     );
-    if (partB.length < 32) return denied;
+    if (partB.length < 32) return false;
 
-    // Combo key: PBKDF2 over hex(partB[0:32] || serverNonce[0:32]). The
-    // SHA512 verifier uses a zero mixing salt and one iteration; a 12c PBKDF2
-    // verifier uses the salt and count the server advertised in phase one.
+    // Combo key: PBKDF2 over hex(partB[0:32] || serverNonce[0:32]).
     final partAB = Uint8List(64)
       ..setRange(0, 32, partB)
       ..setRange(32, 64, serverNonce);
@@ -290,23 +318,20 @@ AuthResponse handleAuthPhaseTwo(ReadBuffer body, AuthPhaseState state) {
     );
 
     // Decrypt AUTH_PASSWORD, drop the 16-byte random prefix, re-derive the
-    // verifier's hash (SHA512 or PBKDF2), and compare against the stored one.
+    // verifier's hash, and compare against the stored one.
     final plain = aes256CbcDecryptPkcs7(
       key: comboKey,
       iv: Uint8List(16),
       data: hexDecode(passwordHex),
     );
-    if (plain.length < 16) return denied;
+    if (plain.length < 16) return false;
     final password = Uint8List.fromList(Uint8List.sublistView(plain, 16));
     final recomputed = verifier.isPbkdf2
         ? _pbkdf2PasswordHash(password, verifier.salt, verifier.iterations)
         : _sha512PasswordHash(password, verifier.salt);
-    if (constantTimeEquals(recomputed, verifier.passwordHash)) {
-      return AuthResponse(buildAuthSuccess(), authenticated: true);
-    }
-    return denied;
+    return constantTimeEquals(recomputed, verifier.passwordHash);
   } catch (_) {
-    return denied;
+    return false;
   }
 }
 
