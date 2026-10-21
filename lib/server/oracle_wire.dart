@@ -669,11 +669,11 @@ class OracleConnection {
           : decodeExecuteRequest(body, lobStore: _lobStore);
     } catch (e) {
       server._log('conn $id EXECUTE decode error: $e');
-      _sendTtc(buildExecuteError(600, 'internal error decoding execute'));
+      _sendExecError(600, 'internal error decoding execute');
       return;
     }
     if (_phase != OraclePhase.ready) {
-      _sendTtc(buildExecuteError(1012, 'not logged on'));
+      _sendExecError(1012, 'not logged on');
       return;
     }
     // Resolve the SQL and cursor id: a fresh statement (cursor 0) is assigned a
@@ -689,7 +689,7 @@ class OracleConnection {
       cursorId = info.cursorId;
       final cached = _cursors[cursorId];
       if (cached == null) {
-        _sendTtc(buildExecuteError(1001, 'invalid cursor'));
+        _sendExecError(1001, 'invalid cursor');
         return;
       }
       sql = cached;
@@ -715,8 +715,8 @@ class OracleConnection {
         if (_nativeClient && result.columns.isNotEmpty) {
           return canEncodeNativeQuery(result)
               ? buildNativeQueryResponse(result)
-              : buildExecuteError(900,
-                  'ORA-00000: native result shape not yet supported');
+              : buildNativeExecuteError(
+                  900, 'native result shape not yet supported');
         }
         if (_nativeClient) {
           return buildNativeDmlResponse(result.affected);
@@ -725,10 +725,24 @@ class OracleConnection {
             ? buildQueryResponse(result, cursorId: cursorId, lobStore: _lobStore)
             : buildDmlResponse(result, cursorId: cursorId);
       } catch (e) {
-        return buildExecuteError(900, _oraErrorText(e));
+        return _nativeClient
+            ? buildNativeExecuteError(900, _oraErrorText(e))
+            : buildExecuteError(900, _oraErrorText(e));
       }
     });
     _sendTtc(response, dataFlags: _nativeClient ? 0x2000 : 0);
+  }
+
+  /// Sends a TTC execute error, native-encoded (with the native data flag) for
+  /// thick clients and thin-encoded otherwise. A thin error sent to a native
+  /// client is unparseable and hangs it.
+  void _sendExecError(int code, String message) {
+    _sendTtc(
+      _nativeClient
+          ? buildNativeExecuteError(code, message)
+          : buildExecuteError(code, message),
+      dataFlags: _nativeClient ? 0x2000 : 0,
+    );
   }
 
   /// Binds the wire's positional [binds] to the SQL's placeholders (in

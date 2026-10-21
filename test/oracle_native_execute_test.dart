@@ -98,6 +98,25 @@ void main() {
       expect(buildNativeStatusOk(),
           [0x09, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1d]);
     });
+
+    test('native error carries the ORA code and message', () {
+      final r = buildNativeExecuteError(942, 'table or view does not exist');
+      expect(r[0], 0x04); // error message type
+      // ORA code as a little-endian 32-bit value at byte 11 and echoed at 66.
+      expect(r[11] | (r[12] << 8), 942);
+      expect(r[66] | (r[67] << 8), 942);
+      expect(r.last, 0x1d); // terminator
+      final text = String.fromCharCodes(r.where((b) => b >= 0x20 && b < 0x7f));
+      expect(text, contains('ORA-00942:'));
+      expect(text, contains('table or view does not exist'));
+    });
+
+    test('native error does not double-prefix an ORA- message', () {
+      final r = buildNativeExecuteError(1, 'ORA-00001: unique constraint');
+      final text = String.fromCharCodes(r.where((b) => b >= 0x20 && b < 0x7f));
+      expect(text, contains('ORA-00001: unique constraint'));
+      expect('ORA-'.allMatches(text).length, 1);
+    });
   });
 }
 

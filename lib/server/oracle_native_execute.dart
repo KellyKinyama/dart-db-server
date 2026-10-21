@@ -266,3 +266,46 @@ Uint8List buildNativeDmlResponse(int affected) {
 /// most visibly as a stalled `oci_close` after any statement.
 Uint8List buildNativeStatusOk() => Uint8List.fromList(
     const [0x09, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1d]);
+
+/// The 79-byte native error (TTC message type `0x04`) header, captured verbatim.
+/// The ORA error number is a 4-byte little-endian scalar carried at byte 11 and
+/// echoed at byte 66; the other fields are per-call counters the client does not
+/// validate. Byte 19 (the error offset into the SQL) is zeroed — not computed.
+final Uint8List _errHeader = Uint8List.fromList(<int>[
+  0x04, 0x01, 0x00, 0x00, 0x00, 0x46, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+]);
+
+/// Builds the native (thick OCI/OCCI) error reply (message type `0x04`) for
+/// `ORA-[errorCode]` with [message]. The native client parses the `ORA-ddddd:`
+/// text and the binary code, so both are set; without this the thin
+/// `buildExecuteError` leaves the client hanging on any failed statement.
+Uint8List buildNativeExecuteError(int errorCode, String message) {
+  var text = message.trim();
+  if (!text.startsWith('ORA-')) {
+    text = 'ORA-${errorCode.toString().padLeft(5, '0')}: $text';
+  }
+  if (text.length > 250) text = text.substring(0, 250);
+  if (!text.endsWith('\n')) text = '$text\n';
+  final msg = Uint8List.fromList(utf8.encode(text));
+  final h = Uint8List.fromList(_errHeader);
+  h[11] = errorCode & 0xFF;
+  h[12] = (errorCode >> 8) & 0xFF;
+  h[13] = (errorCode >> 16) & 0xFF;
+  h[14] = (errorCode >> 24) & 0xFF;
+  h[66] = errorCode & 0xFF;
+  h[67] = (errorCode >> 8) & 0xFF;
+  h[68] = (errorCode >> 16) & 0xFF;
+  h[69] = (errorCode >> 24) & 0xFF;
+  final b = WriteBuffer();
+  b.writeBytes(h);
+  b.writeUint8(msg.length);
+  b.writeBytes(msg);
+  b.writeUint8(0x1d); // end-of-call terminator
+  return b.toBytes();
+}

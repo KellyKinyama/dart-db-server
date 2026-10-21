@@ -246,6 +246,15 @@ answered with the native end-of-call terminal `09 01 00 00 00 00 00 1d`
 short form leaves the client blocked, most visibly as a stalled `oci_close`
 after any statement.
 
+**Errors.** A failing statement must come back as a native error
+(`buildNativeExecuteError`, TTC message type `0x04`), not the thin
+`buildExecuteError` — the thin form is unparseable to OCI and hangs the client on
+*any* error (missing table, syntax, constraint). The frame is a fixed 79-byte
+header carrying the `ORA-` number as a 4-byte little-endian scalar at byte 11
+(echoed at byte 66), then `U8(len)` + the `ORA-ddddd: …\n` text + the `1d`
+terminator. With it, `oci8` surfaces a normal `oci_error()` and — importantly —
+the **session survives**: the next statement on the same connection runs fine.
+
 **Bind variables.** `oci8` keeps the `:name` placeholders in the SQL text and
 appends the bound values at the very end of the OALL8 body as a single `0x07`
 marker followed by one `U8(len) + bytes` value per distinct placeholder — and it
