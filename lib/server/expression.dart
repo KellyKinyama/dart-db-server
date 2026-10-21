@@ -271,16 +271,24 @@ class BinaryExpr extends Expr {
 
   @override
   Object? eval(Map<String, Object?> row) {
-    // Short-circuit logical ops
+    // Short-circuit logical ops with full SQL three-valued (Kleene) logic:
+    // AND -> false if either operand is false (even if the other is NULL);
+    // OR  -> true  if either operand is true  (even if the other is NULL).
+    // NULL results only when no operand is decisive.
     if (op == 'AND' || op == 'OR') {
       final l = left.eval(row);
       if (op == 'AND' && l == false) return false;
       if (op == 'OR' && l == true) return true;
       final r = right.eval(row);
-      if (l == null || r == null) return null;
-      return op == 'AND'
-          ? (l as bool) && (r as bool)
-          : (l as bool) || (r as bool);
+      if (op == 'AND') {
+        if (l == false || r == false) return false;
+        if (l == null || r == null) return null;
+        return (l as bool) && (r as bool);
+      } else {
+        if (l == true || r == true) return true;
+        if (l == null || r == null) return null;
+        return (l as bool) || (r as bool);
+      }
     }
     // NULL-safe equality (mirrors SQLite's IS / IS NOT and the standard
     // IS DISTINCT FROM / IS NOT DISTINCT FROM). These must run before the
@@ -327,25 +335,33 @@ class BinaryExpr extends Expr {
       case '>=':
         return _cmp(l, r) >= 0;
       case '+':
-        return (l as num) + (r as num);
+        return _toNum(l)! + _toNum(r)!;
       case '-':
-        return (l as num) - (r as num);
+        return _toNum(l)! - _toNum(r)!;
       case '*':
-        return (l as num) * (r as num);
+        return _toNum(l)! * _toNum(r)!;
       case '/':
-        return (l as num) / (r as num);
+        {
+          final d = _toNum(r)!;
+          if (d == 0) return null; // SQLite: division by zero yields NULL.
+          return _toNum(l)! / d;
+        }
       case '%':
-        // SQLite uses C-style truncated modulo (sign follows the dividend),
-        // not Dart's Euclidean `%` which is always non-negative.
-        return (l as num).remainder(r as num);
+        {
+          final d = _toNum(r)!;
+          if (d == 0) return null;
+          // SQLite uses C-style truncated modulo (sign follows the dividend),
+          // not Dart's Euclidean `%` which is always non-negative.
+          return _toNum(l)!.remainder(d);
+        }
       case '&':
-        return (l as num).toInt() & (r as num).toInt();
+        return _toNum(l)!.toInt() & _toNum(r)!.toInt();
       case '|':
-        return (l as num).toInt() | (r as num).toInt();
+        return _toNum(l)!.toInt() | _toNum(r)!.toInt();
       case '<<':
-        return (l as num).toInt() << (r as num).toInt();
+        return _toNum(l)!.toInt() << _toNum(r)!.toInt();
       case '>>':
-        return (l as num).toInt() >> (r as num).toInt();
+        return _toNum(l)!.toInt() >> _toNum(r)!.toInt();
       case '||':
         return _stringify(l) + _stringify(r);
       case 'LIKE':
@@ -378,6 +394,17 @@ class BinaryExpr extends Expr {
 
   static bool _eq(Object a, Object b) => sqlEq(a, b);
   static int _cmp(Object a, Object b) => sqlCompare(a, b);
+
+  /// Coerce an arithmetic operand to a number (SQLite affinity rules):
+  /// numbers pass through, booleans map to 1/0, numeric strings parse, and
+  /// anything non-numeric becomes 0. NULL propagates (callers guard it).
+  static num? _toNum(Object? v) {
+    if (v == null) return null;
+    if (v is num) return v;
+    if (v is bool) return v ? 1 : 0;
+    if (v is String) return num.tryParse(v.trim()) ?? 0;
+    return 0;
+  }
 
   static bool _like(String value, String pattern) {
     // Translate SQL LIKE pattern to regex: % -> .*, _ -> .
@@ -2622,11 +2649,10 @@ DateTime? _applyModifier(DateTime dt, String mod) {
         );
       case 'month':
         final totalMonths = dt.month - 1 + n.toInt();
-        final y = dt.year + (totalMonths ~/ 12);
-        var mo = totalMonths % 12;
-        if (mo < 0) {
-          mo += 12;
-        }
+        // Floor division carries the year on underflow (e.g. Jan - 1 month ->
+        // previous Dec); `~/` truncates toward zero and would keep the year.
+        final y = dt.year + (totalMonths / 12).floor();
+        final mo = totalMonths % 12; // Dart's % is Euclidean -> 0..11.
         return DateTime.utc(
           y,
           mo + 1,

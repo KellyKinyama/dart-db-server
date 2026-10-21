@@ -48,7 +48,7 @@ regression guard). Severity and repro come from that report; the **root cause**,
   else `true`; `OR` → `true` if either is `true`, else `null` if either is
   `null`, else `false`. Keep the left short-circuit as an optimization.
 - **Verify:** F7 guard truth table; re-enable `fuzz/random_differential_fuzz_test.dart`.
-- **Effort:** S. **Status:** TODO.
+- **Effort:** S. **Status:** LANDED (batch 1).
 
 ### F15 · Persistence is not crash-atomic (committed data lost)
 - **Bug:** `flush()`/persist rewrites the data file **in place**; a hard kill
@@ -99,7 +99,7 @@ regression guard). Severity and repro come from that report; the **root cause**,
 - **Bug:** real division leaks IEEE `Infinity` into results/stored data.
 - **Approach:** in `BinaryExpr.eval` for `/` (and `%`), return `NULL` when the
   divisor is `0`/`0.0` (SQLite semantics) before performing the division.
-- **Verify:** F9 guard. **Effort:** S. **Status:** TODO.
+- **Verify:** F9 guard. **Effort:** S. **Status:** LANDED (batch 1).
 
 ---
 
@@ -115,7 +115,7 @@ case **1991×**, so this is pervasive, not an edge.
   parsed value, non-numeric `String`→`0` (SQLite) , `null`→`null` (propagate).
   Never cast raw with `as num`.
 - **Verify:** F6 and F12 guards; re-run the arithmetic fuzz slice.
-- **Effort:** S–M. **Status:** TODO.
+- **Effort:** S–M. **Status:** LANDED (batch 1).
 
 ### F11 · Lexer applies C-style `\` escaping in single-quoted strings
 - **Bug:** `'\'` / `LIKE '100\%' ESCAPE '\'` → `Unterminated string`. SQL
@@ -123,7 +123,7 @@ case **1991×**, so this is pervasive, not an edge.
 - **Approach:** in the string scanner (`lexer.dart`), stop treating `\` as an
   escape; only `''` closes-and-continues. (Keep any MySQL `\`-escape behind a
   mode flag if needed for that dialect.)
-- **Verify:** F11 guard. **Effort:** S. **Status:** TODO.
+- **Verify:** F11 guard. **Effort:** S. **Status:** LANDED (batch 1).
 
 ---
 
@@ -150,7 +150,7 @@ case **1991×**, so this is pervasive, not an edge.
 - **Approach:** in the month-arithmetic helper, carry the year when the month
   index underflows below 1 (and overflows above 12) via floor-div / mod on a
   zero-based month.
-- **Verify:** F3 guard. **Effort:** S. **Status:** TODO.
+- **Verify:** F3 guard. **Effort:** S. **Status:** LANDED (batch 1).
 
 ### F13 · `ORDER BY agg DESC` mis-sorts a NULL group key
 - **Bug:** a NULL group sorts to the front regardless of its aggregate value.
@@ -194,4 +194,17 @@ Dialect differences D1–D5 in the findings are **not** bugs (engine matches
 MySQL/Oracle); they stay recorded in the differential suite, not fixed.
 
 ## Landed
-_(none yet)_
+
+### Batch 1 — scalar correctness & exception-leak fixes (`expression.dart`, `lexer.dart`)
+Reliability scorecard: 211 pass / 19 skip / 0 fail (was 205 / 25); all six
+un-skipped guards green; 99 targeted engine unit tests green.
+- **F7** three-valued logic: `BinaryExpr.eval` AND/OR now applies full Kleene
+  rules (`false`/`true` dominates even when the other operand is `NULL`).
+- **F9** division/modulo by zero returns `NULL` instead of IEEE `Infinity`.
+- **F6 / F12** arithmetic operands coerced through a shared `_toNum`
+  (num→self, bool→1/0, numeric string→parsed, other→0) — no more raw
+  `as num` casts leaking `String/bool is not a subtype of num`.
+- **F3** `date(ts, '±N month')` carries the year on under/overflow via floor
+  division (`~/` truncated toward zero and kept the year).
+- **F11** lexer no longer applies C-style `\` escaping in single-quoted
+  strings — only `''` escapes a quote (SQL standard).

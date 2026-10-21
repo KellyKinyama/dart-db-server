@@ -313,29 +313,6 @@ class Lexer {
         _pos++;
         return Token(TokType.string, buf.toString(), start);
       }
-      if (c == '\\' && _pos + 1 < src.length) {
-        final n = src[_pos + 1];
-        if (n == 'n') {
-          buf.write('\n');
-          _pos += 2;
-          continue;
-        }
-        if (n == 't') {
-          buf.write('\t');
-          _pos += 2;
-          continue;
-        }
-        if (n == '\\') {
-          buf.write('\\');
-          _pos += 2;
-          continue;
-        }
-        if (n == quote) {
-          buf.write(quote);
-          _pos += 2;
-          continue;
-        }
-      }
       buf.write(c);
       _pos++;
     }
