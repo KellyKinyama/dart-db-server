@@ -278,6 +278,17 @@ one-byte indicator), so the bind scanner must treat a `0xFD` length as NULL and
 skip the indicator rather than reading it as a 253-byte value. With that, a
 NULL binds and reads back as NULL in either column position.
 
+**Long values and typed binds.** A value longer than 253 bytes — a bind value
+*or* a fetched column — is not `U8(len)`-prefixed; it uses the same `0xFE`
+chunked long form as a long SQL statement (`0xFE + LE32(len) + bytes + LE32(0)`).
+Both the bind scanner and the row encoder handle it, so a 300-char string binds
+and reads back intact. Binds also arrive as **text**, so a clean decimal (no
+leading zeros) is coerced to a number — otherwise `where num_col = :v` with a
+bound `10` would compare the string `"10"` against the number and miss;
+leading-zero strings (zip codes) stay text. Statement-cache **re-execute** (the
+client replays a cached cursor by id with new binds and no SQL text) is not yet
+handled — it needs per-cursor-id SQL tracking.
+
 One sharp edge the first cut got wrong: the SQL text was recovered as the
 *longest* printable run, but a string bind value longer than the statement
 (routine — any `insert … values (:name)` with a long name) would then be picked

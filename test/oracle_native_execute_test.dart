@@ -84,6 +84,14 @@ void main() {
       expect(_contains(r, [0x07, 0x02, 0xc1, 0x02, 0x00]), isTrue);
     });
 
+    test('a long column value uses the 0xFE-chunked form', () {
+      final r = buildNativeQueryResponse(QueryResult(columns: const ['nm'], rows: [
+        ['Q' * 300]
+      ]));
+      // row 07, then fe + LE32(300)=2c 01 00 00 (not a U8 length).
+      expect(_contains(r, [0x07, 0xFE, 0x2c, 0x01, 0x00, 0x00]), isTrue);
+    });
+
     test('canEncodeNativeQuery accepts any non-empty column set', () {
       expect(
           canEncodeNativeQuery(

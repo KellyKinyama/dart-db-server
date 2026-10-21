@@ -48,7 +48,7 @@ void main() {
       expect(info.sql, sql);
       expect(info.numParams, 2);
       expect(info.hasBinds, isTrue);
-      expect(info.binds, ['7', 'xy']);
+      expect(info.binds, [7, 'xy']);
     });
 
     test('native request with no placeholders has no binds', () {
@@ -67,7 +67,7 @@ void main() {
       ];
       final info = decodeNativeExecuteRequest(Uint8List.fromList(body));
       expect(info.numParams, 1); // the ':34' inside '12:34' is not a bind
-      expect(info.binds, ['9']);
+      expect(info.binds, [9]);
     });
 
     test('native request decodes NULL (0xFD) bind values in any position', () {
@@ -78,7 +78,7 @@ void main() {
         0x07, 0x01, 0x37, 0xfd, 0x01,
       ];
       expect(decodeNativeExecuteRequest(Uint8List.fromList(trailing)).binds,
-          ['7', null]);
+          [7, null]);
       // a = NULL, b = "z".
       final leading = <int>[
         sql.length, ...sql.codeUnits, 0, 0, 0,
@@ -86,6 +86,21 @@ void main() {
       ];
       expect(decodeNativeExecuteRequest(Uint8List.fromList(leading)).binds,
           [null, 'z']);
+    });
+
+    test('native request decodes a long (0xFE-chunked) bind value', () {
+      const sql = 'insert into t (a) values (:a)';
+      final val = 'Z' * 300; // > 253 bytes
+      final body = <int>[
+        sql.length, ...sql.codeUnits, 0, 0, 0,
+        0x07, 0xFE,
+        val.length & 0xFF, (val.length >> 8) & 0xFF,
+        (val.length >> 16) & 0xFF, (val.length >> 24) & 0xFF,
+        ...val.codeUnits,
+        0, 0, 0, 0, // LE32(0) chunk terminator
+      ];
+      final info = decodeNativeExecuteRequest(Uint8List.fromList(body));
+      expect(info.binds, [val]);
     });
 
     test('native SQL scan ignores a string bind value longer than the SQL', () {

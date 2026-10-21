@@ -230,16 +230,53 @@ List<Object?> _scanNativeBindValues(Uint8List p, String sql) {
         values.add(null);
         continue;
       }
+      if (len == 0xFE) {
+        // Long bind: a 0xFE marker then LE32(chunkLen)+bytes, terminated by
+        // LE32(0) — the same chunked form as a long SQL statement.
+        final sb = <int>[];
+        var okChunks = true;
+        while (cur + 4 <= p.length) {
+          final clen = p[cur] |
+              (p[cur + 1] << 8) |
+              (p[cur + 2] << 16) |
+              (p[cur + 3] << 24);
+          cur += 4;
+          if (clen == 0) break;
+          if (clen > 0x100000 || cur + clen > p.length) {
+            okChunks = false;
+            break;
+          }
+          sb.addAll(p.sublist(cur, cur + clen));
+          cur += clen;
+        }
+        if (!okChunks) {
+          ok = false;
+          break;
+        }
+        values.add(_coerceBind(utf8.decode(sb, allowMalformed: true)));
+        continue;
+      }
       if (cur + len > p.length) {
         ok = false;
         break;
       }
-      values.add(utf8.decode(p.sublist(cur, cur + len), allowMalformed: true));
+      values.add(
+          _coerceBind(utf8.decode(p.sublist(cur, cur + len), allowMalformed: true)));
       cur += len;
     }
     if (ok && cur == p.length) return values;
   }
   return const [];
+}
+
+/// Binds arrive as text; a clean decimal (no leading zeros) is coerced to a
+/// number so numeric predicates/inserts match, while leading-zero strings
+/// (e.g. `"01234"`) stay text.
+Object? _coerceBind(String s) {
+  if (RegExp(r'^-?(0|[1-9]\d*)(\.\d+)?$').hasMatch(s)) {
+    return num.tryParse(s) ?? s;
+  }
+  return s;
 }
 
 /// The keywords an Oracle statement can lead with, used to tell the SQL text

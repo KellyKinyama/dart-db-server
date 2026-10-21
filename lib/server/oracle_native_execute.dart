@@ -79,6 +79,20 @@ void _u32(WriteBuffer b, int v) {
   b.writeUint8((v >> 24) & 0xFF);
 }
 
+/// Writes one row-data column value: `U8(len) + bytes` up to 253 bytes, else the
+/// chunked long form `0xFE + LE32(len) + bytes + LE32(0)`.
+void _writeColumnValue(WriteBuffer b, Uint8List v) {
+  if (v.length <= 253) {
+    b.writeUint8(v.length);
+    b.writeBytes(v);
+  } else {
+    b.writeUint8(0xFE);
+    _u32(b, v.length);
+    b.writeBytes(v);
+    _u32(b, 0); // chunk terminator
+  }
+}
+
 /// True when every non-null value in [rows] column [col] is an Oracle-number.
 bool _isNumberColumn(List<List<Object?>> rows, int col) {
   var sawValue = false;
@@ -192,8 +206,7 @@ Uint8List buildNativeQueryResponse(QueryResult result) {
     }
     b.writeUint8(0x07); // row-data marker
     for (final v in rows[r]) {
-      b.writeUint8(v.length);
-      b.writeBytes(v);
+      _writeColumnValue(b, v);
     }
   }
   final status = Uint8List.fromList(_statusBlock)..[80] = ncols + 5;
@@ -386,8 +399,7 @@ class NativeResultCursor {
   void _writeRow(WriteBuffer b, List<Uint8List> values) {
     b.writeUint8(0x07); // row-data marker
     for (final v in values) {
-      b.writeUint8(v.length);
-      b.writeBytes(v);
+      _writeColumnValue(b, v);
     }
   }
 }
