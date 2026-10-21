@@ -140,7 +140,12 @@ Scope: the native path only (`_nativeClient == true`). Thin clients
   SQL. Needs the native cursor id located in the OALL8 header.
 - **Verify:** `oci8` prepares once and `oci_execute`s the same handle in a loop.
 - **Effort:** L.
-- **Status:** TODO
+- **Status:** TODO (attempted, reverted). The re-execute is TTC call `03 04`
+  with no SQL and a new bind block. A "last SQL" heuristic is unsafe: `oci8`
+  statement-caches identical SQL, so a *fresh* execute can also arrive with no
+  SQL text, and interleaved statements make "last" wrong — the heuristic silently
+  dropped an insert. Needs the real per-cursor-id mapping (locate the cursor id
+  in the request; the server must also surface a cursor id the client echoes).
 
 ### 5. Typed binds (NUMBER / DATE columns)
 - **Risk:** All binds are decoded as text and handed to the engine as strings.
@@ -155,7 +160,9 @@ Scope: the native path only (`_nativeClient == true`). Thin clients
 - **Verify:** `where num_col = :v` and `where date_col > :d` return the right
   rows.
 - **Effort:** M.
-- **Status:** TODO
+- **Status:** LANDED (numeric) (`979615d`). Native binds arrive as text;
+  `_coerceBind` turns a clean decimal (no leading zeros) into a number so
+  `where num_col = :v` matches. DATE binds still pass as text (follow-up).
 
 ### 6. Bind-count edge cases in the placeholder regex
 - **Risk:** `_scanNativeBindValues` counts distinct binds with `RegExp(r':(\w+)')`
@@ -259,6 +266,8 @@ dart test (Get-ChildItem test -Filter 'oracle*test.dart' | % FullName)
 ```
 
 ## Landed
+- Long bind values & long column values (> 253 bytes) via the `0xFE`-chunked
+  form, plus numeric bind coercion for typed predicates — `979615d`.
 - Multi-column (3+) inter-row marker — corrected to the all-columns-present
   bitmap `(1<<ncols)-1`; 3- and 4-column multi-row verified — `5b6fd66`.
 - Lexer-based bind counting — a `:` inside a string literal is no longer
