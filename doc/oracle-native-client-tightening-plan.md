@@ -59,22 +59,36 @@ Scope: the native path only (`_nativeClient == true`). Thin clients
   surface, session survives). Follow-up (low): map engine errors to specific ORA
   codes instead of the generic 900.
 
-### 2. Row-count status fields wrap past 255 rows
-- **Risk:** In `buildNativeQueryResponse` the multi-row status slots are written
-  as single bytes (`status[11/42/52/106] = n`, `status[40] = 10 + n`,
-  `status[80] = n + 4`). A query returning > ~245 rows overflows these bytes, so
-  the client may under-read the row array or mis-track the cursor.
-- **Evidence:** Suspected. All multi-row captures were ≤ 5 rows; the formulas
-  were derived there. The DML count at `[42]` is already a proper LE32, so the
-  status block clearly *can* carry wider counts — the describe-status slots just
-  haven't been checked at scale.
-- **Approach:** Capture a real `select … union all …` (or a table select) with
-  300+ rows, diff the status block, and widen whichever slots are LE-scalars
-  rather than single bytes.
-- **Verify:** `oci8` fetches a 300-row and a 1000-row result; assert the full
-  set comes back and `oci_close` is clean.
-- **Effort:** M.
-- **Status:** TODO
+### 2. Large result sets need FETCH pagination (hang past the first batch)
+- **Risk:** `buildNativeQueryResponse` inlines **every** row in the EXECUTE
+  response and always appends the `ORA-01403` "done" terminal. But the client
+  advertises a prefetch batch size (mirrored in the mid block, hardcoded to 100),
+  and its prefetch buffer only holds that many rows. A result larger than the
+  batch (~100+ rows) overflows it and the client **hangs** waiting for a proper
+  continuation it never gets.
+- **Evidence:** Confirmed. `select … union all …` of 100 rows returns all 100;
+  150+ hangs. It is **not** a status-counter wrap (nothing overflows a byte at
+  150) — the limiter is the batch/prefetch model. Real Oracle never inlines more
+  than the prefetch count; it returns a "more rows" status and the client issues
+  a FETCH (TTC message type `0x05`) for each subsequent batch.
+- **Approach (feature, not a tweak):** decode the prefetch count from the native
+  EXECUTE, send at most that many rows with a "more rows" (no `ORA-01403`)
+  status, track a per-cursor fetch cursor, and answer the FETCH call with the
+  next batch (ending the last one with `ORA-01403`). Capturing a real paginated
+  `connect by level <= 300` through the proxy gives the FETCH request + response
+  templates.
+- **Verify:** `oci8` fetches 300 / 1000-row results fully; `oci_close` clean.
+- **Effort:** L (new TTC call + per-cursor state).
+- **Status:** TODO. Until then, results past the first batch hang — treat as a
+  known limit.
+
+### 2b. Long SQL (> 253 bytes) mis-parsed
+- **Status:** LANDED (`327edcb`). The SQL is `U8(len)`-prefixed only up to 253
+  bytes; longer statements use the native long-string form (`0xFE` +
+  `LE32(chunkLen)+bytes`, terminated by `LE32(0)`). The U8-only scan latched onto
+  an inner fragment, so any statement over 253 bytes ran as garbage.
+  `_scanNativeSqlText` now decodes the chunked long form. Verified: a 100-way
+  `union all` (≈1.4 KB SQL) returns all rows.
 
 ### 3. NULL bind values and NULL column values
 - **Risk:** `_encodeValue(null, …)` emits a zero-length value and
@@ -218,6 +232,8 @@ dart test (Get-ChildItem test -Filter 'oracle*test.dart' | % FullName)
 ```
 
 ## Landed
+- Long SQL (> 253 bytes) via the `0xFE`-chunked long-string form — statements
+  over 253 bytes no longer run as a garbage fragment — `327edcb`.
 - Native error responses (msg-04) — failing statements surface `oci_error`
   instead of hanging; session survives — `5e4d90e`.
 - Verb-anchored native SQL scan (long string binds no longer mistaken for SQL) —
