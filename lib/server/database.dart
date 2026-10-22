@@ -16135,6 +16135,7 @@ class Database implements SequenceProvider {
       s.table,
       s.when,
       s.body,
+      s.newAssignments,
     );
     return QueryResult.message('Trigger ${s.name} created');
   }
@@ -16287,6 +16288,18 @@ class Database implements SequenceProvider {
       for (final tr in fired) {
         if (tr.when != null && !evalPredicate(_bindExpr(tr.when!), const {})) {
           continue;
+        }
+        // BEFORE row trigger: apply recovered `:new.col := expr` assignments to
+        // the live NEW row (and keep the scope consistent for later ones).
+        if (tr.timing == 'BEFORE' && newRow != null) {
+          for (final a in tr.newAssignments) {
+            final idx =
+                names.indexWhere((n) => n.toLowerCase() == a.column.toLowerCase());
+            if (idx < 0 || idx >= newRow.length) continue;
+            final val = _bindExpr(a.expr).eval(_triggerScope ?? const {});
+            newRow[idx] = val;
+            _triggerScope!['NEW.${names[idx]}'] = val;
+          }
         }
         try {
           for (final stmt in tr.body) {
@@ -18557,14 +18570,16 @@ class _TriggerSpec {
   final String table;
   final Expr? when;
   final List<Statement> body;
+  final List<TriggerNewAssign> newAssignments;
   _TriggerSpec(
     this.name,
     this.timing,
     this.event,
     this.table,
     this.when,
-    this.body,
-  );
+    this.body, [
+    this.newAssignments = const [],
+  ]);
 }
 
 class _Savepoint {

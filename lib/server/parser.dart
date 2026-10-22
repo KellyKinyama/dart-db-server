@@ -1218,10 +1218,10 @@ class Parser {
       when = _parseExpr();
     }
     // A PL/SQL trigger body (DECLARE … / `:new.x := …` procedural assignments)
-    // is not modeled by the engine's SQL-statement trigger executor; consume it
-    // and store an empty body (accepted, no-op) so the schema still loads.
-    if (_checkKw('DECLARE') || _checkWord('DECLARE')) {
-      _skipPlsqlTriggerBody();
+    // is not a SQL-statement body; recover the `:new.col := expr` assignments
+    // (applied to the NEW row of a BEFORE row trigger) and accept the rest.
+    if (_looksLikePlsqlTriggerBody()) {
+      final assigns = _parsePlsqlTriggerBody();
       return CreateTriggerStmt(
         name,
         timing,
@@ -1230,6 +1230,7 @@ class Parser {
         when,
         const <Statement>[],
         ifNotExists: ifNotExists,
+        newAssignments: assigns,
       );
     }
     _expectKw('BEGIN');
@@ -1250,13 +1251,63 @@ class Parser {
     );
   }
 
-  /// Consumes an Oracle PL/SQL trigger body — the `DECLARE` section plus the
-  /// `BEGIN … END;` block (tracking nesting) — which the engine accepts but
-  /// does not execute.
-  void _skipPlsqlTriggerBody() {
+  /// Whether the trigger body is a PL/SQL block (a `DECLARE` section, or a
+  /// `BEGIN` whose first statement is a `:new`/`:old` or `ident :=` assignment)
+  /// rather than the SQL-statement body the engine executes directly.
+  bool _looksLikePlsqlTriggerBody() {
+    if (_checkWord('DECLARE')) return true;
+    if (_checkKw('BEGIN')) {
+      final n = _peek(1);
+      if (n.type == TokType.param) return true;
+      if ((n.type == TokType.ident || n.type == TokType.keyword) &&
+          _peek(2).type == TokType.op &&
+          _peek(2).text == ':=') {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /// Consumes a PL/SQL trigger body (`DECLARE … BEGIN … END;`, tracking nesting)
+  /// and returns its `:new.col := expr` assignments; other procedural
+  /// statements are accepted and ignored.
+  List<TriggerNewAssign> _parsePlsqlTriggerBody() {
+    final out = <TriggerNewAssign>[];
     var depth = 0;
     var sawBegin = false;
     while (!_isAtEnd()) {
+      final p = _peek();
+      // `:new . col := <rhs> ;`
+      if (p.type == TokType.param &&
+          p.text.toUpperCase() == ':NEW' &&
+          _peek(1).type == TokType.punct &&
+          _peek(1).text == '.' &&
+          _peek(3).type == TokType.op &&
+          _peek(3).text == ':=') {
+        _advance(); // :new
+        _advance(); // .
+        final col = _advance().text; // column
+        _advance(); // :=
+        final start = _peek().offset;
+        var pd = 0;
+        while (!_isAtEnd()) {
+          final t = _peek();
+          if (t.type == TokType.punct && t.text == '(') {
+            pd++;
+          } else if (t.type == TokType.punct && t.text == ')') {
+            if (pd == 0) break;
+            pd--;
+          } else if (t.type == TokType.punct && t.text == ';' && pd == 0) {
+            break;
+          }
+          _advance();
+        }
+        final rhs = _sliceSource(start, _peek().offset).trim();
+        final expr = _parseTriggerRhs(rhs);
+        if (expr != null) out.add(TriggerNewAssign(col, expr));
+        _match(TokType.punct, ';');
+        continue;
+      }
       if (_matchWord('BEGIN')) {
         depth++;
         sawBegin = true;
@@ -1264,10 +1315,8 @@ class Parser {
       }
       if (_checkWord('END')) {
         _advance();
-        // `END IF` / `END LOOP` / `END CASE` close an inner construct via a
-        // keyword, not the block.
         if (_matchWord('IF') || _matchWord('LOOP') || _matchWord('CASE')) {
-          continue;
+          continue; // inner construct closed by keyword, not the block
         }
         depth--;
         if (sawBegin && depth <= 0) {
@@ -1279,6 +1328,23 @@ class Parser {
       }
       _advance();
     }
+    return out;
+  }
+
+  /// Parses a PL/SQL assignment RHS into an [Expr], mapping `:new.x`/`:old.x`
+  /// column references onto the engine's `NEW.x`/`OLD.x` trigger scope. Returns
+  /// null when the RHS cannot be parsed (the assignment is then ignored).
+  Expr? _parseTriggerRhs(String rhs) {
+    final mapped = rhs
+        .replaceAll(RegExp(r':new\.', caseSensitive: false), 'NEW.')
+        .replaceAll(RegExp(r':old\.', caseSensitive: false), 'OLD.');
+    try {
+      final stmt = Parser.fromString('SELECT $mapped').parseStatement();
+      if (stmt is SelectStmt && stmt.projection.isNotEmpty) {
+        return stmt.projection.first.expr;
+      }
+    } catch (_) {}
+    return null;
   }
 
   // ---- DROP ---------------------------------------------------------------

@@ -726,6 +726,10 @@ class CreateTriggerStmt extends Statement {
   final Expr? when;
   final List<Statement> body;
   final bool ifNotExists;
+
+  /// `:new.col := expr` assignments recovered from a PL/SQL trigger body,
+  /// applied to the NEW row of a BEFORE row trigger. Empty for SQL triggers.
+  final List<TriggerNewAssign> newAssignments;
   CreateTriggerStmt(
     this.name,
     this.timing,
@@ -734,7 +738,15 @@ class CreateTriggerStmt extends Statement {
     this.when,
     this.body, {
     this.ifNotExists = false,
+    this.newAssignments = const [],
   });
+}
+
+/// A PL/SQL `:new.column := expr` assignment in a BEFORE row trigger.
+class TriggerNewAssign {
+  final String column;
+  final Expr expr;
+  TriggerNewAssign(this.column, this.expr);
 }
 
 class DropTriggerStmt extends Statement {

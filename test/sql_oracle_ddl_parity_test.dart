@@ -142,16 +142,17 @@ void main() {
     }
   });
 
-  // F72: a PL/SQL trigger body is accepted (stored as a no-op).
-  test('PL/SQL trigger with a DECLARE body is accepted', () async {
+  // F72: a PL/SQL trigger body's :new.col := expr assignments are applied.
+  test('PL/SQL BEFORE trigger applies :new assignments', () async {
     final db = await Database.open(null);
     try {
       await db.execute('CREATE TABLE t (id NUMBER, v NUMBER)');
       await db.execute('CREATE OR REPLACE TRIGGER trg BEFORE INSERT ON t '
           'FOR EACH ROW DECLARE x NUMBER; BEGIN :new.v := 1; END;');
-      await db.execute('INSERT INTO t (id) VALUES (1)'); // no-op trigger
-      expect((await db.execute('SELECT id FROM t')).rows, [
-        [1]
+      await db.execute('INSERT INTO t (id) VALUES (1)');
+      // The BEFORE trigger set v := 1 on the inserted row.
+      expect((await db.execute('SELECT id, v FROM t')).rows, [
+        [1, 1]
       ]);
     } finally {
       await db.close();
