@@ -15,6 +15,10 @@
 > In-process emulator (the "other gun", no Instant Client needed):
 > [`test/oracle_native_client.dart`](../test/oracle_native_client.dart),
 > exercised by [`test/oracle_native_handshake_test.dart`](../test/oracle_native_handshake_test.dart).
+> Importable pure-Dart thick client with a full query round-trip:
+> [`lib/oracle_thick_client.dart`](../lib/oracle_thick_client.dart). For driving
+> all three clients (thin, pure-Dart thick, real `oci8`) against the server, see
+> [oracle-triple-threat-testing.md](./oracle-triple-threat-testing.md).
 
 ## Why this was hard
 
