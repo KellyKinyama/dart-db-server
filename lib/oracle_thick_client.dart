@@ -48,6 +48,9 @@ const int _ttcFuncExecute = 0x5E;
 /// Default rows per native fetch batch (mirrors the server's `nativeBatchSize`).
 const int _nativeBatchSize = 100;
 
+/// TTI end-of-call marker: the last byte of every native EXECUTE/FETCH response.
+const int _ttiEndOfCall = 0x1d;
+
 const String _defaultDescriptor =
     '(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=FREEPDB1)))';
 
@@ -645,7 +648,7 @@ class OracleThickClient {
   /// [OracleThickException] on an `ORA-xxxxx` error.
   Future<OracleThickResult> run(String sql, {List<Object?> binds = const []}) async {
     _socket.add(_wrapData(_buildExecuteRequest(sql, binds)));
-    final body = _ttcBody(await _frames.next());
+    final body = await _readNativeResponse();
     if (body.isEmpty) {
       throw StateError('empty native EXECUTE response');
     }
@@ -670,7 +673,7 @@ class OracleThickClient {
     var more = d.moreRows;
     while (more) {
       _socket.add(_wrapData(_buildFetchRequest(_nativeBatchSize)));
-      final fb = _ttcBody(await _frames.next());
+      final fb = await _readNativeResponse();
       more = _decodeFetch(fb, d.columns.length, d.isNumber, rows);
     }
     return OracleThickResult.query(d.columns, rows);
@@ -684,6 +687,22 @@ class OracleThickClient {
   /// of rows affected (0 for DDL).
   Future<int> execute(String sql, {List<Object?> binds = const []}) async =>
       (await run(sql, binds: binds)).affected;
+
+  /// Reads one native EXECUTE/FETCH response, reassembling the DATA packets the
+  /// server splits a response larger than one SDU into. The split carries no
+  /// per-packet "more" flag, so packets are concatenated until the TTI
+  /// end-of-call marker that terminates every native response.
+  Future<Uint8List> _readNativeResponse() async {
+    var body = _ttcBody(await _frames.next());
+    while (body.isEmpty || body.last != _ttiEndOfCall) {
+      final next = _ttcBody(await _frames.next());
+      final merged = Uint8List(body.length + next.length)
+        ..setRange(0, body.length, body)
+        ..setRange(body.length, body.length + next.length, next);
+      body = merged;
+    }
+    return body;
+  }
 
   Future<void> close() async {
     await _frames.cancel();

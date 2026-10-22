@@ -299,14 +299,17 @@ bool _startsWithSqlVerb(String s) {
 bool _startsWithAsciiLetter(int c) =>
     (c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A);
 
-/// Returns the ASCII string of [len] bytes at [start] in [p], or null if any
-/// byte is non-printable.
-String? _printableAscii(List<int> p, int start, int len) {
+/// Returns the UTF-8 text of [len] bytes at [start] in [p], or null if any byte
+/// is a control character — i.e. not plausible statement text. Printable ASCII
+/// (0x20–0x7E) and multi-byte UTF-8 (>= 0x80) are both accepted, so non-ASCII
+/// SQL (e.g. a `'héllo'` literal) is read by its byte length, not rejected and
+/// mangled into a truncated statement.
+String? _printableSqlText(List<int> p, int start, int len) {
   for (var j = start; j < start + len; j++) {
     final c = p[j];
-    if (c < 0x20 || c > 0x7E) return null;
+    if (c < 0x20 || c == 0x7F) return null;
   }
-  return String.fromCharCodes(p, start, start + len);
+  return utf8.decode(p.sublist(start, start + len), allowMalformed: true);
 }
 
 /// Reads the native "long" string at [i]: a `0xFE` marker then repeated
@@ -341,7 +344,7 @@ String _scanNativeSqlText(Uint8List p) {
     if (p[i] == 0xFE) {
       final bytes = _readNativeLongString(p, i);
       if (bytes != null && bytes.isNotEmpty && _startsWithAsciiLetter(bytes[0])) {
-        final text = _printableAscii(bytes, 0, bytes.length);
+        final text = _printableSqlText(bytes, 0, bytes.length);
         if (text != null) {
           if (_startsWithSqlVerb(text)) return text;
           if (text.length > fallback.length) fallback = text;
@@ -352,7 +355,7 @@ String _scanNativeSqlText(Uint8List p) {
     final len = p[i];
     if (len < 4 || len > 253 || i + 1 + len > p.length) continue;
     if (!_startsWithAsciiLetter(p[i + 1])) continue;
-    final text = _printableAscii(p, i + 1, len);
+    final text = _printableSqlText(p, i + 1, len);
     if (text == null) continue;
     if (_startsWithSqlVerb(text)) return text;
     if (len > fallback.length) fallback = text;

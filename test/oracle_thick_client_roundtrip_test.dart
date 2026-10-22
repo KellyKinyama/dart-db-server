@@ -110,5 +110,22 @@ void main() {
         throwsA(isA<OracleThickException>()),
       );
     });
+
+    test('F53 · a VARCHAR2 value larger than one SDU round-trips', () async {
+      await client.execute('CREATE TABLE big_val (id INTEGER PRIMARY KEY, v VARCHAR2(9000))');
+      final big = 'x' * 9000; // > one SDU (~8182): response spans TNS packets
+      await client.execute("INSERT INTO big_val VALUES (1, '$big')");
+
+      final result = await client.query('SELECT v FROM big_val WHERE id = 1');
+      expect((result.rows.first.first as String).length, 9000);
+      expect(result.rows.first.first, big);
+    });
+
+    test('F54 · non-ASCII characters in inbound SQL round-trip', () async {
+      final result = await client.query("SELECT 'héllo' AS v FROM dual");
+      expect(result.rows, [
+        ['héllo'],
+      ]);
+    });
   });
 }
