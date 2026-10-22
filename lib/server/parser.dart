@@ -3546,7 +3546,8 @@ class Parser {
       if (txt.contains('.') || txt.contains('e') || txt.contains('E')) {
         return LiteralExpr(double.parse(txt));
       }
-      return LiteralExpr(int.parse(txt));
+      // An integer literal beyond int64 range promotes to double (SQLite).
+      return LiteralExpr(int.tryParse(txt) ?? double.parse(txt));
     }
     if (t.type == TokType.string) {
       _advance();
