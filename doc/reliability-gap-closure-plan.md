@@ -76,7 +76,7 @@ regression guard). Severity and repro come from that report; the **root cause**,
   from the UPDATE paths for each modified row (UNIQUE/PK must exclude the row
   being updated). Honour `defer_checks` the same way.
 - **Verify:** `constraints/constraints_test.dart` (F1), `constraint_write_paths_test.dart` (F10).
-- **Effort:** M. **Status:** TODO.
+- **Effort:** M. **Status:** LANDED (batch 3).
 
 ### F2 · Composite PRIMARY KEY does not enforce uniqueness
 - **Bug:** a duplicate composite key `(1,1)` is accepted; the uniqueness index
@@ -84,7 +84,7 @@ regression guard). Severity and repro come from that report; the **root cause**,
 - **Approach:** build the PK uniqueness check over the **tuple** of PK columns
   (same `_validateRow` path as Family A); add a composite index/lookup.
 - **Verify:** `constraints/constraints_test.dart` (composite PK).
-- **Effort:** M. **Status:** TODO.
+- **Effort:** M. **Status:** LANDED (batch 3).
 
 ### F14 · Multi-row INSERT / batch write is not statement-atomic
 - **Bug:** `INSERT … VALUES (2),(3),(1),(4)` where `1` violates the PK leaves
@@ -93,7 +93,7 @@ regression guard). Severity and repro come from that report; the **root cause**,
   commit only if every row passes (or wrap the statement in an implicit
   savepoint and roll back on any failure). Same for mid-batch CHECK failures.
 - **Verify:** `constraints/constraint_write_paths_test.dart` (F14).
-- **Effort:** M. **Status:** TODO. *(Shares the `_validateRow` work above.)*
+- **Effort:** M. **Status:** LANDED (batch 3). *(Shares the `_validateRow` work above.)*
 
 ### F9 · Division by zero yields `Infinity` instead of `NULL`
 - **Bug:** real division leaks IEEE `Infinity` into results/stored data.
@@ -217,3 +217,18 @@ unit tests green.
   and resolved by the post-aggregation sort — previously the comparator saw a
   single group row, couldn't recompute the aggregate, treated all groups as
   tied, and let the secondary key drive the order (NULL group to the front).
+
+### Batch 3 — write-path integrity: validate before mutate (`database.dart`)
+Reliability scorecard: 219 pass / 11 skip / 0 fail; full 1580-test engine suite
+green. Root cause for F1/F10 was **mutate-before-validate**: `_update` wrote
+`t.rows[ri]` in place and only failed at the end (`_rebuildIndexes`) or after the
+row was already corrupted.
+- **F1 / F10** UPDATE now builds a row copy, runs CHECK + vector-dim + FK +
+  UNIQUE/PK validation on it (`_assertRowUniqueExcluding`), and commits in place
+  only if it passes — a violation rejects the row and leaves stored data intact.
+- **F2** composite PRIMARY KEY / UNIQUE tuples (no row-store index) are now
+  checked explicitly via `_assertNoCompositeConflict` on the plain INSERT path.
+- **F14** plain INSERT is statement-atomic: the row loop is wrapped so any
+  failure (CHECK, FK, single- or composite-key duplicate) rolls back rows the
+  statement already committed. OR IGNORE / OR REPLACE / UPSERT keep their
+  per-row conflict semantics and are excluded from the rollback.

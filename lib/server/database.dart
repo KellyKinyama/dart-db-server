@@ -5313,6 +5313,10 @@ class Database implements SequenceProvider {
 
     var inserted = 0;
     final returnedRows = <List<Object?>>[];
+    // Plain INSERT must be statement-atomic: if any row fails, undo rows this
+    // statement already added. OR IGNORE / OR REPLACE / UPSERT keep their own
+    // per-row conflict semantics and are excluded from the rollback.
+    final insertSnapshotLen = t.rows.length;
     final returningExprs = <Expr>[];
     final returningCols = <String>[];
     if (s.returning != null) {
@@ -5329,9 +5333,10 @@ class Database implements SequenceProvider {
       }
     }
 
-    for (final values in sourceRows) {
-      _beginSeqRow();
-      final row = List<Object?>.filled(t.columns.length, null, growable: true);
+    try {
+      for (final values in sourceRows) {
+        _beginSeqRow();
+        final row = List<Object?>.filled(t.columns.length, null, growable: true);
       // Apply column defaults first.
       for (var i = 0; i < t.columns.length; i++) {
         final c = t.columns[i];
@@ -5394,6 +5399,13 @@ class Database implements SequenceProvider {
       _enforceForeignKeysOnInsert(t, row);
       _fireTriggers(t.name, 'INSERT', 'BEFORE', newRow: row, sourceTable: t);
 
+      // Composite PRIMARY KEY / UNIQUE tuples aren't backed by a row-store
+      // index, so detect duplicates explicitly on the plain path (single
+      // columns are enforced by insertRow's index build).
+      if (s.onConflict == null && s.mode == InsertMode.normal) {
+        _assertNoCompositeConflict(t, row);
+      }
+
       try {
         t.insertRow(row);
         inserted++;
@@ -5455,6 +5467,18 @@ class Database implements SequenceProvider {
         }
         rethrow;
       }
+    }
+    } catch (_) {
+      // Plain INSERT is statement-atomic: undo any rows this statement already
+      // committed before surfacing the error. OR IGNORE / OR REPLACE / UPSERT
+      // manage their own per-row conflicts and never trigger this rollback.
+      if (s.onConflict == null &&
+          s.mode == InsertMode.normal &&
+          t.rows.length > insertSnapshotLen) {
+        t.rows.removeRange(insertSnapshotLen, t.rows.length);
+        _rebuildIndexes(t);
+      }
+      rethrow;
     }
     if (s.returning != null) {
       return QueryResult(
@@ -5536,6 +5560,73 @@ class Database implements SequenceProvider {
     }
     for (final d in defs) {
       t.createIndex(d);
+    }
+  }
+
+  /// Throw if committing [newRow] into [t] (an UPDATE of the row at
+  /// [excludeRi], or a candidate row when [excludeRi] is -1) would duplicate
+  /// an existing PRIMARY KEY / UNIQUE value. Covers column-level keys and
+  /// table-level composite keys. NULLs never conflict. Used to validate a
+  /// proposed row image BEFORE it is committed, so a violation rejects the
+  /// statement instead of corrupting stored data.
+  void _assertRowUniqueExcluding(Table t, List<Object?> newRow, int excludeRi) {
+    for (var i = 0; i < t.columns.length; i++) {
+      final c = t.columns[i];
+      if (!(c.primaryKey || c.unique)) continue;
+      final v = newRow[i];
+      if (v == null) continue;
+      for (var ri = 0; ri < t.rows.length; ri++) {
+        if (ri == excludeRi) continue;
+        final ev = t.rows[ri][i];
+        if (ev != null && sqlEq(ev, v)) {
+          throw StateError(
+            c.primaryKey
+                ? 'PRIMARY KEY constraint failed: ${t.name}.${c.name}'
+                : 'UNIQUE constraint failed: ${t.name}.${c.name}',
+          );
+        }
+      }
+    }
+    _assertNoCompositeConflict(t, newRow, excludeRi: excludeRi);
+  }
+
+  /// Throw if [row] duplicates an existing table-level composite PRIMARY KEY
+  /// or UNIQUE tuple (single-column keys are enforced by the row-store index).
+  /// Skips the row at [excludeRi] (for in-place UPDATE). Any NULL in the key
+  /// makes it unconstrained, per SQL.
+  void _assertNoCompositeConflict(
+    Table t,
+    List<Object?> row, {
+    int excludeRi = -1,
+  }) {
+    for (final con in t.constraints) {
+      List<String>? cols;
+      final isPk = con is PrimaryKeyConstraint;
+      if (con is PrimaryKeyConstraint) cols = con.columns;
+      if (con is UniqueConstraint) cols = con.columns;
+      if (cols == null || cols.length < 2) continue;
+      final idxs = cols.map(t.columnIndex).toList();
+      final key = idxs.map((i) => row[i]).toList();
+      if (key.any((v) => v == null)) continue;
+      for (var ri = 0; ri < t.rows.length; ri++) {
+        if (ri == excludeRi) continue;
+        final existing = t.rows[ri];
+        var match = true;
+        for (var k = 0; k < idxs.length; k++) {
+          final ev = existing[idxs[k]];
+          if (ev == null || !sqlEq(ev, key[k] as Object)) {
+            match = false;
+            break;
+          }
+        }
+        if (match) {
+          throw StateError(
+            isPk
+                ? 'PRIMARY KEY constraint failed: ${t.name}(${cols.join(", ")})'
+                : 'UNIQUE constraint failed: ${t.name}(${cols.join(", ")})',
+          );
+        }
+      }
     }
   }
 
@@ -5702,12 +5793,13 @@ class Database implements SequenceProvider {
           continue;
         }
         final old = List<Object?>.from(row);
+        final newRow = List<Object?>.from(row);
         _fireTriggers(
           t.name,
           'UPDATE',
           'BEFORE',
           oldRow: old,
-          newRow: row,
+          newRow: newRow,
           sourceTable: t,
         );
         s.assignments.forEach((col, expr) {
@@ -5717,20 +5809,28 @@ class Database implements SequenceProvider {
               'cannot UPDATE generated column "${t.columns[colIdx].name}"',
             );
           }
-          row[colIdx] = coerceForColumn(
+          newRow[colIdx] = coerceForColumn(
             _evalScalar(expr, matchedView!),
             t.columns[colIdx],
             strict: t.strict,
           );
         });
+        _evaluateGenerated(t, newRow);
+        // Validate the proposed image BEFORE committing it, so a failed
+        // CHECK / UNIQUE / PK rejects the row instead of corrupting the
+        // stored data (UPDATE is validate-then-commit, per row).
+        _enforceChecks(t, newRow);
+        _enforceVectorDims(t, newRow);
+        _enforceForeignKeysOnInsert(t, newRow);
+        _assertRowUniqueExcluding(t, newRow, ri);
         // V23: capture position so the vector-index invalidation hook
         // can replay a targeted remove+add instead of dropping the
         // entire index.
         _captureVectorRowUpdate(t.name, ri);
-        _evaluateGenerated(t, row);
-        _enforceChecks(t, row);
-        _enforceVectorDims(t, row);
-        _enforceForeignKeysOnInsert(t, row);
+        // Commit in place, preserving the row list's identity.
+        for (var k = 0; k < newRow.length; k++) {
+          row[k] = newRow[k];
+        }
         _cascadeOnUpdate(t, old, row);
         _fireTriggers(
           t.name,
