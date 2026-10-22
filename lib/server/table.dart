@@ -143,6 +143,12 @@ class Table implements TableBackend {
       _keysQualified = [for (final c in columns) '$name.${c.name}'];
       _keysName = name;
       _keysCount = columns.length;
+      // A rowid table's INTEGER PRIMARY KEY is the rowid alias; expose it under
+      // the `rowid` / `_rowid_` / `oid` pseudo-column names.
+      _rowidAliasIdx = withoutRowid
+          ? -1
+          : columns.indexWhere(
+              (c) => c.primaryKey && c.type == DataType.integer);
     }
     final m = <String, Object?>{};
     final n = columns.length;
@@ -155,13 +161,28 @@ class Table implements TableBackend {
         m[_keysBare![i]] = row[i];
         m['$alias.${_keysBare![i]}'] = row[i];
       }
+      _addRowidAliases(m, row, qualifier: alias);
       return m;
     }
     for (var i = 0; i < n; i++) {
       m[_keysBare![i]] = row[i];
       m[_keysQualified![i]] = row[i];
     }
+    _addRowidAliases(m, row, qualifier: name);
     return m;
+  }
+
+  /// Adds the `rowid` / `_rowid_` / `oid` pseudo-column entries (bare and
+  /// [qualifier]-qualified) for a rowid-alias table, unless a real column
+  /// already claims the name (a user column shadows the pseudo-column).
+  void _addRowidAliases(Map<String, Object?> m, List<Object?> row,
+      {required String qualifier}) {
+    if (_rowidAliasIdx == null || _rowidAliasIdx! < 0) return;
+    final v = row[_rowidAliasIdx!];
+    for (final key in const ['rowid', '_rowid_', 'oid']) {
+      m.putIfAbsent(key, () => v);
+      m.putIfAbsent('$qualifier.$key', () => v);
+    }
   }
 
   // Cached key strings for [rowToMap]; nulled out by [invalidateKeyCache].
@@ -170,6 +191,10 @@ class Table implements TableBackend {
   String? _keysName;
   int _keysCount = -1;
 
+  /// Column index of the INTEGER PRIMARY KEY rowid alias (-1 = none, null =
+  /// not yet computed); refreshed with the key-string cache.
+  int? _rowidAliasIdx;
+
   /// Drop cached row-key strings. Call after renaming the table or
   /// mutating the column list so the next [rowToMap] rebuilds them.
   void invalidateKeyCache() {
@@ -177,6 +202,7 @@ class Table implements TableBackend {
     _keysQualified = null;
     _keysName = null;
     _keysCount = -1;
+    _rowidAliasIdx = null;
   }
 
   // Per-column cache of values present in PK / UNIQUE columns. Lets

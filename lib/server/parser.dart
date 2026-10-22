@@ -2656,14 +2656,18 @@ class Parser {
     int? limit;
     int? offset;
     if (_matchKw('LIMIT')) {
-      limit = int.parse(_expect(TokType.number).text);
+      final lim = _parseSignedInt();
       if (_match(TokType.punct, ',')) {
-        offset = limit;
-        limit = int.parse(_expect(TokType.number).text);
+        offset = lim < 0 ? 0 : lim;
+        final cnt = _parseSignedInt();
+        limit = cnt < 0 ? null : cnt;
+      } else {
+        limit = lim < 0 ? null : lim;
       }
     }
     if (_matchKw('OFFSET')) {
-      offset = int.parse(_expect(TokType.number).text);
+      final off = _parseSignedInt();
+      offset = off < 0 ? 0 : off;
     }
     SelectStmt makeArm(List<Expr> vals, {bool nameCols = false}) {
       final proj = <SelectItem>[];
@@ -2939,16 +2943,20 @@ class Parser {
     int? limit;
     int? offset;
     if (_matchKw('LIMIT')) {
-      limit = int.parse(_expect(TokType.number).text);
+      final lim = _parseSignedInt();
       // MySQL form: `LIMIT offset, count` swaps the meaning of the
       // first integer.
       if (_match(TokType.punct, ',')) {
-        offset = limit;
-        limit = int.parse(_expect(TokType.number).text);
+        offset = lim < 0 ? 0 : lim;
+        final cnt = _parseSignedInt();
+        limit = cnt < 0 ? null : cnt; // SQLite: a negative LIMIT is unlimited
+      } else {
+        limit = lim < 0 ? null : lim; // SQLite: a negative LIMIT is unlimited
       }
     }
     if (_matchKw('OFFSET')) {
-      offset = int.parse(_expect(TokType.number).text);
+      final off = _parseSignedInt();
+      offset = off < 0 ? 0 : off; // SQLite clamps a negative OFFSET to 0
       // Oracle / SQL-standard: OFFSET n { ROW | ROWS }.
       if (_matchKw('ROW') || _matchKw('ROWS')) {}
     }

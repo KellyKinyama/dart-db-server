@@ -14087,6 +14087,10 @@ class Database implements SequenceProvider {
         }
       case 'MIN':
         {
+          if (e.isStarArg || e.args.length != 1) {
+            throw FormatException(
+                'wrong number of arguments to function min()');
+          }
           Object? best;
           for (final v in _aggValues(e, grp)) {
             if (v == null) continue;
@@ -14096,6 +14100,10 @@ class Database implements SequenceProvider {
         }
       case 'MAX':
         {
+          if (e.isStarArg || e.args.length != 1) {
+            throw FormatException(
+                'wrong number of arguments to function max()');
+          }
           Object? best;
           for (final v in _aggValues(e, grp)) {
             if (v == null) continue;

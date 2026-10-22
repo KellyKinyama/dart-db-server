@@ -179,5 +179,29 @@ void main() {
         await db.close();
       }
     });
+
+    // F57: the rowid pseudo-column (and aliases _rowid_/oid) resolves to the
+    // INTEGER PRIMARY KEY on a rowid table, in both the SELECT list and WHERE.
+    test('rowid / _rowid_ / oid resolve to the INTEGER PRIMARY KEY', () async {
+      final db = await Database.open();
+      try {
+        await db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)');
+        await db.execute('INSERT INTO t VALUES (5, 50)');
+        expect((await db.execute('SELECT rowid FROM t')).rows, [
+          [5]
+        ]);
+        expect((await db.execute('SELECT _rowid_ FROM t')).rows, [
+          [5]
+        ]);
+        expect((await db.execute('SELECT oid FROM t')).rows, [
+          [5]
+        ]);
+        expect((await db.execute('SELECT v FROM t WHERE rowid = 5')).rows, [
+          [50]
+        ]);
+      } finally {
+        await db.close();
+      }
+    });
   });
 }
