@@ -156,5 +156,28 @@ void main() {
         await db.close();
       }
     });
+
+    // F56: a plain INTEGER PRIMARY KEY is a rowid alias and auto-assigns the
+    // id when omitted/NULL, like SQLite — even without the AUTOINCREMENT keyword.
+    test('plain INTEGER PRIMARY KEY auto-assigns the rowid when omitted',
+        () async {
+      final db = await Database.open();
+      try {
+        await db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)');
+        await db.execute('INSERT INTO t (v) VALUES (10)');
+        await db.execute('INSERT INTO t (v) VALUES (20)');
+        await db.execute('INSERT INTO t (id, v) VALUES (5, 30)'); // explicit
+        await db.execute('INSERT INTO t (v) VALUES (40)'); // max(5)+1 -> 6
+        final r = await db.execute('SELECT id, v FROM t ORDER BY v');
+        expect(r.rows, [
+          [1, 10],
+          [2, 20],
+          [5, 30],
+          [6, 40]
+        ]);
+      } finally {
+        await db.close();
+      }
+    });
   });
 }

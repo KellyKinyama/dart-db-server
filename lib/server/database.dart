@@ -5462,6 +5462,19 @@ class Database implements SequenceProvider {
           if ((row[i] as int) > cur) t.autoInc[c.name] = row[i] as int;
         }
       }
+      // A plain INTEGER PRIMARY KEY is a rowid alias: SQLite auto-assigns the
+      // rowid (max + 1) when it is omitted/NULL, even without AUTOINCREMENT.
+      if (!t.withoutRowid) {
+        for (var i = 0; i < t.columns.length; i++) {
+          final c = t.columns[i];
+          if (c.primaryKey &&
+              c.type == DataType.integer &&
+              !c.autoIncrement &&
+              row[i] == null) {
+            row[i] = _maxIntColumn(t, i) + 1;
+          }
+        }
+      }
       _evaluateGenerated(t, row);
       _enforceChecks(t, row);
       _enforceVectorDims(t, row);
