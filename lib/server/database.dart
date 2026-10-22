@@ -2443,6 +2443,10 @@ class Database implements SequenceProvider {
         result = _alterRenameColumn(stmt);
       } else if (stmt is AlterTableRenameStmt) {
         result = _alterRenameTable(stmt);
+      } else if (stmt is AlterTableAddConstraintStmt) {
+        result = _alterAddConstraint(stmt);
+      } else if (stmt is CommentStmt) {
+        result = QueryResult.message('Comment accepted');
       } else if (stmt is CreateIndexStmt) {
         result = _createIndex(stmt);
       } else if (stmt is DropIndexStmt) {
@@ -4763,6 +4767,26 @@ class Database implements SequenceProvider {
     return QueryResult.message('Column ${s.column.name} added to ${s.table}');
   }
 
+  QueryResult _alterAddConstraint(AlterTableAddConstraintStmt s) {
+    final t = _requireTable(s.table);
+    for (final c in s.constraints) {
+      t.constraints.add(c);
+      // Back a single-column PRIMARY KEY / UNIQUE with a unique index so it is
+      // enforced on later inserts (composite keys use the row-scan path).
+      final cols = c is PrimaryKeyConstraint
+          ? c.columns
+          : (c is UniqueConstraint ? c.columns : null);
+      if (cols != null && cols.length == 1) {
+        final idxName = '${t.name}__${cols.first}';
+        if (!t.indexDefs.containsKey(idxName)) {
+          t.createIndex(IndexDef(idxName, cols.first, unique: true));
+        }
+      }
+    }
+    t.invalidateKeyCache();
+    return QueryResult.message('Constraint(s) added to ${s.table}');
+  }
+
   QueryResult _alterDropColumn(AlterTableDropColumnStmt s) {
     final t = _requireTable(s.table);
     final idx = t.columnIndex(s.column);
@@ -4800,6 +4824,7 @@ class Database implements SequenceProvider {
       references: old.references,
       generatedExprSql: old.generatedExprSql,
       generatedStored: old.generatedStored,
+      collate: old.collate,
     );
     // Rename in autoInc + index defs that reference this column.
     if (t.autoInc.containsKey(s.oldName)) {
@@ -13431,8 +13456,14 @@ class Database implements SequenceProvider {
     if (_tables.containsKey(name)) {
       for (final c in _tables[name]!.columns) {
         out[c.name] = null;
-        out['$name.${c.name}'] = null;
-        if (alias != null) out['$alias.${c.name}'] = null;
+        // An alias hides the base table name (SQL scoping), so key by the alias
+        // only — otherwise a self-join's `e.col` null-pad clobbers the left
+        // row's own `e.col` when the two row maps merge.
+        if (alias != null) {
+          out['$alias.${c.name}'] = null;
+        } else {
+          out['$name.${c.name}'] = null;
+        }
       }
     }
     return out;
@@ -13455,8 +13486,12 @@ class Database implements SequenceProvider {
       }
       for (final c in cols) {
         out[c] = null;
-        if (table != null) out['$table.$c'] = null;
-        if (alias != null) out['$alias.$c'] = null;
+        // An alias hides the base table name, so key by alias only.
+        if (alias != null) {
+          out['$alias.$c'] = null;
+        } else if (table != null) {
+          out['$table.$c'] = null;
+        }
       }
     }
 
@@ -14011,7 +14046,14 @@ class Database implements SequenceProvider {
         if (e.args.isEmpty) return grp.length;
         final boundArg = _bindExpr(e.args.first);
         final values = grp.map((r) => boundArg.eval(r)).where((v) => v != null);
-        if (e.distinct) return values.map((v) => jsonEncode(v)).toSet().length;
+        if (e.distinct) {
+          // Dedup under the argument's COLLATE override (NOCASE/RTRIM).
+          final coll = collationOf(e.args.first);
+          return values
+              .map((v) => jsonEncode(applyCollation(v, coll)))
+              .toSet()
+              .length;
+        }
         return values.length;
       case 'SUM':
         {

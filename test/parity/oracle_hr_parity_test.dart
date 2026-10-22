@@ -31,6 +31,13 @@ void main() {
         // If the canonical HR tables load, exercise Oracle idioms the parity
         // docs claim: DUAL, NVL, and a hierarchical-friendly self-join shape.
         if (tables.contains('employees')) {
+          // The job_id FK now loads and enforces (ALTER TABLE ADD CONSTRAINT),
+          // so seed the referenced jobs row before the single-employee probe.
+          if (tables.contains('jobs')) {
+            await db.execute(
+              "INSERT INTO jobs (job_id, job_title) VALUES ('AD_PRES','President')",
+            );
+          }
           await db.execute(
             "INSERT INTO employees (employee_id, last_name, email, hire_date, job_id, salary) "
             "VALUES (100,'King','SKING','2003-06-17','AD_PRES',24000)",

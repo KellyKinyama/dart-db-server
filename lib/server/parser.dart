@@ -311,6 +311,7 @@ class Parser {
     }
     if (_checkWord('MERGE')) return _parseMerge();
     if (_checkWord('CALL')) return _parseCall();
+    if (_checkWord('COMMENT')) return _parseComment();
     if (_checkWord('DECLARE')) return _parsePlsqlBlock();
     if (_checkWord('DELIMITER')) {
       // Client-side framing directive; accept and ignore the rest of the line.
@@ -831,7 +832,18 @@ class Parser {
     String? generatedSql;
     bool generatedStored = false;
     Map<String, String>? vectorSpec;
+    String? collate;
     while (true) {
+      // Inline named constraint prefix: `CONSTRAINT <name> <constraint>`. The
+      // name is consumed; the constraint that follows is parsed by the loop.
+      if (_matchWord('CONSTRAINT')) {
+        _expectName();
+        continue;
+      }
+      if (_matchKw('COLLATE')) {
+        collate = _expectIdent().text;
+        continue;
+      }
       if (_matchKw('PRIMARY')) {
         _expectKw('KEY');
         primaryKey = true;
@@ -974,6 +986,7 @@ class Parser {
       generatedExprSql: generatedSql,
       generatedStored: generatedStored,
       vectorSpec: vectorSpec,
+      collate: collate,
     );
   }
 
@@ -2021,9 +2034,39 @@ class Parser {
       return AlterTableDropColumnStmt(table, _expectIdent().text);
     }
     _expectKw('ADD');
+    // Oracle/standard `ADD [(] <constraint>[, …] [)]` — distinguished from an
+    // `ADD [COLUMN] <coldef>` by a leading constraint keyword.
+    final paren = _match(TokType.punct, '(');
+    bool atConstraint() =>
+        _checkWord('CONSTRAINT') ||
+        _checkKw('PRIMARY') ||
+        _checkKw('UNIQUE') ||
+        _checkKw('CHECK') ||
+        _checkKw('FOREIGN');
+    if (atConstraint()) {
+      final cons = <TableConstraint>[_parseTableConstraint()];
+      while (_match(TokType.punct, ',') && atConstraint()) {
+        cons.add(_parseTableConstraint());
+      }
+      if (paren) _expect(TokType.punct, ')');
+      return AlterTableAddConstraintStmt(table, cons);
+    }
     _matchKw('COLUMN');
     final col = _parseColumnDef();
+    if (paren) _expect(TokType.punct, ')');
     return AlterTableAddColumnStmt(table, col);
+  }
+
+  /// `COMMENT ON TABLE/COLUMN <name> IS '<text>'` — accepted as a no-op.
+  CommentStmt _parseComment() {
+    _expectWord('COMMENT');
+    _expectWord('ON');
+    // TABLE <name> | COLUMN <table.col> | any object-type keyword then a name.
+    _advance(); // object type (TABLE / COLUMN / INDEX / …)
+    _parseQualifiedTableName(); // object name (possibly dotted)
+    _expectWord('IS');
+    _advance(); // the comment string literal (or NULL)
+    return CommentStmt();
   }
 
   TruncateTableStmt _parseTruncate() {

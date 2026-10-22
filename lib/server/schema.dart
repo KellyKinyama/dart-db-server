@@ -189,6 +189,10 @@ class ColumnDef {
   /// column. Map keys are lowercased attribute names.
   final Map<String, String>? vectorSpec;
 
+  /// Column-level default collation (`COLLATE NOCASE` / `RTRIM` / `BINARY`),
+  /// applied to comparisons, DISTINCT and GROUP BY on this column.
+  final String? collate;
+
   const ColumnDef(
     this.name,
     this.type, {
@@ -204,6 +208,7 @@ class ColumnDef {
     this.generatedExprSql,
     this.generatedStored = false,
     this.vectorSpec,
+    this.collate,
   });
 
   Map<String, Object?> toJson() => {
@@ -221,6 +226,7 @@ class ColumnDef {
         if (generatedExprSql != null) 'generated': generatedExprSql,
         if (generatedStored) 'generatedStored': true,
         if (vectorSpec != null) 'vectorSpec': vectorSpec,
+        if (collate != null) 'collate': collate,
       };
 
   factory ColumnDef.fromJson(Map<String, Object?> j) => ColumnDef(
@@ -242,6 +248,7 @@ class ColumnDef {
         generatedExprSql: j['generated'] as String?,
         generatedStored: j['generatedStored'] == true,
         vectorSpec: (j['vectorSpec'] as Map?)?.cast<String, String>(),
+        collate: j['collate'] as String?,
       );
 }
 

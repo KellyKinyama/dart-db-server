@@ -102,5 +102,46 @@ void main() {
       final tree = t!.indexes['i_name']!;
       expect(tree.keys.toSet(), {'alice', 'bob', 'carol'});
     });
+
+    // F61: a column-level COLLATE clause parses (SQLite accepts it).
+    test('COLLATE in a column definition parses', () async {
+      final db = await Database.open(null);
+      try {
+        await db.execute(
+            'CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT COLLATE NOCASE)');
+        await db.execute("INSERT INTO t VALUES (1,'Hi')");
+        expect((await db.execute('SELECT s FROM t')).rows, [
+          ['Hi']
+        ]);
+      } finally {
+        await db.close();
+      }
+    });
+
+    // F62: an explicit COLLATE override is honored in DISTINCT de-duplication.
+    test('COLLATE NOCASE / RTRIM apply in DISTINCT dedup', () async {
+      final db = await Database.open(null);
+      try {
+        await db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)');
+        await db.execute("INSERT INTO t VALUES (1,'A'),(2,'a'),(3,'b')");
+        expect(
+            (await db.execute(
+                    'SELECT COUNT(DISTINCT s COLLATE NOCASE) FROM t'))
+                .rows
+                .first
+                .first,
+            2);
+        await db.execute("INSERT INTO t VALUES (4,'b  ')");
+        expect(
+            (await db.execute(
+                    'SELECT COUNT(DISTINCT s COLLATE RTRIM) FROM t'))
+                .rows
+                .first
+                .first,
+            3); // 'A','a','b'(=='b  ') -> A,a,b
+      } finally {
+        await db.close();
+      }
+    });
   });
 }

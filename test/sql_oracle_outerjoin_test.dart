@@ -21,6 +21,30 @@ void main() {
   Future<List<List<Object?>>> rows(String sql) async =>
       (await db.execute(sql)).rows.map((r) => r.toList()).toList();
 
+  // F60: a self LEFT JOIN must keep the left instance's own columns for an
+  // unmatched row (the right null-pad used to clobber them via the shared base
+  // table name).
+  test('self LEFT JOIN keeps the left row own column when unmatched', () async {
+    expect(
+      await rows('SELECT e.id FROM emp e LEFT JOIN emp m ON e.mgr = m.id '
+          'ORDER BY e.id'),
+      [
+        [1], // king: mgr NULL, unmatched — e.id must stay 1
+        [2],
+        [3],
+      ],
+    );
+    expect(
+      await rows('SELECT e.name, m.name FROM emp e LEFT JOIN emp m '
+          'ON e.mgr = m.id ORDER BY e.id'),
+      [
+        ['king', null],
+        ['bob', 'king'],
+        ['amy', 'king'],
+      ],
+    );
+  });
+
   test('comma join behaves as an inner join filtered by WHERE', () async {
     expect(
       await rows('SELECT e.name, m.name FROM emp e, emp m '

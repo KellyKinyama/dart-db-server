@@ -321,26 +321,29 @@ class BinaryExpr extends Expr {
       return null;
     }
     // NOCASE collation on either operand makes string (in)equality and ordering
-    // case-insensitive.
+    // case-insensitive; RTRIM ignores trailing spaces.
     final nocase = _isNoCase(left) || _isNoCase(right);
+    final rtrim = _isRtrim(left) || _isRtrim(right);
+    final lc = rtrim ? applyCollation(l, 'RTRIM') ?? l : l;
+    final rc = rtrim ? applyCollation(r, 'RTRIM') ?? r : r;
     switch (op) {
       case '->':
         return _jsonOp(l, r, asText: false);
       case '->>':
         return _jsonOp(l, r, asText: true);
       case '=':
-        return nocase ? _eqCI(l, r) : _eq(l, r);
+        return nocase ? _eqCI(lc, rc) : _eq(lc, rc);
       case '!=':
       case '<>':
-        return !(nocase ? _eqCI(l, r) : _eq(l, r));
+        return !(nocase ? _eqCI(lc, rc) : _eq(lc, rc));
       case '<':
-        return (nocase ? _cmpCI(l, r) : _cmp(l, r)) < 0;
+        return (nocase ? _cmpCI(lc, rc) : _cmp(lc, rc)) < 0;
       case '<=':
-        return (nocase ? _cmpCI(l, r) : _cmp(l, r)) <= 0;
+        return (nocase ? _cmpCI(lc, rc) : _cmp(lc, rc)) <= 0;
       case '>':
-        return (nocase ? _cmpCI(l, r) : _cmp(l, r)) > 0;
+        return (nocase ? _cmpCI(lc, rc) : _cmp(lc, rc)) > 0;
       case '>=':
-        return (nocase ? _cmpCI(l, r) : _cmp(l, r)) >= 0;
+        return (nocase ? _cmpCI(lc, rc) : _cmp(lc, rc)) >= 0;
       case '+':
         return _arith(_toNum(l)!, _toNum(r)!, '+');
       case '-':
@@ -403,6 +406,7 @@ class BinaryExpr extends Expr {
   static int _cmp(Object a, Object b) => sqlCompare(a, b);
 
   static bool _isNoCase(Expr e) => e is CollateExpr && e.collation == 'NOCASE';
+  static bool _isRtrim(Expr e) => e is CollateExpr && e.collation == 'RTRIM';
   static bool _eqCI(Object a, Object b) =>
       (a is String && b is String) ? a.toLowerCase() == b.toLowerCase() : _eq(a, b);
   static int _cmpCI(Object a, Object b) => (a is String && b is String)
@@ -572,6 +576,27 @@ class CollateExpr extends Expr {
   CollateExpr(this.inner, this.collation);
   @override
   Object? eval(Map<String, Object?> row) => inner.eval(row);
+}
+
+/// The explicit collation name carried by [e] (`expr COLLATE <name>`), or null.
+String? collationOf(Expr e) => e is CollateExpr ? e.collation : null;
+
+/// Normalizes [value] for collation-aware dedup / grouping: NOCASE folds case,
+/// RTRIM strips trailing spaces. Non-strings and other collations pass through.
+Object? applyCollation(Object? value, String? collation) {
+  if (value is! String || collation == null) return value;
+  switch (collation) {
+    case 'NOCASE':
+      return value.toLowerCase();
+    case 'RTRIM':
+      var end = value.length;
+      while (end > 0 && value.codeUnitAt(end - 1) == 0x20) {
+        end--;
+      }
+      return value.substring(0, end);
+    default:
+      return value;
+  }
 }
 
 class InExpr extends Expr {

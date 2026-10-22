@@ -73,6 +73,17 @@ class AlterTableRenameStmt extends Statement {
   AlterTableRenameStmt(this.oldName, this.newName);
 }
 
+/// `ALTER TABLE t ADD [(] CONSTRAINT ... | PRIMARY KEY/UNIQUE/CHECK/FOREIGN ... [)]`
+class AlterTableAddConstraintStmt extends Statement {
+  final String table;
+  final List<TableConstraint> constraints;
+  AlterTableAddConstraintStmt(this.table, this.constraints);
+}
+
+/// `COMMENT ON TABLE/COLUMN <name> IS '<text>'` — Oracle metadata DDL; accepted
+/// as a no-op (the engine stores no object comments).
+class CommentStmt extends Statement {}
+
 class CreateIndexStmt extends Statement {
   final String indexName;
   final String table;
