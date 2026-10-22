@@ -651,10 +651,7 @@ class LikeExpr extends Expr {
 }
 
 /// Convenience: evaluate expression as boolean (NULL -> false).
-bool evalPredicate(Expr e, Map<String, Object?> row) {
-  final v = e.eval(row);
-  return v is bool && v;
-}
+bool evalPredicate(Expr e, Map<String, Object?> row) => sqlTruthy(e.eval(row));
 
 /// Coerce a value to the column's type for storage/comparison purposes.
 Object? coerceForColumn(Object? value, ColumnDef col, {bool strict = false}) {
@@ -739,7 +736,15 @@ int sqlCompareNullable(Object? a, Object? b, {bool nullsFirst = true}) {
   return sqlCompare(a, b);
 }
 
-bool sqlTruthy(Object? v) => v is bool && v;
+/// SQL boolean truthiness: bool passes through; any non-zero number is true;
+/// a string takes its numeric value (non-numeric -> 0 -> false); NULL/other
+/// are false. Matches SQLite/MySQL `WHERE`/`CASE WHEN`/`iif` semantics.
+bool sqlTruthy(Object? v) {
+  if (v is bool) return v;
+  if (v is num) return v != 0;
+  if (v is String) return (num.tryParse(v.trim()) ?? 0) != 0;
+  return false;
+}
 
 // =============================================================================
 // Additional expression nodes.
@@ -1001,6 +1006,26 @@ Object? _propagateNull(List<Object?> args, Object? Function() body) {
     if (a == null) return null;
   }
   return body();
+}
+
+/// Trim every leading/trailing character of [s] that appears in [chars]
+/// (the SQL 2-argument trim form). An empty [chars] leaves [s] unchanged.
+String _trimChars(String s, String chars, {required bool left, required bool right}) {
+  if (chars.isEmpty) return s;
+  final set = chars.split('').toSet();
+  var start = 0;
+  var end = s.length;
+  if (left) {
+    while (start < end && set.contains(s[start])) {
+      start++;
+    }
+  }
+  if (right) {
+    while (end > start && set.contains(s[end - 1])) {
+      end--;
+    }
+  }
+  return s.substring(start, end);
 }
 
 /// Returns the numeric value of an ASCII hex digit (`0`-`9`, `A`-`F`,
@@ -1274,14 +1299,23 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     }
     return best;
   },
-  'TRIM': (a) => _propagateNull(a, () => a[0].toString().trim()),
+  'TRIM': (a) => _propagateNull(
+        a,
+        () => a.length >= 2
+            ? _trimChars(a[0].toString(), a[1].toString(), left: true, right: true)
+            : a[0].toString().trim(),
+      ),
   'LTRIM': (a) => _propagateNull(
         a,
-        () => a[0].toString().replaceFirst(RegExp(r'^\s+'), ''),
+        () => a.length >= 2
+            ? _trimChars(a[0].toString(), a[1].toString(), left: true, right: false)
+            : a[0].toString().replaceFirst(RegExp(r'^\s+'), ''),
       ),
   'RTRIM': (a) => _propagateNull(
         a,
-        () => a[0].toString().replaceFirst(RegExp(r'\s+$'), ''),
+        () => a.length >= 2
+            ? _trimChars(a[0].toString(), a[1].toString(), left: false, right: true)
+            : a[0].toString().replaceFirst(RegExp(r'\s+$'), ''),
       ),
   'SUBSTR': (a) {
     if (a.isEmpty || a[0] == null) return null;
