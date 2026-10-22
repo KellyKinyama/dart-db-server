@@ -135,7 +135,7 @@ case **1991×**, so this is pervasive, not an edge.
   list** (expand `a.*`/`alias.*` against the view's own FROM at creation time),
   and expose those names to the outer query instead of re-resolving the inner
   aliases. Fixes both.
-- **Verify:** `sql_features/views_test.dart` (F16, F17). **Effort:** M. **Status:** TODO.
+- **Verify:** `sql_features/views_test.dart` (F16, F17). **Effort:** M. **Status:** LANDED (batch 4).
 
 ### F4 · Correlated subquery binds outer ref to inner table on base-name clash
 - **Bug:** `… FROM s x WHERE x.g = s.g` inside a scan over `s` binds `s.g` to the
@@ -232,3 +232,15 @@ row was already corrupted.
   failure (CHECK, FK, single- or composite-key duplicate) rolls back rows the
   statement already committed. OR IGNORE / OR REPLACE / UPSERT keep their
   per-row conflict semantics and are excluded from the rollback.
+
+### Batch 4 — views expose SQLite-style columns (`database.dart`)
+Reliability scorecard: 223 pass / 7 skip / 0 fail; `sql_features` 34/0; full
+1580-test engine suite green.
+- **F16** a view's public column names are now unqualified (`_viewPublicColumns`
+  strips the inner `alias.`/`table.` prefix from projection labels), so
+  `SELECT id FROM v` resolves instead of leaking `a.id`. The engine keeps
+  qualified labels *internally* to avoid map-key collisions on joins, so the
+  fix is scoped to the view's materialized output, mirroring a derived table.
+- **F17** `SELECT alias.*` now resolves the qualifier as a FROM/JOIN **alias**
+  (`_starColumns`) before falling back to a table name — `SELECT e.* FROM emp e`
+  (directly or inside a view) no longer throws `No such table or view: e`.

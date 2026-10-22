@@ -10943,13 +10943,14 @@ class Database implements SequenceProvider {
     }
     if (_views.containsKey(name)) {
       final res = _selectTopLevel(_views[name]!, outer);
+      final pub = _viewPublicColumns(res.columns);
       final out = <Map<String, Object?>>[];
       for (final row in res.rows) {
         final m = <String, Object?>{...outer};
-        for (var i = 0; i < res.columns.length; i++) {
-          m[res.columns[i]] = row[i];
-          m['$name.${res.columns[i]}'] = row[i];
-          if (alias != null) m['$alias.${res.columns[i]}'] = row[i];
+        for (var i = 0; i < pub.length; i++) {
+          m[pub[i]] = row[i];
+          m['$name.${pub[i]}'] = row[i];
+          if (alias != null) m['$alias.${pub[i]}'] = row[i];
         }
         out.add(m);
       }
@@ -13385,7 +13386,7 @@ class Database implements SequenceProvider {
     for (final item in s.projection) {
       if (item.isStar) {
         if (item.starTable != null) {
-          final src = _materializeColumns(item.starTable!);
+          final src = _starColumns(s, item.starTable!);
           for (final c in src) {
             outCols.add(c);
             exprs.add(_bindExpr(ColumnExpr(c, table: item.starTable)));
@@ -13449,11 +13450,46 @@ class Database implements SequenceProvider {
     if (_views.containsKey(name)) {
       // Materialize once (small; cached by caller's structure).
       final res = _selectTopLevel(_views[name]!);
-      return res.columns;
+      return _viewPublicColumns(res.columns);
     }
     final catalog = _buildCatalogData(name);
     if (catalog != null) return catalog.$1;
     throw StateError('No such table or view: $name');
+  }
+
+  /// A view's public column names follow SQLite: an explicitly qualified
+  /// projection like `a.id` is exposed as `id`, not `a.id`, so the inner FROM
+  /// alias does not leak to queries over the view. Star-expanded and
+  /// expression/aliased labels are already bare and pass through unchanged.
+  static final RegExp _qualifiedColLabel = RegExp(r'^\w+\.\w+$');
+  List<String> _viewPublicColumns(List<String> cols) {
+    return [
+      for (final c in cols)
+        if (_qualifiedColLabel.hasMatch(c))
+          c.substring(c.indexOf('.') + 1)
+        else
+          c,
+    ];
+  }
+
+  /// Column list for a `qualifier.*` projection, resolving [qualifier] as a
+  /// FROM/JOIN **alias** first (e.g. `SELECT e.* FROM emp e`), then falling
+  /// back to a bare table/view name.
+  List<String> _starColumns(SelectStmt s, String qualifier) {
+    final q = qualifier.toLowerCase();
+    if (s.fromAlias?.toLowerCase() == q ||
+        (s.fromAlias == null && s.fromTable?.toLowerCase() == q)) {
+      if (s.fromSubquery != null) return _selectTopLevel(s.fromSubquery!).columns;
+      if (s.fromTable != null) return _materializeColumns(s.fromTable!);
+    }
+    for (final j in s.joins) {
+      if (j.alias?.toLowerCase() == q ||
+          (j.alias == null && j.table?.toLowerCase() == q)) {
+        if (j.subquery != null) return _selectTopLevel(j.subquery!).columns;
+        if (j.table != null) return _materializeColumns(j.table!);
+      }
+    }
+    return _materializeColumns(qualifier);
   }
 
   String _exprLabel(Expr e) {
@@ -13518,7 +13554,7 @@ class Database implements SequenceProvider {
       if (item.isStar) {
         // Expanding * with aggregates is unusual; do the non-aggregate cols.
         if (item.starTable != null) {
-          for (final c in _materializeColumns(item.starTable!)) {
+          for (final c in _starColumns(s, item.starTable!)) {
             outCols.add(c);
             projExprs.add(_bindExpr(ColumnExpr(c, table: item.starTable)));
           }
