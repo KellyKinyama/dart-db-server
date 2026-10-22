@@ -3468,6 +3468,16 @@ class Parser {
   Expr _parseUnary() {
     if (_check(TokType.op, '-')) {
       _advance();
+      // Fold a unary minus directly onto a numeric literal so int64-min
+      // (`-9223372036854775808`) parses — its positive magnitude overflows a
+      // signed 64-bit int, but the negated value is in range.
+      if (_check(TokType.number)) {
+        final txt = '-${_advance().text}';
+        if (txt.contains('.') || txt.contains('e') || txt.contains('E')) {
+          return LiteralExpr(double.parse(txt));
+        }
+        return LiteralExpr(int.tryParse(txt) ?? double.parse(txt));
+      }
       return UnaryExpr('-', _parseUnary());
     }
     if (_check(TokType.op, '+')) {

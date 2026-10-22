@@ -2383,6 +2383,36 @@ class Database implements SequenceProvider {
     return body(snap);
   }
 
+  /// Begin an isolated per-session (wire connection) transaction. Returns a
+  /// detached [Database] holding a deep clone of the committed tables/views/
+  /// sequences, so this session's writes stay private to the returned handle
+  /// until [commitSessionTransaction] merges them back (ROLLBACK just discards
+  /// it). This gives each connection its own transaction context, independent
+  /// of any other connection sharing this [Database].
+  Future<Database> beginSessionTransaction() => _lock.read(() {
+        final snap = Database();
+        for (final e in _tables.entries) {
+          snap._tables[e.key] = e.value.clone();
+        }
+        snap._views.addAll(_views);
+        snap._sequences.addAll(_sequences);
+        return snap;
+      });
+
+  /// Merge a session transaction's state back into this database on COMMIT.
+  Future<void> commitSessionTransaction(Database tx) => _lock.write(() {
+        _tables
+          ..clear()
+          ..addAll(tx._tables);
+        _views
+          ..clear()
+          ..addAll(tx._views);
+        _sequences
+          ..clear()
+          ..addAll(tx._sequences);
+        return;
+      });
+
   /// Synchronous dispatch \u2014 used directly by trigger bodies (which must run\n  /// in-line with their host INSERT/UPDATE/DELETE).
   QueryResult _dispatch(Statement stmt, [Map<String, Object?>? userVars]) {
     // Reset per-statement observability state.

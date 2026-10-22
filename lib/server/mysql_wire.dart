@@ -194,6 +194,12 @@ class _Conn {
   /// from other connections and persisting for the life of this connection.
   final Map<String, Object?> _userVars = <String, Object?>{};
 
+  /// Per-connection transaction view. When non-null the connection is inside
+  /// its own BEGIN; its statements run against this isolated clone until
+  /// COMMIT merges it back (ROLLBACK discards it). This keeps each wire
+  /// connection's transaction independent of the others sharing [server.db].
+  Database? _txDb;
+
   _Conn(this.server, this.socket, this.threadId);
 
   void start() {
@@ -610,11 +616,23 @@ class _Conn {
   }
 
   Future<void> _executeQuery(String sql) async {
+    // Per-connection transaction control: BEGIN/COMMIT/ROLLBACK operate on this
+    // connection's isolated view, not the shared global one.
+    final txVerb = _transactionVerb(sql);
+    if (txVerb != null) {
+      try {
+        await _handleTransactionVerb(txVerb);
+      } catch (e) {
+        _sendErr(1064, '42000', e.toString());
+      }
+      return;
+    }
+    final target = _txDb ?? server.db;
     List<QueryResult> results;
     try {
       results = _multiStatements
-          ? await server.db.executeScript(sql, userVars: _userVars)
-          : <QueryResult>[await server.db.execute(sql, userVars: _userVars)];
+          ? await target.executeScript(sql, userVars: _userVars)
+          : <QueryResult>[await target.execute(sql, userVars: _userVars)];
     } catch (e) {
       _sendErr(1064, '42000', e.toString());
       return;
@@ -632,6 +650,42 @@ class _Conn {
         _sendResultSet(r, moreResults: more);
       }
     }
+  }
+
+  /// Classify a bare transaction-control statement, or null for a regular
+  /// statement. Only exact control statements are intercepted; `SAVEPOINT` /
+  /// `ROLLBACK TO` fall through to the engine within the clone.
+  String? _transactionVerb(String sql) {
+    var s = sql.trim().toUpperCase();
+    if (s.endsWith(';')) s = s.substring(0, s.length - 1).trimRight();
+    if (s == 'BEGIN' || s == 'BEGIN WORK' || s == 'START TRANSACTION') {
+      return 'BEGIN';
+    }
+    if (s == 'COMMIT' || s == 'COMMIT WORK') return 'COMMIT';
+    if (s == 'ROLLBACK' || s == 'ROLLBACK WORK') return 'ROLLBACK';
+    return null;
+  }
+
+  Future<void> _handleTransactionVerb(String verb) async {
+    switch (verb) {
+      case 'BEGIN':
+        // MySQL implicitly commits an open transaction before starting one.
+        if (_txDb != null) {
+          await server.db.commitSessionTransaction(_txDb!);
+        }
+        _txDb = await server.db.beginSessionTransaction();
+        break;
+      case 'COMMIT':
+        if (_txDb != null) {
+          await server.db.commitSessionTransaction(_txDb!);
+          _txDb = null;
+        }
+        break;
+      case 'ROLLBACK':
+        _txDb = null; // discard the isolated clone
+        break;
+    }
+    _sendOk();
   }
 
   // -------------------------------------------------------------------------
@@ -668,6 +722,11 @@ class _Conn {
         _writePacket(_columnDef('?', _FieldType.varString));
       }
       if (!_deprecateEof) _sendEofOrOk();
+    } else if (!_deprecateEof) {
+      // No parameter defs carry the terminating EOF that non-DEPRECATE_EOF
+      // clients expect after the prepare metadata; send it explicitly so a
+      // parameterless prepare completes instead of hanging the connection.
+      _sendEofOrOk();
     }
   }
 
