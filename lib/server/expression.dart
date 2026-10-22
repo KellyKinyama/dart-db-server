@@ -654,7 +654,8 @@ class LikeExpr extends Expr {
 bool evalPredicate(Expr e, Map<String, Object?> row) => sqlTruthy(e.eval(row));
 
 /// Coerce a value to the column's type for storage/comparison purposes.
-Object? coerceForColumn(Object? value, ColumnDef col, {bool strict = false}) {
+Object? coerceForColumn(Object? value, ColumnDef col,
+    {bool strict = false, bool tableHasRowid = true}) {
   if (value == null) {
     if (col.notNull) {
       throw FormatException('Column ${col.name} is NOT NULL');
@@ -701,11 +702,24 @@ Object? coerceForColumn(Object? value, ColumnDef col, {bool strict = false}) {
   if (col.type == DataType.integer ||
       col.type == DataType.real ||
       col.type == DataType.numeric) {
+    // An INTEGER PRIMARY KEY is a rowid alias: SQLite requires an integer and
+    // raises "datatype mismatch" for a non-integer value, unlike a regular
+    // INTEGER column's loose affinity (which stores it unchanged). A WITHOUT
+    // ROWID table's INTEGER PRIMARY KEY is not a rowid alias, so it keeps the
+    // loose affinity.
+    final rowidAlias =
+        tableHasRowid && col.primaryKey && col.type == DataType.integer;
+    final Object? converted;
     try {
-      return coerce(value, col.type);
+      converted = coerce(value, col.type);
     } on FormatException {
+      if (rowidAlias) throw const FormatException('datatype mismatch');
       return value;
     }
+    if (rowidAlias && converted is! int) {
+      throw const FormatException('datatype mismatch');
+    }
+    return converted;
   }
   return coerce(value, col.type);
 }

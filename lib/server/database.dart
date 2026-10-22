@@ -5225,6 +5225,7 @@ class Database implements SequenceProvider {
             _evalScalar(expr, matchedView!),
             t.columns[colIdx],
             strict: t.strict,
+            tableHasRowid: !t.withoutRowid,
           );
         });
         _captureVectorRowUpdate(t.name, matchIdx);
@@ -5425,6 +5426,7 @@ class Database implements SequenceProvider {
               _evalScalar(values[i]),
               t.columns[i],
               strict: t.strict,
+              tableHasRowid: !t.withoutRowid,
             );
           }
         }
@@ -5444,6 +5446,7 @@ class Database implements SequenceProvider {
             _evalScalar(values[i]),
             t.columns[colIdx],
             strict: t.strict,
+            tableHasRowid: !t.withoutRowid,
           );
         }
       }
@@ -5754,6 +5757,7 @@ class Database implements SequenceProvider {
         _bindExpr(expr).eval(ctx),
         t.columns[ci],
         strict: t.strict,
+        tableHasRowid: !t.withoutRowid,
       );
     });
     _evaluateGenerated(t, newRow);
@@ -5879,6 +5883,7 @@ class Database implements SequenceProvider {
             _evalScalar(expr, matchedView!),
             t.columns[colIdx],
             strict: t.strict,
+            tableHasRowid: !t.withoutRowid,
           );
         });
         _evaluateGenerated(t, newRow);

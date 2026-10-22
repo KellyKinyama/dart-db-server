@@ -98,5 +98,63 @@ void main() {
         await db.close();
       }
     });
+
+    // F55: an INTEGER PRIMARY KEY is a rowid alias — it must hold an integer,
+    // and SQLite raises "datatype mismatch" for a non-integer value (unlike a
+    // regular INTEGER column's loose affinity).
+    test('INTEGER PRIMARY KEY rejects a non-integer text value', () async {
+      final db = await Database.open();
+      try {
+        await db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)');
+        await expectLater(db.execute("INSERT INTO t VALUES ('x', 1)"),
+            throwsA(isA<FormatException>()));
+      } finally {
+        await db.close();
+      }
+    });
+
+    test('INTEGER PRIMARY KEY rejects a non-integer float value', () async {
+      final db = await Database.open();
+      try {
+        await db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)');
+        await expectLater(db.execute('INSERT INTO t VALUES (1.5, 1)'),
+            throwsA(isA<FormatException>()));
+      } finally {
+        await db.close();
+      }
+    });
+
+    test('INTEGER PRIMARY KEY still accepts an integer-valued string/float',
+        () async {
+      final db = await Database.open();
+      try {
+        await db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)');
+        await db.execute("INSERT INTO t VALUES ('7', 1)"); // '7' -> 7
+        await db.execute('INSERT INTO t VALUES (8.0, 2)'); // 8.0 -> 8
+        final r = await db.execute('SELECT id FROM t ORDER BY id');
+        expect(r.rows, [
+          [7],
+          [8]
+        ]);
+      } finally {
+        await db.close();
+      }
+    });
+
+    test('WITHOUT ROWID INTEGER PRIMARY KEY keeps loose affinity', () async {
+      final db = await Database.open();
+      try {
+        // Not a rowid alias, so the non-integer value is stored verbatim.
+        await db.execute(
+            'CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER) WITHOUT ROWID');
+        await db.execute("INSERT INTO t VALUES ('x', 1)");
+        final r = await db.execute('SELECT id FROM t');
+        expect(r.rows, [
+          ['x']
+        ]);
+      } finally {
+        await db.close();
+      }
+    });
   });
 }
