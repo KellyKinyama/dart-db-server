@@ -106,6 +106,10 @@ class Database implements SequenceProvider {
   /// Used to persist views faithfully through save/reload cycles.
   final Map<String, String> _viewSql = <String, String>{};
 
+  /// Explicit output-column names for views created with `CREATE VIEW v (a, b)`,
+  /// keyed by view name. Renames the view's columns positionally.
+  final Map<String, List<String>> _viewColumns = <String, List<String>>{};
+
   /// Named sequences (Oracle CREATE SEQUENCE). Sequence value generation is
   /// intentionally non-transactional (NEXTVAL is not rolled back), matching
   /// Oracle, so this map is not snapshotted by transactions.
@@ -4920,6 +4924,9 @@ class Database implements SequenceProvider {
     }
     _views[s.name] = s.select;
     if (s.selectSql.isNotEmpty) _viewSql[s.name] = s.selectSql;
+    if (s.columns != null && s.columns!.isNotEmpty) {
+      _viewColumns[s.name] = s.columns!;
+    }
     return QueryResult.message('View ${s.name} created');
   }
 
@@ -4932,6 +4939,7 @@ class Database implements SequenceProvider {
     }
     _views.remove(s.name);
     _viewSql.remove(s.name);
+    _viewColumns.remove(s.name);
     return QueryResult.message('View ${s.name} dropped');
   }
 
@@ -11055,7 +11063,7 @@ class Database implements SequenceProvider {
     }
     if (_views.containsKey(name)) {
       final res = _selectTopLevel(_views[name]!, outer);
-      final pub = _viewPublicColumns(res.columns);
+      final pub = _viewColumnsFor(name, res.columns);
       final out = <Map<String, Object?>>[];
       for (final row in res.rows) {
         final m = <String, Object?>{...outer};
@@ -13572,7 +13580,7 @@ class Database implements SequenceProvider {
     if (_views.containsKey(name)) {
       // Materialize once (small; cached by caller's structure).
       final res = _selectTopLevel(_views[name]!);
-      return _viewPublicColumns(res.columns);
+      return _viewColumnsFor(name, res.columns);
     }
     final catalog = _buildCatalogData(name);
     if (catalog != null) return catalog.$1;
@@ -13591,6 +13599,19 @@ class Database implements SequenceProvider {
           c.substring(c.indexOf('.') + 1)
         else
           c,
+    ];
+  }
+
+  /// Public column names for view [name]: its explicit `CREATE VIEW v (…)`
+  /// list (positionally, padded from the derived names) when present, else the
+  /// derived [_viewPublicColumns].
+  List<String> _viewColumnsFor(String name, List<String> cols) {
+    final explicit = _viewColumns[name];
+    if (explicit == null) return _viewPublicColumns(cols);
+    final derived = _viewPublicColumns(cols);
+    return [
+      for (var i = 0; i < derived.length; i++)
+        i < explicit.length ? explicit[i] : derived[i],
     ];
   }
 
@@ -16870,6 +16891,8 @@ class Database implements SequenceProvider {
       '__schema__': 2,
       'tables': {for (final e in _tables.entries) e.key: e.value.toJson()},
       'views': {for (final e in _viewSql.entries) e.key: e.value},
+      if (_viewColumns.isNotEmpty)
+        'view_columns': {for (final e in _viewColumns.entries) e.key: e.value},
       if (_vectorIndexes.isNotEmpty)
         'vector_indexes': [
           for (final e in _vectorIndexes.entries)
@@ -17456,6 +17479,15 @@ class Database implements SequenceProvider {
             }
           } catch (_) {
             // Best-effort: skip views we can no longer parse.
+          }
+        }
+      }
+      final viewColumns = (data['view_columns'] as Map?)?.cast<String, Object?>();
+      if (viewColumns != null) {
+        for (final e in viewColumns.entries) {
+          final cols = (e.value as List?)?.cast<Object?>();
+          if (cols != null) {
+            _viewColumns[e.key] = [for (final c in cols) c.toString()];
           }
         }
       }

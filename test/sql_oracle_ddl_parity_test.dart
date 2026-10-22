@@ -49,4 +49,37 @@ void main() {
       await db.close();
     }
   });
+
+  // F66: a trailing ORGANIZATION INDEX (IOT) storage clause is accepted+ignored.
+  test('ORGANIZATION INDEX clause on CREATE TABLE is accepted', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE t (id NUMBER, nm VARCHAR2(10), '
+          'CONSTRAINT pk PRIMARY KEY (id)) ORGANIZATION INDEX');
+      await db.execute("INSERT INTO t VALUES (1, 'a')");
+      expect((await db.execute('SELECT id FROM t')).rows, [
+        [1]
+      ]);
+    } finally {
+      await db.close();
+    }
+  });
+
+  // F67: an explicit column list renames the view's output columns.
+  test('CREATE VIEW with an explicit column list renames the columns',
+      () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE VIEW v (a, b) AS SELECT 1, 2');
+      final r = await db.execute('SELECT a, b FROM v');
+      expect(r.columns, ['a', 'b']);
+      expect(r.rows, [
+        [1, 2]
+      ]);
+      // Star expansion over the view reports the renamed columns too.
+      expect((await db.execute('SELECT * FROM v')).columns, ['a', 'b']);
+    } finally {
+      await db.close();
+    }
+  });
 }

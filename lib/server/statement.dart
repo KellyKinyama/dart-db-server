@@ -136,11 +136,16 @@ class CreateViewStmt extends Statement {
   /// preserved so views can be persisted and re-parsed verbatim across
   /// open/close cycles. Empty for views created programmatically.
   final String selectSql;
+
+  /// Optional explicit output-column names: `CREATE VIEW v (a, b) AS …`.
+  /// Renames the view's columns positionally; null when omitted.
+  final List<String>? columns;
   CreateViewStmt(
     this.name,
     this.select, {
     this.ifNotExists = false,
     this.selectSql = '',
+    this.columns,
   });
 }
 

@@ -602,6 +602,9 @@ class Parser {
           );
         }
         usingPaged = true;
+      } else if (_matchWord('ORGANIZATION')) {
+        // Oracle index-organized / heap table storage clause: accept + ignore.
+        if (!_matchWord('INDEX')) _matchWord('HEAP');
       } else if (_isMysqlTableOptionStart()) {
         _skipMysqlTableOption();
         // MySQL allows space- or comma-separated options; eat an optional
@@ -1064,6 +1067,15 @@ class Parser {
       ifNotExists = true;
     }
     final name = _expectIdent().text;
+    // Optional explicit column list: `CREATE VIEW v (a, b) AS …`.
+    List<String>? viewCols;
+    if (_match(TokType.punct, '(')) {
+      viewCols = <String>[_expectName()];
+      while (_match(TokType.punct, ',')) {
+        viewCols.add(_expectName());
+      }
+      _expect(TokType.punct, ')');
+    }
     _expectKw('AS');
     final selStart = _peek().offset;
     final sel = _parseSelect();
@@ -1074,6 +1086,7 @@ class Parser {
       sel,
       ifNotExists: ifNotExists,
       selectSql: selSql,
+      columns: viewCols,
     );
   }
 
