@@ -2451,6 +2451,10 @@ class Database implements SequenceProvider {
         result = _alterAddConstraint(stmt);
       } else if (stmt is CommentStmt) {
         result = QueryResult.message('Comment accepted');
+      } else if (stmt is CreateSynonymStmt) {
+        result = _createSynonym(stmt);
+      } else if (stmt is DdlNoopStmt) {
+        result = QueryResult.message('${stmt.kind} accepted');
       } else if (stmt is CreateIndexStmt) {
         result = _createIndex(stmt);
       } else if (stmt is DropIndexStmt) {
@@ -4928,6 +4932,22 @@ class Database implements SequenceProvider {
       _viewColumns[s.name] = s.columns!;
     }
     return QueryResult.message('View ${s.name} created');
+  }
+
+  /// Models `CREATE SYNONYM syn FOR t` as an alias view (`SELECT * FROM t`) so
+  /// queries through the synonym resolve. Does not require the target to exist
+  /// yet (resolved lazily at query time, like any view).
+  QueryResult _createSynonym(CreateSynonymStmt s) {
+    if (_tables.containsKey(s.name) || _views.containsKey(s.name)) {
+      throw StateError('Object ${s.name} already exists');
+    }
+    final sql = 'SELECT * FROM ${s.target}';
+    final stmt = Parser.fromString(sql).parseStatement();
+    if (stmt is SelectStmt) {
+      _views[s.name] = stmt;
+      _viewSql[s.name] = sql;
+    }
+    return QueryResult.message('Synonym ${s.name} created');
   }
 
   QueryResult _dropView(DropViewStmt s) {

@@ -484,6 +484,16 @@ class Parser {
       }
     }
     if (_matchKw('TABLE')) return _parseCreateTableTail();
+    if (_matchWord('MATERIALIZED')) {
+      _expectKw('VIEW');
+      return _parseCreateMaterializedViewTail();
+    }
+    if (_matchWord('PUBLIC')) {
+      _expectWord('SYNONYM');
+      return _parseCreateSynonymTail();
+    }
+    if (_matchWord('SYNONYM')) return _parseCreateSynonymTail();
+    if (_matchWord('TYPE')) return _parseCreateTypeIgnore();
     if (_matchKw('VIRTUAL')) {
       _expectKw('TABLE');
       return _parseCreateVirtualTableTail();
@@ -573,7 +583,9 @@ class Parser {
     final constraints = <TableConstraint>[];
     do {
       if (_isTableLevelConstraintStart()) {
-        constraints.add(_parseTableConstraint());
+        final c = _parseTableConstraint();
+        _skipConstraintState();
+        constraints.add(c);
       } else {
         _lastColumnRawType = '';
         cols.add(_parseColumnDef());
@@ -605,6 +617,13 @@ class Parser {
       } else if (_matchWord('ORGANIZATION')) {
         // Oracle index-organized / heap table storage clause: accept + ignore.
         if (!_matchWord('INDEX')) _matchWord('HEAP');
+      } else if (_matchWord('PARTITION') || _matchWord('PARTITIONS')) {
+        // Oracle partitioning clause (PARTITION BY …): accept and ignore the
+        // remainder of the statement.
+        while (!_isAtEnd() && !_check(TokType.punct, ';')) {
+          _advance();
+        }
+        break;
       } else if (_isMysqlTableOptionStart()) {
         _skipMysqlTableOption();
         // MySQL allows space- or comma-separated options; eat an optional
@@ -1090,6 +1109,70 @@ class Parser {
     );
   }
 
+  /// `CREATE MATERIALIZED VIEW <name> [build/refresh clauses] AS <select>` —
+  /// modeled as a plain view; the Oracle storage/refresh clauses before AS are
+  /// accepted and ignored.
+  CreateViewStmt _parseCreateMaterializedViewTail() {
+    bool ifNotExists = false;
+    if (_matchKw('IF')) {
+      _expectKw('NOT');
+      _expectKw('EXISTS');
+      ifNotExists = true;
+    }
+    final name = _expectIdent().text;
+    while (!_isAtEnd() && !_checkKw('AS') && !_check(TokType.punct, ';')) {
+      _advance();
+    }
+    _expectKw('AS');
+    final selStart = _peek().offset;
+    final sel = _parseSelect();
+    final selEnd = _peek().offset;
+    final selSql = _sliceSource(selStart, selEnd).trim();
+    return CreateViewStmt(name, sel,
+        ifNotExists: ifNotExists, selectSql: selSql);
+  }
+
+  /// `CREATE [PUBLIC] SYNONYM <name> FOR <target>`.
+  CreateSynonymStmt _parseCreateSynonymTail() {
+    final name = _parseQualifiedTableName();
+    _expectWord('FOR');
+    final target = _parseQualifiedTableName();
+    return CreateSynonymStmt(name, target);
+  }
+
+  /// `CREATE TYPE … AS OBJECT/VARRAY/TABLE OF …` — accepted and ignored.
+  DdlNoopStmt _parseCreateTypeIgnore() {
+    while (!_isAtEnd() && !_check(TokType.punct, ';')) {
+      _advance();
+    }
+    return DdlNoopStmt('TYPE');
+  }
+
+  /// Consumes Oracle constraint-state clauses (`ENABLE`, `DISABLE`, `VALIDATE`,
+  /// `NOVALIDATE`, `RELY`, `DEFERRABLE`, `INITIALLY …`) that trail a constraint.
+  void _skipConstraintState() {
+    while (true) {
+      if (_matchWord('ENABLE') ||
+          _matchWord('DISABLE') ||
+          _matchWord('VALIDATE') ||
+          _matchWord('NOVALIDATE') ||
+          _matchWord('RELY') ||
+          _matchWord('NORELY') ||
+          _matchWord('DEFERRABLE')) {
+        continue;
+      }
+      if (_matchWord('NOT')) {
+        _matchWord('DEFERRABLE') || _matchWord('NULL');
+        continue;
+      }
+      if (_matchWord('INITIALLY')) {
+        _matchWord('IMMEDIATE') || _matchWord('DEFERRED');
+        continue;
+      }
+      break;
+    }
+  }
+
   CreateTriggerStmt _parseCreateTriggerTail() {
     bool ifNotExists = false;
     if (_matchKw('IF')) {
@@ -1134,6 +1217,21 @@ class Parser {
     if (_matchKw('WHEN')) {
       when = _parseExpr();
     }
+    // A PL/SQL trigger body (DECLARE … / `:new.x := …` procedural assignments)
+    // is not modeled by the engine's SQL-statement trigger executor; consume it
+    // and store an empty body (accepted, no-op) so the schema still loads.
+    if (_checkKw('DECLARE') || _checkWord('DECLARE')) {
+      _skipPlsqlTriggerBody();
+      return CreateTriggerStmt(
+        name,
+        timing,
+        event,
+        table,
+        when,
+        const <Statement>[],
+        ifNotExists: ifNotExists,
+      );
+    }
     _expectKw('BEGIN');
     final body = <Statement>[];
     while (!_checkKw('END')) {
@@ -1150,6 +1248,37 @@ class Parser {
       body,
       ifNotExists: ifNotExists,
     );
+  }
+
+  /// Consumes an Oracle PL/SQL trigger body — the `DECLARE` section plus the
+  /// `BEGIN … END;` block (tracking nesting) — which the engine accepts but
+  /// does not execute.
+  void _skipPlsqlTriggerBody() {
+    var depth = 0;
+    var sawBegin = false;
+    while (!_isAtEnd()) {
+      if (_matchWord('BEGIN')) {
+        depth++;
+        sawBegin = true;
+        continue;
+      }
+      if (_checkWord('END')) {
+        _advance();
+        // `END IF` / `END LOOP` / `END CASE` close an inner construct via a
+        // keyword, not the block.
+        if (_matchWord('IF') || _matchWord('LOOP') || _matchWord('CASE')) {
+          continue;
+        }
+        depth--;
+        if (sawBegin && depth <= 0) {
+          if (_check(TokType.ident)) _advance(); // optional trigger name
+          _match(TokType.punct, ';');
+          break;
+        }
+        continue;
+      }
+      _advance();
+    }
   }
 
   // ---- DROP ---------------------------------------------------------------
@@ -2058,8 +2187,10 @@ class Parser {
         _checkKw('FOREIGN');
     if (atConstraint()) {
       final cons = <TableConstraint>[_parseTableConstraint()];
+      _skipConstraintState();
       while (_match(TokType.punct, ',') && atConstraint()) {
         cons.add(_parseTableConstraint());
+        _skipConstraintState();
       }
       if (paren) _expect(TokType.punct, ')');
       return AlterTableAddConstraintStmt(table, cons);

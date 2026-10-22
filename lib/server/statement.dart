@@ -84,6 +84,21 @@ class AlterTableAddConstraintStmt extends Statement {
 /// as a no-op (the engine stores no object comments).
 class CommentStmt extends Statement {}
 
+/// `CREATE [PUBLIC] SYNONYM <name> FOR <target>` — modeled as an alias view
+/// (`SELECT * FROM <target>`) so queries through the synonym resolve.
+class CreateSynonymStmt extends Statement {
+  final String name;
+  final String target;
+  CreateSynonymStmt(this.name, this.target);
+}
+
+/// An Oracle DDL statement accepted and ignored (e.g. `CREATE TYPE …`); [kind]
+/// names it for the status message.
+class DdlNoopStmt extends Statement {
+  final String kind;
+  DdlNoopStmt(this.kind);
+}
+
 class CreateIndexStmt extends Statement {
   final String indexName;
   final String table;
