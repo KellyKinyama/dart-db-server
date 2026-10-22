@@ -143,7 +143,7 @@ case **1991×**, so this is pervasive, not an edge.
 - **Approach:** scope name resolution by **alias**, not base table name; an outer
   unqualified/base-qualified reference must resolve to the outer range, and the
   inner alias must shadow only itself.
-- **Verify:** F4 guard. **Effort:** M. **Status:** TODO.
+- **Verify:** F4 guard. **Effort:** M. **Status:** LANDED (batch 6).
 
 ### F3 · Date month-underflow doesn't decrement the year
 - **Bug:** `date('2021-01-01','-1 month')` → `2021-12-01` (should be `2020-12-01`).
@@ -166,16 +166,16 @@ case **1991×**, so this is pervasive, not an edge.
 ### F5 · `GROUP BY` / `ORDER BY` can't reference a SELECT-list alias
 - MySQL/SQLite allow it (Oracle/standard don't). **Approach:** when resolving a
   GROUP BY / ORDER BY identifier that isn't a column, check the SELECT-list
-  aliases before erroring. **Effort:** S. **Status:** TODO.
+  aliases before erroring. **Effort:** S. **Status:** LANDED (batch 6).
 
 ### F18 · `HAVING` without `GROUP BY` is a parse error
 - **Approach:** accept `HAVING` with no `GROUP BY` and apply it to the implicit
-  single group. **Effort:** S. **Status:** TODO.
+  single group. **Effort:** S. **Status:** LANDED (batch 6).
 
 ### F8 · `SUBSTR` negative length
 - SQLite returns the character(s) preceding the start; the engine returns `''`.
   **Approach:** support negative length by walking backward from `start`.
-  **Effort:** S. **Status:** TODO.
+  **Effort:** S. **Status:** LANDED (batch 6).
 
 ---
 
@@ -261,3 +261,21 @@ crash-kill iterations and 8/8 official runs recover the committed baseline.
   atomic-written file (main, `-wal`, `-wal2`, wal2 meta, vector sidecar), with
   a completeness guard (JSON parses; SQLite header page-count matches length)
   for the torn-first-write case.
+
+### Batch 6 — correlated-subquery scoping + parity + 3VL IN (final)
+Reliability scorecard: **230 pass / 0 skip / 0 fail** — every F1–F18 guard closed
+and the differential fuzzer re-enabled (20 seeds × 150 queries, zero
+divergences). Full 1580-test engine suite green.
+- **F4** correlated-subquery alias scoping: `rowToMap` no longer emits the
+  base-table-qualified key (`s.col`) when a relation has an alias — an alias
+  hides the table name (SQL scoping), so an inner `FROM s x` can't shadow an
+  outer correlation `s.g`.
+- **F5** GROUP BY may reference a SELECT-list alias when the bare name isn't a
+  real column (`resolveGroupExpr`), matching MySQL/SQLite.
+- **F18** `HAVING` is parsed with or without `GROUP BY` (moved out of the GROUP
+  block) and applies to the implicit single group.
+- **F8** `SUBSTR` with a negative length walks backward, returning the
+  characters preceding the start (SQLite semantics).
+- **Fuzz-found 3VL bug** (bonus): `x IN (…, NULL)` with no match now yields
+  `NULL` instead of `FALSE`, so `NOT (x IN (…, NULL))` is `NULL` too — this was
+  the last divergence blocking the differential fuzzer.

@@ -477,10 +477,18 @@ class InExpr extends Expr {
   Object? eval(Map<String, Object?> row) {
     final v = value.eval(row);
     if (v == null) return null;
+    var sawNull = false;
     for (final e in values) {
       final ev = e.eval(row);
-      if (ev != null && BinaryExpr._eq(v, ev)) return !negated;
+      if (ev == null) {
+        sawNull = true;
+        continue;
+      }
+      if (BinaryExpr._eq(v, ev)) return !negated;
     }
+    // No match: a NULL in the list makes the result UNKNOWN (SQL 3VL), so
+    // `NOT IN (…, NULL)` is also NULL — not TRUE.
+    if (sawNull) return null;
     return negated;
   }
 }
@@ -1169,8 +1177,13 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     if (idx < 0) idx = 0;
     if (idx >= s.length) return '';
     if (a.length >= 3 && a[2] != null) {
-      var len = (a[2] as num).toInt();
-      if (len < 0) len = 0;
+      final len = (a[2] as num).toInt();
+      if (len < 0) {
+        // SQLite: a negative length returns the |len| characters that
+        // precede the start position (walking backward from `idx`).
+        final back = (idx + len).clamp(0, s.length);
+        return s.substring(back, idx);
+      }
       final end = (idx + len).clamp(0, s.length);
       return s.substring(idx, end);
     }

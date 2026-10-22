@@ -13523,6 +13523,21 @@ class Database implements SequenceProvider {
         }
         return _bindExpr(item.expr!);
       }
+      // MySQL/SQLite extension: GROUP BY may reference a SELECT-list alias.
+      // Only when the bare name isn't a real column (checked against the
+      // incoming rows) does an output alias take over.
+      if (g is ColumnExpr &&
+          g.table == null &&
+          !(rows.isNotEmpty && rows.first.containsKey(g.name))) {
+        for (final item in s.projection) {
+          if (!item.isStar &&
+              item.expr != null &&
+              item.alias != null &&
+              item.alias!.toLowerCase() == g.name.toLowerCase()) {
+            return _bindExpr(item.expr!);
+          }
+        }
+      }
       return _bindExpr(g);
     }
 

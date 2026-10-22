@@ -146,14 +146,20 @@ class Table implements TableBackend {
     }
     final m = <String, Object?>{};
     final n = columns.length;
+    if (alias != null) {
+      // An alias hides the base table name (SQL scoping), so expose only the
+      // bare and alias-qualified keys. Keeping `<table>.col` here would let an
+      // aliased relation shadow an outer correlation that shares the base name
+      // (e.g. `… FROM s x WHERE x.g = s.g` correlated to an outer `s`).
+      for (var i = 0; i < n; i++) {
+        m[_keysBare![i]] = row[i];
+        m['$alias.${_keysBare![i]}'] = row[i];
+      }
+      return m;
+    }
     for (var i = 0; i < n; i++) {
       m[_keysBare![i]] = row[i];
       m[_keysQualified![i]] = row[i];
-    }
-    if (alias != null) {
-      for (var i = 0; i < n; i++) {
-        m['$alias.${_keysBare![i]}'] = row[i];
-      }
     }
     return m;
   }

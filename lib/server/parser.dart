@@ -2900,8 +2900,10 @@ class Parser {
           groupBy.add(_parseExpr());
         }
       }
-      if (_matchKw('HAVING')) having = _parseExpr();
     }
+    // HAVING is accepted with or without GROUP BY (SQLite/MySQL apply it to the
+    // implicit single group when there is no GROUP BY).
+    if (_matchKw('HAVING')) having = _parseExpr();
     final namedWindows = <String, WindowSpec>{};
     if (_matchKw('WINDOW')) {
       do {
