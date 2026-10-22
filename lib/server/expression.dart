@@ -788,17 +788,16 @@ class CastExpr extends Expr {
         if (v is int) return v;
         if (v is double) return v.truncate();
         if (v is String) {
-          final i = int.tryParse(v);
+          final i = int.tryParse(v.trim());
           if (i != null) return i;
-          final d = double.tryParse(v);
-          if (d != null) return d.truncate();
-          return 0;
+          // SQLite parses the leading numeric prefix ('42abc' -> 42).
+          return _sqlTextToNum(v).truncate();
         }
         if (v is bool) return v ? 1 : 0;
         return coerce(v, targetType);
       case DataType.real:
         if (v is num) return v.toDouble();
-        if (v is String) return double.tryParse(v) ?? 0.0;
+        if (v is String) return _sqlTextToNum(v).toDouble();
         return coerce(v, targetType);
       case DataType.text:
         return v.toString();
@@ -1008,8 +1007,19 @@ Object? _propagateNull(List<Object?> args, Object? Function() body) {
   return body();
 }
 
-/// Trim every leading/trailing character of [s] that appears in [chars]
-/// (the SQL 2-argument trim form). An empty [chars] leaves [s] unchanged.
+/// SQLite text→number coercion: a number passes through, a bool maps to 1/0,
+/// and a string yields its leading numeric prefix (e.g. `'42abc'`→42,
+/// `'3.14xyz'`→3.14, `'abc'`→0). Used by math scalars and CAST.
+final RegExp _leadingNumRe =
+    RegExp(r'^[ \t\n\r]*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)');
+num _sqlTextToNum(Object? v) {
+  if (v is num) return v;
+  if (v is bool) return v ? 1 : 0;
+  if (v is! String) return 0;
+  final m = _leadingNumRe.firstMatch(v);
+  if (m == null) return 0;
+  return num.tryParse(m.group(1)!) ?? 0;
+}
 String _trimChars(String s, String chars, {required bool left, required bool right}) {
   if (chars.isEmpty) return s;
   final set = chars.split('').toSet();
@@ -1164,9 +1174,10 @@ String _sqlitePrintf(String fmt, List<Object?> args) {
         if (conv == 'f') {
           body = n.toStringAsFixed(p);
         } else if (conv == 'e') {
-          body = n.toStringAsExponential(p);
+          // C/SQLite use a >=2-digit exponent (`e+03`, not Dart's `e+3`).
+          body = _fixExponentWidth(n.toStringAsExponential(p));
         } else {
-          body = n.toStringAsPrecision(p == 0 ? 1 : p);
+          body = _formatG(n, p == 0 ? 1 : p, alt);
         }
         if (n >= 0) {
           if (plus) {
@@ -1232,6 +1243,51 @@ String _sqlitePrintf(String fmt, List<Object?> args) {
 
 bool _isDigitChar(String c) =>
     c.codeUnitAt(0) >= 0x30 && c.codeUnitAt(0) <= 0x39;
+
+/// Pad a `toStringAsExponential` result's exponent to the C/SQLite minimum of
+/// two digits: `1.5e+3` -> `1.5e+03`.
+String _fixExponentWidth(String s) {
+  final m = RegExp(r'^(.*[eE])([+-])(\d+)$').firstMatch(s);
+  if (m == null) return s;
+  return '${m.group(1)}${m.group(2)}${m.group(3)!.padLeft(2, '0')}';
+}
+
+/// C `printf('%g')`: choose `%e` or `%f` by magnitude and strip trailing
+/// zeros (unless the `#`/alt flag is set).
+String _formatG(double n, int p, bool alt) {
+  if (n == 0) return '0';
+  final probe = n.toStringAsExponential(p - 1);
+  final x = int.parse(RegExp(r'[eE]([+-]?\d+)$').firstMatch(probe)!.group(1)!);
+  String body;
+  if (x < -4 || x >= p) {
+    body = n.toStringAsExponential(p - 1);
+    if (!alt) body = _stripExpTrailingZeros(body);
+    body = _fixExponentWidth(body);
+  } else {
+    final prec = p - 1 - x;
+    body = n.toStringAsFixed(prec < 0 ? 0 : prec);
+    if (!alt) body = _stripFixedTrailingZeros(body);
+  }
+  return body;
+}
+
+String _stripFixedTrailingZeros(String s) {
+  if (!s.contains('.')) return s;
+  var r = s.replaceFirst(RegExp(r'0+$'), '');
+  if (r.endsWith('.')) r = r.substring(0, r.length - 1);
+  return r;
+}
+
+String _stripExpTrailingZeros(String s) {
+  final m = RegExp(r'^([^eE]*)([eE].*)$').firstMatch(s);
+  if (m == null) return s;
+  var mant = m.group(1)!;
+  if (mant.contains('.')) {
+    mant = mant.replaceFirst(RegExp(r'0+$'), '');
+    if (mant.endsWith('.')) mant = mant.substring(0, mant.length - 1);
+  }
+  return '$mant${m.group(2)}';
+}
 
 int _toIntArg(Object? v) {
   if (v == null) return 0;
@@ -1321,20 +1377,34 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     if (a.isEmpty || a[0] == null) return null;
     final s = a[0].toString();
     if (a.length < 2) return s;
-    final start = (a[1] as num).toInt();
-    // SQL is 1-based; negative offsets count from the end.
-    var idx = start > 0 ? start - 1 : (s.length + start).clamp(0, s.length);
-    if (idx < 0) idx = 0;
+    final start = _sqlTextToNum(a[1]).toInt();
+    // SQL is 1-based. A start of 0 means "before position 1" and a negative
+    // start counts from the end; either way the window begins at the string
+    // start, but the part that falls before position 1 still consumes length.
+    int idx;
+    var consumed = 0;
+    if (start > 0) {
+      idx = start - 1;
+    } else if (start == 0) {
+      idx = 0;
+      consumed = 1;
+    } else {
+      idx = s.length + start;
+      if (idx < 0) {
+        consumed = -idx;
+        idx = 0;
+      }
+    }
     if (idx >= s.length) return '';
     if (a.length >= 3 && a[2] != null) {
-      final len = (a[2] as num).toInt();
+      final len = _sqlTextToNum(a[2]).toInt();
       if (len < 0) {
         // SQLite: a negative length returns the |len| characters that
         // precede the start position (walking backward from `idx`).
         final back = (idx + len).clamp(0, s.length);
         return s.substring(back, idx);
       }
-      final end = (idx + len).clamp(0, s.length);
+      final end = (idx + (len - consumed).clamp(0, s.length)).clamp(0, s.length);
       return s.substring(idx, end);
     }
     return s.substring(idx);
@@ -1428,7 +1498,12 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
       }),
   'REPLACE': (a) => _propagateNull(
         a,
-        () => a[0].toString().replaceAll(a[1].toString(), a[2].toString()),
+        () {
+          final search = a[1].toString();
+          // An empty search string matches nothing (SQLite): return unchanged.
+          if (search.isEmpty) return a[0].toString();
+          return a[0].toString().replaceAll(search, a[2].toString());
+        },
       ),
   'CONCAT': (a) => a.map((v) => v ?? '').join(),
   // CONCAT_WS(sep, args...) — joins non-NULL args with the given separator.
@@ -1476,30 +1551,30 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     if (a[1] == null) return a[0];
     return sqlEq(a[0]!, a[1]!) ? null : a[0];
   },
-  'ABS': (a) => _propagateNull(a, () => (a[0] as num).abs()),
+  'ABS': (a) => _propagateNull(a, () => _sqlTextToNum(a[0]).abs()),
   'ROUND': (a) {
     if (a.isEmpty || a[0] == null) return null;
-    final v = (a[0] as num).toDouble();
-    final digits = a.length > 1 && a[1] != null ? (a[1] as num).toInt() : 0;
+    final v = _sqlTextToNum(a[0]).toDouble();
+    final digits = a.length > 1 && a[1] != null ? _sqlTextToNum(a[1]).toInt() : 0;
     final p = _pow10(digits);
     return (v * p).round() / p;
   },
-  'MOD': (a) => _propagateNull(a, () => (a[0] as num) % (a[1] as num)),
-  'FLOOR': (a) => _propagateNull(a, () => (a[0] as num).floor()),
-  'CEIL': (a) => _propagateNull(a, () => (a[0] as num).ceil()),
-  'CEILING': (a) => _propagateNull(a, () => (a[0] as num).ceil()),
+  'MOD': (a) => _propagateNull(a, () => _sqlTextToNum(a[0]) % _sqlTextToNum(a[1])),
+  'FLOOR': (a) => _propagateNull(a, () => _sqlTextToNum(a[0]).floor()),
+  'CEIL': (a) => _propagateNull(a, () => _sqlTextToNum(a[0]).ceil()),
+  'CEILING': (a) => _propagateNull(a, () => _sqlTextToNum(a[0]).ceil()),
   'SQRT': (a) => _propagateNull(a, () {
-        final v = (a[0] as num).toDouble();
+        final v = _sqlTextToNum(a[0]).toDouble();
         if (v < 0) return null;
         return _sqrt(v);
       }),
   'POWER': (a) => _propagateNull(
         a,
-        () => _intPow((a[0] as num).toDouble(), (a[1] as num).toDouble()),
+        () => _intPow(_sqlTextToNum(a[0]).toDouble(), _sqlTextToNum(a[1]).toDouble()),
       ),
   'POW': (a) => kScalarFunctions['POWER']!(a),
   'SIGN': (a) => _propagateNull(a, () {
-        final v = (a[0] as num).toDouble();
+        final v = _sqlTextToNum(a[0]).toDouble();
         if (v == 0) return 0;
         return v > 0 ? 1 : -1;
       }),
