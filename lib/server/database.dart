@@ -13916,6 +13916,15 @@ class Database implements SequenceProvider {
     return v is bool && v;
   }
 
+  /// Numeric coercion for aggregate accumulators (SQLite affinity): bool->1/0,
+  /// numeric string->parsed value, non-numeric->0.
+  num _aggNum(Object? v) {
+    if (v is num) return v;
+    if (v is bool) return v ? 1 : 0;
+    if (v is String) return num.tryParse(v.trim()) ?? 0;
+    return 0;
+  }
+
   Object? _aggregateValue(FunctionCallExpr e, List<Map<String, Object?>> grp) {
     if (e.filterExpr != null) {
       grp = grp.where((r) {
@@ -13964,12 +13973,10 @@ class Database implements SequenceProvider {
           final iter = _aggValues(e, grp);
           for (final v in iter) {
             if (v == null) continue;
+            final n = _aggNum(v);
             any = true;
-            if (v is! num) {
-              throw StateError('SUM requires numeric, got ${v.runtimeType}');
-            }
-            if (v is! int) allInt = false;
-            acc += v.toDouble();
+            if (n is! int) allInt = false;
+            acc += n.toDouble();
           }
           if (!any) return null;
           return allInt ? acc.toInt() : acc;
@@ -13980,10 +13987,7 @@ class Database implements SequenceProvider {
           var acc = 0.0;
           for (final v in _aggValues(e, grp)) {
             if (v == null) continue;
-            if (v is! num) {
-              throw StateError('TOTAL requires numeric, got ${v.runtimeType}');
-            }
-            acc += v.toDouble();
+            acc += _aggNum(v).toDouble();
           }
           return acc;
         }
@@ -14027,10 +14031,7 @@ class Database implements SequenceProvider {
           var n = 0;
           for (final v in _aggValues(e, grp)) {
             if (v == null) continue;
-            if (v is! num) {
-              throw StateError('AVG requires numeric');
-            }
-            acc += v.toDouble();
+            acc += _aggNum(v).toDouble();
             n++;
           }
           if (n == 0) return null;
@@ -15420,12 +15421,22 @@ class Database implements SequenceProvider {
             final t = _tables[target]!;
             for (var i = 0; i < t.columns.length; i++) {
               final c = t.columns[i];
+              // An INTEGER PRIMARY KEY is a rowid alias: SQLite reports
+              // notnull=0 for it even though it can't be null.
+              final rowidAlias = c.primaryKey && c.type == DataType.integer;
+              // SQLite quotes a string default literal (`'x'`), not `x`.
+              Object? dflt = c.defaultValue;
+              if (c.defaultExprSql != null) {
+                dflt = c.defaultExprSql;
+              } else if (dflt is String) {
+                dflt = "'$dflt'";
+              }
               rows.add([
                 i,
                 c.name,
                 c.type == DataType.any ? '' : c.type.name.toUpperCase(),
-                c.notNull ? 1 : 0,
-                c.defaultValue,
+                (!rowidAlias && c.notNull) ? 1 : 0,
+                dflt,
                 c.primaryKey ? 1 : 0,
               ]);
             }

@@ -558,7 +558,7 @@ class Parser {
       _expectKw('EXISTS');
       ifNotExists = true;
     }
-    final name = _expectIdent().text;
+    final name = _parseQualifiedTableName();
     // CREATE TABLE <name> [AS] SELECT … (CTAS): schema + data from a query.
     if (_checkKw('AS') || _checkKw('SELECT')) {
       _matchKw('AS');
@@ -1135,7 +1135,7 @@ class Parser {
         _expectKw('EXISTS');
         ifExists = true;
       }
-      return DropTableStmt(_expectIdent().text, ifExists: ifExists);
+      return DropTableStmt(_parseQualifiedTableName(), ifExists: ifExists);
     }
     if (_matchKw('INDEX')) {
       bool ifExists = false;
@@ -2156,7 +2156,7 @@ class Parser {
 
   InsertStmt _parseInsertTail(InsertMode mode) {
     _expectKw('INTO');
-    final table = _expectIdent().text;
+    final table = _parseQualifiedTableName();
     List<String>? cols;
     if (_match(TokType.punct, '(')) {
       cols = [_expectIdent().text];
@@ -2385,7 +2385,7 @@ class Parser {
 
   UpdateStmt _parseUpdate() {
     _expectKw('UPDATE');
-    final table = _expectIdent().text;
+    final table = _parseQualifiedTableName();
     final hint = _consumeIndexedHint();
     _expectKw('SET');
     final assignments = <String, Expr>{};
@@ -2435,7 +2435,7 @@ class Parser {
   DeleteStmt _parseDelete() {
     _expectKw('DELETE');
     _expectKw('FROM');
-    final table = _expectIdent().text;
+    final table = _parseQualifiedTableName();
     final hint = _consumeIndexedHint();
     Expr? where;
     if (_matchKw('WHERE')) where = _parseExpr();

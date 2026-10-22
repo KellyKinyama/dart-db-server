@@ -231,10 +231,10 @@ class UnaryExpr extends Expr {
         return !(v as bool);
       case '-':
         if (v == null) return null;
-        return -(v as num);
+        return -_sqlTextToNum(v);
       case '~':
         if (v == null) return null;
-        return ~((v as num).toInt());
+        return ~_sqlTextToNum(v).toInt();
       case 'IS NULL':
         return v == null;
       case 'IS NOT NULL':
@@ -800,7 +800,19 @@ class CastExpr extends Expr {
         if (v is String) return _sqlTextToNum(v).toDouble();
         return coerce(v, targetType);
       case DataType.text:
+        // CAST(<blob> AS TEXT) decodes the bytes (SQLite), not list.toString().
+        if (v is List<int>) {
+          try {
+            return utf8.decode(v);
+          } catch (_) {
+            return String.fromCharCodes(v);
+          }
+        }
         return v.toString();
+      case DataType.blob:
+        // SQLite yields the blob of the value's text representation.
+        if (v is List<int>) return v;
+        return utf8.encode(v.toString());
       default:
         return coerce(v, targetType);
     }
