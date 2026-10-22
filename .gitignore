@@ -15,3 +15,7 @@ mydatabase.json
 kb_vectors.json
 kb_vectors.json.*
 *.lock
+
+# Parity sample/benchmark datasets (downloaded, not committed)
+parity/datasets/**
+!parity/datasets/.gitkeep
