@@ -144,6 +144,18 @@ reports the right row counts, and `oci_close` / `connection.close()` tears down
 without an `ORA-`/`TNS-` error. That is the same lifecycle Gun 1 and Gun 2 run —
 compare results three ways against the SQLite reference.
 
+A ready-to-run Python version of this lifecycle (thick mode, JSON output for
+diffing) ships at [`tool/oci8_runner.py`](../tool/oci8_runner.py):
+
+```bash
+pip install oracledb
+python tool/oci8_runner.py --user native --password Secret123   # -> JSON result
+```
+
+It mirrors the yajra/`oci8` flow (combined `ALTER SESSION`, create, named-bind
+insert, multi-row select, bound select, update, drop) and exits non-zero on any
+`ORA-`/`DPY-` error, so it drops straight into CI or the harness.
+
 ### Gun 3 against the client
 
 Use real `oci8` as the **byte reference** for the pure-Dart thick client: capture
