@@ -238,8 +238,14 @@ class Lexer {
         _skipBlockComment();
         continue;
       }
-      if (c == "'" || c == '"') {
+      if (c == "'") {
         out.add(_readString(c));
+        continue;
+      }
+      // Double-quoted identifier (SQL standard): `"my col"`. A doubled quote
+      // (`""`) escapes a literal quote.
+      if (c == '"') {
+        out.add(_readDoubleQuotedIdent());
         continue;
       }
       // MySQL-style backtick-quoted identifier.
@@ -319,6 +325,28 @@ class Lexer {
     throw FormatException('Unterminated string at $start');
   }
 
+  Token _readDoubleQuotedIdent() {
+    final start = _pos;
+    _pos++; // opening quote
+    final buf = StringBuffer();
+    while (_pos < src.length) {
+      final c = src[_pos];
+      if (c == '"') {
+        // Doubled quote is an escape for a literal double-quote.
+        if (_peek(1) == '"') {
+          buf.write('"');
+          _pos += 2;
+          continue;
+        }
+        _pos++;
+        return Token(TokType.ident, buf.toString(), start);
+      }
+      buf.write(c);
+      _pos++;
+    }
+    throw FormatException('Unterminated double-quoted identifier at $start');
+  }
+
   Token _readBacktickIdent() {
     final start = _pos;
     _pos++; // opening backtick
@@ -368,6 +396,20 @@ class Lexer {
 
   Token _readNumber() {
     final start = _pos;
+    // Hex integer literal: 0x1F / 0XFF. Emit the decimal value so the parser's
+    // numeric parse works unchanged.
+    if (src[_pos] == '0' && (_peek(1) == 'x' || _peek(1) == 'X')) {
+      final hexStart = _pos + 2;
+      var p = hexStart;
+      while (p < src.length && _isHexDigit(src[p])) {
+        p++;
+      }
+      if (p > hexStart) {
+        _pos = p;
+        final value = int.parse(src.substring(hexStart, p), radix: 16);
+        return Token(TokType.number, value.toString(), start);
+      }
+    }
     bool dotSeen = false;
     while (_pos < src.length) {
       final c = src[_pos];
@@ -382,7 +424,28 @@ class Lexer {
       }
       break;
     }
+    // Scientific-notation exponent: e[+-]?digits. Only consume when a valid
+    // exponent follows, so a trailing `e` stays available as an identifier.
+    if (_pos < src.length && (src[_pos] == 'e' || src[_pos] == 'E')) {
+      var p = _pos + 1;
+      if (p < src.length && (src[p] == '+' || src[p] == '-')) p++;
+      if (p < src.length && _isDigit(src[p])) {
+        p++;
+        while (p < src.length && _isDigit(src[p])) {
+          p++;
+        }
+        _pos = p;
+      }
+    }
     return Token(TokType.number, src.substring(start, _pos), start);
+  }
+
+  bool _isHexDigit(String c) {
+    if (c.isEmpty) return false;
+    final cu = c.codeUnitAt(0);
+    return (cu >= 48 && cu <= 57) ||
+        (cu >= 65 && cu <= 70) ||
+        (cu >= 97 && cu <= 102);
   }
 
   Token _readIdentOrKeyword() {

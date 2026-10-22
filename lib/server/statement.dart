@@ -21,6 +21,10 @@ class CreateTableStmt extends Statement {
   /// Database._executePagedStmt).
   final bool usingPaged;
 
+  /// `CREATE TABLE name AS SELECT …` (CTAS). When set, [columns] is empty and
+  /// the schema + data are derived from running this query at execution time.
+  final SelectStmt? asSelect;
+
   CreateTableStmt(
     this.name,
     this.columns, {
@@ -29,6 +33,7 @@ class CreateTableStmt extends Statement {
     this.strict = false,
     this.withoutRowid = false,
     this.usingPaged = false,
+    this.asSelect,
   });
 }
 

@@ -559,6 +559,13 @@ class Parser {
       ifNotExists = true;
     }
     final name = _expectIdent().text;
+    // CREATE TABLE <name> [AS] SELECT … (CTAS): schema + data from a query.
+    if (_checkKw('AS') || _checkKw('SELECT')) {
+      _matchKw('AS');
+      final sel = _parseSelect();
+      return CreateTableStmt(name, const [],
+          ifNotExists: ifNotExists, asSelect: sel);
+    }
     _expect(TokType.punct, '(');
     final cols = <ColumnDef>[];
     final rawTypes = <String>[]; // parallel to cols; for STRICT validation
@@ -3471,7 +3478,12 @@ class Parser {
       _advance();
       return UnaryExpr('~', _parseUnary());
     }
-    return _parsePrimary();
+    var e = _parsePrimary();
+    // Postfix `COLLATE <name>` binds tightly to its operand.
+    while (_matchKw('COLLATE')) {
+      e = CollateExpr(e, _expectName().toUpperCase());
+    }
+    return e;
   }
 
   Expr _parsePrimary() {
@@ -3520,8 +3532,11 @@ class Parser {
     }
     if (t.type == TokType.number) {
       _advance();
-      if (t.text.contains('.')) return LiteralExpr(double.parse(t.text));
-      return LiteralExpr(int.parse(t.text));
+      final txt = t.text;
+      if (txt.contains('.') || txt.contains('e') || txt.contains('E')) {
+        return LiteralExpr(double.parse(txt));
+      }
+      return LiteralExpr(int.parse(txt));
     }
     if (t.type == TokType.string) {
       _advance();
@@ -3580,6 +3595,15 @@ class Parser {
         return SubquerySelectExpr(sel);
       }
       final e = _parseExpr();
+      // Row value / tuple: `(a, b, …)`.
+      if (_check(TokType.punct, ',')) {
+        final items = <Expr>[e];
+        while (_match(TokType.punct, ',')) {
+          items.add(_parseExpr());
+        }
+        _expect(TokType.punct, ')');
+        return RowValueExpr(items);
+      }
       _expect(TokType.punct, ')');
       return e;
     }
@@ -3910,6 +3934,15 @@ class Parser {
     _expectKw('AS');
     final typeTok = _advance();
     final type = parseDataType(typeTok.text);
+    // Optional size/precision — `VARCHAR(10)`, `DECIMAL(5,2)` — accepted but
+    // not retained (the engine casts by affinity, not by declared width).
+    if (_check(TokType.punct, '(')) {
+      _advance();
+      while (!_check(TokType.punct, ')') && !_check(TokType.eof)) {
+        _advance();
+      }
+      _expect(TokType.punct, ')');
+    }
     _expect(TokType.punct, ')');
     return CastExpr(e, type);
   }

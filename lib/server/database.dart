@@ -4541,12 +4541,43 @@ class Database implements SequenceProvider {
   // ---------------------------------------------------------------------------
   // DDL
   // ---------------------------------------------------------------------------
+  /// Infer a column's storage type for `CREATE TABLE … AS SELECT` from the
+  /// first non-null value produced for that column.
+  DataType _inferColumnType(List<List<Object?>> rows, int col) {
+    for (final r in rows) {
+      final v = col >= 0 && col < r.length ? r[col] : null;
+      if (v == null) continue;
+      if (v is int || v is bool) return DataType.integer;
+      if (v is double) return DataType.real;
+      if (v is List<int>) return DataType.blob;
+      return DataType.text;
+    }
+    return DataType.text;
+  }
+
   QueryResult _createTable(CreateTableStmt s) {
     if (_tables.containsKey(s.name) || _views.containsKey(s.name)) {
       if (s.ifNotExists) {
         return QueryResult.message('Table ${s.name} already exists');
       }
       throw StateError('Table ${s.name} already exists');
+    }
+    // CREATE TABLE … AS SELECT: derive the schema from the query result, then
+    // insert its rows.
+    if (s.asSelect != null) {
+      final res = _selectTopLevel(s.asSelect!);
+      final cols = <ColumnDef>[
+        for (final name in res.columns)
+          ColumnDef(name, _inferColumnType(res.rows, res.columns.indexOf(name))),
+      ];
+      final t = Table(s.name, cols);
+      _tables[s.name] = t;
+      for (final row in res.rows) {
+        t.insertRow(List<Object?>.from(row));
+      }
+      _persist();
+      return QueryResult.message(
+          'Table ${s.name} created', affected: res.rows.length);
     }
     final t = Table(
       s.name,
@@ -13597,6 +13628,8 @@ class Database implements SequenceProvider {
 
     final outRows = <List<Object?>>[];
     final orderingMaps = <Map<String, Object?>>[];
+    // Per-output-row source rows, for a window-over-GROUP BY pass.
+    final grpRowsList = <List<Map<String, Object?>>>[];
     // ORDER BY keys that reference aggregates must be computed per group here
     // (the post-aggregation sort only sees one group-context row and can't
     // recompute an aggregate). Bind them once and stash values in the ctx.
@@ -13633,8 +13666,122 @@ class Database implements SequenceProvider {
       }
       outRows.add(row);
       orderingMaps.add(ctx);
+      grpRowsList.add(grpRows);
     }
+    _windowOverAggregate(
+        s, projExprs, outCols, outRows, orderingMaps, grpRowsList);
     return _AggResult(outCols, outRows, orderingMaps);
+  }
+
+  /// Window functions in a GROUP BY query operate on the *grouped* rows. After
+  /// the aggregation has produced one row per group (with window items left as
+  /// NULL placeholders), evaluate each window function over those rows and fill
+  /// the placeholders. Window `PARTITION BY` / `ORDER BY` expressions that
+  /// reference an aggregate (e.g. `ORDER BY SUM(v)`) are precomputed per group
+  /// and the spec rewritten to read them.
+  void _windowOverAggregate(
+    SelectStmt s,
+    List<Expr> projExprs,
+    List<String> outCols,
+    List<List<Object?>> outRows,
+    List<Map<String, Object?>> orderingMaps,
+    List<List<Map<String, Object?>>> grpRowsList,
+  ) {
+    final winFns = <FunctionCallExpr>[];
+    for (final e in projExprs) {
+      _collectWindowFns(e, winFns);
+    }
+    if (winFns.isEmpty || outRows.isEmpty) return;
+
+    // Row maps for the window pass: group context + the projected output cols.
+    final winRows = <Map<String, Object?>>[];
+    for (var i = 0; i < outRows.length; i++) {
+      final m = Map<String, Object?>.from(orderingMaps[i]);
+      for (var j = 0; j < outCols.length && j < outRows[i].length; j++) {
+        m[outCols[j]] = outRows[i][j];
+      }
+      winRows.add(m);
+    }
+
+    // Rewrite each spec's aggregate PARTITION/ORDER expressions to synthetic
+    // columns precomputed per group.
+    var k = 0;
+    final rewritten = <FunctionCallExpr, FunctionCallExpr>{};
+    for (final fn in winFns) {
+      final spec = fn.window!;
+      final newPart = <Expr>[];
+      for (final p in spec.partitionBy) {
+        if (_containsAggregate(p)) {
+          final key = '__winagg${k++}';
+          for (var i = 0; i < winRows.length; i++) {
+            winRows[i][key] =
+                _evalProjectedWithAggregates(p, grpRowsList[i], winRows[i]);
+          }
+          newPart.add(ColumnExpr(key));
+        } else {
+          newPart.add(p);
+        }
+      }
+      final newOrder = <WindowOrderItem>[];
+      for (final ob in spec.orderBy) {
+        if (_containsAggregate(ob.expr)) {
+          final key = '__winagg${k++}';
+          for (var i = 0; i < winRows.length; i++) {
+            winRows[i][key] = _evalProjectedWithAggregates(
+                ob.expr, grpRowsList[i], winRows[i]);
+          }
+          newOrder.add(WindowOrderItem(ColumnExpr(key),
+              descending: ob.descending, nullsFirst: ob.nullsFirst));
+        } else {
+          newOrder.add(ob);
+        }
+      }
+      rewritten[fn] = FunctionCallExpr(
+        fn.name,
+        fn.args,
+        isStarArg: fn.isStarArg,
+        distinct: fn.distinct,
+        window: WindowSpec(
+          baseName: spec.baseName,
+          partitionBy: newPart,
+          orderBy: newOrder,
+          frame: spec.frame,
+        ),
+        filterExpr: fn.filterExpr,
+        aggOrderBy: fn.aggOrderBy,
+      );
+    }
+
+    final winValues = <FunctionCallExpr, List<Object?>>{};
+    for (final fn in winFns) {
+      winValues[fn] = _evalWindowFn(rewritten[fn]!, winRows, s.namedWindows);
+    }
+
+    // Fill the window placeholders by re-evaluating only the projection items
+    // that contain a window function, with per-row window values published.
+    final itemHasWindow = [
+      for (final e in projExprs)
+        () {
+          final tmp = <FunctionCallExpr>[];
+          _collectWindowFns(e, tmp);
+          return tmp.isNotEmpty;
+        }()
+    ];
+    for (var i = 0; i < outRows.length; i++) {
+      FunctionCallExpr.windowRowValues = {
+        for (final fn in winFns) fn: winValues[fn]![i],
+      };
+      try {
+        for (var j = 0; j < projExprs.length; j++) {
+          if (itemHasWindow[j]) {
+            outRows[i][j] = _evalProjectedWithAggregates(
+                projExprs[j], grpRowsList[i], winRows[i]);
+          }
+        }
+      } finally {
+        FunctionCallExpr.windowRowValues = null;
+      }
+    }
   }
 
   bool _containsAggregate(Expr? e) {
@@ -13715,6 +13862,11 @@ class Database implements SequenceProvider {
     List<Map<String, Object?>> grp,
     Map<String, Object?> ctx,
   ) {
+    // Window functions are computed in a separate pass over the grouped rows
+    // (see _windowOverAggregate); leave a placeholder here.
+    if (e is FunctionCallExpr && e.isWindow) {
+      return FunctionCallExpr.windowRowValues?[e];
+    }
     if (e is FunctionCallExpr && e.isAggregate) {
       return _aggregateValue(e, grp);
     }

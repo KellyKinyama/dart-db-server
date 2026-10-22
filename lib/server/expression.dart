@@ -312,34 +312,41 @@ class BinaryExpr extends Expr {
     }
     final l = left.eval(row);
     final r = right.eval(row);
+    // Row-value (tuple) comparison: `(a, b) = (1, 2)` etc.
+    if (l is List && r is List) {
+      return _rowValueCompare(op, l, r);
+    }
     if (l == null || r == null) {
       // SQL three-valued logic: comparisons with NULL yield NULL (treated as false).
       return null;
     }
+    // NOCASE collation on either operand makes string (in)equality and ordering
+    // case-insensitive.
+    final nocase = _isNoCase(left) || _isNoCase(right);
     switch (op) {
       case '->':
         return _jsonOp(l, r, asText: false);
       case '->>':
         return _jsonOp(l, r, asText: true);
       case '=':
-        return _eq(l, r);
+        return nocase ? _eqCI(l, r) : _eq(l, r);
       case '!=':
       case '<>':
-        return !_eq(l, r);
+        return !(nocase ? _eqCI(l, r) : _eq(l, r));
       case '<':
-        return _cmp(l, r) < 0;
+        return (nocase ? _cmpCI(l, r) : _cmp(l, r)) < 0;
       case '<=':
-        return _cmp(l, r) <= 0;
+        return (nocase ? _cmpCI(l, r) : _cmp(l, r)) <= 0;
       case '>':
-        return _cmp(l, r) > 0;
+        return (nocase ? _cmpCI(l, r) : _cmp(l, r)) > 0;
       case '>=':
-        return _cmp(l, r) >= 0;
+        return (nocase ? _cmpCI(l, r) : _cmp(l, r)) >= 0;
       case '+':
-        return _toNum(l)! + _toNum(r)!;
+        return _arith(_toNum(l)!, _toNum(r)!, '+');
       case '-':
-        return _toNum(l)! - _toNum(r)!;
+        return _arith(_toNum(l)!, _toNum(r)!, '-');
       case '*':
-        return _toNum(l)! * _toNum(r)!;
+        return _arith(_toNum(l)!, _toNum(r)!, '*');
       case '/':
         {
           final d = _toNum(r)!;
@@ -395,6 +402,54 @@ class BinaryExpr extends Expr {
   static bool _eq(Object a, Object b) => sqlEq(a, b);
   static int _cmp(Object a, Object b) => sqlCompare(a, b);
 
+  static bool _isNoCase(Expr e) => e is CollateExpr && e.collation == 'NOCASE';
+  static bool _eqCI(Object a, Object b) =>
+      (a is String && b is String) ? a.toLowerCase() == b.toLowerCase() : _eq(a, b);
+  static int _cmpCI(Object a, Object b) => (a is String && b is String)
+      ? a.toLowerCase().compareTo(b.toLowerCase())
+      : _cmp(a, b);
+
+  /// SQL row-value comparison for `(a, …) <op> (b, …)`. Equality is the AND of
+  /// element equalities (any decisive mismatch -> false, else a NULL -> NULL);
+  /// ordering compares element-wise, the first difference deciding, with a NULL
+  /// before any difference yielding NULL.
+  static Object? _rowValueCompare(String op, List<Object?> a, List<Object?> b) {
+    final n = a.length < b.length ? a.length : b.length;
+    if (op == '=' || op == '!=' || op == '<>') {
+      var sawNull = false;
+      for (var i = 0; i < n; i++) {
+        final x = a[i];
+        final y = b[i];
+        if (x == null || y == null) {
+          sawNull = true;
+          continue;
+        }
+        if (!_eq(x, y)) return op == '=' ? false : true;
+      }
+      if (a.length != b.length) return op == '=' ? false : true;
+      if (sawNull) return null;
+      return op == '=';
+    }
+    for (var i = 0; i < n; i++) {
+      final x = a[i];
+      final y = b[i];
+      if (x == null || y == null) return null;
+      final c = _cmp(x, y);
+      if (c != 0) {
+        switch (op) {
+          case '<':
+          case '<=':
+            return c < 0;
+          case '>':
+          case '>=':
+            return c > 0;
+        }
+      }
+    }
+    // All compared positions equal.
+    return op == '<=' || op == '>=';
+  }
+
   /// Coerce an arithmetic operand to a number (SQLite affinity rules):
   /// numbers pass through, booleans map to 1/0, numeric strings parse, and
   /// anything non-numeric becomes 0. NULL propagates (callers guard it).
@@ -404,6 +459,38 @@ class BinaryExpr extends Expr {
     if (v is bool) return v ? 1 : 0;
     if (v is String) return num.tryParse(v.trim()) ?? 0;
     return 0;
+  }
+
+  /// Apply an int-or-double arithmetic op ([o] is `+`, `-`, or `*`). When both
+  /// operands are integers, detect 64-bit overflow via BigInt and promote to
+  /// double, matching SQLite (which keeps the magnitude instead of wrapping).
+  static final BigInt _maxInt64 = BigInt.parse('9223372036854775807');
+  static final BigInt _minInt64 = BigInt.parse('-9223372036854775808');
+  static num _arith(num a, num b, String o) {
+    if (a is int && b is int) {
+      final ba = BigInt.from(a);
+      final bb = BigInt.from(b);
+      final big = o == '+'
+          ? ba + bb
+          : o == '-'
+              ? ba - bb
+              : ba * bb;
+      if (big < _minInt64 || big > _maxInt64) {
+        final da = a.toDouble();
+        final db = b.toDouble();
+        return o == '+'
+            ? da + db
+            : o == '-'
+                ? da - db
+                : da * db;
+      }
+      return big.toInt();
+    }
+    return o == '+'
+        ? a + b
+        : o == '-'
+            ? a - b
+            : a * b;
   }
 
   static bool _like(String value, String pattern) {
@@ -466,6 +553,25 @@ class BetweenExpr extends Expr {
     final inRange = BinaryExpr._cmp(v, l) >= 0 && BinaryExpr._cmp(v, h) <= 0;
     return negated ? !inRange : inRange;
   }
+}
+
+/// A parenthesized row value / tuple: `(a, b, …)`. Evaluates to a `List` so
+/// `BinaryExpr` can do element-wise row comparison.
+class RowValueExpr extends Expr {
+  final List<Expr> items;
+  RowValueExpr(this.items);
+  @override
+  Object? eval(Map<String, Object?> row) => [for (final e in items) e.eval(row)];
+}
+
+/// `expr COLLATE <name>`. The value is unchanged; the collation influences how
+/// an enclosing comparison/sort treats it (only NOCASE is special-cased here).
+class CollateExpr extends Expr {
+  final Expr inner;
+  final String collation; // uppercased, e.g. NOCASE / BINARY / RTRIM
+  CollateExpr(this.inner, this.collation);
+  @override
+  Object? eval(Map<String, Object?> row) => inner.eval(row);
 }
 
 class InExpr extends Expr {
@@ -1802,6 +1908,7 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     }
     if (a.length >= 2) {
       v = jsonPathLookup(v, a[1].toString());
+      if (v == null) return null; // missing path -> SQL NULL (not 'null')
     }
     if (v == null) return 'null';
     if (v is bool) return v ? 'true' : 'false';
@@ -1852,7 +1959,10 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     } catch (_) {
       return null;
     }
-    if (a.length >= 2) v = jsonPathLookup(v, a[1].toString());
+    if (a.length >= 2) {
+      v = jsonPathLookup(v, a[1].toString());
+      if (v == null) return null; // missing path -> SQL NULL
+    }
     return v is List ? v.length : 0;
   },
   'JSON_QUOTE': (a) {
