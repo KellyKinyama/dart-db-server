@@ -61,7 +61,7 @@ regression guard). Severity and repro come from that report; the **root cause**,
   vector-index sidecar. (SQLite-format backend: ensure WAL/journal ordering, or
   reuse the same temp-rename for the whole-file rewrite.)
 - **Verify:** `durability/crash_recovery_test.dart` (un-skip) + `durability_worker.dart`.
-- **Effort:** M. **Status:** TODO.
+- **Effort:** M. **Status:** LANDED (batch 5).
 
 ---
 
@@ -244,3 +244,20 @@ Reliability scorecard: 223 pass / 7 skip / 0 fail; `sql_features` 34/0; full
 - **F17** `SELECT alias.*` now resolves the qualifier as a FROM/JOIN **alias**
   (`_starColumns`) before falling back to a table name — `SELECT e.* FROM emp e`
   (directly or inside a view) no longer throws `No such table or view: e`.
+
+### Batch 5 — crash-atomic persistence (`database.dart`)
+Reliability scorecard: 225 pass / 5 skip / 0 fail; `durability` 5/0; 60/60 local
+crash-kill iterations and 8/8 official runs recover the committed baseline.
+- **F15** root cause was two-fold: (1) `_atomicWriteBytes` on Windows did a
+  *delete-then-rename*, leaving a gap where neither the old nor new file
+  exists; a hard kill there lost the file. (2) recovery discarded the leftover
+  `.tmp`, and for the SQLite backend the committed rows live in the `-wal`
+  companion (the main file is just the empty-schema baseline), so dropping the
+  WAL tmp lost everything.
+- **Fix:** Windows writes are now gap-free — the committed copy is moved aside
+  to `<dest>.old`, the new file is renamed into place, then `.old` is removed,
+  so `dest`/`.tmp`/`.old` always holds a complete image. Recovery
+  (`_recoverAtomicTmp`) restores the newest complete copy for **every**
+  atomic-written file (main, `-wal`, `-wal2`, wal2 meta, vector sidecar), with
+  a completeness guard (JSON parses; SQLite header page-count matches length)
+  for the torn-first-write case.

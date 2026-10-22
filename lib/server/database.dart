@@ -16759,16 +16759,15 @@ class Database implements SequenceProvider {
     }
   }
 
-  /// Crash-safe write: writes to `<dest>.tmp`, fsyncs the temp file's
-  /// contents, then atomically renames it over `dest`. On Windows the
-  /// rename can't overwrite an existing file, so we delete the
-  /// destination first; the surrounding [DbFileLock] keeps other
-  /// processes out of the brief gap.
-  ///
-  /// A torn write therefore manifests as either:
-  ///  * the original file unchanged (rename never ran); or
-  ///  * the new file fully written (rename completed),
-  /// and never as a half-written destination.
+  /// Crash-safe write: writes to `<dest>.tmp`, fsyncs it, then atomically
+  /// publishes it over `dest`. On POSIX the `rename` atomically replaces the
+  /// destination. On Windows `rename` can't overwrite, so rather than a plain
+  /// delete-then-rename (which leaves a window where neither the old nor the
+  /// new file exists), the current committed copy is first moved aside to
+  /// `<dest>.old`, then the new file is renamed into place, then `.old` is
+  /// removed. A crash in that gap is always recoverable (see
+  /// [_recoverAtomicTmp]): either `dest`, `<dest>.tmp`, or `<dest>.old` holds a
+  /// complete image, never a half-written destination.
   static Future<void> _atomicWriteBytes(String dest, List<int> bytes) async {
     final tmp = '$dest.tmp';
     final raf = await File(tmp).open(mode: FileMode.write);
@@ -16781,11 +16780,19 @@ class Database implements SequenceProvider {
     if (Platform.isWindows) {
       final destFile = File(dest);
       if (await destFile.exists()) {
-        try {
-          await destFile.delete();
-        } catch (_) {
-          /* best-effort */
+        final old = '$dest.old';
+        final oldFile = File(old);
+        if (await oldFile.exists()) {
+          try {
+            await oldFile.delete();
+          } catch (_) {/* best-effort */}
         }
+        await destFile.rename(old); // preserve committed copy
+        await File(tmp).rename(dest); // publish new
+        try {
+          await oldFile.delete();
+        } catch (_) {/* best-effort */}
+        return;
       }
     }
     await File(tmp).rename(dest);
@@ -16805,35 +16812,129 @@ class Database implements SequenceProvider {
     if (Platform.isWindows) {
       final destFile = File(dest);
       if (destFile.existsSync()) {
-        try {
-          destFile.deleteSync();
-        } catch (_) {
-          /* best-effort */
+        final old = '$dest.old';
+        final oldFile = File(old);
+        if (oldFile.existsSync()) {
+          try {
+            oldFile.deleteSync();
+          } catch (_) {/* best-effort */}
         }
+        destFile.renameSync(old);
+        File(tmp).renameSync(dest);
+        try {
+          oldFile.deleteSync();
+        } catch (_) {/* best-effort */}
+        return;
       }
     }
     File(tmp).renameSync(dest);
   }
 
-  /// Recover from a previous crash mid-[_atomicWriteBytes]: if a stale
-  /// `<path>.tmp` is sitting next to the data file, it's an incomplete
-  /// write that never made it to the rename step — discard it.
+  /// Recover from a crash mid-[_atomicWriteBytes] across every atomic-written
+  /// file (main image, WAL companions, wal2 meta, vector sidecar). Each may be
+  /// left as `dest`, `<dest>.tmp` (new, already fully written+flushed), and/or
+  /// `<dest>.old` (the previous committed copy, preserved across the Windows
+  /// rename gap). [_recoverAtomicTmp] restores the newest complete copy.
   Future<void> _reapStaleTempFiles() async {
     if (path == null) return;
-    for (final p in [
-      '$path.tmp',
-      '${path!}-wal.tmp',
-      '${path!}-wal2.tmp',
-      '${path!}.vec.json.tmp',
+    for (final dest in [
+      path!,
+      '${path!}-wal',
+      '${path!}-wal2',
+      '${path!}-wal2.meta',
+      '${path!}.vec.json',
     ]) {
-      final f = File(p);
-      if (await f.exists()) {
+      await _recoverAtomicTmp(dest);
+    }
+  }
+
+  Future<void> _recoverAtomicTmp(String dest) async {
+    final tmpF = File('$dest.tmp');
+    final oldF = File('$dest.old');
+    if (await File(dest).exists()) {
+      // The committed copy is in place; clean up any leftovers.
+      if (await tmpF.exists()) {
         try {
-          await f.delete();
-        } catch (_) {
-          /* best-effort */
+          await tmpF.delete();
+        } catch (_) {/* best-effort */}
+      }
+      if (await oldF.exists()) {
+        try {
+          await oldF.delete();
+        } catch (_) {/* best-effort */}
+      }
+      return;
+    }
+    // `dest` is missing: the crash hit the publish gap. Restore the newest
+    // complete copy. When `.old` exists the `.tmp` was fully written before
+    // `dest` was moved aside, so it is complete; otherwise validate it (guards
+    // against a torn first-ever write with no prior committed copy).
+    final oldExists = await oldF.exists();
+    if (await tmpF.exists() &&
+        (oldExists || await _atomicTmpIsComplete(tmpF, dest))) {
+      try {
+        await tmpF.rename(dest);
+        if (oldExists) {
+          try {
+            await oldF.delete();
+          } catch (_) {/* best-effort */}
+        }
+        return;
+      } catch (_) {/* fall through */}
+    }
+    if (oldExists) {
+      try {
+        await oldF.rename(dest);
+      } catch (_) {/* best-effort */}
+      if (await tmpF.exists()) {
+        try {
+          await tmpF.delete();
+        } catch (_) {/* best-effort */}
+      }
+      return;
+    }
+    if (await tmpF.exists()) {
+      try {
+        await tmpF.delete();
+      } catch (_) {/* best-effort */}
+    }
+  }
+
+  /// True when `<dest>.tmp` is a fully-written image (not a torn first write):
+  /// JSON parses cleanly; an SQLite image carries the format magic and its
+  /// header page-count matches the file length.
+  static Future<bool> _atomicTmpIsComplete(File tmp, String dest) async {
+    try {
+      final len = await tmp.length();
+      if (len == 0) return false;
+      final lower = dest.toLowerCase();
+      final isSqlite = lower.endsWith('.db') ||
+          lower.endsWith('.sqlite') ||
+          lower.endsWith('.sqlite3');
+      if (isSqlite) {
+        final raf = await tmp.open();
+        try {
+          final head = await raf.read(32);
+          if (head.length < 32) return false;
+          if (String.fromCharCodes(head.sublist(0, 15)) != 'SQLite format 3') {
+            return false;
+          }
+          var ps = (head[16] << 8) | head[17];
+          if (ps == 1) ps = 65536; // SQLite encodes 64KiB pages as 1.
+          if (ps < 512 || len % ps != 0) return false;
+          final pageCount =
+              (head[28] << 24) | (head[29] << 16) | (head[30] << 8) | head[31];
+          return pageCount > 0 && len == pageCount * ps;
+        } finally {
+          await raf.close();
         }
       }
+      // JSON backend (plain or `.vec.json`): a complete image parses; a
+      // truncated one throws.
+      jsonDecode(await tmp.readAsString());
+      return true;
+    } catch (_) {
+      return false;
     }
   }
 
