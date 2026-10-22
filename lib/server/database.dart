@@ -179,6 +179,11 @@ class Database implements SequenceProvider {
   bool get _deferFks => _truthy(_pragmas['defer_foreign_keys']);
   bool get _deferChecks => _truthy(_pragmas['defer_checks']);
 
+  /// Whether FK constraints are enforced (`PRAGMA foreign_keys`). When off,
+  /// enforcement is skipped entirely, which also permits forward references to
+  /// not-yet-created parent tables (SQLite semantics).
+  bool get _fkEnabled => _truthy(_pragmas['foreign_keys']);
+
   static bool _truthy(Object? v) {
     if (v == null) return false;
     if (v is bool) return v;
@@ -6078,6 +6083,7 @@ class Database implements SequenceProvider {
   }
 
   void _enforceForeignKeysOnInsert(Table child, List<Object?> row) {
+    if (!_fkEnabled) return;
     if (_deferFks && inTransaction) {
       _deferredFkChecks.add(_DeferredFk(child.name, List<Object?>.from(row)));
       return;
@@ -6123,6 +6129,7 @@ class Database implements SequenceProvider {
   }
 
   void _enforceForeignKeysOnDelete(Table parent, List<Object?> parentRow) {
+    if (!_fkEnabled) return;
     for (final child in _tables.values) {
       for (final fk in _foreignKeysOf(child)) {
         if (fk.references.table != parent.name) continue;
@@ -6185,6 +6192,7 @@ class Database implements SequenceProvider {
     List<Object?> oldRow,
     List<Object?> newRow,
   ) {
+    if (!_fkEnabled) return;
     final pkCols = _primaryKeyColumns(parent);
     if (pkCols.isEmpty) return;
     final oldPk = pkCols.map((c) => oldRow[parent.columnIndex(c)]).toList();

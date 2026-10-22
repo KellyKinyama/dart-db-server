@@ -617,7 +617,9 @@ bool sqlEq(Object a, Object b) {
 }
 
 int sqlCompare(Object a, Object b) {
-  if (a is num && b is num) return a.compareTo(b);
+  // IEEE equality first so -0.0 compares equal to 0.0 (Dart's num.compareTo is a
+  // total order that ranks -0.0 below 0.0, which would make `0 > -0.0` true).
+  if (a is num && b is num) return a == b ? 0 : a.compareTo(b);
   if (a is Comparable && b is Comparable && a.runtimeType == b.runtimeType) {
     return a.compareTo(b);
   }
@@ -794,9 +796,17 @@ class InSubqueryExpr extends Expr {
     final v = value.eval(row);
     if (v == null) return null;
     final list = run(row);
+    var sawNull = false;
     for (final ev in list) {
-      if (ev != null && sqlEq(v, ev)) return !negated;
+      if (ev == null) {
+        sawNull = true;
+        continue;
+      }
+      if (sqlEq(v, ev)) return !negated;
     }
+    // No match: a NULL in the result set makes it UNKNOWN (SQL 3VL), so
+    // `NOT IN (… NULL …)` is NULL — never TRUE.
+    if (sawNull) return null;
     return negated;
   }
 }

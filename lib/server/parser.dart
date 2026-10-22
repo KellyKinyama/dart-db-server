@@ -694,6 +694,9 @@ class Parser {
   }
 
   bool _isTableLevelConstraintStart() {
+    // A leading `CONSTRAINT <name>` always introduces a named table-level
+    // constraint when it appears at the start of a CREATE TABLE item.
+    if (_checkWord('CONSTRAINT')) return true;
     final t = _peek();
     if (t.type != TokType.keyword) return false;
     if (t.upper == 'PRIMARY' || t.upper == 'UNIQUE' || t.upper == 'CHECK') {
@@ -706,6 +709,11 @@ class Parser {
   }
 
   TableConstraint _parseTableConstraint() {
+    // Optional `CONSTRAINT <name>` prefix (the name is accepted but not
+    // retained) before PRIMARY KEY / UNIQUE / CHECK / FOREIGN KEY.
+    if (_matchWord('CONSTRAINT')) {
+      _advance();
+    }
     if (_matchKw('PRIMARY')) {
       _expectKw('KEY');
       _expect(TokType.punct, '(');
