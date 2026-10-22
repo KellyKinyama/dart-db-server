@@ -13,7 +13,7 @@
 |-----|------------|----------------|
 | **1. Thin Dart** | `package:oracledb` thin mode (open source, UB-varint wire) | Server speaks the documented thin TTC dialect. |
 | **2. Pure-Dart thick** | [`lib/oracle_thick_client.dart`](../lib/oracle_thick_client.dart) — our own native (OCI/OCCI, v320) client | Server speaks the *native* dialect; and the client itself round-trips auth + query + DML + FETCH. |
-| **3. Real `oci8`** | Oracle Instant Client 23.9 via PHP `oci8` / `python-oracledb` thick / `node-oracledb` thick (closed-source `libclntsh`) | Ground truth: a real Oracle client works against the server, and its bytes are the reference the pure-Dart thick client is diffed against. |
+| **3. Real `oci8`** | Oracle Instant Client 23.9 via the PHP `oci8` extension (closed-source `libclntsh`) | Ground truth: a real Oracle client works against the server, and its bytes are the reference the pure-Dart thick client is diffed against. |
 
 "Test against **both the server and the client**" means Gun 3 is used two ways:
 
@@ -97,11 +97,9 @@ the **host architecture** of the process that loads it (the thick client is
 native `libclntsh`; e.g. an x86_64 PHP must use an x86_64 Instant Client — on
 Apple Silicon run it under an x86_64 runtime or use an x86_64 container).
 
-- PHP: enable the `oci8` extension (`pecl install oci8`), pointing it at the
-  Instant Client.
-- Python: `pip install oracledb` (it ships thin; call `init_oracle_client()` to
-  switch to thick, which loads Instant Client).
-- Node: `npm i oracledb` and `oracledb.initOracleClient()`.
+Enable the PHP `oci8` extension (`php -m` should list `oci8`) pointing at the
+Instant Client. This is the client already in use on the dev box — `oci_connect`
+working from PHP means the Instant Client is correctly installed.
 
 ### Gun 3 against the server
 
@@ -125,36 +123,22 @@ while ($row = oci_fetch_array($sel, OCI_ASSOC)) { print_r($row); }
 oci_close($c);
 ```
 
-**`python-oracledb` (thick mode):**
-
-```python
-import oracledb
-oracledb.init_oracle_client()  # loads Instant Client -> thick mode
-c = oracledb.connect(user="native", password="Secret123",
-                     dsn="127.0.0.1:1521/FREEPDB1")
-cur = c.cursor()
-cur.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name VARCHAR2(40))")
-cur.execute("INSERT INTO t VALUES (:id, :name)", id=1, name="alice")
-print(cur.execute("SELECT id, name FROM t WHERE id > :m", m=0).fetchall())
-c.close()
-```
-
 Pass criteria: connect succeeds, the `SELECT` returns the inserted rows, DML
-reports the right row counts, and `oci_close` / `connection.close()` tears down
-without an `ORA-`/`TNS-` error. That is the same lifecycle Gun 1 and Gun 2 run —
-compare results three ways against the SQLite reference.
+reports the right row counts, and `oci_close` tears down without an
+`ORA-`/`TNS-` error. That is the same lifecycle Gun 1 and Gun 2 run — compare
+results three ways against the SQLite reference.
 
-A ready-to-run Python version of this lifecycle (thick mode, JSON output for
-diffing) ships at [`tool/oci8_runner.py`](../tool/oci8_runner.py):
+A ready-to-run version of this lifecycle (JSON output for diffing) ships at
+[`tool/oci8_runner.php`](../tool/oci8_runner.php):
 
 ```bash
-pip install oracledb
-python tool/oci8_runner.py --user native --password Secret123   # -> JSON result
+php tool/oci8_runner.php                       # -> JSON result
+ORA_USER=native ORA_PASSWORD=Secret123 php tool/oci8_runner.php
 ```
 
 It mirrors the yajra/`oci8` flow (combined `ALTER SESSION`, create, named-bind
 insert, multi-row select, bound select, update, drop) and exits non-zero on any
-`ORA-`/`DPY-` error, so it drops straight into CI or the harness.
+`ORA-` error, so it drops straight into CI or the harness.
 
 ### Gun 3 against the client
 
