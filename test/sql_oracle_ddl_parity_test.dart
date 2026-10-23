@@ -338,4 +338,23 @@ void main() {
       await db.close();
     }
   });
+
+  // F85: CREATE INDEX on a materialized view is accepted (no-op); the MV stays
+  // queryable.
+  test('CREATE INDEX on a materialized view is accepted', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE s (m VARCHAR2(10), amt NUMBER)');
+      await db.execute("INSERT INTO s VALUES ('x', 10), ('x', 5)");
+      await db.execute('CREATE MATERIALIZED VIEW mv AS '
+          'SELECT m, SUM(amt) AS total FROM s GROUP BY m');
+      await db.execute('CREATE INDEX ix ON mv (m)');
+      await db.execute('CREATE BITMAP INDEX bx ON mv (total)');
+      expect((await db.execute('SELECT m, total FROM mv')).rows, [
+        ['x', 15]
+      ]);
+    } finally {
+      await db.close();
+    }
+  });
 }

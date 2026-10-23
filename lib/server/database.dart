@@ -4895,6 +4895,11 @@ class Database implements SequenceProvider {
   }
 
   QueryResult _createIndex(CreateIndexStmt s) {
+    // An index on a view / materialized view is an optimization the engine does
+    // not model (the relation is materialized on demand); accept it as a no-op.
+    if (!_tables.containsKey(s.table) && _views.containsKey(s.table)) {
+      return QueryResult.message('Index ${s.indexName} created');
+    }
     final t = _requireTable(s.table);
     final hasNonBinary = s.collations.any((c) => c.toUpperCase() != 'BINARY');
     t.createIndex(
