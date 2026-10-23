@@ -709,6 +709,25 @@ class LikeExpr extends Expr {
 /// Convenience: evaluate expression as boolean (NULL -> false).
 bool evalPredicate(Expr e, Map<String, Object?> row) => sqlTruthy(e.eval(row));
 
+/// Exact-decimal half-up rounding of [value] to [scale] fractional digits.
+/// Recovers the intended decimal through a guard-digit string first so binary
+/// floating-point noise (1.005 stored as 1.00499999…) rounds like Oracle.
+num _roundHalfUpDecimal(num value, int scale) {
+  if (value is int) return value;
+  final neg = value < 0;
+  final abs = value.abs();
+  final str = abs.toStringAsFixed(scale + 3); // guard digits kill binary noise
+  final dot = str.indexOf('.');
+  final intPart = str.substring(0, dot);
+  final fracPart = str.substring(dot + 1);
+  final keep = scale == 0 ? '' : fracPart.substring(0, scale);
+  final roundDigit = int.parse(fracPart[scale]);
+  var n = BigInt.parse('$intPart$keep');
+  if (roundDigit >= 5) n += BigInt.one;
+  final result = n.toDouble() / _pow10(scale);
+  return neg ? -result : result;
+}
+
 /// Coerce a value to the column's type for storage/comparison purposes.
 Object? coerceForColumn(Object? value, ColumnDef col,
     {bool strict = false, bool tableHasRowid = true}) {
@@ -738,11 +757,9 @@ Object? coerceForColumn(Object? value, ColumnDef col,
     }
     if (n != null) {
       final scale = col.numericScale ?? 0;
-      // Round half-away-from-zero to the declared scale.
-      final factor = _pow10(scale);
-      num rounded = scale >= 0
-          ? (n * factor).roundToDouble() / factor
-          : n.toDouble();
+      // Exact-decimal half-up rounding to the declared scale (Oracle NUMBER is
+      // decimal, not binary — 1.005 -> 1.01, not the double's 1.00).
+      num rounded = scale >= 0 ? _roundHalfUpDecimal(n, scale) : n.toDouble();
       // Normalize integral doubles back to int.
       if (rounded is double && rounded == rounded.truncateToDouble()) {
         rounded = rounded.toInt();
@@ -758,6 +775,15 @@ Object? coerceForColumn(Object? value, ColumnDef col,
         }
       }
       value = rounded;
+    }
+  }
+  // Oracle CHAR(n) / NCHAR(n) are fixed-length: blank-pad a shorter string to
+  // the declared length (LENGTH('ab') in a CHAR(5) column is 5).
+  if (col.charLength != null && value is String) {
+    final dt = col.declaredType?.toUpperCase();
+    if ((dt == 'CHAR' || dt == 'NCHAR' || dt == 'CHARACTER') &&
+        value.length < col.charLength!) {
+      value = value.padRight(col.charLength!);
     }
   }
   if (strict) {

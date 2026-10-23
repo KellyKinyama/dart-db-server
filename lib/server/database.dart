@@ -5972,6 +5972,22 @@ class Database implements SequenceProvider {
       var skip = s.offset == null
           ? 0
           : ((_evalScalar(s.offset!, const {}) as num?)?.toInt() ?? 0);
+      // Oracle ROWNUM in `SET col = ROWNUM` lowers to ROW_NUMBER() OVER ();
+      // supply it a running 1-based counter over the updated rows. Bind the
+      // assignment expressions once so the window nodes keep a stable identity.
+      final boundAssign = <String, Expr>{
+        for (final e in s.assignments.entries) e.key: _bindExpr(e.value)
+      };
+      final assignWinFns = <FunctionCallExpr>[];
+      for (final expr in boundAssign.values) {
+        _collectWindowFns(expr, assignWinFns);
+      }
+      var rownumCtr = 0;
+      final prevWinValues = FunctionCallExpr.windowRowValues;
+      if (assignWinFns.isNotEmpty) {
+        FunctionCallExpr.windowRowValues = <FunctionCallExpr, Object?>{};
+      }
+      try {
       for (final ri in rowOrder) {
         if (lim == 0 || (lim > 0 && count >= lim)) break;
         _beginSeqRow();
@@ -6005,6 +6021,12 @@ class Database implements SequenceProvider {
         }
         final old = List<Object?>.from(row);
         final newRow = List<Object?>.from(row);
+        if (assignWinFns.isNotEmpty) {
+          rownumCtr++;
+          for (final fn in assignWinFns) {
+            FunctionCallExpr.windowRowValues![fn] = rownumCtr;
+          }
+        }
         _fireTriggers(
           t.name,
           'UPDATE',
@@ -6021,7 +6043,7 @@ class Database implements SequenceProvider {
             );
           }
           newRow[colIdx] = coerceForColumn(
-            _evalScalar(expr, matchedView!),
+            boundAssign[col]!.eval(matchedView!),
             t.columns[colIdx],
             strict: t.strict,
             tableHasRowid: !t.withoutRowid,
@@ -6068,6 +6090,11 @@ class Database implements SequenceProvider {
         );
       }
       return QueryResult.message('$count row(s) updated', affected: count);
+      } finally {
+        if (assignWinFns.isNotEmpty) {
+          FunctionCallExpr.windowRowValues = prevWinValues;
+        }
+      }
     } finally {
       if (pushed) _cteStack.removeLast();
     }
@@ -13904,6 +13931,15 @@ class Database implements SequenceProvider {
         boundOrderAgg[oi] = _bindExpr(s.orderBy[oi].expr);
       }
     }
+    // Oracle nested aggregate over GROUP BY (e.g. MAX(MIN(s)) GROUP BY d):
+    // two-level aggregation collapsing all groups to a single output row.
+    if (s.groupBy.isNotEmpty && projExprs.any(_containsNestedAggregate)) {
+      final row = [
+        for (final e in projExprs)
+          _collapseNestedAggregate(e, s, groups, groupOrder, groupKeys)
+      ];
+      return _AggResult(outCols, [row], [<String, Object?>{}]);
+    }
     for (final key in groupOrder) {
       final grpRows = groups[key]!;
       // Group context map: columns of an arbitrary row (used by non-aggregate
@@ -14072,6 +14108,86 @@ class Database implements SequenceProvider {
     if (e is CastExpr) return _containsAggregate(e.expr);
     if (e is FunctionCallExpr) return e.args.any(_containsAggregate);
     return false;
+  }
+
+  /// True when [e] contains an aggregate whose argument itself contains an
+  /// aggregate (Oracle's two-level `MAX(MIN(x))` over GROUP BY).
+  bool _containsNestedAggregate(Expr? e) {
+    if (e == null) return false;
+    if (e is FunctionCallExpr && e.isAggregate && !e.isWindow) {
+      if (e.args.any(_containsAggregate)) return true;
+    }
+    if (e is FunctionCallExpr) return e.args.any(_containsNestedAggregate);
+    if (e is BinaryExpr) {
+      return _containsNestedAggregate(e.left) ||
+          _containsNestedAggregate(e.right);
+    }
+    if (e is UnaryExpr) return _containsNestedAggregate(e.operand);
+    if (e is CastExpr) return _containsNestedAggregate(e.expr);
+    if (e is CaseExpr) {
+      return e.whens.any(_containsNestedAggregate) ||
+          e.thens.any(_containsNestedAggregate) ||
+          _containsNestedAggregate(e.elseExpr);
+    }
+    return false;
+  }
+
+  /// Collapse a projection containing a nested aggregate into a single value:
+  /// the inner aggregate is computed per group, then the outer aggregate runs
+  /// across the per-group results.
+  Object? _collapseNestedAggregate(
+    Expr e,
+    SelectStmt s,
+    Map<String, List<Map<String, Object?>>> groups,
+    List<String> groupOrder,
+    Map<String, List<Object?>> groupKeys,
+  ) {
+    if (e is FunctionCallExpr &&
+        e.isAggregate &&
+        !e.isWindow &&
+        e.args.any(_containsAggregate)) {
+      final innerRows = <Map<String, Object?>>[];
+      for (final key in groupOrder) {
+        final grpRows = groups[key]!;
+        final ctx = grpRows.isEmpty
+            ? <String, Object?>{}
+            : Map<String, Object?>.from(grpRows.first);
+        for (var gi = 0; gi < s.groupBy.length; gi++) {
+          ctx['__group$gi'] = groupKeys[key]![gi];
+        }
+        if (s.having != null && !_evalHaving(s.having!, grpRows, ctx)) continue;
+        final iv = e.args.isEmpty
+            ? null
+            : _evalProjectedWithAggregates(e.args.first, grpRows, ctx);
+        innerRows.add({'__v': iv});
+      }
+      final rebuilt = FunctionCallExpr(
+        e.name,
+        [ColumnExpr('__v')],
+        distinct: e.distinct,
+        aggOrderBy: e.aggOrderBy,
+        keepFirst: e.keepFirst,
+        keepOrderBy: e.keepOrderBy,
+      );
+      return _aggregateValue(rebuilt, innerRows);
+    }
+    if (e is BinaryExpr) {
+      final l = _collapseNestedAggregate(e.left, s, groups, groupOrder, groupKeys);
+      final r =
+          _collapseNestedAggregate(e.right, s, groups, groupOrder, groupKeys);
+      return BinaryExpr(e.op, LiteralExpr(l), LiteralExpr(r)).eval(const {});
+    }
+    if (e is UnaryExpr) {
+      final v =
+          _collapseNestedAggregate(e.operand, s, groups, groupOrder, groupKeys);
+      return UnaryExpr(e.op, LiteralExpr(v)).eval(const {});
+    }
+    // Non-nested leaf: aggregate / evaluate over all rows flattened.
+    final allRows = [for (final key in groupOrder) ...groups[key]!];
+    final ctx = allRows.isEmpty
+        ? <String, Object?>{}
+        : Map<String, Object?>.from(allRows.first);
+    return _evalProjectedWithAggregates(e, allRows, ctx);
   }
 
   /// Collect every window-function call nested anywhere in [e] (top level or

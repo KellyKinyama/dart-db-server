@@ -643,6 +643,45 @@ class Parser {
     );
   }
 
+  /// Parses an Oracle `UNPIVOT [INCLUDE|EXCLUDE NULLS] (valueCol FOR labelCol
+  /// IN (c1 [AS label], …))` over table [tableName] and rewrites it into a
+  /// UNION ALL subquery with one arm per unpivoted column.
+  SelectStmt _parseUnpivotClause(String tableName) {
+    var includeNulls = false;
+    if (_matchWord('INCLUDE')) {
+      _matchWord('NULLS');
+      includeNulls = true;
+    } else if (_matchWord('EXCLUDE')) {
+      _matchWord('NULLS');
+    }
+    _expect(TokType.punct, '(');
+    final valueCol = _expectName();
+    _expectWord('FOR');
+    final labelCol = _expectName();
+    _expectKw('IN');
+    _expect(TokType.punct, '(');
+    final cols = <(String, String)>[];
+    do {
+      final colName = _expectName();
+      var label = colName;
+      if (_matchKw('AS')) {
+        label = _check(TokType.string)
+            ? _advance().text
+            : _expectName();
+      }
+      cols.add((colName, label));
+    } while (_match(TokType.punct, ','));
+    _expect(TokType.punct, ')'); // IN list
+    _expect(TokType.punct, ')'); // UNPIVOT
+    final arms = cols
+        .map((c) =>
+            "SELECT $tableName.*, '${c.$2}' AS $labelCol, ${c.$1} AS $valueCol "
+            "FROM $tableName"
+            '${includeNulls ? '' : ' WHERE ${c.$1} IS NOT NULL'}')
+        .join(' UNION ALL ');
+    return Parser.fromString(arms).parseStatement() as SelectStmt;
+  }
+
   void _columnNamesInto(Expr e, Set<String> out) {
     if (e is ColumnExpr) {
       out.add(e.name.toLowerCase());
@@ -2103,6 +2142,7 @@ class Parser {
     var depth = 0;
     int? intoTokIdx;
     int? fromTokIdx;
+    int? bulkTokIdx;
     while (!_isAtEnd() && !(depth == 0 && _check(TokType.punct, ';'))) {
       final t = _peek();
       if (t.type == TokType.punct && t.text == '(') {
@@ -2110,6 +2150,7 @@ class Parser {
       } else if (t.type == TokType.punct && t.text == ')') {
         depth--;
       } else if (depth == 0 && isSelect) {
+        if (bulkTokIdx == null && t.upper == 'BULK') bulkTokIdx = _pos;
         if (intoTokIdx == null && t.upper == 'INTO') intoTokIdx = _pos;
         if (fromTokIdx == null && t.upper == 'FROM') fromTokIdx = _pos;
       }
@@ -2121,7 +2162,10 @@ class Parser {
     if (isSelect && intoTokIdx != null) {
       final intoTok = _tokens[intoTokIdx];
       final fromTok = fromTokIdx != null ? _tokens[fromTokIdx] : null;
-      final q1 = _sliceRoutine(startOff, intoTok.offset);
+      // `SELECT … BULK COLLECT INTO coll …`: the query text stops before the
+      // BULK COLLECT marker (the selected column(s) land in the collection).
+      final qEndTok = bulkTokIdx != null ? _tokens[bulkTokIdx] : intoTok;
+      final q1 = _sliceRoutine(startOff, qEndTok.offset);
       final q2 =
           fromTok != null ? ' ${_sliceRoutine(fromTok.offset, endOff)}' : '';
       final intoVars = <String>[];
@@ -2220,6 +2264,15 @@ class Parser {
   List<RoutineDecl> _parsePlsqlDeclarations() {
     final decls = <RoutineDecl>[];
     while (!_checkWord('BEGIN') && !_isAtEnd()) {
+      // PL/SQL type declarations (TYPE … IS TABLE OF / RECORD / REF CURSOR /
+      // VARRAY, and SUBTYPE / CURSOR / PRAGMA) are parsed and discarded.
+      if (_matchWord('TYPE') ||
+          _matchWord('SUBTYPE') ||
+          _matchWord('CURSOR') ||
+          _matchWord('PRAGMA')) {
+        _skipToSemicolon();
+        continue;
+      }
       final name = _expectIdent().text;
       _matchWord('CONSTANT');
       _consumeRoutineType();
@@ -3157,6 +3210,14 @@ class Parser {
     while (_match(TokType.punct, ',')) {
       items.add(_parseSelectItem());
     }
+    // PL/SQL `RETURNING ... INTO var[, var]`: consume the bind-variable
+    // targets (the values are surfaced via the statement's RETURNING result).
+    if (_matchWord('INTO')) {
+      _parseExpr();
+      while (_match(TokType.punct, ',')) {
+        _parseExpr();
+      }
+    }
     return items;
   }
 
@@ -3337,7 +3398,9 @@ class Parser {
         fromAlias = _expectName();
       } else if (_check(TokType.ident) &&
           !_isClauseStartWord() &&
-          !_checkWord('PIVOT')) {
+          !_checkWord('PIVOT') &&
+          !_checkWord('UNPIVOT') &&
+          !_checkWord('MODEL')) {
         fromAlias = _advance().text;
       }
       fromIndexHint = _consumeIndexedHint();
@@ -3351,6 +3414,14 @@ class Parser {
               fromTable: fromTable,
               orderBy: const [],
             ));
+        fromTable = null;
+        fromFunc = null;
+      }
+      // Oracle UNPIVOT: rewrite `FROM tbl UNPIVOT (val FOR col IN (c1, c2))`
+      // into a UNION ALL subquery (one arm per unpivoted column).
+      if (_checkWord('UNPIVOT') && fromTable != null) {
+        _advance(); // UNPIVOT
+        fromSub = _parseUnpivotClause(fromTable);
         fromTable = null;
         fromFunc = null;
       }
@@ -3457,6 +3528,35 @@ class Parser {
     // joins, moving the marked equality predicate(s) from WHERE into the ON.
     if (where != null && joins.isNotEmpty) {
       where = _rewriteOracleOuterJoins(fromTable, fromAlias, joins, where);
+    }
+    // Oracle MODEL clause (spreadsheet-style RULES): advanced and rare — it is
+    // consumed and discarded so the underlying query still runs.
+    if (_matchWord('MODEL')) {
+      var depth = 0;
+      while (!_isAtEnd()) {
+        final t = _peek();
+        if (t.type == TokType.punct && t.text == '(') {
+          depth++;
+          _advance();
+          continue;
+        }
+        if (t.type == TokType.punct && t.text == ')') {
+          if (depth == 0) break;
+          depth--;
+          _advance();
+          continue;
+        }
+        if (depth == 0 &&
+            ((t.type == TokType.punct && t.text == ';') ||
+                t.upper == 'ORDER' ||
+                t.upper == 'UNION' ||
+                t.upper == 'INTERSECT' ||
+                t.upper == 'EXCEPT' ||
+                t.upper == 'MINUS')) {
+          break;
+        }
+        _advance();
+      }
     }
     // Oracle hierarchical query: [START WITH ...] CONNECT BY [NOCYCLE] ...
     // (START WITH and CONNECT BY may appear in either order).

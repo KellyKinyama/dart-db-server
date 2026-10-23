@@ -253,6 +253,19 @@ class Lexer {
         out.add(_readBacktickIdent());
         continue;
       }
+      // Oracle q-quote (alternative quoting): q'[...]', q'{...}', q'!...!',
+      // and the national nq'...' variant. The char after q' is the opening
+      // delimiter; []{}()<> are bracket pairs, any other char is its own close.
+      if ((c == 'q' || c == 'Q') && _peek(1) == "'") {
+        out.add(_readQQuote(_pos + 2));
+        continue;
+      }
+      if ((c == 'n' || c == 'N') &&
+          (_peek(1) == 'q' || _peek(1) == 'Q') &&
+          _peek(2) == "'") {
+        out.add(_readQQuote(_pos + 3));
+        continue;
+      }
       // X'...' BLOB literal (hex). Must be a standalone X immediately
       // followed by a single-quoted run of hex digits.
       if ((c == 'X' || c == 'x') && _peek(1) == "'") {
@@ -323,6 +336,35 @@ class Lexer {
       _pos++;
     }
     throw FormatException('Unterminated string at $start');
+  }
+
+  /// Reads an Oracle q-quote literal body. [afterQuote] is the index of the
+  /// opening delimiter (just past `q'`). The closing delimiter (bracket-matched
+  /// for []{}()<>, else the same char) followed by `'` ends the literal.
+  Token _readQQuote(int afterQuote) {
+    final start = _pos;
+    if (afterQuote >= src.length) {
+      throw FormatException('Unterminated q-quote at $start');
+    }
+    final open = src[afterQuote];
+    final close = switch (open) {
+      '[' => ']',
+      '{' => '}',
+      '(' => ')',
+      '<' => '>',
+      _ => open,
+    };
+    final buf = StringBuffer();
+    var i = afterQuote + 1;
+    while (i < src.length) {
+      if (src[i] == close && i + 1 < src.length && src[i + 1] == "'") {
+        _pos = i + 2;
+        return Token(TokType.string, buf.toString(), start);
+      }
+      buf.write(src[i]);
+      i++;
+    }
+    throw FormatException('Unterminated q-quote at $start');
   }
 
   Token _readDoubleQuotedIdent() {
@@ -518,6 +560,12 @@ class Lexer {
       return Token(TokType.op, c, start);
     }
     if ('(),;.'.contains(c)) {
+      _pos++;
+      return Token(TokType.punct, c, start);
+    }
+    // Square brackets: Oracle MODEL cell references (v[2020]) and other
+    // bracketed syntaxes. Tokenized so higher layers can consume them.
+    if (c == '[' || c == ']') {
       _pos++;
       return Token(TokType.punct, c, start);
     }
