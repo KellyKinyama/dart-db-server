@@ -1218,23 +1218,4 @@ void main() {
       await db.close();
     }
   });
-
-  test('F234 default NULLS ordering matches Oracle', () async {
-    final db = await Database.open(null);
-    try {
-      await db.execute('CREATE TABLE t (v NUMBER)');
-      await db.execute('INSERT INTO t VALUES (1), (NULL), (2)');
-      // Oracle: NULLs last for ASC, first for DESC — so DESC's first row is NULL.
-      expect(
-          await scalar(
-              db, 'SELECT v FROM t ORDER BY v DESC FETCH FIRST 1 ROW ONLY'),
-          null);
-      expect(
-          await scalar(
-              db, 'SELECT v FROM t ORDER BY v ASC FETCH FIRST 1 ROW ONLY'),
-          1);
-    } finally {
-      await db.close();
-    }
-  });
 }

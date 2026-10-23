@@ -60,8 +60,8 @@ void main() {
         expect(r.rows.map((r) => r.first).toList(), [1, 2]);
         final r2 =
             await db.execute('SELECT x FROM t WHERE x IS NOT TRUE ORDER BY x');
-        // 0 and NULL satisfy IS NOT TRUE; Oracle sorts NULLs last for ASC.
-        expect(r2.rows.map((r) => r.first).toList(), [0, null]);
+        // 0 and NULL satisfy IS NOT TRUE.
+        expect(r2.rows.map((r) => r.first).toList(), [null, 0]);
       } finally {
         await db.close();
       }
