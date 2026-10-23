@@ -4596,10 +4596,15 @@ class Parser {
         final s = tp.length > 2 ? (double.tryParse(tp[2]) ?? 0) : 0;
         magnitude = dayPart + h / 24 + mi / 1440 + s / 86400;
       } else if (body.contains('-')) {
+        // 'Y-M' year-to-month: a calendar-month interval (keep the day).
         final ym = body.split('-');
         final y = int.tryParse(ym[0]) ?? 0;
         final mo = ym.length > 1 ? (int.tryParse(ym[1]) ?? 0) : 0;
-        magnitude = y * 365 + mo * 30;
+        return LiteralExpr(YmInterval(sign * (y * 12 + mo)));
+      } else if (unit == 'YEAR' || unit == 'MONTH') {
+        // Single-field YEAR / MONTH: also a calendar-month interval.
+        final months = unit == 'YEAR' ? lead * 12 : lead;
+        return LiteralExpr(YmInterval(sign * months));
       } else {
         magnitude = lead * (daysPerUnit[unit] ?? 1);
       }

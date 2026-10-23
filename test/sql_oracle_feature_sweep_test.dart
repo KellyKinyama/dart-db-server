@@ -675,4 +675,46 @@ void main() {
       await db.close();
     }
   });
+
+  // ---- Round 50 (mega-sweep V): F209–F211 ---------------------------------
+
+  test('F209 REGEXP POSIX character classes', () async {
+    final db = await Database.open(null);
+    try {
+      expect(
+          await scalar(
+              db, "SELECT REGEXP_REPLACE('a1b2','[[:digit:]]','#') FROM dual"),
+          'a#b#');
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F210 APPROX_PERCENTILE aggregate', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE m (v NUMBER)');
+      await db.execute('INSERT INTO m VALUES (10), (20), (30), (40)');
+      expect(
+          await scalar(db,
+              'SELECT APPROX_PERCENTILE(0.5) WITHIN GROUP (ORDER BY v) FROM m'),
+          20);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F211 INTERVAL YEAR TO MONTH keeps the day', () async {
+    final db = await Database.open(null);
+    try {
+      expect(
+          await scalar(
+              db,
+              "SELECT TO_CHAR(DATE '2024-07-20' + INTERVAL '1-6' YEAR TO "
+              "MONTH, 'YYYY-MM-DD') FROM dual"),
+          '2026-01-20');
+    } finally {
+      await db.close();
+    }
+  });
 }

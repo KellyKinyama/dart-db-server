@@ -302,6 +302,20 @@ class UnaryExpr extends Expr {
   }
 }
 
+/// A YEAR-TO-MONTH interval value (a signed whole number of months). Kept as a
+/// distinct type — rather than a day count — so DATE arithmetic adds *calendar*
+/// months (preserving the day-of-month) instead of ~30-day approximations.
+class YmInterval {
+  final int months;
+  const YmInterval(this.months);
+  @override
+  String toString() {
+    final y = months.abs() ~/ 12;
+    final m = months.abs() % 12;
+    return '${months < 0 ? '-' : ''}$y-$m';
+  }
+}
+
 class BinaryExpr extends Expr {
   final String op;
   final Expr left;
@@ -388,8 +402,14 @@ class BinaryExpr extends Expr {
           // Oracle date arithmetic: DATE + n (days) shifts the date; numbers
           // on both sides fall through to numeric addition.
           final ld = _asSqlDate(l);
+          if (ld != null && r is YmInterval) {
+            return _shiftMonths(ld, r.months, l);
+          }
           if (ld != null && r is num) return _shiftDate(ld, r.toDouble(), l);
           final rd = _asSqlDate(r);
+          if (rd != null && l is YmInterval) {
+            return _shiftMonths(rd, l.months, r);
+          }
           if (rd != null && l is num) return _shiftDate(rd, l.toDouble(), r);
           return _arith(_toNum(l)!, _toNum(r)!, '+');
         }
@@ -398,6 +418,9 @@ class BinaryExpr extends Expr {
           // Oracle date arithmetic: DATE - DATE = day count; DATE - n shifts.
           final ld = _asSqlDate(l);
           final rd = _asSqlDate(r);
+          if (ld != null && r is YmInterval) {
+            return _shiftMonths(ld, -r.months, l);
+          }
           if (ld != null && rd != null) {
             final diff = ld.difference(rd).inSeconds / 86400.0;
             return diff == diff.roundToDouble() ? diff.toInt() : diff;
@@ -1576,16 +1599,42 @@ class RaiseException implements Exception {
 
 /// Builds a [RegExp] honouring Oracle's REGEXP `match_param` flags:
 /// `i` case-insensitive, `c` case-sensitive (overrides `i`), `m` multiline
-/// anchors, `n` dot matches newlines. Unknown flags are ignored.
+/// anchors, `n` dot matches newlines. Unknown flags are ignored. POSIX
+/// character classes (`[[:digit:]]`, `[[:alpha:]]`, …) are translated to their
+/// Dart `RegExp` equivalents.
 RegExp _oracleRegex(String pattern, String? matchParam) {
   final mp = matchParam ?? '';
   final caseSensitive = mp.contains('c') ? true : !mp.contains('i');
   return RegExp(
-    pattern,
+    _translatePosixClasses(pattern),
     caseSensitive: caseSensitive,
     multiLine: mp.contains('m'),
     dotAll: mp.contains('n'),
   );
+}
+
+/// Replaces POSIX character classes of the form `[:name:]` (used inside a
+/// bracket expression) with the equivalent Dart character ranges.
+String _translatePosixClasses(String pattern) {
+  const map = {
+    'alpha': 'a-zA-Z',
+    'digit': '0-9',
+    'alnum': 'a-zA-Z0-9',
+    'upper': 'A-Z',
+    'lower': 'a-z',
+    'space': r'\s',
+    'blank': ' \\t',
+    'xdigit': '0-9A-Fa-f',
+    'punct': r'!-/:-@\[-`{-~',
+    'cntrl': r'\x00-\x1f\x7f',
+    'print': r'\x20-\x7e',
+    'graph': r'\x21-\x7e',
+    'word': r'\w',
+  };
+  return pattern.replaceAllMapped(RegExp(r'\[:(\^?)(\w+):\]'), (m) {
+    final cls = map[m.group(2)!.toLowerCase()];
+    return cls ?? m.group(0)!;
+  });
 }
 
 final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
@@ -4029,7 +4078,20 @@ Object _shiftDate(DateTime d, double days, Object? original) {
   return (hadTime || hasTime) ? _fmtDateTime(shifted) : _fmtDate(shifted);
 }
 
-/// Maps a day name (full or 3-letter, any case) to a Dart weekday (Mon=1..Sun=7).
+/// Shifts [d] by [months] *calendar* months (preserving the day-of-month,
+/// clamping to the target month's last day), for DATE + INTERVAL YEAR TO MONTH.
+Object _shiftMonths(DateTime d, int months, Object? original) {
+  final total = d.year * 12 + (d.month - 1) + months;
+  final y = total ~/ 12;
+  final mo = total % 12 + 1;
+  final lastDay = DateTime.utc(y, mo + 1, 0).day;
+  final day = d.day > lastDay ? lastDay : d.day;
+  final shifted = DateTime.utc(y, mo, day, d.hour, d.minute, d.second);
+  final hadTime = original is String && original.contains(RegExp(r'\d:\d'));
+  final hasTime =
+      shifted.hour != 0 || shifted.minute != 0 || shifted.second != 0;
+  return (hadTime || hasTime) ? _fmtDateTime(shifted) : _fmtDate(shifted);
+}
 int? _weekdayFromName(String name) {
   const days = {
     'MON': 1, 'TUE': 2, 'WED': 3, 'THU': 4, 'FRI': 5, 'SAT': 6, 'SUN': 7,  };
@@ -4876,6 +4938,7 @@ const Set<String> kAggregateFunctions = {
   'CORR',
   'PERCENTILE_CONT',
   'PERCENTILE_DISC',
+  'APPROX_PERCENTILE',
   'STATS_MODE',
   'APPROX_COUNT_DISTINCT',
   'REGR_COUNT',

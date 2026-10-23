@@ -14999,6 +14999,7 @@ class Database implements SequenceProvider {
         }
       case 'PERCENTILE_CONT':
       case 'PERCENTILE_DISC':
+      case 'APPROX_PERCENTILE':
         {
           // PERCENTILE_x(frac) WITHIN GROUP (ORDER BY expr): the fraction is
           // the first arg; the ordered-by expression supplies the values.
@@ -15019,7 +15020,7 @@ class Database implements SequenceProvider {
           }
           if (nums.isEmpty) return null;
           nums.sort();
-          if (e.name == 'PERCENTILE_DISC') {
+          if (e.name == 'PERCENTILE_DISC' || e.name == 'APPROX_PERCENTILE') {
             // Smallest value whose cumulative distribution >= frac.
             final idx =
                 (frac * nums.length).ceil().clamp(1, nums.length) - 1;
