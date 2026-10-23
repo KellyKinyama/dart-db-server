@@ -3315,6 +3315,8 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
   // CLOB/NCLOB conversions are no-ops in this engine (text is already text).
   'TO_CLOB': (a) => a.isEmpty || a[0] == null ? null : a[0].toString(),
   'TO_NCLOB': (a) => a.isEmpty || a[0] == null ? null : a[0].toString(),
+  // Oracle JSON(expr) / JSON constructor: keep the JSON text as-is.
+  'JSON': (a) => a.isEmpty || a[0] == null ? null : a[0].toString(),
   // NLS case functions: the linguistic parameter is accepted and ignored; the
   // transform matches UPPER / LOWER / INITCAP.
   'NLS_UPPER': (a) =>

@@ -3385,6 +3385,31 @@ class Parser {
       final body = _parseSelect();
       _expect(TokType.punct, ')');
       ctes[name] = body;
+      // Oracle recursive-WITH SEARCH / CYCLE clauses — parsed and ignored (the
+      // ordering/cycle-mark columns are not materialised).
+      if (_matchWord('SEARCH')) {
+        if (!_matchWord('DEPTH')) _matchWord('BREADTH');
+        _matchWord('FIRST');
+        _matchWord('BY');
+        _parseOrderByItem();
+        while (_match(TokType.punct, ',')) {
+          _parseOrderByItem();
+        }
+        _matchWord('SET');
+        _expectName();
+      }
+      if (_matchWord('CYCLE')) {
+        _expectName();
+        while (_match(TokType.punct, ',')) {
+          _expectName();
+        }
+        _matchWord('SET');
+        _expectName();
+        _matchWord('TO');
+        _parsePrimary();
+        _matchWord('DEFAULT');
+        _parsePrimary();
+      }
       } while (_match(TokType.punct, ','));
     }
 
@@ -4977,13 +5002,28 @@ class Parser {
                 _peek(2).text == ')')) {
           return _parseFunctionCall('${t.text}.$col');
         }
-        // Object-attribute navigation `alias.col.attr[.attr…]`: the column
-        // holds a JSON object; extract the nested attribute path.
+        // Object-attribute navigation `alias.col.attr[.attr…][.string()]`: the
+        // column holds a JSON object; extract the nested attribute path. A
+        // trailing type accessor (`.string()`, `.number()`, …) is consumed.
         if (_check(TokType.punct, '.')) {
           final path = StringBuffer(r'$');
-          while (_match(TokType.punct, '.')) {
+          while (_check(TokType.punct, '.') &&
+              (_peek(1).type == TokType.ident ||
+                  _peek(1).type == TokType.keyword)) {
+            // A `.method()` accessor terminates the path.
+            if (_peek(2).type == TokType.punct && _peek(2).text == '(') {
+              _advance(); // .
+              _advance(); // accessor name
+              _expect(TokType.punct, '(');
+              while (!_check(TokType.punct, ')') && !_isAtEnd()) {
+                _advance();
+              }
+              _expect(TokType.punct, ')');
+              break;
+            }
+            _advance(); // .
             path.write('.');
-            path.write(_expectName());
+            path.write(_advance().text);
           }
           return FunctionCallExpr('JSON_VALUE', [
             ColumnExpr(col, table: t.text),

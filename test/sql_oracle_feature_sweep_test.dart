@@ -1189,4 +1189,33 @@ void main() {
       await db.close();
     }
   });
+
+  test('F226 recursive WITH CYCLE clause', () async {
+    final db = await Database.open(null);
+    try {
+      expect(
+          await scalar(
+              db,
+              'SELECT COUNT(*) FROM (WITH r(n) AS (SELECT 1 FROM dual '
+              'UNION ALL SELECT n+1 FROM r WHERE n < 4) CYCLE n SET cyc '
+              'TO 1 DEFAULT 0 SELECT n FROM r)'),
+          4);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F233 JSON dot-notation column access', () async {
+    final db = await Database.open(null);
+    try {
+      expect(
+          await scalar(
+              db,
+              "SELECT jt.doc.name.string() FROM "
+              "(SELECT JSON('{\"name\":\"x\"}') doc FROM dual) jt"),
+          'x');
+    } finally {
+      await db.close();
+    }
+  });
 }
