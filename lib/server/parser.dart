@@ -682,6 +682,50 @@ class Parser {
     return Parser.fromString(arms).parseStatement() as SelectStmt;
   }
 
+  /// Parses `JSON_TABLE(src, 'path' COLUMNS (col type [PATH 'p'], …))` (the
+  /// opening `JSON_TABLE` word is already consumed) into a placeholder derived
+  /// table exposing the declared column names, so views/queries that lateral-
+  /// join JSON_TABLE parse. Row extraction is not modelled.
+  SelectStmt _parseJsonTableClause() {
+    _expect(TokType.punct, '(');
+    _parseExpr(); // JSON source expression
+    if (_match(TokType.punct, ',')) {
+      if (_check(TokType.string)) _advance(); // row path
+    }
+    final cols = <String>[];
+    if (_matchWord('COLUMNS')) {
+      _expect(TokType.punct, '(');
+      do {
+        cols.add(_expectName());
+        var depth = 0;
+        while (!_isAtEnd()) {
+          final tk = _peek();
+          if (tk.type == TokType.punct && tk.text == '(') {
+            depth++;
+            _advance();
+            continue;
+          }
+          if (tk.type == TokType.punct && tk.text == ')') {
+            if (depth == 0) break;
+            depth--;
+            _advance();
+            continue;
+          }
+          if (depth == 0 && tk.type == TokType.punct && tk.text == ',') break;
+          _advance();
+        }
+      } while (_match(TokType.punct, ','));
+      _expect(TokType.punct, ')'); // COLUMNS list
+    }
+    _expect(TokType.punct, ')'); // JSON_TABLE
+    return SelectStmt(
+      projection: [
+        for (final c in cols) SelectItem.expr(LiteralExpr(null), alias: c)
+      ],
+      orderBy: const [],
+    );
+  }
+
   void _columnNamesInto(Expr e, Set<String> out) {
     if (e is ColumnExpr) {
       out.add(e.name.toLowerCase());
@@ -3417,6 +3461,11 @@ class Parser {
       if (_match(TokType.punct, '(')) {
         fromSub = _parseSelect();
         _expect(TokType.punct, ')');
+      } else if (_checkWord('JSON_TABLE') &&
+          _peek(1).type == TokType.punct &&
+          _peek(1).text == '(') {
+        _advance(); // JSON_TABLE
+        fromSub = _parseJsonTableClause();
       } else {
         // Look ahead: an identifier immediately followed by `(` is a
         // table-valued function call (e.g. `json_each('[1,2]')`).
@@ -3470,6 +3519,11 @@ class Parser {
           if (_match(TokType.punct, '(')) {
             csub = _parseSelect();
             _expect(TokType.punct, ')');
+          } else if (_checkWord('JSON_TABLE') &&
+              _peek(1).type == TokType.punct &&
+              _peek(1).text == '(') {
+            _advance(); // JSON_TABLE
+            csub = _parseJsonTableClause();
           } else {
             ctbl = _parseQualifiedTableName();
           }
@@ -4106,6 +4160,19 @@ class Parser {
       if (_matchKw('FALSE')) {
         return UnaryExpr(negated ? 'IS NOT FALSE' : 'IS FALSE', left);
       }
+      // IS [NOT] JSON — Oracle validity predicate. Optional FORMAT/semantics
+      // keywords after JSON are consumed and ignored.
+      if (_matchWord('JSON')) {
+        while (_matchWord('FORMAT') ||
+            _matchWord('STRICT') ||
+            _matchWord('LAX') ||
+            _matchWord('WITH') ||
+            _matchWord('WITHOUT') ||
+            _matchWord('UNIQUE') ||
+            _matchWord('KEYS') ||
+            _matchWord('JSON')) {}
+        return UnaryExpr(negated ? 'IS NOT JSON' : 'IS JSON', left);
+      }
       // Bare IS / IS NOT <expr> — NULL-safe (in)equality (SQLite extension).
       final right = _parseConcat();
       return BinaryExpr(negated ? 'IS NOT' : 'IS', left, right);
@@ -4488,6 +4555,19 @@ class Parser {
                 _peek(2).type == TokType.punct &&
                 _peek(2).text == ')')) {
           return _parseFunctionCall('${t.text}.$col');
+        }
+        // Object-attribute navigation `alias.col.attr[.attr…]`: the column
+        // holds a JSON object; extract the nested attribute path.
+        if (_check(TokType.punct, '.')) {
+          final path = StringBuffer(r'$');
+          while (_match(TokType.punct, '.')) {
+            path.write('.');
+            path.write(_expectName());
+          }
+          return FunctionCallExpr('JSON_VALUE', [
+            ColumnExpr(col, table: t.text),
+            LiteralExpr(path.toString()),
+          ]);
         }
         return _maybeOuterJoin(ColumnExpr(col, table: t.text));
       }

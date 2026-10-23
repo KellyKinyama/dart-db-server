@@ -5193,6 +5193,16 @@ class Database implements SequenceProvider {
   /// (the caller already holds the lock, so embedded SQL runs via nested
   /// [_dispatch]). Throws when [name] is not a defined function.
   Object? _invokeStoredFunctionSync(String name, List<Object?> args) {
+    // Oracle object-type default constructor: TYPE_NAME(attr1, …) builds a
+    // JSON object keyed by the type's declared attribute names.
+    final objType = _objectTypes[name.toUpperCase()];
+    if (objType != null) {
+      final m = <String, Object?>{};
+      for (var i = 0; i < objType.length; i++) {
+        m[objType[i].name] = i < args.length ? args[i] : null;
+      }
+      return jsonEncode(m);
+    }
     final r = _routines[name.toUpperCase()];
     if (r == null || !r.isFunction) {
       throw StateError('Unknown function: $name');
@@ -14345,6 +14355,13 @@ class Database implements SequenceProvider {
     return acc.toDouble() / scale.toDouble();
   }
 
+  /// Strips binary floating-point noise by round-tripping through a 15-digit
+  /// decimal (1.0150000000000001 -> 1.015), mirroring Oracle's exact NUMBER.
+  double _cleanDecimal(double v) {
+    if (v == 0 || !v.isFinite) return v;
+    return double.parse(v.toStringAsPrecision(15));
+  }
+
   Object? _aggregateValue(FunctionCallExpr e, List<Map<String, Object?>> grp) {
     if (e.filterExpr != null) {
       grp = grp.where((r) {
@@ -14633,7 +14650,9 @@ class Database implements SequenceProvider {
           nums.sort();
           final mid = nums.length ~/ 2;
           if (nums.length.isOdd) return nums[mid];
-          return (nums[mid - 1] + nums[mid]) / 2;
+          // Average the two middle values in exact decimal (Oracle NUMBER),
+          // not binary — MEDIAN(1.01, 1.02) is 1.015, not 1.0150000000000001.
+          return _cleanDecimal((nums[mid - 1] + nums[mid]) / 2);
         }
       case 'PERCENTILE_CONT':
       case 'PERCENTILE_DISC':

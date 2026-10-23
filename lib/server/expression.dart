@@ -260,8 +260,34 @@ class UnaryExpr extends Expr {
         return _truthy(v) == false;
       case 'IS NOT FALSE':
         return _truthy(v) != false;
+      case 'IS JSON':
+        return _isValidJson(v);
+      case 'IS NOT JSON':
+        return !_isValidJson(v);
     }
     throw StateError('Unknown unary op: $op');
+  }
+
+  /// True when [v] is syntactically valid JSON. RAW/BLOB bytes are decoded as
+  /// UTF-8 first (Oracle stores JSON in RAW/BLOB columns).
+  static bool _isValidJson(Object? v) {
+    if (v == null) return false;
+    String s;
+    if (v is List<int>) {
+      try {
+        s = utf8.decode(v);
+      } catch (_) {
+        return false;
+      }
+    } else {
+      s = v.toString();
+    }
+    try {
+      jsonDecode(s);
+      return true;
+    } catch (_) {
+      return false;
+    }
   }
 
   /// SQL truthiness: NULL stays NULL; numeric zero is false; bool passes
@@ -3638,6 +3664,14 @@ DateTime? _parseOracleDate(String text, String? fmt) {
   final captured = <String>[];
   var i = 0;
   while (i < f.length) {
+    // Fractional seconds FF[1-9]: match the digit run as microseconds.
+    if (f.startsWith('FF', i)) {
+      i += 2;
+      if (i < f.length && RegExp(r'\d').hasMatch(f[i])) i++; // FFn precision
+      pattern.write(r'(\d{1,9})');
+      captured.add('FF');
+      continue;
+    }
     var matched = false;
     for (final tok in order) {
       if (!f.startsWith(tok, i)) continue;
@@ -3691,6 +3725,7 @@ DateTime? _parseOracleDate(String text, String? fmt) {
       RegExp(pattern.toString(), caseSensitive: false).firstMatch(t);
   if (m == null) return _parseDateTime(t) ?? DateTime.tryParse(t);
   var year = 2000, month = 1, day = 1, hour = 0, minute = 0, second = 0;
+  var millis = 0, micros = 0;
   for (var g = 0; g < captured.length; g++) {
     final v = m.group(g + 1);
     if (v == null) continue;
@@ -3714,10 +3749,14 @@ DateTime? _parseOracleDate(String text, String? fmt) {
         minute = int.parse(v);
       case 'SS':
         second = int.parse(v);
+      case 'FF':
+        final frac = v.padRight(6, '0').substring(0, 6);
+        millis = int.parse(frac.substring(0, 3));
+        micros = int.parse(frac.substring(3, 6));
     }
   }
   try {
-    return DateTime.utc(year, month, day, hour, minute, second);
+    return DateTime.utc(year, month, day, hour, minute, second, millis, micros);
   } catch (_) {
     return null;
   }
