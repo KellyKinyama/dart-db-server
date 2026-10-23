@@ -14306,6 +14306,45 @@ class Database implements SequenceProvider {
     return 0;
   }
 
+  /// Exact-decimal sum of [vals] (Oracle NUMBER arithmetic is decimal, not
+  /// binary — SUM(0.1, 0.2) is 0.3, not 0.30000000000000004). Scales every
+  /// value to a common power of ten and accumulates with BigInt. Returns null
+  /// when a value uses scientific notation or needs more than 15 fraction
+  /// digits, so the caller falls back to a plain double sum.
+  num? _decimalSum(List<num> vals) {
+    if (vals.isEmpty) return null;
+    var maxDec = 0;
+    for (final v in vals) {
+      final s = v.toString();
+      if (s.contains('e') || s.contains('E')) return null;
+      final dot = s.indexOf('.');
+      if (dot >= 0) {
+        final d = s.length - dot - 1;
+        if (d > maxDec) maxDec = d;
+      }
+    }
+    if (maxDec > 15) return null;
+    final scale = BigInt.from(10).pow(maxDec);
+    var acc = BigInt.zero;
+    for (final v in vals) {
+      var s = v.toString();
+      final neg = s.startsWith('-');
+      if (neg) s = s.substring(1);
+      final dot = s.indexOf('.');
+      final intp = dot < 0 ? s : s.substring(0, dot);
+      var frac = dot < 0 ? '' : s.substring(dot + 1);
+      frac = frac.padRight(maxDec, '0').substring(0, maxDec);
+      final digits = '$intp$frac';
+      var big = BigInt.parse(digits.isEmpty ? '0' : digits);
+      if (neg) big = -big;
+      acc += big;
+    }
+    if (maxDec == 0) {
+      return acc.isValidInt ? acc.toInt() : acc.toDouble();
+    }
+    return acc.toDouble() / scale.toDouble();
+  }
+
   Object? _aggregateValue(FunctionCallExpr e, List<Map<String, Object?>> grp) {
     if (e.filterExpr != null) {
       grp = grp.where((r) {
@@ -14376,27 +14415,43 @@ class Database implements SequenceProvider {
         return values.length;
       case 'SUM':
         {
-          var acc = 0.0;
-          var any = false;
+          final vals = <num>[];
           var allInt = true;
-          final iter = _aggValues(e, grp);
-          for (final v in iter) {
+          for (final v in _aggValues(e, grp)) {
             if (v == null) continue;
             final n = _aggNum(v);
-            any = true;
             if (n is! int) allInt = false;
-            acc += n.toDouble();
+            vals.add(n);
           }
-          if (!any) return null;
-          return allInt ? acc.toInt() : acc;
+          if (vals.isEmpty) return null;
+          if (allInt) {
+            var acc = 0;
+            for (final v in vals) {
+              acc += v as int;
+            }
+            return acc;
+          }
+          final dec = _decimalSum(vals);
+          if (dec != null) return dec;
+          var acc = 0.0;
+          for (final v in vals) {
+            acc += v.toDouble();
+          }
+          return acc;
         }
       case 'TOTAL':
         {
           // SQLite TOTAL: always returns a float, returns 0.0 on empty.
-          var acc = 0.0;
+          final vals = <num>[];
           for (final v in _aggValues(e, grp)) {
             if (v == null) continue;
-            acc += _aggNum(v).toDouble();
+            vals.add(_aggNum(v));
+          }
+          final dec = _decimalSum(vals);
+          if (dec != null) return dec.toDouble();
+          var acc = 0.0;
+          for (final v in vals) {
+            acc += v.toDouble();
           }
           return acc;
         }

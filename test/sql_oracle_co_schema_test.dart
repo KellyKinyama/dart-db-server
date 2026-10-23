@@ -87,4 +87,17 @@ void main() {
       await db.close();
     }
   });
+
+  test('SUM over NUMBER uses exact-decimal arithmetic', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE t (v NUMBER(8,2))');
+      await db.execute('INSERT INTO t VALUES (0.1), (0.2)');
+      expect(await scalar(db, 'SELECT SUM(v) FROM t'), 0.3);
+      await db.execute('INSERT INTO t VALUES (0.1), (0.1), (0.1)');
+      expect(await scalar(db, 'SELECT SUM(v) FROM t'), 0.6);
+    } finally {
+      await db.close();
+    }
+  });
 }
