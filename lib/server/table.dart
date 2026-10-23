@@ -85,6 +85,10 @@ class Table implements TableBackend {
   /// stores rows the same way regardless.
   bool withoutRowid;
 
+  /// Names of constraints disabled via `ALTER TABLE … DISABLE CONSTRAINT`.
+  /// While non-empty the table's FK checks are skipped (deferred-load flow).
+  final Set<String> disabledConstraints = <String>{};
+
   Table(this.name, this.columns,
       {List<TableConstraint>? constraints,
       this.strict = false,

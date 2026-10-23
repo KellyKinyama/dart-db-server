@@ -2225,6 +2225,13 @@ class Parser {
   // ---- ALTER --------------------------------------------------------------
   Statement _parseAlter() {
     _expectKw('ALTER');
+    if (_matchWord('SESSION')) {
+      // ALTER SESSION SET … — accepted and ignored.
+      while (!_isAtEnd() && !_check(TokType.punct, ';')) {
+        _advance();
+      }
+      return DdlNoopStmt('ALTER SESSION');
+    }
     _expectKw('TABLE');
     final table = _expectIdent().text;
     if (_matchKw('RENAME')) {
@@ -2236,6 +2243,24 @@ class Parser {
       _expectKw('TO');
       final newName = _expectIdent().text;
       return AlterTableRenameColumnStmt(table, oldName, newName);
+    }
+    if (_checkWord('DISABLE') || _checkWord('ENABLE')) {
+      final enable = _peek().upper == 'ENABLE';
+      _advance();
+      _matchWord('VALIDATE');
+      _matchWord('NOVALIDATE');
+      if (_matchWord('CONSTRAINT')) {
+        final cname = _expectName();
+        while (!_isAtEnd() && !_check(TokType.punct, ';')) {
+          _advance();
+        }
+        return AlterTableSetConstraintStmt(table, cname, enable);
+      }
+      // DISABLE/ENABLE ROW MOVEMENT / etc. — accept and ignore.
+      while (!_isAtEnd() && !_check(TokType.punct, ';')) {
+        _advance();
+      }
+      return DdlNoopStmt('ALTER TABLE');
     }
     if (_matchKw('DROP')) {
       _matchKw('COLUMN');

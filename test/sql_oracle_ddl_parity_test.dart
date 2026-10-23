@@ -173,4 +173,80 @@ void main() {
       await db.close();
     }
   });
+
+  // F75: TO_DATE parses text by an Oracle format model.
+  test('TO_DATE parses common Oracle date formats', () async {
+    final db = await Database.open(null);
+    try {
+      expect((await db.execute(
+                  "SELECT TO_DATE('2024-01-15','YYYY-MM-DD') FROM dual"))
+              .rows
+              .first
+              .first,
+          '2024-01-15');
+      expect((await db.execute(
+                  "SELECT TO_DATE('17-JUN-2003','DD-MON-YYYY') FROM dual"))
+              .rows
+              .first
+              .first,
+          '2003-06-17');
+      expect((await db.execute("SELECT TO_DATE("
+                  "'2003-06-17 13:45:00','YYYY-MM-DD HH24:MI:SS') FROM dual"))
+              .rows
+              .first
+              .first,
+          '2003-06-17 13:45:00');
+    } finally {
+      await db.close();
+    }
+  });
+
+  // F76: ALTER TABLE DISABLE/ENABLE CONSTRAINT toggles FK enforcement.
+  test('DISABLE CONSTRAINT suspends FK checks; ENABLE restores them', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE p (id NUMBER, CONSTRAINT p_pk PRIMARY KEY (id))');
+      await db.execute('CREATE TABLE c (id NUMBER, pid NUMBER, '
+          'CONSTRAINT c_fk FOREIGN KEY (pid) REFERENCES p (id))');
+      // FK normally rejects an orphan child.
+      await expectLater(
+          db.execute('INSERT INTO c VALUES (1, 99)'), throwsA(anything));
+      // Disabled: the orphan loads (deferred-load flow).
+      await db.execute('ALTER TABLE c DISABLE CONSTRAINT c_fk');
+      await db.execute('INSERT INTO c VALUES (1, 99)');
+      // Re-enabled: FK checks resume.
+      await db.execute('ALTER TABLE c ENABLE CONSTRAINT c_fk');
+      await expectLater(
+          db.execute('INSERT INTO c VALUES (2, 98)'), throwsA(anything));
+    } finally {
+      await db.close();
+    }
+  });
+
+  // F77: ALTER SESSION SET is accepted and ignored.
+  test('ALTER SESSION SET is accepted', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('ALTER SESSION SET NLS_LANGUAGE=American');
+      await db.execute("ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD'");
+    } finally {
+      await db.close();
+    }
+  });
+
+  // F78: COMMIT with no active transaction is a no-op.
+  test('COMMIT with no active transaction is a no-op', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('COMMIT'); // no error
+      await db.execute('CREATE TABLE t (id NUMBER)');
+      await db.execute('INSERT INTO t VALUES (1)');
+      await db.execute('COMMIT'); // still a no-op (autocommit)
+      expect((await db.execute('SELECT id FROM t')).rows, [
+        [1]
+      ]);
+    } finally {
+      await db.close();
+    }
+  });
 }

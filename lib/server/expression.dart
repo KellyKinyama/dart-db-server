@@ -2326,6 +2326,22 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     if (v is String) return num.tryParse(v.trim());
     return null;
   },
+  // TO_DATE(text [, fmt]) parses [text] by the Oracle format model [fmt] (a
+  // useful subset) and returns the engine's ISO text date/datetime.
+  'TO_DATE': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final dt = _parseOracleDate(
+        a[0].toString(), a.length > 1 ? a[1]?.toString() : null);
+    if (dt == null) return null;
+    final hasTime = dt.hour != 0 || dt.minute != 0 || dt.second != 0;
+    return hasTime ? _fmtDateTime(dt) : _fmtDate(dt);
+  },
+  'TO_TIMESTAMP': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final dt = _parseOracleDate(
+        a[0].toString(), a.length > 1 ? a[1]?.toString() : null);
+    return dt == null ? null : _fmtDateTime(dt);
+  },
   'CURDATE': (a) => _fmtDate(DateTime.now().toUtc()),
   'CURTIME': (a) => _fmtTime(DateTime.now().toUtc()),
   'UTC_TIMESTAMP': (a) => _fmtDateTime(DateTime.now().toUtc(), full: true),
@@ -2988,6 +3004,114 @@ String _fmtDate(DateTime d) => '${d.year.toString().padLeft(4, "0")}-'
 String _fmtTime(DateTime d) => '${d.hour.toString().padLeft(2, "0")}:'
     '${d.minute.toString().padLeft(2, "0")}:'
     '${d.second.toString().padLeft(2, "0")}';
+
+const Map<String, int> _oracleMonthAbbr = {
+  'JAN': 1, 'FEB': 2, 'MAR': 3, 'APR': 4, 'MAY': 5, 'JUN': 6, //
+  'JUL': 7, 'AUG': 8, 'SEP': 9, 'OCT': 10, 'NOV': 11, 'DEC': 12,
+};
+
+/// Parses [text] by an Oracle date format model [fmt] (a common subset: YYYY,
+/// RRRR, YY, MM, MON, MONTH, DD, HH24/HH, MI, SS). Falls back to ISO parsing
+/// when [fmt] is absent or does not match.
+DateTime? _parseOracleDate(String text, String? fmt) {
+  final t = text.trim();
+  if (fmt == null || fmt.trim().isEmpty) {
+    return _parseDateTime(t) ?? DateTime.tryParse(t);
+  }
+  final f = fmt.trim().toUpperCase();
+  // Longest-first so YYYY beats YY, MONTH beats MON, HH24 beats HH.
+  const order = [
+    'YYYY', 'RRRR', 'YYY', 'MONTH', 'MON', 'HH24', 'HH12', 'YY', 'RR', 'MM',
+    'DD', 'HH', 'MI', 'SS',
+  ];
+  final pattern = StringBuffer('^');
+  final captured = <String>[];
+  var i = 0;
+  while (i < f.length) {
+    var matched = false;
+    for (final tok in order) {
+      if (!f.startsWith(tok, i)) continue;
+      switch (tok) {
+        case 'YYYY':
+        case 'RRRR':
+          pattern.write(r'(\d{4})');
+          captured.add('Y4');
+        case 'YYY':
+          pattern.write(r'(\d{3})');
+          captured.add('Y3');
+        case 'YY':
+        case 'RR':
+          pattern.write(r'(\d{2})');
+          captured.add('Y2');
+        case 'MONTH':
+          pattern.write(r'([A-Za-z]+)');
+          captured.add('MON');
+        case 'MON':
+          pattern.write(r'([A-Za-z]{3,})');
+          captured.add('MON');
+        case 'MM':
+          pattern.write(r'(\d{1,2})');
+          captured.add('MM');
+        case 'DD':
+          pattern.write(r'(\d{1,2})');
+          captured.add('DD');
+        case 'HH24':
+        case 'HH12':
+        case 'HH':
+          pattern.write(r'(\d{1,2})');
+          captured.add('HH');
+        case 'MI':
+          pattern.write(r'(\d{1,2})');
+          captured.add('MI');
+        case 'SS':
+          pattern.write(r'(\d{1,2})');
+          captured.add('SS');
+      }
+      i += tok.length;
+      matched = true;
+      break;
+    }
+    if (!matched) {
+      pattern.write(RegExp.escape(f[i]));
+      i++;
+    }
+  }
+  pattern.write(r'$');
+  final m =
+      RegExp(pattern.toString(), caseSensitive: false).firstMatch(t);
+  if (m == null) return _parseDateTime(t) ?? DateTime.tryParse(t);
+  var year = 2000, month = 1, day = 1, hour = 0, minute = 0, second = 0;
+  for (var g = 0; g < captured.length; g++) {
+    final v = m.group(g + 1);
+    if (v == null) continue;
+    switch (captured[g]) {
+      case 'Y4':
+        year = int.parse(v);
+      case 'Y3':
+        year = 2000 + int.parse(v);
+      case 'Y2':
+        final yy = int.parse(v);
+        year = yy < 50 ? 2000 + yy : 1900 + yy;
+      case 'MON':
+        month = _oracleMonthAbbr[v.substring(0, 3).toUpperCase()] ?? month;
+      case 'MM':
+        month = int.parse(v);
+      case 'DD':
+        day = int.parse(v);
+      case 'HH':
+        hour = int.parse(v);
+      case 'MI':
+        minute = int.parse(v);
+      case 'SS':
+        second = int.parse(v);
+    }
+  }
+  try {
+    return DateTime.utc(year, month, day, hour, minute, second);
+  } catch (_) {
+    return null;
+  }
+}
 
 String _fmtDateTime(DateTime d, {bool full = false}) =>
     '${_fmtDate(d)} ${_fmtTime(d)}';

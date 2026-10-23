@@ -80,6 +80,15 @@ class AlterTableAddConstraintStmt extends Statement {
   AlterTableAddConstraintStmt(this.table, this.constraints);
 }
 
+/// `ALTER TABLE t ENABLE|DISABLE CONSTRAINT <name>` — toggles constraint
+/// enforcement (used by the circular-FK deferred-load flow).
+class AlterTableSetConstraintStmt extends Statement {
+  final String table;
+  final String constraint;
+  final bool enable;
+  AlterTableSetConstraintStmt(this.table, this.constraint, this.enable);
+}
+
 /// `COMMENT ON TABLE/COLUMN <name> IS '<text>'` — Oracle metadata DDL; accepted
 /// as a no-op (the engine stores no object comments).
 class CommentStmt extends Statement {}

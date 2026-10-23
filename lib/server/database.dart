@@ -2449,6 +2449,8 @@ class Database implements SequenceProvider {
         result = _alterRenameTable(stmt);
       } else if (stmt is AlterTableAddConstraintStmt) {
         result = _alterAddConstraint(stmt);
+      } else if (stmt is AlterTableSetConstraintStmt) {
+        result = _alterSetConstraint(stmt);
       } else if (stmt is CommentStmt) {
         result = QueryResult.message('Comment accepted');
       } else if (stmt is CreateSynonymStmt) {
@@ -4795,6 +4797,18 @@ class Database implements SequenceProvider {
     return QueryResult.message('Constraint(s) added to ${s.table}');
   }
 
+  QueryResult _alterSetConstraint(AlterTableSetConstraintStmt s) {
+    final t = _requireTable(s.table);
+    if (s.enable) {
+      t.disabledConstraints.remove(s.constraint);
+    } else {
+      t.disabledConstraints.add(s.constraint);
+    }
+    return QueryResult.message(
+        'Constraint ${s.constraint} ${s.enable ? 'enabled' : 'disabled'} '
+        'on ${s.table}');
+  }
+
   QueryResult _alterDropColumn(AlterTableDropColumnStmt s) {
     final t = _requireTable(s.table);
     final idx = t.columnIndex(s.column);
@@ -6216,6 +6230,9 @@ class Database implements SequenceProvider {
 
   void _enforceForeignKeysOnInsert(Table child, List<Object?> row) {
     if (!_fkEnabled) return;
+    // A disabled constraint (ALTER TABLE … DISABLE CONSTRAINT) suspends the
+    // table's FK checks — the circular-FK deferred-load flow.
+    if (child.disabledConstraints.isNotEmpty) return;
     if (_deferFks && inTransaction) {
       _deferredFkChecks.add(_DeferredFk(child.name, List<Object?>.from(row)));
       return;
@@ -14994,7 +15011,8 @@ class Database implements SequenceProvider {
   }
 
   QueryResult _commit() {
-    if (!inTransaction) throw StateError('No transaction in progress');
+    // Oracle/MySQL treat COMMIT with no active transaction as a no-op.
+    if (!inTransaction) return QueryResult.message('OK');
     // Replay any deferred FK checks now. Failure rolls the txn back
     // and throws with a deferred-prefixed message.
     if (_deferredFkChecks.isNotEmpty && !_readOnlySnapshot) {
