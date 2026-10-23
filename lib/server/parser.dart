@@ -169,6 +169,48 @@ class Parser {
     return null;
   }
 
+  /// Consumes Oracle flashback (`AS OF SCN|TIMESTAMP …`, `VERSIONS BETWEEN …
+  /// AND …`) and `SAMPLE [BLOCK] (n) [SEED (n)]` clauses after a FROM table.
+  /// Accepted and ignored — the engine queries the current, full table.
+  void _consumeFlashbackAndSample() {
+    if (_checkWord('VERSIONS')) {
+      _advance(); // VERSIONS
+      _matchWord('BETWEEN');
+      // SCN|TIMESTAMP <lo> AND <hi> — tokens up to a clause boundary.
+      while (!_isAtEnd() &&
+          !_isClauseStartWord() &&
+          !_check(TokType.punct, ';') &&
+          !_check(TokType.punct, ')') &&
+          !_check(TokType.punct, ',')) {
+        _advance();
+      }
+    }
+    if (_checkWord('AS') && _peek(1).upper == 'OF') {
+      _advance(); // AS
+      _advance(); // OF
+      _matchWord('SCN');
+      _matchWord('TIMESTAMP');
+      _parseExpr(); // the SCN / timestamp value
+    }
+    if (_matchWord('SAMPLE')) {
+      _matchWord('BLOCK');
+      if (_match(TokType.punct, '(')) {
+        while (!_isAtEnd() && !_check(TokType.punct, ')')) {
+          _advance();
+        }
+        _expect(TokType.punct, ')');
+      }
+      if (_matchWord('SEED')) {
+        if (_match(TokType.punct, '(')) {
+          while (!_isAtEnd() && !_check(TokType.punct, ')')) {
+            _advance();
+          }
+          _expect(TokType.punct, ')');
+        }
+      }
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Statements
   // ---------------------------------------------------------------------------
@@ -476,10 +518,15 @@ class Parser {
       _expectWord('REPLACE');
       orReplace = true;
     }
-    // Accept TEMP / TEMPORARY before TABLE/VIEW/TRIGGER/INDEX. We don't
-    // model temp scope; the modifier is parsed and ignored so that the
+    // Accept [GLOBAL|PRIVATE] TEMP / TEMPORARY before TABLE/VIEW/TRIGGER/INDEX.
+    // We don't model temp scope; the modifiers are parsed and ignored so the
     // CREATE statement is recognised.
     {
+      if (_checkWord('GLOBAL') || _checkWord('PRIVATE')) {
+        if (_peek(1).upper == 'TEMPORARY' || _peek(1).upper == 'TEMP') {
+          _advance();
+        }
+      }
       final p = _peek();
       if (p.type == TokType.ident &&
           (p.upper == 'TEMP' || p.upper == 'TEMPORARY')) {
@@ -824,6 +871,11 @@ class Parser {
       } else if (_matchWord('ORGANIZATION')) {
         // Oracle index-organized / heap table storage clause: accept + ignore.
         if (!_matchWord('INDEX')) _matchWord('HEAP');
+      } else if (_matchWord('ON')) {
+        // Oracle GLOBAL TEMPORARY `ON COMMIT {PRESERVE|DELETE} ROWS` — accept.
+        _matchWord('COMMIT');
+        if (!_matchWord('PRESERVE')) _matchWord('DELETE');
+        _matchWord('ROWS');
       } else if (_matchWord('PARTITION') || _matchWord('PARTITIONS')) {
         // Oracle partitioning clause (PARTITION BY …): accept and ignore the
         // remainder of the statement.
@@ -1249,6 +1301,24 @@ class Parser {
       }
       if (_checkKw('REFERENCES')) {
         references = _parseReferencesClause();
+        continue;
+      }
+      // Constraint-state attributes (DEFERRABLE / INITIALLY DEFERRED|IMMEDIATE,
+      // ENABLE/DISABLE, RELY/NORELY, VALIDATE/NOVALIDATE) — accepted + ignored.
+      if (_matchWord('DEFERRABLE')) {
+        if (_matchWord('INITIALLY')) {
+          if (!_matchWord('DEFERRED')) _matchWord('IMMEDIATE');
+        }
+        continue;
+      }
+      if (_checkWord('NOT') && _peek(1).upper == 'DEFERRABLE') {
+        _advance();
+        _advance();
+        continue;
+      }
+      // Oracle column visibility: VISIBLE / INVISIBLE — accepted (the column is
+      // still addressable by name).
+      if (_matchWord('VISIBLE') || _matchWord('INVISIBLE')) {
         continue;
       }
       if (_matchKw('GENERATED')) {
@@ -3570,6 +3640,10 @@ class Parser {
           fromTable = _parseQualifiedTableName();
         }
       }
+      // Oracle flashback (`AS OF SCN|TIMESTAMP …`, `VERSIONS BETWEEN … AND …`)
+      // and `SAMPLE [BLOCK] (n) [SEED (n)]` — accepted and ignored (we query
+      // the current rows / the full table).
+      _consumeFlashbackAndSample();
       if (_matchKw('AS')) {
         fromAlias = _expectName();
       } else if (_check(TokType.ident) &&

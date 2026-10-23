@@ -1043,4 +1043,87 @@ void main() {
       await db.close();
     }
   });
+
+  // ---- Rounds 59-60 (schema DDL / misc built-ins): F241-F246 --------------
+
+  test('F241 DEFERRABLE constraint', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE p (id NUMBER PRIMARY KEY)');
+      await db.execute('CREATE TABLE c (pid NUMBER REFERENCES p(id) '
+          'DEFERRABLE INITIALLY DEFERRED)');
+      await db.execute('INSERT INTO p VALUES (1)');
+      await db.execute('INSERT INTO c VALUES (1)');
+      expect(await scalar(db, 'SELECT COUNT(*) FROM c'), 1);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F242 GLOBAL TEMPORARY TABLE', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE GLOBAL TEMPORARY TABLE gt (v NUMBER) '
+          'ON COMMIT PRESERVE ROWS');
+      await db.execute('INSERT INTO gt VALUES (1), (2)');
+      expect(await scalar(db, 'SELECT COUNT(*) FROM gt'), 2);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F243 INVISIBLE column', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE inv (a NUMBER, b NUMBER INVISIBLE)');
+      await db.execute('INSERT INTO inv (a, b) VALUES (1, 2)');
+      expect(await scalar(db, 'SELECT b FROM inv'), 2);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F244 TO_TIMESTAMP_TZ', () async {
+    final db = await Database.open(null);
+    try {
+      expect(
+          await scalar(
+              db,
+              "SELECT TO_CHAR(TO_TIMESTAMP_TZ("
+              "'2024-01-01 10:00:00 +05:00','YYYY-MM-DD HH24:MI:SS TZH:TZM'),"
+              "'HH24') FROM dual"),
+          '10');
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F245 flashback VERSIONS BETWEEN', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE t (v NUMBER)');
+      await db.execute('INSERT INTO t VALUES (1), (2)');
+      expect(
+          await scalar(
+              db,
+              'SELECT COUNT(*) FROM t VERSIONS BETWEEN SCN MINVALUE '
+              'AND MAXVALUE'),
+          2);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F246 SAMPLE clause', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE t (v NUMBER)');
+      await db.execute('INSERT INTO t VALUES (1), (2), (3), (4)');
+      // SAMPLE is non-deterministic; assert it parses and runs.
+      final r = await db.execute('SELECT COUNT(*) FROM t SAMPLE (50)');
+      expect(r.rows.first.first, isA<int>());
+    } finally {
+      await db.close();
+    }
+  });
 }

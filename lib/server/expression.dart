@@ -3374,6 +3374,29 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
         a[0].toString(), a.length > 1 ? a[1]?.toString() : null);
     return dt == null ? null : _fmtDateTime(dt);
   },
+  // TO_TIMESTAMP_TZ(text [, fmt]): parse a timestamp with a timezone. The
+  // engine keeps wall-clock time, so the TZH/TZM/TZR tokens and the text's
+  // trailing offset are stripped before parsing.
+  'TO_TIMESTAMP_TZ': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final text = a[0]
+        .toString()
+        .replaceFirst(RegExp(r'\s*[+-]\d{1,2}:\d{2}\s*$'), '')
+        .trim();
+    final fmt = a.length > 1 && a[1] != null
+        ? a[1].toString().replaceFirst(
+            RegExp(r'\s*TZ[HMRD].*$', caseSensitive: false), '').trim()
+        : null;
+    final dt = _parseOracleDate(text, fmt);
+    return dt == null ? null : _fmtDateTime(dt);
+  },
+  // TZ_OFFSET(region): the engine runs in UTC; a numeric offset passes through.
+  'TZ_OFFSET': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final s = a[0].toString().trim();
+    final m = RegExp(r'^[+-]\d{1,2}:\d{2}$').firstMatch(s);
+    return m != null ? s : '+00:00';
+  },
   // TRANSLATE(str, from, to): maps each char in [from] to the char at the same
   // position in [to]; chars past [to]'s length are removed.
   'TRANSLATE': (a) {
