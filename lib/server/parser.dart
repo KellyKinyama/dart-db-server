@@ -4336,6 +4336,34 @@ class Parser {
           _peek(1).text == '(') {
         final quant = _advance().text.toUpperCase();
         _expect(TokType.punct, '(');
+        // The operand may be a subquery or a parenthesised value list
+        // (`= ANY ('a', 'b')`), which behaves like IN / a quantified OR/AND.
+        if (!_checkKw('SELECT') && !_checkKw('WITH')) {
+          final items = <Expr>[_parseExpr()];
+          while (_match(TokType.punct, ',')) {
+            items.add(_parseExpr());
+          }
+          _expect(TokType.punct, ')');
+          final all = quant == 'ALL';
+          final eq = op == '=';
+          final ne = op == '!=' || op == '<>';
+          if (eq && !all) {
+            left = InExpr(left, items, negated: false);
+            continue;
+          }
+          if (ne && all) {
+            left = InExpr(left, items, negated: true);
+            continue;
+          }
+          // Other operators: ANY -> OR chain, ALL -> AND chain.
+          Expr chain = BinaryExpr(op, left, items.first);
+          for (var i = 1; i < items.length; i++) {
+            chain = BinaryExpr(
+                all ? 'AND' : 'OR', chain, BinaryExpr(op, left, items[i]));
+          }
+          left = chain;
+          continue;
+        }
         final sub = _parseSelect();
         _expect(TokType.punct, ')');
         final all = quant == 'ALL';

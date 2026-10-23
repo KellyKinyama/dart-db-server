@@ -874,4 +874,98 @@ void main() {
       await db.close();
     }
   });
+
+  // ---- Rounds 55-62 (advanced SQL / NLS / built-ins) ----------------------
+
+  test('F231 SYS_CONTEXT / USERENV', () async {
+    final db = await Database.open(null);
+    try {
+      expect(
+          await scalar(
+              db,
+              "SELECT CASE WHEN SYS_CONTEXT('USERENV','SESSION_USER') "
+              'IS NOT NULL THEN 1 ELSE 0 END FROM dual'),
+          1);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F247 STANDARD_HASH MD5 length', () async {
+    final db = await Database.open(null);
+    try {
+      expect(
+          await scalar(db, "SELECT LENGTH(STANDARD_HASH('abc','MD5')) FROM dual"),
+          32);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test("F248 TO_CHAR(date, 'D') numeric day-of-week", () async {
+    final db = await Database.open(null);
+    try {
+      expect(await scalar(db, "SELECT TO_CHAR(DATE '2024-07-20','D') FROM dual"),
+          '7');
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F249 NLS_NUMERIC_CHARACTERS parameter in TO_CHAR', () async {
+    final db = await Database.open(null);
+    try {
+      expect(
+          await scalar(
+              db,
+              "SELECT TO_CHAR(1234.56,'FM9G999D99',"
+              "'NLS_NUMERIC_CHARACTERS='',.''') FROM dual"),
+          '1.234,56');
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F250 = ANY (value list)', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE t (v VARCHAR2(8))');
+      await db.execute("INSERT INTO t VALUES ('King'), ('Kochhar'), ('X')");
+      expect(
+          await scalar(
+              db, "SELECT COUNT(*) FROM t WHERE v = ANY ('King', 'Kochhar')"),
+          2);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F251 row/tuple = (subquery)', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE t (a NUMBER, b NUMBER)');
+      await db.execute('INSERT INTO t VALUES (1, 10), (2, 20)');
+      expect(
+          await scalar(
+              db,
+              'SELECT COUNT(*) FROM t WHERE (a, b) = (SELECT 1, 10 FROM dual)'),
+          1);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F252 EXTRACT field from an INTERVAL literal', () async {
+    final db = await Database.open(null);
+    try {
+      expect(
+          await scalar(
+              db,
+              "SELECT EXTRACT(YEAR FROM INTERVAL '2-6' YEAR TO MONTH) "
+              'FROM dual'),
+          2);
+    } finally {
+      await db.close();
+    }
+  });
 }

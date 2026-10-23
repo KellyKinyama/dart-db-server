@@ -15737,8 +15737,11 @@ class Database implements SequenceProvider {
       return ScalarSubqueryExpr((row) {
         final r = _selectTopLevel(e.select, {...outerScope, ...row});
         if (r.rows.isEmpty) return null;
-        if (r.rows.first.isEmpty) return null;
-        return r.rows.first.first;
+        final first = r.rows.first;
+        if (first.isEmpty) return null;
+        // A multi-column single-row subquery yields a row value so it can be
+        // compared against a tuple: `(a, b) = (SELECT 1, 10)`.
+        return first.length == 1 ? first.first : List<Object?>.from(first);
       });
     }
     if (e is SubqueryInExpr) {

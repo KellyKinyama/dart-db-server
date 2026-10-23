@@ -5,6 +5,8 @@ import 'dart:convert';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
+import 'package:crypto/crypto.dart' as crypto;
+
 import 'fts5.dart';
 import 'schema.dart';
 import 'vector.dart';
@@ -1604,6 +1606,31 @@ class RaiseException implements Exception {
   String toString() => 'RAISE($action${message.isEmpty ? '' : ", '$message'"})';
 }
 
+/// Resolves a USERENV / SYS_CONTEXT('USERENV', …) parameter to a value. The
+/// engine is single-user, so these are sensible constants.
+String _userenvValue(String param) {
+  switch (param.toUpperCase()) {
+    case 'SESSION_USER':
+    case 'CURRENT_USER':
+    case 'CURRENT_SCHEMA':
+    case 'SCHEMAID':
+      return 'USER';
+    case 'DB_NAME':
+      return 'FREEPDB1';
+    case 'LANG':
+      return 'US';
+    case 'LANGUAGE':
+      return 'AMERICAN_AMERICA.AL32UTF8';
+    case 'SID':
+    case 'SESSIONID':
+      return '1';
+    case 'ISDBA':
+      return 'FALSE';
+    default:
+      return 'UNKNOWN';
+  }
+}
+
 /// Builds a [RegExp] honouring Oracle's REGEXP `match_param` flags:
 /// `i` case-insensitive, `c` case-sensitive (overrides `i`), `m` multiline
 /// anchors, `n` dot matches newlines. Unknown flags are ignored. POSIX
@@ -1732,6 +1759,46 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
       h = (h * 0x01000193) & 0xFFFFFFFF;
     }
     return maxBucket <= 0 ? 0 : h % (maxBucket + 1);
+  },
+  // STANDARD_HASH(expr [, 'algo']): cryptographic hash as uppercase hex.
+  // Supported algorithms: SHA1 (default), MD5, SHA256, SHA384, SHA512.
+  'STANDARD_HASH': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final algo =
+        (a.length > 1 && a[1] != null ? a[1].toString() : 'SHA1').toUpperCase();
+    final bytes = utf8.encode(a[0].toString());
+    final crypto.Hash h;
+    switch (algo) {
+      case 'MD5':
+        h = crypto.md5;
+        break;
+      case 'SHA256':
+        h = crypto.sha256;
+        break;
+      case 'SHA384':
+        h = crypto.sha384;
+        break;
+      case 'SHA512':
+        h = crypto.sha512;
+        break;
+      default:
+        h = crypto.sha1;
+    }
+    return h.convert(bytes).toString().toUpperCase();
+  },
+  // ROWIDTOCHAR: the rowid value is already text in this engine.
+  'ROWIDTOCHAR': (a) => a.isEmpty || a[0] == null ? null : a[0].toString(),
+  'CHARTOROWID': (a) => a.isEmpty || a[0] == null ? null : a[0].toString(),
+  // SYS_CONTEXT(namespace, parameter): session-context values. We return
+  // sensible constants for the common USERENV parameters.
+  'SYS_CONTEXT': (a) {
+    if (a.length < 2 || a[1] == null) return null;
+    return _userenvValue(a[1].toString());
+  },
+  // USERENV(parameter): legacy session-context accessor.
+  'USERENV': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    return _userenvValue(a[0].toString());
   },
   // LEAST(a, b, ...) -- smallest non-NULL value; returns NULL if all NULL.
   'LEAST': (a) {
@@ -3176,7 +3243,21 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
           return fmt.toUpperCase().startsWith('FM') ? hex : ' $padded';
         }
         if (_looksLikeNumberFormat(fmt) || RegExp(r'[90]').hasMatch(fmt)) {
-          return _formatOracleNumber(n, fmt);
+          // NLS_NUMERIC_CHARACTERS='<decimal><group>' (3rd arg) overrides the
+          // decimal / group separators.
+          var dec = '.';
+          var grp = ',';
+          if (a.length > 2 && a[2] != null) {
+            final m = RegExp(
+                    "NLS_NUMERIC_CHARACTERS\\s*=\\s*'?(..)'?",
+                    caseSensitive: false)
+                .firstMatch(a[2].toString());
+            if (m != null) {
+              dec = m.group(1)![0];
+              grp = m.group(1)![1];
+            }
+          }
+          return _formatOracleNumber(n, fmt, decimalChar: dec, groupChar: grp);
         }
       }
     }
@@ -3403,6 +3484,18 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
           return mins;
         case 'SECOND':
           return secs;
+        default:
+          return 0;
+      }
+    }
+    // A YEAR-TO-MONTH interval value: extract its year / month components.
+    if (a[1] is YmInterval) {
+      final months = (a[1] as YmInterval).months;
+      switch (field) {
+        case 'YEAR':
+          return months ~/ 12;
+        case 'MONTH':
+          return months % 12;
         default:
           return 0;
       }
@@ -4276,7 +4369,7 @@ String _applyNameCase(String value, String token) {
 }
 
 bool _looksLikeDateFormat(String fmt) =>
-    RegExp(r'Y{2,4}|R{2,4}|RM|MON|MM|DD|DAY|DY|HH|MI|SS|FF|WW|IW|CC|\bW\b|\bQ\b|\bJ\b|"',
+    RegExp(r'Y{2,4}|R{2,4}|RM|MON|MM|DD|DAY|DY|HH|MI|SS|FF|WW|IW|CC|\bW\b|\bQ\b|\bJ\b|\bD\b|"',
             caseSensitive: false)
         .hasMatch(fmt);
 
@@ -4596,7 +4689,8 @@ num? _evalConstArith(String src) {
 
 /// Formats [n] by an Oracle number format model [fmt] (9/0 digits, comma
 /// grouping, decimal point, optional leading FM to drop the sign blank).
-String _formatOracleNumber(num n, String fmt) {
+String _formatOracleNumber(num n, String fmt,
+    {String decimalChar = '.', String groupChar = ','}) {
   var f = fmt;
   final fm = f.toUpperCase().startsWith('FM');
   if (fm) f = f.substring(2);
@@ -4619,13 +4713,13 @@ String _formatOracleNumber(num n, String fmt) {
   if (grouping) {
     final buf = StringBuffer();
     for (var i = 0; i < intPart.length; i++) {
-      if (i > 0 && (intPart.length - i) % 3 == 0) buf.write(',');
+      if (i > 0 && (intPart.length - i) % 3 == 0) buf.write(groupChar);
       buf.write(intPart[i]);
     }
     intPart = buf.toString();
   }
   var out = intPart;
-  if (decimals > 0) out = '$out.$decPart';
+  if (decimals > 0) out = '$out$decimalChar$decPart';
   if (trailingSign) {
     out = neg ? '$out-' : (fm ? out : '$out ');
   } else if (neg) {
