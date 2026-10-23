@@ -4705,6 +4705,28 @@ class Parser {
         while (_match(TokType.punct, ',')) {
           args.add(_parseExpr());
         }
+      } else if (upper == 'JSON_OBJECT' || upper == 'JSON_OBJECTAGG') {
+        // Oracle key/value syntax: JSON_OBJECT([KEY] k VALUE v, …) and the
+        // colon form JSON_OBJECT(k : v) map onto the (key, value, …) arg list.
+        do {
+          _matchWord('KEY');
+          args.add(_parseExpr());
+          if (_matchWord('VALUE') || _match(TokType.punct, ':')) {
+            args.add(_parseExpr());
+          }
+        } while (_match(TokType.punct, ','));
+        // Trailing output clauses (FORMAT JSON, [NULL|ABSENT] ON NULL, …).
+        while (_matchWord('FORMAT') ||
+            _matchWord('JSON') ||
+            _matchWord('NULL') ||
+            _matchWord('ABSENT') ||
+            _matchWord('ON') ||
+            _matchWord('RETURNING') ||
+            _matchWord('STRICT') ||
+            _matchWord('WITH') ||
+            _matchWord('WITHOUT') ||
+            _matchWord('UNIQUE') ||
+            _matchWord('KEYS')) {}
       } else {
         if (_matchKw('DISTINCT')) distinct = true;
         args.add(_parseExpr());

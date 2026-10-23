@@ -14636,6 +14636,27 @@ class Database implements SequenceProvider {
           }
           return null;
         }
+      case 'STATS_MODE':
+        {
+          // Most frequent value; ties resolved by first-seen order.
+          final counts = <Object?, int>{};
+          final order = <Object?>[];
+          for (final v in _aggValues(e, grp)) {
+            if (v == null) continue;
+            if (!counts.containsKey(v)) order.add(v);
+            counts[v] = (counts[v] ?? 0) + 1;
+          }
+          if (order.isEmpty) return null;
+          Object? best;
+          var bestCount = -1;
+          for (final v in order) {
+            if (counts[v]! > bestCount) {
+              bestCount = counts[v]!;
+              best = v;
+            }
+          }
+          return best;
+        }
       case 'MEDIAN':
         {
           final nums = <double>[];

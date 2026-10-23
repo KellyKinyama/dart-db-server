@@ -1841,13 +1841,71 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
   'ABS': (a) => _propagateNull(a, () => _sqlTextToNum(a[0]).abs()),
   'ROUND': (a) {
     if (a.isEmpty || a[0] == null) return null;
-    final v = _sqlTextToNum(a[0]).toDouble();
+    final v0 = a[0];
+    // ROUND(date[, fmt]) rounds a date to the nearest unit (Oracle rounding
+    // model). Default rounds to the nearest day (noon rounds up).
+    if (v0 is String && RegExp(r'^\d{4}-\d{2}-\d{2}').hasMatch(v0.trim())) {
+      final dt = _parseDateTime(v0);
+      if (dt != null) {
+        final fmt = a.length > 1 && a[1] != null
+            ? a[1].toString().toUpperCase()
+            : 'DD';
+        DateTime out;
+        switch (fmt) {
+          case 'YYYY':
+          case 'YYY':
+          case 'YY':
+          case 'Y':
+          case 'YEAR':
+          case 'SYYYY':
+          case 'SYEAR':
+            out = dt.month >= 7
+                ? DateTime.utc(dt.year + 1, 1, 1)
+                : DateTime.utc(dt.year, 1, 1);
+            break;
+          case 'MM':
+          case 'MON':
+          case 'MONTH':
+          case 'RM':
+            out = dt.day >= 16
+                ? DateTime.utc(dt.year, dt.month + 1, 1)
+                : DateTime.utc(dt.year, dt.month, 1);
+            break;
+          case 'HH':
+          case 'HH12':
+          case 'HH24':
+            out = DateTime.utc(dt.year, dt.month, dt.day, dt.hour)
+                .add(Duration(hours: dt.minute >= 30 ? 1 : 0));
+            break;
+          case 'MI':
+            out = DateTime.utc(dt.year, dt.month, dt.day, dt.hour, dt.minute)
+                .add(Duration(minutes: dt.second >= 30 ? 1 : 0));
+            break;
+          default:
+            final day = DateTime.utc(dt.year, dt.month, dt.day);
+            out = dt.hour >= 12 ? day.add(const Duration(days: 1)) : day;
+        }
+        final hasTime = out.hour != 0 || out.minute != 0 || out.second != 0;
+        return hasTime ? _fmtDateTime(out) : _fmtDate(out);
+      }
+    }
+    final v = _sqlTextToNum(v0).toDouble();
     final digits = a.length > 1 && a[1] != null ? _sqlTextToNum(a[1]).toInt() : 0;
     final p = _pow10(digits);
     return (v * p).round() / p;
   },
   'MOD': (a) => _propagateNull(
       a, () => _sqlTextToNum(a[0]).remainder(_sqlTextToNum(a[1]))),
+  // Oracle REMAINDER(n, m) = n - m * ROUND(n/m) — rounds the quotient (ties to
+  // even) rather than flooring like MOD: REMAINDER(17, 6) = -1.
+  'REMAINDER': (a) => _propagateNull(a, () {
+        final n = _sqlTextToNum(a[0]).toDouble();
+        final m = _sqlTextToNum(a[1]).toDouble();
+        if (m == 0) return null;
+        final q = (n / m).roundToDouble();
+        final r = n - m * q;
+        return r == r.truncateToDouble() ? r.toInt() : r;
+      }),
   'FLOOR': (a) => _propagateNull(a, () => _sqlTextToNum(a[0]).floor()),
   'CEIL': (a) => _propagateNull(a, () => _sqlTextToNum(a[0]).ceil()),
   'CEILING': (a) => _propagateNull(a, () => _sqlTextToNum(a[0]).ceil()),
@@ -2775,8 +2833,18 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
       } else if (v is String) {
         n = num.tryParse(v.trim());
       }
-      if (n != null && _looksLikeNumberFormat(fmt)) {
-        return _formatOracleNumber(n, fmt);
+      if (n != null) {
+        // Hexadecimal format model (FMXXX / XXXX): emit uppercase hex.
+        final hexFmt = RegExp(r'^(FM)?X+$', caseSensitive: false);
+        if (hexFmt.hasMatch(fmt)) {
+          final hex = n.toInt().toRadixString(16).toUpperCase();
+          final width = fmt.toUpperCase().replaceAll('FM', '').length;
+          final padded = hex.padLeft(width, '0');
+          return fmt.toUpperCase().startsWith('FM') ? hex : ' $padded';
+        }
+        if (_looksLikeNumberFormat(fmt)) {
+          return _formatOracleNumber(n, fmt);
+        }
       }
     }
     return v is String ? v : v.toString();
@@ -4264,6 +4332,7 @@ const Set<String> kAggregateFunctions = {
   'CORR',
   'PERCENTILE_CONT',
   'PERCENTILE_DISC',
+  'STATS_MODE',
   // Vector aggregates — batch-oriented centroid / sum operations.
   // See _aggregateValue in database.dart for implementation.
   'VEC_AVG',
