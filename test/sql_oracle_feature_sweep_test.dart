@@ -1352,4 +1352,156 @@ void main() {
       await db.close();
     }
   });
+
+  // ---- Round 64 (JSON/XML fidelity): F264-F274 ----------------------------
+
+  test('F264 JSON_TABLE FOR ORDINALITY column', () async {
+    final db = await Database.open(null);
+    try {
+      final r = await db.execute(
+          "SELECT seq, val FROM JSON_TABLE('[10,20,30]', '\$[*]' "
+          "COLUMNS (seq FOR ORDINALITY, val NUMBER PATH '\$'))");
+      expect(r.rows, [
+        [1, 10],
+        [2, 20],
+        [3, 30],
+      ]);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F265 JSON_VALUE RETURNING NUMBER + DEFAULT ON ERROR', () async {
+    final db = await Database.open(null);
+    try {
+      expect(
+          await scalar(db,
+              "SELECT JSON_VALUE('{\"a\":\"x\"}', '\$.a' RETURNING NUMBER) "
+              'FROM dual'),
+          null);
+      expect(
+          await scalar(db,
+              "SELECT JSON_VALUE('{\"a\":\"x\"}', '\$.a' RETURNING NUMBER "
+              'DEFAULT -1 ON ERROR) FROM dual'),
+          -1);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F266 JSON_TABLE column DEFAULT ON ERROR + coercion', () async {
+    final db = await Database.open(null);
+    try {
+      final r = await db.execute(
+          "SELECT a FROM JSON_TABLE('{\"a\":\"xyz\"}', '\$' "
+          "COLUMNS (a NUMBER PATH '\$.a' DEFAULT 0 ON ERROR))");
+      expect(r.rows, [
+        [0],
+      ]);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F267 JSON_OBJECT ABSENT ON NULL', () async {
+    final db = await Database.open(null);
+    try {
+      expect(
+          await scalar(
+              db, "SELECT JSON_OBJECT('a' VALUE NULL ABSENT ON NULL) FROM dual"),
+          '{}');
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F268 JSON_ARRAY defaults to ABSENT ON NULL', () async {
+    final db = await Database.open(null);
+    try {
+      expect(await scalar(db, 'SELECT JSON_ARRAY(1, NULL, 3) FROM dual'),
+          '[1,3]');
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F269 JSON_TABLE EXISTS PATH yields 0 when absent', () async {
+    final db = await Database.open(null);
+    try {
+      final r = await db.execute(
+          "SELECT has_b FROM JSON_TABLE('{\"a\":1}', '\$' "
+          "COLUMNS (has_b NUMBER EXISTS PATH '\$.b'))");
+      expect(r.rows, [
+        [0],
+      ]);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F270 JSON_TABLE NESTED PATH', () async {
+    final db = await Database.open(null);
+    try {
+      final r = await db.execute(
+          "SELECT id, p FROM JSON_TABLE("
+          "'{\"id\":1,\"items\":[{\"p\":\"x\"},{\"p\":\"y\"}]}', '\$' "
+          "COLUMNS (id NUMBER PATH '\$.id', NESTED PATH '\$.items[*]' "
+          "COLUMNS (p VARCHAR2(5) PATH '\$.p')))");
+      expect(r.rows, [
+        [1, 'x'],
+        [1, 'y'],
+      ]);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F271 JSON_QUERY WITH WRAPPER', () async {
+    final db = await Database.open(null);
+    try {
+      expect(
+          await scalar(
+              db, "SELECT JSON_QUERY('{\"a\":1}', '\$.a' WITH WRAPPER) FROM dual"),
+          '[1]');
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F272 JSON_MERGEPATCH', () async {
+    final db = await Database.open(null);
+    try {
+      expect(
+          await scalar(db,
+              "SELECT JSON_MERGEPATCH('{\"a\":1,\"b\":2}', "
+              "'{\"b\":20,\"c\":3}') FROM dual"),
+          '{"a":1,"b":20,"c":3}');
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F273 XMLFOREST with AS alias', () async {
+    final db = await Database.open(null);
+    try {
+      expect(
+          await scalar(db, "SELECT XMLFOREST(1 AS \"x\", 2 AS \"y\") FROM dual"),
+          '<x>1</x><y>2</y>');
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F274 XMLTYPE constructor + EXTRACTVALUE', () async {
+    final db = await Database.open(null);
+    try {
+      expect(
+          await scalar(db,
+              "SELECT EXTRACTVALUE(XMLTYPE('<r><a>7</a></r>'), '/r/a') "
+              'FROM dual'),
+          '7');
+    } finally {
+      await db.close();
+    }
+  });
 }

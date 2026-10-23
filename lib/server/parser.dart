@@ -2,6 +2,8 @@
 /// [Statement] AST nodes. Supports the SQL subset documented in README.
 library;
 
+import 'dart:convert';
+
 import 'expression.dart';
 import 'lexer.dart';
 import 'routine.dart';
@@ -733,10 +735,10 @@ class Parser {
     return Parser.fromString(arms).parseStatement() as SelectStmt;
   }
 
-  /// Parses `JSON_TABLE(src, 'path' COLUMNS (col type [PATH 'p'], …))` (the
-  /// opening `JSON_TABLE` word is already consumed) into a derived table whose
-  /// FROM is a `JSON_TABLE` table-function call the executor materialises:
-  /// args are `[src, rowPath, name1, colPath1, name2, colPath2, …]`.
+  /// Parses `JSON_TABLE(src, 'path' COLUMNS (col …))` (the opening JSON_TABLE
+  /// word is already consumed) into a derived table whose FROM is a JSON_TABLE
+  /// table-function call the executor materialises: args are
+  /// `[src, rowPath, jsonEncode(columnSpecs)]`.
   SelectStmt _parseJsonTableClause() {
     _expect(TokType.punct, '(');
     final src = _parseExpr(); // JSON source expression
@@ -744,53 +746,95 @@ class Parser {
     if (_match(TokType.punct, ',')) {
       if (_check(TokType.string)) rowPath = _advance().text; // row path
     }
-    final cols = <String>[];
-    final fnArgs = <Expr>[src, LiteralExpr(rowPath)];
+    final names = <String>[];
+    final specs = <Map<String, Object?>>[];
     if (_matchWord('COLUMNS')) {
-      _expect(TokType.punct, '(');
-      do {
-        final name = _expectName();
-        cols.add(name);
-        String? colPath;
-        var depth = 0;
-        while (!_isAtEnd()) {
-          final tk = _peek();
-          if (tk.type == TokType.punct && tk.text == '(') {
-            depth++;
-            _advance();
-            continue;
-          }
-          if (tk.type == TokType.punct && tk.text == ')') {
-            if (depth == 0) break;
-            depth--;
-            _advance();
-            continue;
-          }
-          if (depth == 0 && tk.type == TokType.punct && tk.text == ',') break;
-          // Capture the column's `PATH '<p>'` if present.
-          if (depth == 0 && tk.type == TokType.keyword && tk.upper == 'PATH' ||
-              (depth == 0 &&
-                  tk.type == TokType.ident &&
-                  tk.upper == 'PATH')) {
-            _advance();
-            if (_check(TokType.string)) colPath = _advance().text;
-            continue;
-          }
-          _advance();
-        }
-        fnArgs.add(LiteralExpr(name));
-        fnArgs.add(LiteralExpr(colPath ?? '\$.$name'));
-      } while (_match(TokType.punct, ','));
-      _expect(TokType.punct, ')'); // COLUMNS list
+      _parseJsonTableColumns(names, specs);
     }
     _expect(TokType.punct, ')'); // JSON_TABLE
     return SelectStmt(
-      projection: [
-        for (final c in cols) SelectItem.expr(ColumnExpr(c)),
-      ],
-      fromFunction: FunctionCallExpr('JSON_TABLE', fnArgs),
+      projection: [for (final c in names) SelectItem.expr(ColumnExpr(c))],
+      fromFunction: FunctionCallExpr(
+        'JSON_TABLE',
+        [src, LiteralExpr(rowPath), LiteralExpr(jsonEncode(specs))],
+      ),
       orderBy: const [],
     );
+  }
+
+  /// Parses a JSON_TABLE `COLUMNS ( … )` list into [names] (projection order)
+  /// and [specs] (per-column descriptors: FOR ORDINALITY, EXISTS PATH, a typed
+  /// PATH column with optional DEFAULT … ON ERROR, or a NESTED PATH subtree).
+  void _parseJsonTableColumns(
+      List<String> names, List<Map<String, Object?>> specs) {
+    _expect(TokType.punct, '(');
+    do {
+      if (_matchWord('NESTED')) {
+        _matchWord('PATH');
+        final p = _check(TokType.string) ? _advance().text : r'$';
+        _expectWord('COLUMNS');
+        final innerNames = <String>[];
+        final innerSpecs = <Map<String, Object?>>[];
+        _parseJsonTableColumns(innerNames, innerSpecs);
+        names.addAll(innerNames);
+        specs.add({'kind': 'nested', 'path': p, 'cols': innerSpecs});
+        continue;
+      }
+      final name = _expectName();
+      if (_matchWord('FOR')) {
+        _matchWord('ORDINALITY');
+        names.add(name);
+        specs.add({'kind': 'ord', 'name': name});
+        continue;
+      }
+      final typeName = _advance().text.toUpperCase();
+      if (_check(TokType.punct, '(')) {
+        while (!_check(TokType.punct, ')') && !_isAtEnd()) {
+          _advance();
+        }
+        _match(TokType.punct, ')');
+      }
+      if (_matchWord('EXISTS')) {
+        _matchWord('PATH');
+        final p = _check(TokType.string) ? _advance().text : '\$.$name';
+        names.add(name);
+        specs.add({'kind': 'exists', 'name': name, 'path': p});
+        continue;
+      }
+      var path = '\$.$name';
+      if (_matchWord('PATH')) {
+        if (_check(TokType.string)) path = _advance().text;
+      }
+      Object? defaultVal;
+      var hasDefault = false;
+      // Trailing `[DEFAULT expr] ON {ERROR|EMPTY}` clauses.
+      while (true) {
+        if (_matchWord('DEFAULT')) {
+          final d = _parsePrimary();
+          if (!hasDefault && d is LiteralExpr) {
+            defaultVal = d.value;
+            hasDefault = true;
+          }
+          continue;
+        }
+        if (_matchWord('NULL') ||
+            _matchWord('ERROR') ||
+            _matchWord('EMPTY') ||
+            _matchWord('ON')) {
+          continue;
+        }
+        break;
+      }
+      names.add(name);
+      specs.add({
+        'kind': 'path',
+        'name': name,
+        'path': path,
+        'type': typeName,
+        if (hasDefault) 'default': defaultVal,
+      });
+    } while (_match(TokType.punct, ','));
+    _expect(TokType.punct, ')');
   }
 
   void _columnNamesInto(Expr e, Set<String> out) {
@@ -5215,6 +5259,22 @@ class Parser {
         while (_match(TokType.punct, ',')) {
           args.add(_parseExpr());
         }
+      } else if (upper == 'XMLFOREST') {
+        // XMLFOREST(value [AS "name"], …): collect (name, value) pairs, the
+        // name defaulting to the value expression's column identifier.
+        do {
+          final v = _parseExpr();
+          String name;
+          if (_matchKw('AS')) {
+            name = _check(TokType.string) ? _advance().text : _expectName();
+          } else if (v is ColumnExpr) {
+            name = v.name;
+          } else {
+            name = 'C';
+          }
+          args.add(LiteralExpr(name));
+          args.add(v);
+        } while (_match(TokType.punct, ','));
       } else if (upper == 'JSON_OBJECT' || upper == 'JSON_OBJECTAGG') {
         // Oracle key/value syntax: JSON_OBJECT([KEY] k VALUE v, …) and the
         // colon form JSON_OBJECT(k : v) map onto the (key, value, …) arg list.
@@ -5226,17 +5286,29 @@ class Parser {
           }
         } while (_match(TokType.punct, ','));
         // Trailing output clauses (FORMAT JSON, [NULL|ABSENT] ON NULL, …).
-        while (_matchWord('FORMAT') ||
-            _matchWord('JSON') ||
-            _matchWord('NULL') ||
-            _matchWord('ABSENT') ||
-            _matchWord('ON') ||
-            _matchWord('RETURNING') ||
-            _matchWord('STRICT') ||
-            _matchWord('WITH') ||
-            _matchWord('WITHOUT') ||
-            _matchWord('UNIQUE') ||
-            _matchWord('KEYS')) {}
+        var absentOnNull = false;
+        while (true) {
+          if (_matchWord('ABSENT')) {
+            absentOnNull = true;
+            continue;
+          }
+          if (_matchWord('FORMAT') ||
+              _matchWord('JSON') ||
+              _matchWord('NULL') ||
+              _matchWord('ON') ||
+              _matchWord('RETURNING') ||
+              _matchWord('STRICT') ||
+              _matchWord('WITH') ||
+              _matchWord('WITHOUT') ||
+              _matchWord('UNIQUE') ||
+              _matchWord('KEYS')) {
+            continue;
+          }
+          break;
+        }
+        if (absentOnNull && upper == 'JSON_OBJECT') {
+          args.add(LiteralExpr('\u0001ABSENT'));
+        }
       } else {
         if (_matchKw('DISTINCT')) distinct = true;
         args.add(_parseExpr());
@@ -5254,9 +5326,15 @@ class Parser {
       if (_matchWord('WITH') || _matchWord('WITHOUT')) _matchWord('COUNT');
     }
     // Oracle JSON_VALUE/JSON_QUERY `RETURNING <type>` and ON ERROR/EMPTY
-    // clauses. Consumed (the value is returned as parsed).
+    // clauses. For JSON_VALUE the type + DEFAULT … ON ERROR drive coercion;
+    // for JSON_QUERY, WITH WRAPPER wraps a scalar result in an array.
+    String? jsonRetType;
+    Object? jsonDefault;
+    var jsonHasDefault = false;
+    var jsonWrapper = false;
     if (_matchWord('RETURNING')) {
-      _advance(); // return type word
+      final rt = _advance(); // return type word
+      jsonRetType = rt.text.toUpperCase();
       if (_check(TokType.punct, '(')) {
         var depth = 0;
         do {
@@ -5265,6 +5343,18 @@ class Parser {
           if (tk.type == TokType.punct && tk.text == ')') depth--;
         } while (depth > 0 && !_isAtEnd());
       }
+    }
+    // JSON_QUERY wrapper clause.
+    if (_matchWord('WITH')) {
+      _matchWord('UNCONDITIONAL');
+      _matchWord('CONDITIONAL');
+      if (_matchWord('WRAPPER') || _matchWord('ARRAY')) {
+        jsonWrapper = true;
+        _matchWord('WRAPPER');
+      }
+    } else if (_matchWord('WITHOUT')) {
+      _matchWord('WRAPPER');
+      _matchWord('ARRAY');
     }
     while (_checkWord('ERROR') ||
         _checkWord('NULL') ||
@@ -5275,10 +5365,30 @@ class Parser {
         (_checkWord('ON') &&
             (_peek(1).upper == 'ERROR' || _peek(1).upper == 'EMPTY'))) {
       if (_matchWord('DEFAULT')) {
-        _parseExpr();
+        var neg = false;
+        if (_check(TokType.op, '-')) {
+          neg = true;
+          _advance();
+        } else if (_check(TokType.op, '+')) {
+          _advance();
+        }
+        final d = _parsePrimary();
+        if (!jsonHasDefault && d is LiteralExpr) {
+          final val = d.value;
+          jsonDefault = neg && val is num ? -val : val;
+          jsonHasDefault = true;
+        }
       } else {
         _advance();
       }
+    }
+    if (upper == 'JSON_VALUE' && (jsonRetType != null || jsonHasDefault)) {
+      args.add(LiteralExpr('\u0001JV:${jsonEncode({
+            'ret': jsonRetType,
+            if (jsonHasDefault) 'def': jsonDefault,
+          })}'));
+    } else if (upper == 'JSON_QUERY' && jsonWrapper) {
+      args.add(LiteralExpr('\u0001JQW'));
     }
     // Oracle `IGNORE NULLS` / `RESPECT NULLS` modifier (FIRST_VALUE,
     // LAST_VALUE, LAG, LEAD, NTH_VALUE).

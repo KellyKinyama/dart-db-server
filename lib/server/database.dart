@@ -13993,38 +13993,101 @@ class Database implements SequenceProvider {
     if (root == null) return const [];
     final rowPath =
         args.length >= 2 && args[1] != null ? args[1].toString() : r'$';
-    // Column (name, path) pairs follow the first two positional args.
-    final colNames = <String>[];
-    final colPaths = <String>[];
-    for (var i = 2; i + 1 < args.length; i += 2) {
-      colNames.add(args[i].toString());
-      colPaths.add(args[i + 1].toString());
-    }
-    // Resolve the row path. A trailing `[*]` selects each element of the
-    // addressed array; otherwise the path yields a single node.
-    List<Object?> nodes;
-    if (rowPath.endsWith('[*]')) {
-      final prefix = rowPath.substring(0, rowPath.length - 3);
-      final arr = prefix.isEmpty || prefix == r'$'
-          ? root
-          : jsonPathLookup(root, prefix);
-      nodes = arr is List ? List<Object?>.from(arr) : const [];
-    } else {
-      final node = rowPath == r'$' ? root : jsonPathLookup(root, rowPath);
-      nodes = node == null ? const [] : [node];
-    }
+    final specs = args.length >= 3 && args[2] != null
+        ? (jsonDecode(args[2].toString()) as List).cast<Map<String, Object?>>()
+        : const <Map<String, Object?>>[];
+    final nodes = _jsonTableNodes(root, rowPath);
     final out = <Map<String, Object?>>[];
+    final ord = [0]; // shared 1-based ordinality counter
     for (final node in nodes) {
-      final m = <String, Object?>{};
-      for (var c = 0; c < colNames.length; c++) {
-        final raw = jsonPathLookup(node, colPaths[c]);
-        final v = (raw is List || raw is Map) ? jsonEncode(raw) : raw;
-        m[colNames[c]] = v;
-        m['$qual.${colNames[c]}'] = v;
-      }
-      out.add(m);
+      out.addAll(_expandJsonTableNode(node, specs, qual, ord));
     }
     return out;
+  }
+
+  /// Resolves a JSON_TABLE row/nested path to the list of nodes it addresses;
+  /// a trailing `[*]` iterates array elements.
+  List<Object?> _jsonTableNodes(Object? root, String path) {
+    if (path.endsWith('[*]')) {
+      final prefix = path.substring(0, path.length - 3);
+      final arr =
+          prefix.isEmpty || prefix == r'$' ? root : jsonPathLookup(root, prefix);
+      return arr is List ? List<Object?>.from(arr) : const [];
+    }
+    final node = path == r'$' ? root : jsonPathLookup(root, path);
+    return node == null ? const [] : [node];
+  }
+
+  /// Builds the JSON_TABLE output rows for one [node] against [specs], handling
+  /// FOR ORDINALITY, EXISTS PATH, typed PATH columns (with DEFAULT … ON ERROR),
+  /// and NESTED PATH subtrees ([ord] is the shared ordinality counter).
+  List<Map<String, Object?>> _expandJsonTableNode(Object? node,
+      List<Map<String, Object?>> specs, String qual, List<int> ord) {
+    final base = <String, Object?>{};
+    final ordNames = <String>[];
+    final nested = <Map<String, Object?>>[];
+    for (final spec in specs) {
+      final kind = spec['kind'];
+      if (kind == 'ord') {
+        ordNames.add(spec['name'] as String);
+      } else if (kind == 'exists') {
+        base[spec['name'] as String] =
+            jsonPathLookup(node, spec['path'] as String) != null ? 1 : 0;
+      } else if (kind == 'nested') {
+        nested.add(spec);
+      } else {
+        final name = spec['name'] as String;
+        final raw = jsonPathLookup(node, spec['path'] as String);
+        base[name] = _coerceJsonTableValue(raw, spec);
+      }
+    }
+    var rows = <Map<String, Object?>>[Map<String, Object?>.from(base)];
+    for (final n in nested) {
+      final subNodes =
+          _jsonTableNodes(node, n['path'] as String);
+      final subSpecs = (n['cols'] as List).cast<Map<String, Object?>>();
+      final next = <Map<String, Object?>>[];
+      for (final r in rows) {
+        for (final sn in subNodes) {
+          for (final sr in _expandJsonTableNode(sn, subSpecs, qual, ord)) {
+            next.add({...r, ...sr});
+          }
+        }
+      }
+      rows = next.isEmpty ? rows : next;
+    }
+    for (final r in rows) {
+      for (final on in ordNames) {
+        r[on] = ++ord[0];
+      }
+      // Expose bare and qualified keys for every column in the row.
+      for (final e in r.entries.toList()) {
+        r['$qual.${e.key}'] = e.value;
+      }
+    }
+    return rows;
+  }
+
+  /// Coerces a JSON_TABLE PATH value by its declared [spec] type, applying the
+  /// column's `DEFAULT … ON ERROR` when the value can't be coerced.
+  Object? _coerceJsonTableValue(Object? raw, Map<String, Object?> spec) {
+    final type = (spec['type'] as String?)?.toUpperCase() ?? '';
+    final hasDefault = spec.containsKey('default');
+    final isNumeric = type.startsWith('NUMBER') ||
+        type.startsWith('INT') ||
+        type.startsWith('DEC') ||
+        type.startsWith('FLOAT') ||
+        type.startsWith('NUMERIC');
+    if (raw is List || raw is Map) {
+      return hasDefault ? spec['default'] : jsonEncode(raw);
+    }
+    if (isNumeric && raw is! num) {
+      final n = raw == null ? null : num.tryParse(raw.toString());
+      if (n != null) return n;
+      return hasDefault ? spec['default'] : null;
+    }
+    if (raw == null && hasDefault) return spec['default'];
+    return raw;
   }
 
   /// Implementation of `json_each` / `json_tree`. Returns rows with the

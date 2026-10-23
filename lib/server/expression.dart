@@ -2086,6 +2086,26 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     if (a.isEmpty || a[0] == null) return null;
     return a[0].toString();
   },
+  // XMLFOREST(name, value, …): concat `<name>value</name>` for each pair,
+  // omitting NULL-valued elements.
+  'XMLFOREST': (a) {
+    final sb = StringBuffer();
+    for (var i = 0; i + 1 < a.length; i += 2) {
+      final name = a[i]?.toString() ?? 'C';
+      final v = a[i + 1];
+      if (v == null) continue;
+      sb.write('<$name>$v</$name>');
+    }
+    return sb.toString();
+  },
+  // XMLTYPE(doc): the engine keeps XML as its text, so this is a passthrough.
+  'XMLTYPE': (a) => a.isEmpty || a[0] == null ? null : a[0].toString(),
+  // EXTRACTVALUE(xml, xpath): the text of the first node matched by a simple
+  // `/a/b` child-navigation XPath.
+  'EXTRACTVALUE': (a) {
+    if (a.length < 2 || a[0] == null || a[1] == null) return null;
+    return _xmlExtractText(a[0].toString(), a[1].toString());
+  },
   // SPACE(n) -- string of n spaces.
   'SPACE': (a) => _propagateNull(a, () {
         final n = (a[0] as num).toInt();
@@ -2972,22 +2992,46 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     }
     return jsonEncode(out);
   },
-  'JSON_ARRAY': (a) => jsonEncode(a.map(_jsonValueOf).toList()),
+  // Oracle JSON_ARRAY defaults to ABSENT ON NULL: NULL elements are omitted.
+  'JSON_ARRAY': (a) =>
+      jsonEncode([for (final e in a) if (e != null) _jsonValueOf(e)]),
   // Oracle JSON_VALUE(json, path): the scalar at [path] (NULL for object/array
   // results, matching Oracle). JSON_QUERY returns the object/array fragment.
   'JSON_VALUE': (a) {
     if (a.length < 2 || a[0] == null || a[1] == null) return null;
     final root = _decodeJsonSource(a[0]);
     if (root == null) return null;
-    final v = jsonPathLookup(root, a[1].toString());
-    return (v is List || v is Map) ? null : v;
+    var v = jsonPathLookup(root, a[1].toString());
+    v = (v is List || v is Map) ? null : v;
+    // Optional `\u0001JV:{ret,def}` marker from RETURNING / DEFAULT ON ERROR.
+    if (a.length >= 3 && a[2] is String && (a[2] as String).startsWith('\u0001JV:')) {
+      final opts =
+          jsonDecode((a[2] as String).substring(4)) as Map<String, Object?>;
+      final ret = (opts['ret'] as String?)?.toUpperCase();
+      final hasDef = opts.containsKey('def');
+      if (ret != null &&
+          (ret.startsWith('NUMBER') ||
+              ret.startsWith('INT') ||
+              ret.startsWith('FLOAT') ||
+              ret.startsWith('DEC'))) {
+        final n = v is num ? v : (v == null ? null : num.tryParse(v.toString()));
+        if (n == null) return hasDef ? opts['def'] : null;
+        return n;
+      }
+      if (v == null && hasDef) return opts['def'];
+    }
+    return v;
   },
   'JSON_QUERY': (a) {
     if (a.length < 2 || a[0] == null || a[1] == null) return null;
     final root = _decodeJsonSource(a[0]);
     if (root == null) return null;
+    final wrapper =
+        a.length >= 3 && a[2] is String && a[2] == '\u0001JQW';
     final v = jsonPathLookup(root, a[1].toString());
-    return (v is List || v is Map) ? jsonEncode(v) : null;
+    if (v is List || v is Map) return jsonEncode(v);
+    // WITH WRAPPER wraps a scalar (or missing) result in a JSON array.
+    return wrapper ? jsonEncode(v == null ? [] : [v]) : null;
   },
   // Oracle JSON_EXISTS(json, path): true when the path matches a value.
   'JSON_EXISTS': (a) {
@@ -3019,14 +3063,32 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     return 'Len=${bytes.length}: ${bytes.join(',')}';
   },
   'JSON_OBJECT': (a) {
-    if (a.length.isOdd) {
+    // A trailing `__ABSENT__` marker (added by the parser for ABSENT ON NULL)
+    // omits keys whose value is NULL.
+    var args = a;
+    var absentOnNull = false;
+    if (args.isNotEmpty && args.last == '\u0001ABSENT') {
+      absentOnNull = true;
+      args = args.sublist(0, args.length - 1);
+    }
+    if (args.length.isOdd) {
       throw StateError('json_object requires an even number of arguments');
     }
     final m = <String, Object?>{};
-    for (var i = 0; i < a.length; i += 2) {
-      m[a[i].toString()] = _jsonValueOf(a[i + 1]);
+    for (var i = 0; i < args.length; i += 2) {
+      final v = _jsonValueOf(args[i + 1]);
+      if (absentOnNull && v == null) continue;
+      m[args[i].toString()] = v;
     }
     return jsonEncode(m);
+  },
+  // Oracle JSON_MERGEPATCH(target, patch): RFC 7386 merge; a null in the patch
+  // deletes the key, nested objects merge recursively.
+  'JSON_MERGEPATCH': (a) {
+    if (a.length < 2 || a[0] == null || a[1] == null) return null;
+    final target = _decodeJsonSource(a[0]);
+    final patch = _decodeJsonSource(a[1]);
+    return jsonEncode(_jsonMergePatch(target, patch));
   },
   'JSON_ARRAY_LENGTH': (a) {
     if (a.isEmpty || a[0] == null) return null;
@@ -3950,6 +4012,24 @@ Object? _jsonValueOf(Object? v) {
   return v;
 }
 
+/// RFC 7386 JSON Merge Patch: applies [patch] to [target]. Object members merge
+/// recursively; a `null` member in the patch deletes the target key; any
+/// non-object patch replaces the target wholesale.
+Object? _jsonMergePatch(Object? target, Object? patch) {
+  if (patch is! Map) return patch;
+  final result = <String, Object?>{
+    if (target is Map) for (final e in target.entries) '${e.key}': e.value,
+  };
+  patch.forEach((k, v) {
+    if (v == null) {
+      result.remove(k.toString());
+    } else {
+      result[k.toString()] = _jsonMergePatch(result[k.toString()], v);
+    }
+  });
+  return result;
+}
+
 /// Implementation of the `->` and `->>` JSON operators.
 /// The right operand is either a JSON path (string starting with `$`) or a
 /// shorthand: a string is treated as a top-level object key, an integer as
@@ -4724,6 +4804,21 @@ int _isoWeek(DateTime d) {
 int _isoYear(DateTime d) {
   final day = DateTime.utc(d.year, d.month, d.day);
   return day.add(Duration(days: 4 - day.weekday)).year;
+}
+
+/// Returns the text content of the first node matched by a simple absolute
+/// XPath (`/a/b/c`, child navigation only) within [xml]; null if unmatched.
+String? _xmlExtractText(String xml, String xpath) {
+  final segs = xpath.split('/').where((s) => s.isNotEmpty).toList();
+  var content = xml.trim();
+  for (final seg in segs) {
+    final tag = seg.replaceAll(RegExp(r'\[.*\]$'), ''); // drop a [predicate]
+    final m = RegExp('<$tag\\b[^>]*>(.*?)</$tag>', dotAll: true)
+        .firstMatch(content);
+    if (m == null) return null;
+    content = m.group(1)!.trim();
+  }
+  return content;
 }
 
 /// Evaluates a constant arithmetic expression string (`+ - * /` over numeric
