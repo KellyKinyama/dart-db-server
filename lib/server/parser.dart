@@ -3237,6 +3237,24 @@ class Parser {
     _expectKw('SET');
     final assignments = <String, Expr>{};
     do {
+      // Oracle multi-column form: `SET (a, b) = (SELECT …)` assigns each column
+      // from the matching element of a single-row subquery.
+      if (_check(TokType.punct, '(')) {
+        _advance(); // (
+        final cols = <String>[_expectIdent().text];
+        while (_match(TokType.punct, ',')) {
+          cols.add(_expectIdent().text);
+        }
+        _expect(TokType.punct, ')');
+        _expect(TokType.op, '=');
+        _expect(TokType.punct, '(');
+        final sub = SubquerySelectExpr(_parseSelect());
+        _expect(TokType.punct, ')');
+        for (var i = 0; i < cols.length; i++) {
+          assignments[cols[i]] = RowElementExpr(sub, i);
+        }
+        continue;
+      }
       final col = _expectIdent().text;
       _expect(TokType.op, '=');
       assignments[col] = _parseExpr();
@@ -3605,6 +3623,37 @@ class Parser {
     );
   }
 
+  /// Shreds a `TABLE(collection)` operand into a derived table with one
+  /// `COLUMN_VALUE` row per collection element (the constructor's arguments).
+  SelectStmt _parseTableCollection() {
+    final inner = _parseExpr();
+    final elems = inner is FunctionCallExpr ? inner.args : <Expr>[inner];
+    List<SelectItem> arm(Expr e) =>
+        [SelectItem.expr(e, alias: 'COLUMN_VALUE')];
+    if (elems.isEmpty) {
+      return SelectStmt(
+        projection: [SelectItem.expr(LiteralExpr(null), alias: 'COLUMN_VALUE')],
+        where: LiteralExpr(0),
+        orderBy: const [],
+      );
+    }
+    SelectStmt? tail;
+    for (var i = elems.length - 1; i >= 1; i--) {
+      tail = SelectStmt(
+        projection: arm(elems[i]),
+        orderBy: const [],
+        setOp: tail == null ? null : 'UNION ALL',
+        setOpRight: tail,
+      );
+    }
+    return SelectStmt(
+      projection: arm(elems.first),
+      orderBy: const [],
+      setOp: elems.length == 1 ? null : 'UNION ALL',
+      setOpRight: tail,
+    );
+  }
+
   SelectStmt _parseSimpleSelect() {
     _expectKw('SELECT');
     final distinct = _matchKw('DISTINCT');
@@ -3621,6 +3670,15 @@ class Parser {
     if (_matchKw('FROM')) {
       if (_match(TokType.punct, '(')) {
         fromSub = _parseSelect();
+        _expect(TokType.punct, ')');
+      } else if (_checkWord('TABLE') &&
+          _peek(1).type == TokType.punct &&
+          _peek(1).text == '(') {
+        // Oracle `TABLE(collection)` unnesting: shred a collection constructor
+        // (e.g. SYS.ODCINUMBERLIST(10,20,30)) into one COLUMN_VALUE row each.
+        _advance(); // TABLE
+        _expect(TokType.punct, '(');
+        fromSub = _parseTableCollection();
         _expect(TokType.punct, ')');
       } else if (_checkWord('JSON_TABLE') &&
           _peek(1).type == TokType.punct &&
@@ -3681,7 +3739,14 @@ class Parser {
         if (_match(TokType.punct, ',')) {
           String? ctbl;
           SelectStmt? csub;
-          if (_match(TokType.punct, '(')) {
+          var clateral = false;
+          // Oracle/ANSI `, LATERAL (subquery)` — a correlated derived table.
+          if (_matchWord('LATERAL')) {
+            clateral = true;
+            _expect(TokType.punct, '(');
+            csub = _parseSelect();
+            _expect(TokType.punct, ')');
+          } else if (_match(TokType.punct, '(')) {
             csub = _parseSelect();
             _expect(TokType.punct, ')');
           } else if (_checkWord('JSON_TABLE') &&
@@ -3698,11 +3763,13 @@ class Parser {
           } else if (_check(TokType.ident) && !_isClauseStartWord()) {
             calias = _advance().text;
           }
-          joins.add(JoinClause('CROSS', ctbl, calias, null, subquery: csub));
+          joins.add(JoinClause('CROSS', ctbl, calias, null,
+              subquery: csub, lateral: clateral));
           continue;
         }
         String? joinType;
         bool natural = false;
+        var lateral = false;
         if (_matchKw('NATURAL')) {
           natural = true;
         }
@@ -3722,8 +3789,20 @@ class Parser {
           _expectKw('JOIN');
           joinType = 'FULL';
         } else if (_matchKw('CROSS')) {
-          _expectKw('JOIN');
-          joinType = 'CROSS';
+          // `CROSS APPLY (…)` is a correlated inner join; `CROSS JOIN` is plain.
+          if (_matchWord('APPLY')) {
+            joinType = 'CROSS';
+            lateral = true;
+          } else {
+            _expectKw('JOIN');
+            joinType = 'CROSS';
+          }
+        } else if (_checkWord('OUTER') && _peek(1).upper == 'APPLY') {
+          // `OUTER APPLY (…)` is a correlated left join.
+          _advance(); // OUTER
+          _advance(); // APPLY
+          joinType = 'LEFT';
+          lateral = true;
         } else if (_matchKw('JOIN')) {
           joinType = 'INNER';
         }
@@ -3750,7 +3829,7 @@ class Parser {
         final joinHint = _consumeIndexedHint();
         Expr? on;
         List<String>? usingCols;
-        if (!natural && joinType != 'CROSS') {
+        if (!natural && joinType != 'CROSS' && !lateral) {
           if (_matchKw('USING')) {
             _expect(TokType.punct, '(');
             usingCols = [_expectName()];
@@ -3773,6 +3852,7 @@ class Parser {
             using: usingCols,
             natural: natural,
             indexedBy: joinHint,
+            lateral: lateral,
           ),
         );
       }

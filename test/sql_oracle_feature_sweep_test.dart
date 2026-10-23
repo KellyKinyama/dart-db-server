@@ -1126,4 +1126,67 @@ void main() {
       await db.close();
     }
   });
+
+  // ---- Rounds 53-55 (query features): F224, F227, F229, F230 --------------
+
+  test('F224 multi-column UPDATE SET (a,b) = (subquery)', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE t (id NUMBER, a NUMBER, b NUMBER)');
+      await db.execute('INSERT INTO t VALUES (1, 0, 0)');
+      await db.execute(
+          'UPDATE t SET (a, b) = (SELECT 5, 7 FROM dual) WHERE id = 1');
+      expect(await scalar(db, 'SELECT a + b FROM t'), 12);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F227 TABLE() collection unnesting', () async {
+    final db = await Database.open(null);
+    try {
+      expect(
+          await scalar(
+              db, 'SELECT COUNT(*) FROM TABLE(SYS.ODCINUMBERLIST(10, 20, 30))'),
+          3);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F229 LATERAL inline view', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE la (id NUMBER)');
+      await db.execute('INSERT INTO la VALUES (1), (2)');
+      await db.execute('CREATE TABLE lb (aid NUMBER)');
+      await db.execute('INSERT INTO lb VALUES (1), (1)');
+      expect(
+          await scalar(
+              db,
+              'SELECT COUNT(*) FROM la, LATERAL (SELECT 1 x FROM lb '
+              'WHERE lb.aid = la.id)'),
+          2);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F230 CROSS APPLY', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE la (id NUMBER)');
+      await db.execute('INSERT INTO la VALUES (1), (2)');
+      await db.execute('CREATE TABLE lb (aid NUMBER)');
+      await db.execute('INSERT INTO lb VALUES (1), (1)');
+      expect(
+          await scalar(
+              db,
+              'SELECT COUNT(*) FROM la CROSS APPLY (SELECT 1 x FROM lb '
+              'WHERE lb.aid = la.id)'),
+          2);
+    } finally {
+      await db.close();
+    }
+  });
 }

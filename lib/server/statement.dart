@@ -458,6 +458,11 @@ class JoinClause {
   /// Optional `INDEXED BY` / `NOT INDEXED` hint on this joined relation.
   final IndexHint? indexedBy;
 
+  /// True for a correlated derived table: `LATERAL (…)`, `CROSS APPLY (…)`,
+  /// `OUTER APPLY (…)`. The [subquery] is re-evaluated per left row with that
+  /// row visible as outer scope.
+  final bool lateral;
+
   JoinClause(
     this.type,
     this.table,
@@ -467,6 +472,7 @@ class JoinClause {
     this.using,
     this.natural = false,
     this.indexedBy,
+    this.lateral = false,
   });
 }
 

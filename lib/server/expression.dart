@@ -245,6 +245,21 @@ class PriorExpr extends Expr {
   }
 }
 
+/// Picks the [index]-th element of a row-valued expression (e.g. a multi-column
+/// single-row subquery), used by `UPDATE … SET (a, b) = (SELECT …)`.
+class RowElementExpr extends Expr {
+  final Expr row;
+  final int index;
+  RowElementExpr(this.row, this.index);
+  @override
+  Object? eval(Map<String, Object?> r) {
+    final v = row.eval(r);
+    if (v is List) return index < v.length ? v[index] : null;
+    // A single-column subquery yields a scalar; index 0 returns it.
+    return index == 0 ? v : null;
+  }
+}
+
 class UnaryExpr extends Expr {
   final String op; // NOT, -
   final Expr operand;

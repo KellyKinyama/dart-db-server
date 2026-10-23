@@ -11177,6 +11177,24 @@ class Database implements SequenceProvider {
     var working = left;
     for (var ji = 0; ji < s.joins.length; ji++) {
       final j = s.joins[ji];
+      // LATERAL / CROSS APPLY / OUTER APPLY: the right subquery is correlated,
+      // so re-materialise it per left row with that row visible as outer scope.
+      if (j.lateral && j.subquery != null) {
+        final next = <Map<String, Object?>>[];
+        for (final l in working) {
+          final rightRows =
+              _materializeSubquery(j.subquery!, j.alias, {...outer, ...l});
+          if (rightRows.isEmpty && j.type == 'LEFT') {
+            next.add(l); // OUTER APPLY keeps the unmatched left row
+          } else {
+            for (final r in rightRows) {
+              next.add({...l, ...r});
+            }
+          }
+        }
+        working = next;
+        continue;
+      }
       final right = j.subquery != null
           ? _materializeSubquery(j.subquery!, j.alias, outer)
           : _materializeRelation(j.table!, j.alias, outer);
@@ -15852,6 +15870,9 @@ class Database implements SequenceProvider {
     }
     if (e is UnaryExpr) {
       return UnaryExpr(e.op, _bindExpr(e.operand, outerScope));
+    }
+    if (e is RowElementExpr) {
+      return RowElementExpr(_bindExpr(e.row, outerScope), e.index);
     }
     if (e is BetweenExpr) {
       return BetweenExpr(
