@@ -3741,6 +3741,7 @@ class Parser {
     }
     int? limit;
     int? offset;
+    var limitPercent = false;
     if (_matchKw('LIMIT')) {
       final lim = _parseSignedInt();
       // MySQL form: `LIMIT offset, count` swaps the meaning of the
@@ -3772,11 +3773,13 @@ class Parser {
       }
       var count = 1;
       if (_check(TokType.number)) count = int.parse(_advance().text);
-      if (_matchKw('ROW') || _matchKw('ROWS')) {}
+      final percent = _matchWord('PERCENT');
+      if (_matchKw('ROW') || _matchWord('ROWS')) {}
       if (!_matchWord('ONLY')) {
         if (_matchKw('WITH')) _expectKw('TIES');
       }
       limit = count;
+      limitPercent = percent;
     }
     // Oracle ROWNUM pseudo-column used as a row limiter in the WHERE clause,
     // e.g. `WHERE ROWNUM <= 10`. Rewrite such top-level conjuncts into an
@@ -3801,6 +3804,7 @@ class Parser {
       limit: limit,
       offset: offset,
       distinct: distinct,
+      limitPercent: limitPercent,
       fromFunction: fromFunc,
       namedWindows: namedWindows,
       indexedBy: fromIndexHint,

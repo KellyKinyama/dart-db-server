@@ -2966,8 +2966,12 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     if (a.isEmpty || a[0] == null) return null;
     final v = a[0];
     if (v is num) return v;
-    if (v is String) return num.tryParse(v.trim());
-    return null;
+    var s = v.toString().trim();
+    // With a format model, strip currency / grouping characters first.
+    if (a.length > 1 && a[1] != null) {
+      s = s.replaceAll(RegExp(r'[^0-9.\-]'), '');
+    }
+    return num.tryParse(s);
   },
   // Oracle RAW hex round-trip: HEXTORAW('DEADBEEF') -> bytes, RAWTOHEX -> hex.
   'HEXTORAW': (a) {
@@ -4000,6 +4004,11 @@ bool _looksLikeNumberFormat(String fmt) =>
 /// Formats [d] by an Oracle date format model [fmt] (a common subset). Honours
 /// token case for alphabetic names (MON -> JUN, Mon -> Jun, mon -> jun).
 String _formatOracleDate(DateTime d, String fmt) {
+  // Leading fill-mode modifier `FM` (any case) trims padding; our names are
+  // already unpadded, so it's simply stripped.
+  if (fmt.length >= 2 && fmt.substring(0, 2).toUpperCase() == 'FM') {
+    fmt = fmt.substring(2);
+  }
   // Longest tokens first so e.g. MONTH wins over MON over MM, DDD over DD.
   const tokens = [
     'YYYY', 'RRRR', 'YEAR', 'MONTH', 'HH24', 'HH12', 'DDD', 'MON', 'DAY', 'CC',

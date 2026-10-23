@@ -265,4 +265,44 @@ void main() {
       await db.close();
     }
   });
+
+  test('TO_NUMBER with a format model strips grouping', () async {
+    final db = await Database.open(null);
+    try {
+      expect(await scalar(db, "SELECT TO_NUMBER('1,234.56', '9,999.99')"),
+          1234.56);
+      expect(await scalar(db, "SELECT TO_NUMBER('\$1,234', 'L9,999')"), 1234);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('TO_CHAR lowercase fm modifier trims padding', () async {
+    final db = await Database.open(null);
+    try {
+      expect(
+          await scalar(db,
+              "SELECT TO_CHAR(DATE '2024-07-20', 'fmDay, Month DD, YYYY')"),
+          'Saturday, July 20, 2024');
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('FETCH FIRST n PERCENT ROWS ONLY', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE t (v NUMBER)');
+      for (var i = 1; i <= 10; i++) {
+        await db.execute('INSERT INTO t VALUES ($i)');
+      }
+      expect(
+          await scalar(db,
+              'SELECT COUNT(*) FROM (SELECT v FROM t ORDER BY v '
+              'FETCH FIRST 50 PERCENT ROWS ONLY)'),
+          5);
+    } finally {
+      await db.close();
+    }
+  });
 }

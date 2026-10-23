@@ -472,6 +472,10 @@ class SelectStmt extends Statement {
   final int? offset;
   final bool distinct;
 
+  /// True when [limit] is a percentage of the row count (Oracle
+  /// `FETCH FIRST n PERCENT ROWS ONLY`): the effective count is `CEIL(n% * N)`.
+  final bool limitPercent;
+
   /// Optional set-operation chain (UNION / UNION ALL / EXCEPT / INTERSECT).
   /// When present, this SELECT's result is combined with [setOpRight].
   final String? setOp; // 'UNION', 'UNION ALL', 'EXCEPT', 'INTERSECT'
@@ -527,6 +531,7 @@ class SelectStmt extends Statement {
     this.limit,
     this.offset,
     this.distinct = false,
+    this.limitPercent = false,
     this.setOp,
     this.setOpRight,
     this.ctes = const {},

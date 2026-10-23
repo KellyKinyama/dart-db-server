@@ -7334,7 +7334,13 @@ class Database implements SequenceProvider {
     // LIMIT / OFFSET
     final start = (s.offset ?? 0).clamp(0, resultRows.length);
     var end = resultRows.length;
-    if (s.limit != null) end = (start + s.limit!).clamp(0, resultRows.length);
+    if (s.limit != null) {
+      // Oracle FETCH FIRST n PERCENT: CEIL of n% of the (post-offset) rows.
+      final effLimit = s.limitPercent
+          ? ((s.limit! * (resultRows.length - start)) / 100).ceil()
+          : s.limit!;
+      end = (start + effLimit).clamp(0, resultRows.length);
+    }
     resultRows = resultRows.sublist(start, end);
 
     return QueryResult(
