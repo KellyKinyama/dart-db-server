@@ -1060,6 +1060,7 @@ class FunctionCallExpr extends Expr {
     this.keepFirst,
     this.keepOrderBy,
     this.ignoreNulls = false,
+    this.fromLast = false,
   });
 
   /// Oracle `KEEP (DENSE_RANK FIRST|LAST ORDER BY …)` ordered-set modifier:
@@ -1070,6 +1071,10 @@ class FunctionCallExpr extends Expr {
   /// `IGNORE NULLS` modifier (FIRST_VALUE/LAST_VALUE/LAG/LEAD): skip NULLs when
   /// picking the value. Default false = RESPECT NULLS.
   final bool ignoreNulls;
+
+  /// Oracle `NTH_VALUE(expr, n) FROM LAST` modifier: count the nth row from the
+  /// end of the window frame instead of the start. Default false = FROM FIRST.
+  final bool fromLast;
 
   bool get isAggregate => kAggregateFunctions.contains(name);
   bool get isWindow => window != null;
@@ -1797,6 +1802,61 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
   // Oracle NLSSORT: a collation sort key (we fold to upper-case for a
   // case-insensitive linguistic-ish ordering).
   'NLSSORT': (a) => _propagateNull(a, () => a[0].toString().toUpperCase()),
+  // NCHR(n): national-charset character for a codepoint (same as CHR here).
+  'NCHR': (a) => _propagateNull(a, () {
+        return String.fromCharCode((a[0] as num).toInt());
+      }),
+  // COMPOSE / TO_SINGLE_BYTE: identity for the ASCII/BMP subset we model.
+  'COMPOSE': (a) => _propagateNull(a, () => a[0].toString()),
+  'TO_SINGLE_BYTE': (a) => _propagateNull(a, () => a[0].toString()),
+  // NEW_TIME(d, z1, z2): timezone shift; modelled as a no-op on the text date.
+  'NEW_TIME': (a) => a.isEmpty ? null : a[0],
+  // TO_YMINTERVAL('y-m'): year-month interval as a day count.
+  'TO_YMINTERVAL': (a) => _propagateNull(a, () {
+        final m = RegExp(r'(-?\d+)-(\d+)').firstMatch(a[0].toString());
+        if (m == null) return null;
+        return int.parse(m.group(1)!) * 365 + int.parse(m.group(2)!) * 30;
+      }),
+  // TO_DSINTERVAL('d hh:mi:ss'): day-to-second interval as a day count.
+  'TO_DSINTERVAL': (a) => _propagateNull(a, () {
+        final s = a[0].toString().trim();
+        var dayPart = 0;
+        var timePart = s;
+        if (s.contains(' ')) {
+          final sp = s.split(RegExp(r'\s+'));
+          dayPart = int.tryParse(sp[0]) ?? 0;
+          timePart = sp[1];
+        }
+        final tp = timePart.split(':');
+        final h = tp.isNotEmpty ? (int.tryParse(tp[0]) ?? 0) : 0;
+        final mi = tp.length > 1 ? (int.tryParse(tp[1]) ?? 0) : 0;
+        final sec = tp.length > 2 ? (double.tryParse(tp[2]) ?? 0) : 0;
+        final days = dayPart + h / 24 + mi / 1440 + sec / 86400;
+        return days == days.roundToDouble() ? days.toInt() : days;
+      }),
+  // SYS_GUID(): a random 32-char uppercase hex RAW id.
+  'SYS_GUID': (a) {
+    final b = List<int>.generate(16, (_) => _rng.nextInt(256));
+    return b.map((x) => x.toRadixString(16).padLeft(2, '0')).join().toUpperCase();
+  },
+  // SESSIONTIMEZONE / DBTIMEZONE: UTC in this engine.
+  'SESSIONTIMEZONE': (a) => '+00:00',
+  'DBTIMEZONE': (a) => '+00:00',
+  // ROWID pseudocolumn: a synthetic non-null rowid token.
+  'ROWID': (a) => 'AAAAAAAAAA',
+  // (s1, e1) OVERLAPS (s2, e2): the two periods share any instant.
+  '__OVERLAPS': (a) {
+    if (a.length < 2 || a[0] is! List || a[1] is! List) return null;
+    final p1 = a[0] as List;
+    final p2 = a[1] as List;
+    if (p1.length < 2 || p2.length < 2) return null;
+    final s1 = _parseDateTime(p1[0]?.toString());
+    final e1 = _parseDateTime(p1[1]?.toString());
+    final s2 = _parseDateTime(p2[0]?.toString());
+    final e2 = _parseDateTime(p2[1]?.toString());
+    if (s1 == null || e1 == null || s2 == null || e2 == null) return null;
+    return s1.isBefore(e2) && s2.isBefore(e1);
+  },
   // ASCIISTR: non-ASCII characters become \XXXX escapes.
   'ASCIISTR': (a) => _propagateNull(a, () {
         final sb = StringBuffer();
@@ -1838,6 +1898,20 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     final content =
         a.length > 1 ? a.sublist(1).map((x) => x?.toString() ?? '').join() : '';
     return '<$name>$content</$name>';
+  },
+  // XMLQUERY(xquery RETURNING CONTENT): evaluate a constant XQuery expression.
+  // We support the common case of a scalar arithmetic expression (e.g. '1+2'),
+  // returning the computed value; otherwise the query text is returned as-is.
+  'XMLQUERY': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final q = a[0].toString().trim();
+    final v = _evalConstArith(q);
+    return v ?? q;
+  },
+  // XMLSERIALIZE([DOCUMENT|CONTENT] value ...): render the value as text.
+  'XMLSERIALIZE': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    return a[0].toString();
   },
   // SPACE(n) -- string of n spaces.
   'SPACE': (a) => _propagateNull(a, () {
@@ -3008,7 +3082,7 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
           final padded = hex.padLeft(width, '0');
           return fmt.toUpperCase().startsWith('FM') ? hex : ' $padded';
         }
-        if (_looksLikeNumberFormat(fmt)) {
+        if (_looksLikeNumberFormat(fmt) || RegExp(r'[90]').hasMatch(fmt)) {
           return _formatOracleNumber(n, fmt);
         }
       }
@@ -3139,7 +3213,12 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     final d2 = _parseDateTime(a[1].toString());
     if (d1 == null || d2 == null) return null;
     final months = (d1.year - d2.year) * 12 + (d1.month - d2.month);
-    final result = months + (d1.day - d2.day) / 31.0;
+    bool isEom(DateTime d) =>
+        d.day == DateTime.utc(d.year, d.month + 1, 0).day;
+    // Oracle: two last-day-of-month dates give a whole-month result.
+    final dayFrac =
+        (d1.day == d2.day) || (isEom(d1) && isEom(d2)) ? 0.0 : (d1.day - d2.day) / 31.0;
+    final result = months + dayFrac;
     return result == result.truncateToDouble() ? result.toInt() : result;
   },
   // NEXT_DAY(date, weekday): the first [weekday] strictly after [date].
@@ -4045,7 +4124,7 @@ String _applyNameCase(String value, String token) {
 }
 
 bool _looksLikeDateFormat(String fmt) =>
-    RegExp(r'Y{2,4}|R{2,4}|MON|MM|DD|DAY|DY|HH|MI|SS|FF|WW|IW|CC|\bQ\b|\bJ\b|"',
+    RegExp(r'Y{2,4}|R{2,4}|RM|MON|MM|DD|DAY|DY|HH|MI|SS|FF|WW|IW|CC|\bW\b|\bQ\b|\bJ\b|"',
             caseSensitive: false)
         .hasMatch(fmt);
 
@@ -4064,9 +4143,9 @@ String _formatOracleDate(DateTime d, String fmt) {
   }
   // Longest tokens first so e.g. MONTH wins over MON over MM, DDD over DD.
   const tokens = [
-    'YYYY', 'RRRR', 'YEAR', 'MONTH', 'HH24', 'HH12', 'DDD', 'MON', 'DAY', 'CC',
-    'YY', 'RR', 'MM', 'DD', 'DY', 'HH', 'MI', 'WW', 'IW', 'SS', 'AM', 'PM',
-    'Q', 'J', 'D',
+    'YYYY', 'RRRR', 'IYYY', 'YEAR', 'MONTH', 'SSSSS', 'HH24', 'HH12', 'DDD',
+    'MON', 'DAY', 'CC', 'RM', 'YY', 'RR', 'MM', 'DD', 'DY', 'HH', 'MI', 'WW',
+    'IW', 'SS', 'AM', 'PM', 'Q', 'J', 'W', 'D',
   ];
   final sb = StringBuffer();
   var i = 0;
@@ -4113,6 +4192,18 @@ String _formatOracleDate(DateTime d, String fmt) {
       case 'YYYY':
       case 'RRRR':
         sb.write(d.year.toString().padLeft(4, '0'));
+        break;
+      case 'IYYY':
+        sb.write(_isoYear(d).toString().padLeft(4, '0'));
+        break;
+      case 'RM':
+        sb.write((_toRoman(d.month) ?? '').toUpperCase());
+        break;
+      case 'W':
+        sb.write(((d.day - 1) ~/ 7 + 1).toString());
+        break;
+      case 'SSSSS':
+        sb.write((d.hour * 3600 + d.minute * 60 + d.second).toString());
         break;
       case 'YY':
       case 'RR':
@@ -4280,12 +4371,89 @@ int _isoWeek(DateTime d) {
   return thursday.difference(week1).inDays ~/ 7 + 1;
 }
 
+/// ISO-8601 year (the year owning the ISO week that contains [d]).
+int _isoYear(DateTime d) {
+  final day = DateTime.utc(d.year, d.month, d.day);
+  return day.add(Duration(days: 4 - day.weekday)).year;
+}
+
+/// Evaluates a constant arithmetic expression string (`+ - * /` over numeric
+/// literals, with parentheses) and returns the result, or null when the text
+/// is not a pure arithmetic expression. Used for XMLQUERY content evaluation.
+num? _evalConstArith(String src) {
+  final s = src.trim();
+  if (s.isEmpty || !RegExp(r'^[\d\s.+\-*/()]+$').hasMatch(s)) return null;
+  var pos = 0;
+  late num? Function() parseExpr;
+  void skip() {
+    while (pos < s.length && s[pos] == ' ') pos++;
+  }
+
+  num? parseFactor() {
+    skip();
+    if (pos >= s.length) return null;
+    if (s[pos] == '(') {
+      pos++;
+      final v = parseExpr();
+      skip();
+      if (pos < s.length && s[pos] == ')') pos++;
+      return v;
+    }
+    final start = pos;
+    if (s[pos] == '+' || s[pos] == '-') pos++;
+    while (pos < s.length && RegExp(r'[\d.]').hasMatch(s[pos])) {
+      pos++;
+    }
+    return num.tryParse(s.substring(start, pos));
+  }
+
+  num? parseTerm() {
+    var v = parseFactor();
+    if (v == null) return null;
+    skip();
+    while (pos < s.length && (s[pos] == '*' || s[pos] == '/')) {
+      final op = s[pos++];
+      final r = parseFactor();
+      if (r == null) return null;
+      v = op == '*' ? v! * r : v! / r;
+      skip();
+    }
+    return v;
+  }
+
+  parseExpr = () {
+    var v = parseTerm();
+    if (v == null) return null;
+    skip();
+    while (pos < s.length && (s[pos] == '+' || s[pos] == '-')) {
+      final op = s[pos++];
+      final r = parseTerm();
+      if (r == null) return null;
+      v = op == '+' ? v! + r : v! - r;
+      skip();
+    }
+    return v;
+  };
+
+  final result = parseExpr();
+  skip();
+  if (pos != s.length) return null;
+  if (result == null) return null;
+  return result == result.roundToDouble() ? result.toInt() : result;
+}
+
 /// Formats [n] by an Oracle number format model [fmt] (9/0 digits, comma
 /// grouping, decimal point, optional leading FM to drop the sign blank).
 String _formatOracleNumber(num n, String fmt) {
   var f = fmt;
   final fm = f.toUpperCase().startsWith('FM');
   if (fm) f = f.substring(2);
+  // MI: trailing sign for negatives (space for positives).
+  final trailingSign = f.toUpperCase().endsWith('MI');
+  if (trailingSign) f = f.substring(0, f.length - 2);
+  // G / D are locale group/decimal placeholders for , / .
+  f = f.replaceAll(RegExp('G', caseSensitive: false), ',');
+  f = f.replaceAll(RegExp('D', caseSensitive: false), '.');
   final grouping = f.contains(',');
   final dotIdx = f.indexOf('.');
   final decimals = dotIdx >= 0
@@ -4306,7 +4474,9 @@ String _formatOracleNumber(num n, String fmt) {
   }
   var out = intPart;
   if (decimals > 0) out = '$out.$decPart';
-  if (neg) {
+  if (trailingSign) {
+    out = neg ? '$out-' : (fm ? out : '$out ');
+  } else if (neg) {
     out = '-$out';
   } else if (!fm) {
     out = ' $out';
@@ -4636,6 +4806,17 @@ const Set<String> kAggregateFunctions = {
   'PERCENTILE_DISC',
   'STATS_MODE',
   'APPROX_COUNT_DISTINCT',
+  'REGR_COUNT',
+  'REGR_AVGX',
+  'REGR_AVGY',
+  'REGR_SLOPE',
+  'REGR_INTERCEPT',
+  'REGR_SXX',
+  'REGR_SYY',
+  'REGR_SXY',
+  'REGR_R2',
+  'JSON_ARRAYAGG',
+  'JSON_OBJECTAGG',
   // Vector aggregates — batch-oriented centroid / sum operations.
   // See _aggregateValue in database.dart for implementation.
   'VEC_AVG',

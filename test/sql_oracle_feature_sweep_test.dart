@@ -373,4 +373,102 @@ void main() {
       await db.close();
     }
   });
+
+  // ---- Round 46 (mega-sweep): F183–F193 ----------------------------------
+
+  test('F183 TO_CHAR(date) IYYY/RM/W/SSSSS tokens', () async {
+    final db = await Database.open(null);
+    try {
+      expect(await scalar(db, "SELECT TO_CHAR(DATE '2024-07-20','IYYY')"),
+          '2024');
+      expect(await scalar(db, "SELECT TO_CHAR(DATE '2024-07-20','RM')"), 'VII');
+      expect(await scalar(db, "SELECT TO_CHAR(DATE '2024-07-20','W')"), '3');
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F184 TO_CHAR(number) MI/G/D elements', () async {
+    final db = await Database.open(null);
+    try {
+      expect(await scalar(db, "SELECT TO_CHAR(-1234,'FM9999MI')"), '1234-');
+      expect(await scalar(db, "SELECT TO_CHAR(1234,'FM9G999')"), '1,234');
+      expect(await scalar(db, "SELECT TO_CHAR(12.5,'FM99D9')"), '12.5');
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F186 NTH_VALUE ... FROM LAST', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE m (y NUMBER)');
+      await db.execute('INSERT INTO m VALUES (10), (20), (30)');
+      expect(
+          await scalar(
+              db,
+              'SELECT MAX(nv) FROM (SELECT NTH_VALUE(y, 1) FROM LAST OVER '
+              '(ORDER BY y ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED '
+              'FOLLOWING) nv FROM m)'),
+          30);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F188 XMLQUERY / XMLCAST evaluate constant content', () async {
+    final db = await Database.open(null);
+    try {
+      expect(
+          await scalar(db,
+              "SELECT XMLCAST(XMLQUERY('1+2' RETURNING CONTENT) AS NUMBER) "
+              'FROM dual'),
+          3);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F189 ROWID pseudo-column resolves on any rowid table', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE t (x NUMBER)');
+      await db.execute('INSERT INTO t VALUES (1)');
+      expect(
+          await scalar(db, 'SELECT COUNT(*) FROM t WHERE ROWID IS NOT NULL'),
+          1);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F191 OVERLAPS predicate', () async {
+    final db = await Database.open(null);
+    try {
+      expect(
+          await scalar(
+              db,
+              "SELECT CASE WHEN (DATE '2024-01-01', DATE '2024-06-01') OVERLAPS "
+              "(DATE '2024-03-01', DATE '2024-09-01') THEN 1 ELSE 0 END "
+              'FROM dual'),
+          1);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F192 = ALL (subquery)', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE s (v NUMBER)');
+      await db.execute('INSERT INTO s VALUES (5), (5), (5)');
+      expect(
+          await scalar(
+              db, 'SELECT CASE WHEN 5 = ALL (SELECT v FROM s) THEN 1 ELSE 0 '
+              'END FROM dual'),
+          1);
+    } finally {
+      await db.close();
+    }
+  });
 }

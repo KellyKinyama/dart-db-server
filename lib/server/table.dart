@@ -181,11 +181,23 @@ class Table implements TableBackend {
   /// already claims the name (a user column shadows the pseudo-column).
   void _addRowidAliases(Map<String, Object?> m, List<Object?> row,
       {required String qualifier}) {
-    if (_rowidAliasIdx == null || _rowidAliasIdx! < 0) return;
-    final v = row[_rowidAliasIdx!];
+    // Rowid-alias table: expose the INTEGER PRIMARY KEY under the rowid names.
+    if (_rowidAliasIdx != null && _rowidAliasIdx! >= 0) {
+      final v = row[_rowidAliasIdx!];
+      for (final key in const ['rowid', '_rowid_', 'oid']) {
+        m.putIfAbsent(key, () => v);
+        m.putIfAbsent('$qualifier.$key', () => v);
+      }
+      return;
+    }
+    // Any other rowid table (no integer-PK alias) still has an implicit,
+    // always-present rowid pseudo-column in SQLite/Oracle. We don't track the
+    // physical row number here, so expose a synthetic non-null token — enough
+    // for `WHERE rowid IS NOT NULL` and Oracle's ROWID pseudo-column to resolve.
+    if (withoutRowid) return;
     for (final key in const ['rowid', '_rowid_', 'oid']) {
-      m.putIfAbsent(key, () => v);
-      m.putIfAbsent('$qualifier.$key', () => v);
+      m.putIfAbsent(key, () => 'AAAAAAAAAA');
+      m.putIfAbsent('$qualifier.$key', () => 'AAAAAAAAAA');
     }
   }
 

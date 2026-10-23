@@ -14707,6 +14707,98 @@ class Database implements SequenceProvider {
           }
           return seen.length;
         }
+      case 'REGR_COUNT':
+      case 'REGR_AVGX':
+      case 'REGR_AVGY':
+      case 'REGR_SLOPE':
+      case 'REGR_INTERCEPT':
+      case 'REGR_SXX':
+      case 'REGR_SYY':
+      case 'REGR_SXY':
+      case 'REGR_R2':
+        {
+          // Linear-regression aggregates over (y, x) pairs with both non-null.
+          if (e.args.length < 2) return null;
+          final ey = _bindExpr(e.args[0]);
+          final ex = _bindExpr(e.args[1]);
+          final xs = <double>[];
+          final ys = <double>[];
+          for (final r in grp) {
+            final yv = ey.eval(r);
+            final xv = ex.eval(r);
+            if (yv is num && xv is num) {
+              ys.add(yv.toDouble());
+              xs.add(xv.toDouble());
+            }
+          }
+          final n = xs.length;
+          if (e.name == 'REGR_COUNT') return n;
+          if (n == 0) return null;
+          final avgX = xs.reduce((a, b) => a + b) / n;
+          final avgY = ys.reduce((a, b) => a + b) / n;
+          if (e.name == 'REGR_AVGX') return avgX;
+          if (e.name == 'REGR_AVGY') return avgY;
+          var sxx = 0.0, syy = 0.0, sxy = 0.0;
+          for (var i = 0; i < n; i++) {
+            sxx += (xs[i] - avgX) * (xs[i] - avgX);
+            syy += (ys[i] - avgY) * (ys[i] - avgY);
+            sxy += (xs[i] - avgX) * (ys[i] - avgY);
+          }
+          switch (e.name) {
+            case 'REGR_SXX':
+              return sxx;
+            case 'REGR_SYY':
+              return syy;
+            case 'REGR_SXY':
+              return sxy;
+            case 'REGR_SLOPE':
+              return sxx == 0 ? null : sxy / sxx;
+            case 'REGR_INTERCEPT':
+              return sxx == 0 ? null : avgY - (sxy / sxx) * avgX;
+            case 'REGR_R2':
+              return (sxx == 0 || syy == 0) ? null : (sxy * sxy) / (sxx * syy);
+          }
+          return null;
+        }
+      case 'JSON_ARRAYAGG':
+        {
+          final arg = e.args.isNotEmpty ? _bindExpr(e.args.first) : null;
+          var rows = grp;
+          if (e.aggOrderBy != null && e.aggOrderBy!.isNotEmpty) {
+            final bound = [for (final ob in e.aggOrderBy!) (_bindExpr(ob.expr), ob)];
+            rows = List<Map<String, Object?>>.from(grp)
+              ..sort((a, b) {
+                for (final (ex2, ob) in bound) {
+                  final av = ex2.eval(a), bv = ex2.eval(b);
+                  if (av == null && bv == null) continue;
+                  if (av == null) return ob.descending ? 1 : -1;
+                  if (bv == null) return ob.descending ? -1 : 1;
+                  final c = sqlCompare(av, bv);
+                  if (c != 0) return ob.descending ? -c : c;
+                }
+                return 0;
+              });
+          }
+          final out = <Object?>[];
+          for (final r in rows) {
+            final v = arg?.eval(r);
+            if (v != null) out.add(v);
+          }
+          return jsonEncode(out);
+        }
+      case 'JSON_OBJECTAGG':
+        {
+          if (e.args.length < 2) return null;
+          final ek = _bindExpr(e.args[0]);
+          final ev = _bindExpr(e.args[1]);
+          final m = <String, Object?>{};
+          for (final r in grp) {
+            final k = ek.eval(r);
+            if (k == null) continue;
+            m[k.toString()] = ev.eval(r);
+          }
+          return jsonEncode(m);
+        }
       case 'MEDIAN':
         {
           final nums = <double>[];
@@ -15302,9 +15394,11 @@ class Database implements SequenceProvider {
             final nth = (fn.args[1].eval(const {}) as num).toInt();
             for (var k = 0; k < ordered.length; k++) {
               final fr = frameRows(k);
-              out[ordered[k]] = (nth < 1 || nth > fr.length)
+              // FROM LAST: count the nth row from the end of the frame.
+              final idx = fn.fromLast ? fr.length - nth : nth - 1;
+              out[ordered[k]] = (nth < 1 || idx < 0 || idx >= fr.length)
                   ? null
-                  : fn.args.first.eval(fr[nth - 1]);
+                  : fn.args.first.eval(fr[idx]);
             }
           }
           break;
@@ -15494,6 +15588,7 @@ class Database implements SequenceProvider {
         keepFirst: e.keepFirst,
         keepOrderBy: e.keepOrderBy,
         ignoreNulls: e.ignoreNulls,
+        fromLast: e.fromLast,
       );
     }
     return e;

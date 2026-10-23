@@ -4257,15 +4257,19 @@ class Parser {
       if (negated) r = UnaryExpr('NOT', r);
       return r;
     }
+    // Oracle period predicate `(s1, e1) OVERLAPS (s2, e2)`.
+    if (_matchWord('OVERLAPS')) {
+      final right = _parseConcat();
+      return FunctionCallExpr('__OVERLAPS', [left, right]);
+    }
     if (negated) {
       throw FormatException('Unexpected NOT before "${_peek().text}"');
     }
     while (_check(TokType.op) &&
         const {'=', '!=', '<>', '<', '<=', '>', '>='}.contains(_peek().text)) {
       final op = _advance().text;
-      // Quantified comparison `op {ALL|ANY|SOME} (subquery)`: rewrite an
-      // ordering comparison to a MAX/MIN scalar subquery.
-      if (const {'<', '<=', '>', '>='}.contains(op) &&
+      // Quantified comparison `op {ALL|ANY|SOME} (subquery)`.
+      if (const {'=', '!=', '<>', '<', '<=', '>', '>='}.contains(op) &&
           (_checkWord('ALL') || _checkWord('ANY') || _checkWord('SOME')) &&
           _peek(1).type == TokType.punct &&
           _peek(1).text == '(') {
@@ -4273,19 +4277,44 @@ class Parser {
         _expect(TokType.punct, '(');
         final sub = _parseSelect();
         _expect(TokType.punct, ')');
-        final gt = op == '>' || op == '>=';
         final all = quant == 'ALL';
+        final eq = op == '=';
+        final ne = op == '!=' || op == '<>';
+        // Equality quantifiers map onto IN / NOT IN or MIN=MAX bounds.
+        if (eq && !all) {
+          left = SubqueryInExpr(left, sub, negated: false);
+          continue;
+        }
+        if (ne && all) {
+          left = SubqueryInExpr(left, sub, negated: true);
+          continue;
+        }
+        SelectStmt aggSel(String aggName) {
+          final first = sub.projection.first;
+          final label = first.alias ??
+              (first.expr is ColumnExpr
+                  ? (first.expr as ColumnExpr).name
+                  : 'c');
+          return SelectStmt(
+            projection: [
+              SelectItem.expr(FunctionCallExpr(aggName, [ColumnExpr(label)]))
+            ],
+            fromSubquery: sub,
+          );
+        }
+
+        if (eq && all) {
+          // x = ALL (S) iff x = MIN(S) and x = MAX(S).
+          left = BinaryExpr(
+            'AND',
+            BinaryExpr('=', left, SubquerySelectExpr(aggSel('MIN'))),
+            BinaryExpr('=', left, SubquerySelectExpr(aggSel('MAX'))),
+          );
+          continue;
+        }
+        final gt = op == '>' || op == '>=';
         final aggName = all ? (gt ? 'MAX' : 'MIN') : (gt ? 'MIN' : 'MAX');
-        final first = sub.projection.first;
-        final label = first.alias ??
-            (first.expr is ColumnExpr ? (first.expr as ColumnExpr).name : 'c');
-        final aggSel = SelectStmt(
-          projection: [
-            SelectItem.expr(FunctionCallExpr(aggName, [ColumnExpr(label)]))
-          ],
-          fromSubquery: sub,
-        );
-        left = BinaryExpr(op, left, SubquerySelectExpr(aggSel));
+        left = BinaryExpr(op, left, SubquerySelectExpr(aggSel(aggName)));
         continue;
       }
       left = BinaryExpr(op, left, _parseConcat());
@@ -4658,6 +4687,10 @@ class Parser {
         'CURRENT_TIME',
         'SYSDATE',
         'SYSTIMESTAMP',
+        'ROWID',
+        'SESSIONTIMEZONE',
+        'DBTIMEZONE',
+        'SYS_GUID',
       };
       if (bareFns.contains(t.upper)) {
         return FunctionCallExpr(t.upper, const []);
@@ -4687,6 +4720,11 @@ class Parser {
         _advance();
         final col = _expectName();
         return ColumnExpr(col, table: t.text);
+      }
+      // Oracle ROWID pseudo-column: map to the engine's lowercase `rowid`
+      // pseudo-column so `WHERE ROWID IS NOT NULL` resolves like `rowid`.
+      if (t.upper == 'ROWID') {
+        return ColumnExpr('rowid');
       }
       return ColumnExpr(t.text);
     }
@@ -4765,6 +4803,36 @@ class Parser {
                 : 'TRIM';
         return FunctionCallExpr(fn, chars == null ? [str] : [str, chars]);
       }
+    }
+    // Oracle XMLCAST(value AS type): convert an XML/content value to a SQL
+    // type. Modelled as a plain CAST (the XQuery content is already a scalar).
+    if (upper == 'XMLCAST') {
+      final e = _parseExpr();
+      _expectKw('AS');
+      final typeTok = _advance();
+      final type = parseDataType(typeTok.text);
+      if (_check(TokType.punct, '(')) {
+        var depth = 0;
+        do {
+          final tk = _advance();
+          if (tk.type == TokType.punct && tk.text == '(') depth++;
+          if (tk.type == TokType.punct && tk.text == ')') depth--;
+        } while (depth > 0 && !_isAtEnd());
+      }
+      _expect(TokType.punct, ')');
+      return CastExpr(e, type);
+    }
+    // Oracle XMLSERIALIZE([DOCUMENT|CONTENT] expr [AS type] …): serialise an
+    // XML value to text. We keep the inner expression and ignore the options.
+    if (upper == 'XMLSERIALIZE') {
+      _matchWord('DOCUMENT');
+      _matchWord('CONTENT');
+      final e = _parseExpr();
+      while (!_check(TokType.punct, ')') && !_isAtEnd()) {
+        _advance();
+      }
+      _expect(TokType.punct, ')');
+      return FunctionCallExpr('XMLSERIALIZE', [e]);
     }
     bool isStar = false;
     bool distinct = false;
@@ -4928,6 +4996,23 @@ class Parser {
         _expectWord('NULLS');
       }
     }
+    // Oracle `NTH_VALUE(expr, n) FROM FIRST|LAST`. Only consume FROM when it
+    // introduces this modifier (FIRST/LAST next), never the query's FROM clause.
+    bool fromLast = false;
+    if (_checkKw('FROM') &&
+        (_peek(1).upper == 'FIRST' || _peek(1).upper == 'LAST')) {
+      _advance(); // FROM
+      fromLast = _advance().upper == 'LAST';
+    }
+    // IGNORE/RESPECT NULLS can also trail the FROM FIRST|LAST clause.
+    if (!ignoreNulls) {
+      if (_matchWord('IGNORE')) {
+        _expectWord('NULLS');
+        ignoreNulls = true;
+      } else if (_matchWord('RESPECT')) {
+        _expectWord('NULLS');
+      }
+    }
     WindowSpec? window;
     if (_matchKw('OVER')) {
       // OVER w   |   OVER (...)
@@ -4949,6 +5034,7 @@ class Parser {
       keepFirst: keepFirst,
       keepOrderBy: keepOrderBy,
       ignoreNulls: ignoreNulls,
+      fromLast: fromLast,
     );
   }
 
