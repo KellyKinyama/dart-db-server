@@ -7371,8 +7371,10 @@ class Database implements SequenceProvider {
     // A hierarchical (CONNECT BY) query changes the row multiset, so none of
     // the table-level fast paths below are valid for it. A ROWNUM input limit
     // also disables the aggregate fast paths so the row cap is applied before
-    // the aggregate (see the truncation after WHERE below).
-    if (s.connectBy == null) {
+    // the aggregate (see the truncation after WHERE below). A MATCH_RECOGNIZE
+    // clause likewise reshapes the source relation (one row per match), so the
+    // table-level fast paths must not short-circuit it.
+    if (s.connectBy == null && s.matchRecognize == null) {
       final cov = _tryCoveringScan(s);
       if (cov != null) return cov;
 
@@ -7671,6 +7673,7 @@ class Database implements SequenceProvider {
     if (s.fromTable == null) return null;
     if (s.joins.isNotEmpty) return null;
     if (s.fromSubquery != null || s.fromFunction != null) return null;
+    if (s.matchRecognize != null) return null; // row pattern changes the count
     if (s.connectBy != null) return null; // hierarchical walk changes the count
     if (s.groupBy.isNotEmpty || s.having != null) return null;
     if (s.orderBy.isNotEmpty) return null;
@@ -11272,6 +11275,10 @@ class Database implements SequenceProvider {
       left = _materializeRelation(s.fromTable!, s.fromAlias, outer);
     }
     var working = left;
+    if (s.matchRecognize != null) {
+      working = _applyMatchRecognize(
+          left, s.matchRecognize!, s.fromAlias ?? s.fromTable);
+    }
     for (var ji = 0; ji < s.joins.length; ji++) {
       final j = s.joins[ji];
       // LATERAL / CROSS APPLY / OUTER APPLY: the right subquery is correlated,
@@ -12047,6 +12054,127 @@ class Database implements SequenceProvider {
       out.add(m);
     }
     return out;
+  }
+
+  /// Applies an Oracle `MATCH_RECOGNIZE` clause to the already-materialized
+  /// source [rows]: partitions, orders, greedily matches the row pattern, and
+  /// (for ONE ROW PER MATCH) emits one row per match carrying the MEASURES.
+  List<Map<String, Object?>> _applyMatchRecognize(
+    List<Map<String, Object?>> rows,
+    MatchRecognizeClause mr,
+    String? qual,
+  ) {
+    final q = qual ?? 'match_recognize';
+    final partitions = <String, List<Map<String, Object?>>>{};
+    final partOrder = <String>[];
+    if (mr.partitionBy.isEmpty) {
+      partitions[''] = rows;
+      partOrder.add('');
+    } else {
+      final partBound = [for (final e in mr.partitionBy) _bindExpr(e)];
+      for (final r in rows) {
+        final key = partBound.map((b) => '${b.eval(r)}').join('\u0001');
+        final bucket = partitions.putIfAbsent(key, () {
+          partOrder.add(key);
+          return <Map<String, Object?>>[];
+        });
+        bucket.add(r);
+      }
+    }
+    final out = <Map<String, Object?>>[];
+    for (final key in partOrder) {
+      var part = partitions[key]!;
+      if (mr.orderBy.isNotEmpty) {
+        final bound = [for (final ob in mr.orderBy) (_bindExpr(ob.expr), ob)];
+        part = List<Map<String, Object?>>.from(part)
+          ..sort((a, b) {
+            for (final (ex, ob) in bound) {
+              final av = ex.eval(a);
+              final bv = ex.eval(b);
+              final nullsFirst = ob.nullsFirst ?? ob.descending;
+              if (av == null && bv == null) continue;
+              if (av == null) return nullsFirst ? -1 : 1;
+              if (bv == null) return nullsFirst ? 1 : -1;
+              final c = sqlCompare(av, bv);
+              if (c != 0) return ob.descending ? -c : c;
+            }
+            return 0;
+          });
+      }
+      bool satisfies(String v, Map<String, Object?> row) {
+        final def = mr.defines[v.toUpperCase()];
+        if (def == null) return true; // an undefined variable always matches
+        final val = _bindExpr(def).eval(row);
+        return val == true || (val is num && val != 0);
+      }
+
+      // Greedy pattern matcher with backtracking; returns the exclusive end
+      // index of a match starting at [ri], or null if no match.
+      int? matchFrom(int pi, int ri) {
+        if (pi == mr.pattern.length) return ri;
+        final el = mr.pattern[pi];
+        final maxR = el.maxRep < 0 ? part.length - ri : el.maxRep;
+        var avail = 0;
+        while (avail < maxR &&
+            ri + avail < part.length &&
+            satisfies(el.variable, part[ri + avail])) {
+          avail++;
+        }
+        for (var take = avail; take >= el.minRep; take--) {
+          final res = matchFrom(pi + 1, ri + take);
+          if (res != null) return res;
+        }
+        return null;
+      }
+
+      var i = 0;
+      while (i < part.length) {
+        final end = matchFrom(0, i);
+        if (end != null && end > i) {
+          final matched = part.sublist(i, end);
+          if (mr.allRowsPerMatch) {
+            for (final mrow in matched) {
+              out.add(_matchMeasureRow(mr, matched, mrow, q));
+            }
+          } else {
+            out.add(_matchMeasureRow(mr, matched, matched.last, q));
+          }
+          i = end; // AFTER MATCH SKIP PAST LAST ROW (the default)
+        } else {
+          i++;
+        }
+      }
+    }
+    return out;
+  }
+
+  /// Builds one MATCH_RECOGNIZE output row: partition keys plus each MEASURES
+  /// expression (aggregates evaluated over [matched]; scalar expressions over
+  /// [current]), exposed under both bare and `qual.col` qualified keys.
+  Map<String, Object?> _matchMeasureRow(
+    MatchRecognizeClause mr,
+    List<Map<String, Object?>> matched,
+    Map<String, Object?> current,
+    String qual,
+  ) {
+    final row = <String, Object?>{};
+    for (final pb in mr.partitionBy) {
+      if (pb is ColumnExpr) row[pb.name] = matched.first[pb.name];
+    }
+    for (final m in mr.measures) {
+      final e = m.expr;
+      if (e == null) continue;
+      final name = m.alias ?? 'MEASURE';
+      if (e is FunctionCallExpr && e.isAggregate) {
+        row[name] = _aggregateValue(e, matched);
+      } else {
+        row[name] = _bindExpr(e).eval(current);
+      }
+    }
+    for (final entry in row.entries.toList()) {
+      row['$qual.${entry.key}'] = entry.value;
+    }
+    return row;
   }
 
   /// Materialize a table-valued function call (e.g. `json_each(...)`) into

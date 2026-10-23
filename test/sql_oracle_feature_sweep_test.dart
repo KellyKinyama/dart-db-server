@@ -1520,4 +1520,36 @@ void main() {
       await db.close();
     }
   });
+
+  test('F228 PIVOT XML groups by implicit non-pivot columns', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE px (g NUMBER, j VARCHAR2(2))');
+      await db.execute("INSERT INTO px VALUES (1, 'a'), (2, 'b')");
+      expect(
+          await scalar(
+              db,
+              'SELECT COUNT(*) FROM (SELECT * FROM (SELECT g, j FROM px) '
+              'PIVOT XML (COUNT(*) FOR j IN (ANY)))'),
+          2);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F225 MATCH_RECOGNIZE one row per contiguous match', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE mr (id NUMBER, v NUMBER)');
+      await db.execute('INSERT INTO mr VALUES (1, 5), (2, 5)');
+      expect(
+          await scalar(
+              db,
+              'SELECT COUNT(*) FROM mr MATCH_RECOGNIZE (ORDER BY id '
+              'MEASURES COUNT(*) AS c PATTERN (A+) DEFINE A AS v > 0)'),
+          1);
+    } finally {
+      await db.close();
+    }
+  });
 }

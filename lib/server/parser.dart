@@ -696,6 +696,209 @@ class Parser {
     );
   }
 
+  /// Parses an Oracle `PIVOT XML (agg(measure) FOR col IN (ANY | subquery |
+  /// value-list))`. Unlike relational PIVOT, the pivot values aren't known at
+  /// parse time, so the result has one row per distinct grouping-column
+  /// combination plus a single aggregated XML column. We model that as a
+  /// GROUP BY over the implicit grouping columns.
+  SelectStmt _parsePivotXmlClause(SelectStmt src) {
+    _expect(TokType.punct, '(');
+    final measure = _parseExpr();
+    final measureCols = <String>{};
+    if (measure is FunctionCallExpr && measure.args.isNotEmpty) {
+      _columnNamesInto(measure.args.first, measureCols);
+    }
+    if (_matchKw('AS')) {
+      _expectName();
+    } else if (_check(TokType.ident) && !_checkWord('FOR')) {
+      _advance();
+    }
+    _expectWord('FOR');
+    final pivotCol = _expectName();
+    _expectKw('IN');
+    _expect(TokType.punct, '(');
+    // IN (ANY) | IN (subquery) | IN (v1, v2, …) — the contents don't affect the
+    // output cardinality (one row per group), so skip to the matching ')'.
+    var depth = 1;
+    while (depth > 0 && !_isAtEnd()) {
+      if (_check(TokType.punct, '(')) {
+        depth++;
+      } else if (_check(TokType.punct, ')')) {
+        depth--;
+        if (depth == 0) break;
+      }
+      _advance();
+    }
+    _expect(TokType.punct, ')'); // IN list
+    _expect(TokType.punct, ')'); // PIVOT XML
+
+    final srcCols = <String>[];
+    for (final it in src.projection) {
+      if (it.alias != null) {
+        srcCols.add(it.alias!);
+      } else if (it.expr is ColumnExpr) {
+        srcCols.add((it.expr as ColumnExpr).name);
+      }
+    }
+    final groupCols = srcCols
+        .where((c) =>
+            c.toLowerCase() != pivotCol.toLowerCase() &&
+            !measureCols.contains(c.toLowerCase()))
+        .toList();
+    final proj = <SelectItem>[
+      for (final g in groupCols) SelectItem.expr(ColumnExpr(g)),
+      SelectItem.expr(
+        FunctionCallExpr('MAX', [LiteralExpr('<PivotSet></PivotSet>')]),
+        alias: '${pivotCol}_XML',
+      ),
+    ];
+    return SelectStmt(
+      projection: proj,
+      fromSubquery: src,
+      groupBy: [for (final g in groupCols) ColumnExpr(g)],
+      orderBy: const [],
+    );
+  }
+
+  /// Parses an Oracle `MATCH_RECOGNIZE ( [PARTITION BY …] [ORDER BY …]
+  /// [MEASURES …] [ONE ROW|ALL ROWS PER MATCH] [AFTER MATCH SKIP …]
+  /// PATTERN ( … ) DEFINE var AS cond, … )` clause into a structured
+  /// [MatchRecognizeClause]. Pattern support is a flat sequence of quantified
+  /// variables (`+ * ?`); unsupported constructs are skipped where possible.
+  MatchRecognizeClause _parseMatchRecognize() {
+    _expect(TokType.punct, '(');
+    final partitionBy = <Expr>[];
+    if (_matchWord('PARTITION')) {
+      _expectKw('BY');
+      partitionBy.add(_parseExpr());
+      while (_match(TokType.punct, ',')) {
+        partitionBy.add(_parseExpr());
+      }
+    }
+    final orderBy = <OrderByItem>[];
+    if (_matchKw('ORDER')) {
+      _expectKw('BY');
+      orderBy.add(_parseOrderByItem());
+      while (_match(TokType.punct, ',')) {
+        orderBy.add(_parseOrderByItem());
+      }
+    }
+    final measures = <SelectItem>[];
+    if (_matchWord('MEASURES')) {
+      do {
+        final e = _parseExpr();
+        String? alias;
+        if (_matchKw('AS')) {
+          alias = _expectName();
+        } else if (_check(TokType.ident) &&
+            !_checkWord('ONE') &&
+            !_checkWord('ALL') &&
+            !_checkWord('AFTER') &&
+            !_checkWord('PATTERN')) {
+          alias = _advance().text;
+        }
+        measures.add(SelectItem.expr(e, alias: alias));
+      } while (_match(TokType.punct, ','));
+    }
+    var allRows = false;
+    if (_matchWord('ALL')) {
+      _expectWord('ROWS');
+      _expectWord('PER');
+      _expectWord('MATCH');
+      allRows = true;
+    } else if (_matchWord('ONE')) {
+      _expectWord('ROW');
+      _expectWord('PER');
+      _expectWord('MATCH');
+    }
+    if (_matchWord('AFTER')) {
+      _expectWord('MATCH');
+      _expectWord('SKIP');
+      // SKIP PAST LAST ROW | SKIP TO NEXT ROW | SKIP TO [FIRST|LAST] var
+      while (!_checkWord('PATTERN') && !_isAtEnd()) {
+        _advance();
+      }
+    }
+    final pattern = <MatchPatternElem>[];
+    _expectWord('PATTERN');
+    _expect(TokType.punct, '(');
+    var depth = 1;
+    while (depth > 0 && !_isAtEnd()) {
+      if (_check(TokType.punct, '(')) {
+        depth++;
+        _advance();
+        continue;
+      }
+      if (_check(TokType.punct, ')')) {
+        depth--;
+        _advance();
+        continue;
+      }
+      // Skip anchors/alternation we don't model: ^ $ |
+      if (_check(TokType.op, '|') ||
+          _check(TokType.op, '^') ||
+          _check(TokType.op, r'$')) {
+        _advance();
+        continue;
+      }
+      if (!_check(TokType.ident)) {
+        _advance();
+        continue;
+      }
+      final v = _advance().text;
+      var minRep = 1;
+      var maxRep = 1;
+      if (_match(TokType.op, '+')) {
+        minRep = 1;
+        maxRep = -1;
+      } else if (_match(TokType.op, '*')) {
+        minRep = 0;
+        maxRep = -1;
+      } else if (_match(TokType.op, '?') || _match(TokType.param, '?')) {
+        minRep = 0;
+        maxRep = 1;
+      } else if (_check(TokType.punct, '{') || _check(TokType.op, '{')) {
+        // {n} or {n,m} — consume and best-effort parse.
+        _advance(); // {
+        final lo = _check(TokType.number) ? int.parse(_advance().text) : 0;
+        var hi = lo;
+        if (_match(TokType.punct, ',')) {
+          hi = _check(TokType.number) ? int.parse(_advance().text) : -1;
+        }
+        _match(TokType.punct, '}');
+        _match(TokType.op, '}');
+        minRep = lo;
+        maxRep = hi;
+      }
+      pattern.add(MatchPatternElem(v, minRep, maxRep));
+    }
+    // SUBSET clause (ignored) up to DEFINE / ')'.
+    if (_matchWord('SUBSET')) {
+      while (!_checkWord('DEFINE') &&
+          !_check(TokType.punct, ')') &&
+          !_isAtEnd()) {
+        _advance();
+      }
+    }
+    final defines = <String, Expr>{};
+    if (_matchWord('DEFINE')) {
+      do {
+        final v = _expectName();
+        _expectKw('AS');
+        defines[v.toUpperCase()] = _parseExpr();
+      } while (_match(TokType.punct, ','));
+    }
+    _expect(TokType.punct, ')'); // MATCH_RECOGNIZE
+    return MatchRecognizeClause(
+      partitionBy: partitionBy,
+      orderBy: orderBy,
+      measures: measures,
+      allRowsPerMatch: allRows,
+      pattern: pattern,
+      defines: defines,
+    );
+  }
+
   /// Parses an Oracle `UNPIVOT [INCLUDE|EXCLUDE NULLS] (valueCol FOR labelCol
   /// IN (c1 [AS label], …))` over table [tableName] and rewrites it into a
   /// UNION ALL subquery with one arm per unpivoted column.
@@ -3785,6 +3988,7 @@ class Parser {
     String? fromAlias;
     FunctionCallExpr? fromFunc;
     IndexHint? fromIndexHint;
+    MatchRecognizeClause? fromMatchRecognize;
     final joins = <JoinClause>[];
     if (_matchKw('FROM')) {
       if (_match(TokType.punct, '(')) {
@@ -3832,6 +4036,7 @@ class Parser {
           !_isClauseStartWord() &&
           !_checkWord('PIVOT') &&
           !_checkWord('UNPIVOT') &&
+          !_checkWord('MATCH_RECOGNIZE') &&
           !_checkWord('MODEL')) {
         fromAlias = _advance().text;
       }
@@ -3840,12 +4045,14 @@ class Parser {
       // grouped CASE-aggregate subquery the outer SELECT reads from.
       if (_checkWord('PIVOT') && (fromSub != null || fromTable != null)) {
         _advance(); // PIVOT
-        fromSub = _parsePivotClause(fromSub ??
+        final srcSel = fromSub ??
             SelectStmt(
               projection: [SelectItem.star()],
               fromTable: fromTable,
               orderBy: const [],
-            ));
+            );
+        fromSub =
+            _matchWord('XML') ? _parsePivotXmlClause(srcSel) : _parsePivotClause(srcSel);
         fromTable = null;
         fromFunc = null;
       }
@@ -3856,6 +4063,20 @@ class Parser {
         fromSub = _parseUnpivotClause(fromTable);
         fromTable = null;
         fromFunc = null;
+      }
+      // Oracle MATCH_RECOGNIZE row-pattern recognition clause.
+      if (_checkWord('MATCH_RECOGNIZE') &&
+          (fromTable != null || fromSub != null)) {
+        _advance(); // MATCH_RECOGNIZE
+        fromMatchRecognize = _parseMatchRecognize();
+        if (_matchKw('AS')) {
+          fromAlias = _expectName();
+        } else if (_check(TokType.ident) &&
+            !_isClauseStartWord() &&
+            !_checkWord('PIVOT') &&
+            !_checkWord('UNPIVOT')) {
+          fromAlias = _advance().text;
+        }
       }
       while (true) {
         // Comma join: `FROM a, b` is a CROSS JOIN; any join predicate lives
@@ -4211,6 +4432,7 @@ class Parser {
       groupingSets: groupingSets,
       connectBy: connectBy,
       rownumLimit: rownumLimit,
+      matchRecognize: fromMatchRecognize,
     );
   }
 

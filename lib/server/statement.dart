@@ -549,6 +549,10 @@ class SelectStmt extends Statement {
   /// n` counts at most n rows.
   final int? rownumLimit;
 
+  /// Oracle `MATCH_RECOGNIZE (...)` row-pattern clause attached to the FROM
+  /// source; applied to the materialized source rows before joins.
+  final MatchRecognizeClause? matchRecognize;
+
   SelectStmt({
     required this.projection,
     this.fromTable,
@@ -576,6 +580,36 @@ class SelectStmt extends Statement {
     this.connectBy,
     this.withFunctions = const [],
     this.rownumLimit,
+    this.matchRecognize,
+  });
+}
+
+/// One element of a `MATCH_RECOGNIZE` PATTERN: a pattern variable with a
+/// repetition quantifier. [maxRep] of -1 means unbounded (`*`/`+`).
+class MatchPatternElem {
+  final String variable;
+  final int minRep;
+  final int maxRep;
+  MatchPatternElem(this.variable, this.minRep, this.maxRep);
+}
+
+/// Oracle `MATCH_RECOGNIZE` clause: a bounded row-pattern matcher supporting
+/// PARTITION BY / ORDER BY, MEASURES, a flat PATTERN of quantified variables,
+/// and per-variable DEFINE predicates. ONE ROW PER MATCH is the default.
+class MatchRecognizeClause {
+  final List<Expr> partitionBy;
+  final List<OrderByItem> orderBy;
+  final List<SelectItem> measures;
+  final bool allRowsPerMatch;
+  final List<MatchPatternElem> pattern;
+  final Map<String, Expr> defines;
+  MatchRecognizeClause({
+    this.partitionBy = const [],
+    this.orderBy = const [],
+    this.measures = const [],
+    this.allRowsPerMatch = false,
+    this.pattern = const [],
+    this.defines = const {},
   });
 }
 
