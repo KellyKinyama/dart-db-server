@@ -518,6 +518,10 @@ class SelectStmt extends Statement {
   /// Oracle hierarchical query: `START WITH ... CONNECT BY ...`.
   final ConnectByClause? connectBy;
 
+  /// Inline PL/SQL routines declared in the WITH clause (`WITH FUNCTION f ...`),
+  /// registered for the duration of this query.
+  final List<StoredRoutine> withFunctions;
+
   SelectStmt({
     required this.projection,
     this.fromTable,
@@ -543,6 +547,7 @@ class SelectStmt extends Statement {
     this.indexedBy,
     this.groupingSets,
     this.connectBy,
+    this.withFunctions = const [],
   });
 }
 

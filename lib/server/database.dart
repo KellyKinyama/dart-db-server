@@ -6566,6 +6566,16 @@ class Database implements SequenceProvider {
     if (s.cteMaterialized.isNotEmpty) {
       _lastCteHints = Map<String, bool>.from(s.cteMaterialized);
     }
+    // Inline WITH FUNCTION routines are registered for the duration of the
+    // query (removed afterwards so they don't leak into later statements).
+    final inlineFnKeys = <String>[];
+    for (final r in s.withFunctions) {
+      final key = r.name.toUpperCase();
+      if (!_routines.containsKey(key)) {
+        _routines[key] = r;
+        inlineFnKeys.add(key);
+      }
+    }
     final pushed = _pushCtes(
       s.ctes,
       recursive: s.ctesRecursive,
@@ -6616,6 +6626,9 @@ class Database implements SequenceProvider {
       return acc;
     } finally {
       if (pushed) _cteStack.removeLast();
+      for (final k in inlineFnKeys) {
+        _routines.remove(k);
+      }
     }
   }
 
@@ -7033,7 +7046,11 @@ class Database implements SequenceProvider {
           blank.add(s.projection.length + h);
         }
       }
-      for (final row in res.rows) {
+      // The empty grouping set `()` is a single grand-total group: when the
+      // projection has no aggregate to collapse it, keep just one row.
+      final setRows =
+          set.isEmpty && res.rows.length > 1 ? res.rows.take(1) : res.rows;
+      for (final row in setRows) {
         final r = List<Object?>.from(row);
         for (final i in blank) {
           r[i] = null;

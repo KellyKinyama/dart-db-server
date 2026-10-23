@@ -3183,8 +3183,35 @@ class Parser {
     final ctes = <String, SelectStmt>{};
     final cteColumns = <String, List<String>>{};
     final cteMaterialized = <String, bool>{};
-    do {
-      final name = _expectIdent().text;
+    // Oracle inline PL/SQL: `WITH FUNCTION f(...) RETURN t IS ... END; … SELECT`.
+    final withFns = <StoredRoutine>[];
+    while (_checkWord('FUNCTION') || _checkWord('PROCEDURE')) {
+      final isFn = _matchWord('FUNCTION');
+      if (!isFn) _matchWord('PROCEDURE');
+      final fname = _expectIdent().text;
+      final params = _parseRoutineParams();
+      String? returnType;
+      if (isFn) {
+        if (!_matchWord('RETURNS')) _matchWord('RETURN');
+        returnType = _consumeRoutineType();
+      }
+      RoutineBlock block;
+      if (_matchWord('IS') || _matchWord('AS')) {
+        final decls = _parsePlsqlDeclarations();
+        block = _parsePlsqlBody(decls);
+      } else {
+        _consumeRoutineCharacteristics();
+        block = _parseRoutineBody();
+      }
+      withFns.add(StoredRoutine(fname, params, block,
+          isFunction: isFn, returnType: returnType));
+      _match(TokType.punct, ';');
+      _match(TokType.punct, ',');
+    }
+    // Named CTEs (optional when only inline functions precede the query).
+    if (_check(TokType.ident)) {
+      do {
+        final name = _expectIdent().text;
       // Optional column list. When present, used to rename the CTE's
       // projected columns (necessary for WITH RECURSIVE so the recursive
       // arm can reference them by name).
@@ -3208,7 +3235,8 @@ class Parser {
       final body = _parseSelect();
       _expect(TokType.punct, ')');
       ctes[name] = body;
-    } while (_match(TokType.punct, ','));
+      } while (_match(TokType.punct, ','));
+    }
 
     final t = _peek();
     if (t.type != TokType.keyword) {
@@ -3236,6 +3264,7 @@ class Parser {
           cteColumns: cteColumns,
           ctesRecursive: recursive,
           cteMaterialized: cteMaterialized,
+          withFunctions: withFns,
         );
       case 'INSERT':
         final s = _parseInsert();
@@ -4356,6 +4385,13 @@ class Parser {
     // Postfix `COLLATE <name>` binds tightly to its operand.
     while (_matchKw('COLLATE')) {
       e = CollateExpr(e, _expectName().toUpperCase());
+    }
+    // Postfix `AT TIME ZONE <tz>` shifts a timestamp to the given zone.
+    while (_checkWord('AT') && _peek(1).upper == 'TIME') {
+      _advance(); // AT
+      _expectWord('TIME');
+      _expectWord('ZONE');
+      e = FunctionCallExpr('__AT_TIME_ZONE', [e, _parsePrimary()]);
     }
     return e;
   }

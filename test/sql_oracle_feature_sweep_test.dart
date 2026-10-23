@@ -305,4 +305,72 @@ void main() {
       await db.close();
     }
   });
+
+  test('FROM_TZ + AT TIME ZONE shifts the wall-clock time', () async {
+    final db = await Database.open(null);
+    try {
+      expect(
+          await scalar(db,
+              "SELECT TO_CHAR(FROM_TZ(TIMESTAMP '2024-01-01 12:00:00','+00:00') "
+              "AT TIME ZONE '+05:00','HH24:MI')"),
+          '17:00');
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('GROUP BY CUBE/ROLLUP collapse grouping sets', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE t (a NUMBER, b NUMBER)');
+      await db.execute('INSERT INTO t VALUES (1, 10), (1, 20), (2, 10)');
+      expect(
+          await scalar(db,
+              'SELECT COUNT(*) FROM (SELECT a, b FROM t GROUP BY CUBE(a, b))'),
+          8);
+      expect(
+          await scalar(db,
+              'SELECT COUNT(*) FROM (SELECT a, b FROM t GROUP BY ROLLUP(a, b))'),
+          6);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('row/tuple IN-list', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE u (a NUMBER, b VARCHAR2(5))');
+      await db.execute("INSERT INTO u VALUES (90, 'x'), (60, 'y'), (1, 'z')");
+      expect(
+          await scalar(db,
+              "SELECT COUNT(*) FROM u WHERE (a, b) IN ((90, 'x'), (60, 'y'))"),
+          2);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('ROUND / NANVL exact-decimal + NaN guard', () async {
+    final db = await Database.open(null);
+    try {
+      expect(await scalar(db, 'SELECT ROUND(1.005, 2)'), 1.01);
+      expect(await scalar(db, 'SELECT NANVL(5, -1)'), 5);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('inline WITH FUNCTION', () async {
+    final db = await Database.open(null);
+    try {
+      expect(
+          await scalar(db,
+              'WITH FUNCTION dbl(x NUMBER) RETURN NUMBER IS BEGIN RETURN x*2; '
+              'END; SELECT dbl(21) v FROM dual'),
+          42);
+    } finally {
+      await db.close();
+    }
+  });
 }

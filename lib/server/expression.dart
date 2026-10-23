@@ -672,6 +672,21 @@ class InExpr extends Expr {
         sawNull = true;
         continue;
       }
+      // Row/tuple IN-list: `(a, b) IN ((..), (..))` compares element-wise.
+      if (v is List && ev is List) {
+        if (v.length == ev.length) {
+          var all = true;
+          for (var i = 0; i < v.length; i++) {
+            final a = v[i], b = ev[i];
+            if (a == null || b == null || !BinaryExpr._eq(a, b)) {
+              all = false;
+              break;
+            }
+          }
+          if (all) return !negated;
+        }
+        continue;
+      }
       if (BinaryExpr._eq(v, ev)) return !negated;
     }
     // No match: a NULL in the list makes the result UNKNOWN (SQL 3VL), so
@@ -1809,6 +1824,13 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     final isTrue = v == true || (v is num && v != 0);
     return !isTrue;
   },
+  // NANVL(n, default): returns [default] when n is NaN, else n.
+  'NANVL': (a) {
+    if (a.isEmpty) return null;
+    final v = a[0];
+    if (v is double && v.isNaN) return a.length > 1 ? a[1] : null;
+    return v;
+  },
   // XMLELEMENT("name", content…): a minimal XML element string.
   'XMLELEMENT': (a) {
     if (a.isEmpty) return null;
@@ -1950,8 +1972,16 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     }
     final v = _sqlTextToNum(v0).toDouble();
     final digits = a.length > 1 && a[1] != null ? _sqlTextToNum(a[1]).toInt() : 0;
-    final p = _pow10(digits);
-    return (v * p).round() / p;
+    // Oracle NUMBER is exact decimal: ROUND(1.005, 2) = 1.01, not the binary
+    // double's 1.00.
+    if (digits >= 0) {
+      final r = _roundHalfUpDecimal(v, digits);
+      return r is double && r == r.truncateToDouble() && digits == 0
+          ? r.toInt()
+          : r;
+    }
+    final p = _pow10(-digits);
+    return (v / p).round() * p;
   },
   'MOD': (a) => _propagateNull(
       a, () => _sqlTextToNum(a[0]).remainder(_sqlTextToNum(a[1]))),
@@ -2910,6 +2940,29 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
   'NOW': (a) => _fmtDateTime(DateTime.now().toUtc(), full: true),
   'SYSDATE': (a) => _fmtDateTime(DateTime.now().toUtc(), full: true),
   'SYSTIMESTAMP': (a) => _fmtDateTime(DateTime.now().toUtc(), full: true),
+  // Oracle FROM_TZ(ts, tz): tag a naive timestamp with a UTC offset; encoded
+  // as "<ts><±HH:MM>" so AT TIME ZONE can read the source offset.
+  'FROM_TZ': (a) {
+    if (a.length < 2 || a[0] == null || a[1] == null) return null;
+    final ts = a[0].toString().trim();
+    var tz = a[1].toString().trim();
+    if (!RegExp(r'^[+-]\d{2}:\d{2}$').hasMatch(tz)) tz = '+00:00';
+    return '$ts$tz';
+  },
+  // `expr AT TIME ZONE tz`: shift a (possibly offset-tagged) timestamp to [tz],
+  // returning the target wall-clock time.
+  '__AT_TIME_ZONE': (a) {
+    if (a.length < 2 || a[0] == null || a[1] == null) return null;
+    final raw = a[0].toString().trim();
+    final m = RegExp(r'^(.*?)([+-]\d{2}:\d{2})$').firstMatch(raw);
+    final tsStr = m != null ? m.group(1)!.trim() : raw;
+    final srcMin = _tzOffsetMinutes(m != null ? m.group(2)! : '+00:00');
+    final tgtMin = _tzOffsetMinutes(a[1].toString().trim());
+    final dt = _parseDateTime(tsStr);
+    if (dt == null) return null;
+    final shifted = dt.add(Duration(minutes: tgtMin - srcMin));
+    return _fmtDateTime(shifted);
+  },
   // Oracle conversion functions. TO_CHAR returns a value's canonical text; a
   // format model (second arg) is accepted but not interpreted. TO_NUMBER
   // parses a numeric string.
@@ -4138,6 +4191,14 @@ String _formatOracleDate(DateTime d, String fmt) {
     i += matched.length;
   }
   return sb.toString();
+}
+
+/// Parses a `±HH:MM` timezone offset to a signed minute count.
+int _tzOffsetMinutes(String tz) {
+  final m = RegExp(r'^([+-])(\d{2}):(\d{2})$').firstMatch(tz.trim());
+  if (m == null) return 0;
+  final sign = m.group(1) == '-' ? -1 : 1;
+  return sign * (int.parse(m.group(2)!) * 60 + int.parse(m.group(3)!));
 }
 
 /// Roman numeral for 1..3999 (Oracle TO_CHAR 'RN'); null outside that range.
