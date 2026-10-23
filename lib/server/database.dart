@@ -6782,7 +6782,8 @@ class Database implements SequenceProvider {
           final ob = entry.$2;
           final av = a[idx];
           final bv = b[idx];
-          final nullsFirst = ob.nullsFirst ?? !ob.descending;
+          // Oracle default: NULLs sort LAST for ASC, FIRST for DESC.
+          final nullsFirst = ob.nullsFirst ?? ob.descending;
           if (av == null && bv == null) continue;
           if (av == null) return nullsFirst ? -1 : 1;
           if (bv == null) return nullsFirst ? 1 : -1;
@@ -7457,7 +7458,7 @@ class Database implements SequenceProvider {
               }
               final av = a.row[pos];
               final bv = b.row[pos];
-              final nullsFirst = ob.nullsFirst ?? !ob.descending;
+              final nullsFirst = ob.nullsFirst ?? ob.descending;
               if (av == null && bv == null) continue;
               if (av == null) return nullsFirst ? -1 : 1;
               if (bv == null) return nullsFirst ? 1 : -1;
@@ -7471,7 +7472,7 @@ class Database implements SequenceProvider {
             if (hasAggregates && _containsAggregate(ob.expr)) {
               final av = a.src['__orderagg$oi'];
               final bv = b.src['__orderagg$oi'];
-              final nullsFirst = ob.nullsFirst ?? !ob.descending;
+              final nullsFirst = ob.nullsFirst ?? ob.descending;
               if (av == null && bv == null) continue;
               if (av == null) return nullsFirst ? -1 : 1;
               if (bv == null) return nullsFirst ? 1 : -1;
@@ -7519,7 +7520,7 @@ class Database implements SequenceProvider {
                 }
               }
             }
-            final nullsFirst = ob.nullsFirst ?? !ob.descending;
+            final nullsFirst = ob.nullsFirst ?? ob.descending;
             if (av == null && bv == null) continue;
             if (av == null) return nullsFirst ? -1 : 1;
             if (bv == null) return nullsFirst ? 1 : -1;

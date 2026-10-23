@@ -115,10 +115,11 @@ void main() {
     final r = await rows(
       'SELECT a.x, b.y FROM a FULL JOIN b ON a.x = b.y ORDER BY a.x, b.y',
     );
+    // Oracle sorts NULLs last for ASC.
     expect(r, [
-      [null, 3],
       [1, null],
       [2, 2],
+      [null, 3],
     ]);
   });
 }

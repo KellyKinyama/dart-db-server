@@ -100,9 +100,9 @@ void main() {
           await db.execute('SELECT v, COUNT(*) FROM t GROUP BY v ORDER BY v');
       // Generic path emits a NULL group with count=2.
       expect(r.rows.length, 3);
-      // SQLite groups NULLs together.
-      expect(r.rows.first.first, isNull);
-      expect(r.rows.first[1], 2);
+      // Groups NULLs together; Oracle sorts the NULL group last for ASC.
+      expect(r.rows.last.first, isNull);
+      expect(r.rows.last[1], 2);
     } finally {
       await db.close();
     }
