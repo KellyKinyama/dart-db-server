@@ -741,4 +741,63 @@ void main() {
       await db.close();
     }
   });
+
+  // ---- Round 52 (DML/DDL effects): F214–F217 ------------------------------
+
+  test('F214 INSERT ALL (multi-table insert)', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE ia (id NUMBER, v NUMBER)');
+      await db.execute('INSERT ALL INTO ia (id, v) VALUES (1, 10) '
+          'INTO ia (id, v) VALUES (2, 20) SELECT * FROM dual');
+      expect(await scalar(db, 'SELECT COUNT(*) FROM ia'), 2);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F215 BEFORE UPDATE row-level trigger fires', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute(
+          'CREATE TABLE tg (id NUMBER, v NUMBER, upd NUMBER DEFAULT 0)');
+      await db.execute('INSERT INTO tg VALUES (1, 10, 0)');
+      await db.execute(
+          'CREATE OR REPLACE TRIGGER tg_bu BEFORE UPDATE ON tg FOR EACH ROW '
+          'BEGIN :NEW.upd := :OLD.upd + 1; END;');
+      await db.execute('UPDATE tg SET v = 20 WHERE id = 1');
+      expect(await scalar(db, 'SELECT upd FROM tg WHERE id = 1'), 1);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F216 INSTEAD OF trigger on a view', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE iob (id NUMBER, v NUMBER)');
+      await db.execute('CREATE VIEW iov AS SELECT id, v FROM iob');
+      await db.execute(
+          'CREATE OR REPLACE TRIGGER iov_ii INSTEAD OF INSERT ON iov '
+          'FOR EACH ROW BEGIN INSERT INTO iob VALUES (:NEW.id, :NEW.v * 10); '
+          'END;');
+      await db.execute('INSERT INTO iov VALUES (1, 5)');
+      expect(await scalar(db, 'SELECT v FROM iob WHERE id = 1'), 50);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F217 DEFAULT <sequence>.NEXTVAL column default', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE SEQUENCE ns2 START WITH 1');
+      await db.execute(
+          'CREATE TABLE nn (id NUMBER DEFAULT ns2.NEXTVAL NOT NULL, v NUMBER)');
+      await db.execute('INSERT INTO nn (v) VALUES (10)');
+      expect(await scalar(db, 'SELECT id FROM nn'), 1);
+    } finally {
+      await db.close();
+    }
+  });
 }

@@ -1206,20 +1206,27 @@ class Parser {
           defaultExprSql = _advance().text;
           continue;
         }
-        // 3) Bare literal (possibly signed numeric).
+        // 3) Bare literal (possibly signed numeric), else a scalar expression
+        //    default (e.g. `seq.NEXTVAL`, a function call) captured as SQL and
+        //    evaluated per INSERT.
+        final exprStart = _peek().offset;
         Expr lit;
         if (_check(TokType.op, '-') || _check(TokType.op, '+')) {
           final sign = _advance().text;
           final next = _parsePrimary();
-          if (next is! LiteralExpr || next.value is! num) {
-            throw FormatException('DEFAULT must be a literal');
+          if (next is LiteralExpr && next.value is num) {
+            lit =
+                LiteralExpr(sign == '-' ? -(next.value as num) : next.value);
+          } else {
+            defaultExprSql = _sliceSource(exprStart, _peek().offset);
+            continue;
           }
-          lit = LiteralExpr(sign == '-' ? -(next.value as num) : next.value);
         } else {
           lit = _parsePrimary();
         }
         if (lit is! LiteralExpr) {
-          throw FormatException('DEFAULT must be a literal');
+          defaultExprSql = _sliceSource(exprStart, _peek().offset);
+          continue;
         }
         defaultValue = lit.value;
         continue;
@@ -1687,8 +1694,8 @@ class Parser {
   /// null when the RHS cannot be parsed (the assignment is then ignored).
   Expr? _parseTriggerRhs(String rhs) {
     final mapped = rhs
-        .replaceAll(RegExp(r':new\.', caseSensitive: false), 'NEW.')
-        .replaceAll(RegExp(r':old\.', caseSensitive: false), 'OLD.');
+        .replaceAll(RegExp(r':new\s*\.\s*', caseSensitive: false), 'NEW.')
+        .replaceAll(RegExp(r':old\s*\.\s*', caseSensitive: false), 'OLD.');
     try {
       final stmt = Parser.fromString('SELECT $mapped').parseStatement();
       if (stmt is SelectStmt && stmt.projection.isNotEmpty) {
@@ -4613,6 +4620,15 @@ class Parser {
     }
     if (t.type == TokType.param) {
       _advance();
+      // Trigger pseudo-records `:NEW.col` / `:OLD.col` — resolve to the trigger
+      // scope's NEW/OLD columns rather than a bind parameter.
+      final upper = t.text.toUpperCase();
+      if ((upper == ':NEW' || upper == ':OLD') &&
+          _check(TokType.punct, '.')) {
+        _advance(); // .
+        final col = _expectName();
+        return ColumnExpr(col, table: upper.substring(1)); // NEW / OLD
+      }
       // Anonymous '?' — auto-number sequentially.
       if (t.text == '?') {
         paramCount++;

@@ -13981,6 +13981,8 @@ class Database implements SequenceProvider {
     }
     final catalog = _buildCatalogData(name);
     if (catalog != null) return catalog.$1;
+    // Oracle's synthetic one-row DUAL table exposes a single DUMMY column.
+    if (name.toUpperCase() == 'DUAL') return const ['DUMMY'];
     throw StateError('No such table or view: $name');
   }
 
