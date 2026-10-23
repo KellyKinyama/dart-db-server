@@ -110,6 +110,11 @@ class Database implements SequenceProvider {
   /// keyed by view name. Renames the view's columns positionally.
   final Map<String, List<String>> _viewColumns = <String, List<String>>{};
 
+  /// Attribute columns of Oracle object types (`CREATE TYPE … AS OBJECT`),
+  /// keyed by upper-cased type name; used by object tables (`… OF type`).
+  final Map<String, List<ColumnDef>> _objectTypes =
+      <String, List<ColumnDef>>{};
+
   /// Named sequences (Oracle CREATE SEQUENCE). Sequence value generation is
   /// intentionally non-transactional (NEXTVAL is not rolled back), matching
   /// Oracle, so this map is not snapshotted by transactions.
@@ -2457,6 +2462,15 @@ class Database implements SequenceProvider {
         result = _createSynonym(stmt);
       } else if (stmt is DdlNoopStmt) {
         result = QueryResult.message('${stmt.kind} accepted');
+      } else if (stmt is CreateTypeStmt) {
+        _objectTypes[stmt.name.toUpperCase()] = stmt.columns;
+        result = QueryResult.message('Type ${stmt.name} created');
+      } else if (stmt is CreateObjectTableStmt) {
+        result = _createTable(CreateTableStmt(
+          stmt.name,
+          _objectTypes[stmt.typeName.toUpperCase()] ?? const <ColumnDef>[],
+          ifNotExists: stmt.ifNotExists,
+        ));
       } else if (stmt is CreateIndexStmt) {
         result = _createIndex(stmt);
       } else if (stmt is DropIndexStmt) {
@@ -6841,6 +6855,28 @@ class Database implements SequenceProvider {
     }
 
     final allKeyStrings = allKeys.map(key).toSet();
+    // ORDER BY on a grouping column that isn't projected (allowed under plain
+    // GROUP BY): project it as a hidden trailing sort column, then trim it.
+    final projectedKeys = {
+      for (final p in s.projection)
+        if (p.expr != null) key(p.expr!)
+    };
+    final hiddenExprs = <ColumnExpr>[];
+    for (final ob in s.orderBy) {
+      final e = ob.expr;
+      if (e is ColumnExpr &&
+          allKeyStrings.contains(key(e)) &&
+          !projectedKeys.contains(key(e)) &&
+          !hiddenExprs.any((h) => key(h) == key(e))) {
+        hiddenExprs.add(e);
+      }
+    }
+    final effProjection = hiddenExprs.isEmpty
+        ? s.projection
+        : [
+            ...s.projection,
+            for (final e in hiddenExprs) SelectItem.expr(e, alias: e.name),
+          ];
     final unionRows = <List<Object?>>[];
     List<String>? cols;
     for (final set in s.groupingSets!) {
@@ -6848,7 +6884,7 @@ class Database implements SequenceProvider {
       // Build a copy with this set's GROUP BY active and groupingSets
       // cleared so we hit the normal aggregation path.
       final perSet = SelectStmt(
-        projection: s.projection,
+        projection: effProjection,
         fromTable: s.fromTable,
         fromSubquery: s.fromSubquery,
         fromAlias: s.fromAlias,
@@ -6900,6 +6936,12 @@ class Database implements SequenceProvider {
           }
         }
       }
+      // Hidden sort columns are NULL for the sets that roll their key up.
+      for (var h = 0; h < hiddenExprs.length; h++) {
+        if (!setKeyStrings.contains(key(hiddenExprs[h]))) {
+          blank.add(s.projection.length + h);
+        }
+      }
       for (final row in res.rows) {
         final r = List<Object?>.from(row);
         for (final i in blank) {
@@ -6915,6 +6957,14 @@ class Database implements SequenceProvider {
     var combined = QueryResult(columns: cols ?? const [], rows: unionRows);
     if (s.orderBy.isNotEmpty || s.limit != null || s.offset != null) {
       combined = _applyCompoundOrderLimit(combined, s);
+    }
+    // Drop the hidden sort columns added for non-projected ORDER BY keys.
+    if (hiddenExprs.isNotEmpty) {
+      final n = s.projection.length;
+      combined = QueryResult(
+        columns: combined.columns.sublist(0, n),
+        rows: [for (final r in combined.rows) r.sublist(0, n)],
+      );
     }
     return combined;
   }

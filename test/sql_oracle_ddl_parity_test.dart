@@ -357,4 +357,50 @@ void main() {
       await db.close();
     }
   });
+
+  // F86: an object table (CREATE TABLE t OF type) takes its columns from the
+  // object type.
+  test('object table (CREATE TABLE t OF type) resolves type columns', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute(
+          'CREATE TYPE category_typ AS OBJECT ( id NUMBER, name VARCHAR2(30) )');
+      await db.execute('CREATE TABLE categories_tab OF category_typ');
+      await db.execute("INSERT INTO categories_tab (id, name) VALUES (1, 'a')");
+      expect((await db.execute('SELECT id, name FROM categories_tab')).rows, [
+        [1, 'a']
+      ]);
+    } finally {
+      await db.close();
+    }
+  });
+
+  // F87: a REF column type parses.
+  test('REF column type parses', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TYPE product_typ AS OBJECT ( id NUMBER )');
+      await db.execute(
+          'CREATE TABLE line_items ( id NUMBER, product_ref REF product_typ )');
+      await db.execute('INSERT INTO line_items (id) VALUES (1)');
+      expect((await db.execute('SELECT id FROM line_items')).rows, [
+        [1]
+      ]);
+    } finally {
+      await db.close();
+    }
+  });
+
+  // F88: a NESTED TABLE ... STORE AS storage clause is accepted and ignored.
+  test('NESTED TABLE STORE AS clause is accepted', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TYPE item_typ AS OBJECT ( id NUMBER )');
+      await db.execute('CREATE TYPE item_tab AS TABLE OF item_typ');
+      await db.execute('CREATE TABLE orders2 ( id NUMBER, items item_tab ) '
+          'NESTED TABLE items STORE AS items_nt');
+    } finally {
+      await db.close();
+    }
+  });
 }

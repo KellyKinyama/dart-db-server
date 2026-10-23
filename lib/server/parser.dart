@@ -493,7 +493,7 @@ class Parser {
       return _parseCreateSynonymTail();
     }
     if (_matchWord('SYNONYM')) return _parseCreateSynonymTail();
-    if (_matchWord('TYPE')) return _parseCreateTypeIgnore();
+    if (_matchWord('TYPE')) return _parseCreateType();
     if (_matchWord('DIMENSION')) {
       // Oracle OLAP CREATE DIMENSION — accepted and ignored.
       while (!_isAtEnd() && !_check(TokType.punct, ';')) {
@@ -570,7 +570,7 @@ class Parser {
     return CreateVirtualTableStmt(name, module, args, ifNotExists: ifNotExists);
   }
 
-  CreateTableStmt _parseCreateTableTail() {
+  Statement _parseCreateTableTail() {
     bool ifNotExists = false;
     if (_matchKw('IF')) {
       _expectKw('NOT');
@@ -578,6 +578,14 @@ class Parser {
       ifNotExists = true;
     }
     final name = _parseQualifiedTableName();
+    // Object table: `CREATE TABLE <name> OF <object_type>` (columns from type).
+    if (_matchWord('OF')) {
+      final typeName = _parseQualifiedTableName();
+      while (!_isAtEnd() && !_check(TokType.punct, ';')) {
+        _advance(); // trailing object-table storage clauses
+      }
+      return CreateObjectTableStmt(name, typeName, ifNotExists: ifNotExists);
+    }
     // CREATE TABLE <name> [AS] SELECT … (CTAS): schema + data from a query.
     if (_checkKw('AS') || _checkKw('SELECT')) {
       _matchKw('AS');
@@ -628,6 +636,12 @@ class Parser {
       } else if (_matchWord('PARTITION') || _matchWord('PARTITIONS')) {
         // Oracle partitioning clause (PARTITION BY …): accept and ignore the
         // remainder of the statement.
+        while (!_isAtEnd() && !_check(TokType.punct, ';')) {
+          _advance();
+        }
+        break;
+      } else if (_matchWord('NESTED')) {
+        // NESTED TABLE <col> STORE AS <name> storage clause: accept + ignore.
         while (!_isAtEnd() && !_check(TokType.punct, ';')) {
           _advance();
         }
@@ -847,6 +861,12 @@ class Parser {
     final typeTok = _advance();
     _lastColumnRawType = typeTok.text;
     final type = parseDataType(typeTok.text);
+    // Oracle REF column: `col REF <object_type>` — model the opaque reference as
+    // its declared type and consume the referenced type name.
+    if (typeTok.text.toUpperCase() == 'REF' &&
+        (_check(TokType.ident) || _peek().type == TokType.keyword)) {
+      _advance();
+    }
     // Optional size/precision qualifier: VARCHAR(10), DECIMAL(10,2), etc.
     // Consumed and ignored — it does not affect affinity.
     if (_match(TokType.punct, '(')) {
@@ -1158,8 +1178,35 @@ class Parser {
     return CreateSynonymStmt(name, target);
   }
 
-  /// `CREATE TYPE … AS OBJECT/VARRAY/TABLE OF …` — accepted and ignored.
-  DdlNoopStmt _parseCreateTypeIgnore() {
+  /// `CREATE TYPE <name> AS OBJECT (attrs)` records the attribute columns so an
+  /// object table can resolve them; VARRAY / TABLE OF and method members are
+  /// accepted and ignored.
+  Statement _parseCreateType() {
+    final name = _check(TokType.ident) ? _parseQualifiedTableName() : '';
+    final isObject =
+        (_matchWord('AS') || _matchWord('IS')) && _matchWord('OBJECT');
+    if (isObject && _match(TokType.punct, '(')) {
+      final cols = <ColumnDef>[];
+      if (!_check(TokType.punct, ')')) {
+        cols.add(_parseColumnDef());
+        while (_match(TokType.punct, ',')) {
+          // Stop at a method/member clause (not a plain attribute).
+          if (_checkWord('MEMBER') ||
+              _checkWord('MAP') ||
+              _checkWord('STATIC') ||
+              _checkWord('CONSTRUCTOR') ||
+              _checkWord('FINAL') ||
+              _checkWord('ORDER')) {
+            break;
+          }
+          cols.add(_parseColumnDef());
+        }
+      }
+      while (!_isAtEnd() && !_check(TokType.punct, ';')) {
+        _advance();
+      }
+      return CreateTypeStmt(name, cols);
+    }
     while (!_isAtEnd() && !_check(TokType.punct, ';')) {
       _advance();
     }
@@ -2685,7 +2732,12 @@ class Parser {
         _expectKw('SET');
         matchedAssignments = <String, Expr>{};
         do {
-          final col = _expectIdent().text;
+          var col = _expectIdent().text;
+          // Accept an alias-qualified target column (`SET t.v = …`); the alias
+          // refers to the target table, so drop it.
+          if (_match(TokType.punct, '.')) {
+            col = _expectIdent().text;
+          }
           _expect(TokType.op, '=');
           matchedAssignments[col] = _parseExpr();
         } while (_match(TokType.punct, ','));
@@ -4061,6 +4113,47 @@ class Parser {
       _expect(TokType.punct, ')');
       return FunctionCallExpr('EXTRACT', [LiteralExpr(field), source]);
     }
+    // ANSI TRIM([LEADING|TRAILING|BOTH] [chars] FROM string), detected by a
+    // top-level FROM inside the parens.
+    if (upper == 'TRIM') {
+      var depth = 0;
+      var ansi = false;
+      for (var i = 0;; i++) {
+        final tk = _peek(i);
+        if (tk.type == TokType.eof) break;
+        if (tk.type == TokType.punct && tk.text == '(') {
+          depth++;
+        } else if (tk.type == TokType.punct && tk.text == ')') {
+          if (depth == 0) break;
+          depth--;
+        } else if (depth == 0 &&
+            tk.type == TokType.keyword &&
+            tk.upper == 'FROM') {
+          ansi = true;
+          break;
+        }
+      }
+      if (ansi) {
+        var side = 'BOTH';
+        if (_matchWord('LEADING')) {
+          side = 'LEADING';
+        } else if (_matchWord('TRAILING')) {
+          side = 'TRAILING';
+        } else {
+          _matchWord('BOTH');
+        }
+        final chars = _checkKw('FROM') ? null : _parseExpr();
+        _expectKw('FROM');
+        final str = _parseExpr();
+        _expect(TokType.punct, ')');
+        final fn = side == 'LEADING'
+            ? 'LTRIM'
+            : side == 'TRAILING'
+                ? 'RTRIM'
+                : 'TRIM';
+        return FunctionCallExpr(fn, chars == null ? [str] : [str, chars]);
+      }
+    }
     bool isStar = false;
     bool distinct = false;
     final args = <Expr>[];
@@ -4097,6 +4190,18 @@ class Parser {
       }
     }
     _expect(TokType.punct, ')');
+    // Oracle ordered-set aggregate: `agg(args) WITHIN GROUP (ORDER BY …)`.
+    if (_matchWord('WITHIN')) {
+      _expectWord('GROUP');
+      _expect(TokType.punct, '(');
+      _expectKw('ORDER');
+      _expectKw('BY');
+      aggOrderBy = <WindowOrderItem>[_parseWindowOrderItem()];
+      while (_match(TokType.punct, ',')) {
+        aggOrderBy.add(_parseWindowOrderItem());
+      }
+      _expect(TokType.punct, ')');
+    }
     // IIF(cond, a, b) desugars to CASE WHEN cond THEN a ELSE b END so
     // that branches short-circuit, matching SQLite semantics.
     if (upper == 'IIF' && args.length == 3) {

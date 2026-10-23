@@ -1390,19 +1390,19 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
       }),
   // LEAST(a, b, ...) -- smallest non-NULL value; returns NULL if all NULL.
   'LEAST': (a) {
+    if (a.any((v) => v == null)) return null; // any NULL -> NULL (Oracle/SQLite)
     Object? best;
     for (final v in a) {
-      if (v == null) continue;
-      if (best == null || sqlCompare(v, best) < 0) best = v;
+      if (best == null || sqlCompare(v!, best) < 0) best = v;
     }
     return best;
   },
-  // GREATEST(a, b, ...) -- largest non-NULL value.
+  // GREATEST(a, b, ...) -- NULL when any argument is NULL, else the largest.
   'GREATEST': (a) {
+    if (a.any((v) => v == null)) return null;
     Object? best;
     for (final v in a) {
-      if (v == null) continue;
-      if (best == null || sqlCompare(v, best) > 0) best = v;
+      if (best == null || sqlCompare(v!, best) > 0) best = v;
     }
     return best;
   },
@@ -1553,7 +1553,9 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
           final search = a[1].toString();
           // An empty search string matches nothing (SQLite): return unchanged.
           if (search.isEmpty) return a[0].toString();
-          return a[0].toString().replaceAll(search, a[2].toString());
+          // Oracle 2-arg REPLACE(s, sub) removes sub (replacement defaults to '').
+          final repl = a.length > 2 && a[2] != null ? a[2].toString() : '';
+          return a[0].toString().replaceAll(search, repl);
         },
       ),
   'CONCAT': (a) => a.map((v) => v ?? '').join(),
@@ -1610,7 +1612,8 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     final p = _pow10(digits);
     return (v * p).round() / p;
   },
-  'MOD': (a) => _propagateNull(a, () => _sqlTextToNum(a[0]) % _sqlTextToNum(a[1])),
+  'MOD': (a) => _propagateNull(
+      a, () => _sqlTextToNum(a[0]).remainder(_sqlTextToNum(a[1]))),
   'FLOOR': (a) => _propagateNull(a, () => _sqlTextToNum(a[0]).floor()),
   'CEIL': (a) => _propagateNull(a, () => _sqlTextToNum(a[0]).ceil()),
   'CEILING': (a) => _propagateNull(a, () => _sqlTextToNum(a[0]).ceil()),
@@ -1744,7 +1747,20 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
       _propagateNull(a, () => (a[0] as num).toDouble() * math.pi / 180),
   'DEGREES': (a) =>
       _propagateNull(a, () => (a[0] as num).toDouble() * 180 / math.pi),
-  'TRUNC': (a) => _propagateNull(a, () => (a[0] as num).truncate()),
+  'TRUNC': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final v0 = a[0];
+    // TRUNC(date[, fmt]) truncates a date to the start of day (fmt ignored).
+    if (v0 is String && RegExp(r'^\d{4}-\d{2}-\d{2}').hasMatch(v0.trim())) {
+      final dt = _parseDateTime(v0);
+      if (dt != null) return _fmtDate(DateTime.utc(dt.year, dt.month, dt.day));
+    }
+    final n = _sqlTextToNum(v0).toDouble();
+    final places = a.length > 1 && a[1] != null ? _sqlTextToNum(a[1]).toInt() : 0;
+    final p = _pow10(places);
+    final t = (n * p).truncateToDouble() / p;
+    return places <= 0 ? t.toInt() : t;
+  },
   // REGEXP family. SQLite's REGEXP operator desugars to regexp(pat, val);
   // we accept both forms. Pattern is Dart's RegExp (PCRE-like).
   'REGEXP': (a) {
@@ -1772,7 +1788,32 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     final hay = a[0].toString();
     final needle = a[1].toString();
     if (needle.isEmpty) return 1;
-    return hay.indexOf(needle) + 1; // 1-based; 0 == not found
+    if (a.length <= 2) return hay.indexOf(needle) + 1; // 1-based; 0 = not found
+    // Oracle INSTR(str, sub, position, occurrence): 1-based; a negative
+    // position searches backward from the end.
+    final pos = a[2] == null ? 1 : _sqlTextToNum(a[2]).toInt();
+    final occ = a.length > 3 && a[3] != null ? _sqlTextToNum(a[3]).toInt() : 1;
+    if (pos == 0 || occ < 1) return 0;
+    if (pos > 0) {
+      var idx = pos - 1;
+      var found = -1;
+      for (var k = 0; k < occ; k++) {
+        if (idx > hay.length) return 0;
+        found = hay.indexOf(needle, idx);
+        if (found < 0) return 0;
+        idx = found + 1;
+      }
+      return found + 1;
+    }
+    var start = hay.length + pos;
+    var found = -1;
+    for (var k = 0; k < occ; k++) {
+      if (start < 0) return 0;
+      found = hay.lastIndexOf(needle, start);
+      if (found < 0) return 0;
+      start = found - 1;
+    }
+    return found + 1;
   },
   'LPAD': (a) {
     if (a.isEmpty || a[0] == null) return null;
@@ -2341,6 +2382,68 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     final dt = _parseOracleDate(
         a[0].toString(), a.length > 1 ? a[1]?.toString() : null);
     return dt == null ? null : _fmtDateTime(dt);
+  },
+  // TRANSLATE(str, from, to): maps each char in [from] to the char at the same
+  // position in [to]; chars past [to]'s length are removed.
+  'TRANSLATE': (a) {
+    if (a.length < 3 || a[0] == null || a[1] == null || a[2] == null) {
+      return null;
+    }
+    final src = a[0].toString();
+    final from = a[1].toString();
+    final to = a[2].toString();
+    final map = <String, String?>{};
+    for (var i = 0; i < from.length; i++) {
+      map.putIfAbsent(from[i], () => i < to.length ? to[i] : null);
+    }
+    final buf = StringBuffer();
+    for (var i = 0; i < src.length; i++) {
+      final ch = src[i];
+      if (!map.containsKey(ch)) {
+        buf.write(ch);
+      } else if (map[ch] != null) {
+        buf.write(map[ch]);
+      }
+    }
+    return buf.toString();
+  },
+  // ADD_MONTHS(date, n): add n months, clamping the day to the target month's
+  // last day (Oracle semantics: Jan 31 + 1 -> Feb 28/29).
+  'ADD_MONTHS': (a) {
+    if (a.length < 2 || a[0] == null || a[1] == null) return null;
+    final dt = _parseDateTime(a[0].toString());
+    if (dt == null) return null;
+    final total = dt.year * 12 + (dt.month - 1) + _sqlTextToNum(a[1]).toInt();
+    final y = total ~/ 12;
+    final mo = total % 12 + 1;
+    final lastDay = DateTime.utc(y, mo + 1, 0).day;
+    final day = dt.day > lastDay ? lastDay : dt.day;
+    final r = DateTime.utc(y, mo, day, dt.hour, dt.minute, dt.second);
+    final hasTime = dt.hour != 0 || dt.minute != 0 || dt.second != 0;
+    return hasTime ? _fmtDateTime(r) : _fmtDate(r);
+  },
+  // MONTHS_BETWEEN(d1, d2): months between the dates (fractional on a 31-day
+  // basis); a whole-number result is returned as an integer.
+  'MONTHS_BETWEEN': (a) {
+    if (a.length < 2 || a[0] == null || a[1] == null) return null;
+    final d1 = _parseDateTime(a[0].toString());
+    final d2 = _parseDateTime(a[1].toString());
+    if (d1 == null || d2 == null) return null;
+    final months = (d1.year - d2.year) * 12 + (d1.month - d2.month);
+    final result = months + (d1.day - d2.day) / 31.0;
+    return result == result.truncateToDouble() ? result.toInt() : result;
+  },
+  // NEXT_DAY(date, weekday): the first [weekday] strictly after [date].
+  'NEXT_DAY': (a) {
+    if (a.length < 2 || a[0] == null || a[1] == null) return null;
+    final dt = _parseDateTime(a[0].toString());
+    final target = _weekdayFromName(a[1].toString());
+    if (dt == null || target == null) return null;
+    var d = DateTime.utc(dt.year, dt.month, dt.day);
+    do {
+      d = d.add(const Duration(days: 1));
+    } while (d.weekday % 7 != target % 7);
+    return _fmtDate(d);
   },
   'CURDATE': (a) => _fmtDate(DateTime.now().toUtc()),
   'CURTIME': (a) => _fmtTime(DateTime.now().toUtc()),
@@ -3009,6 +3112,15 @@ const Map<String, int> _oracleMonthAbbr = {
   'JAN': 1, 'FEB': 2, 'MAR': 3, 'APR': 4, 'MAY': 5, 'JUN': 6, //
   'JUL': 7, 'AUG': 8, 'SEP': 9, 'OCT': 10, 'NOV': 11, 'DEC': 12,
 };
+
+/// Maps a day name (full or 3-letter, any case) to a Dart weekday (Mon=1..Sun=7).
+int? _weekdayFromName(String name) {
+  const days = {
+    'MON': 1, 'TUE': 2, 'WED': 3, 'THU': 4, 'FRI': 5, 'SAT': 6, 'SUN': 7,
+  };
+  final k = name.trim().toUpperCase();
+  return k.length >= 3 ? days[k.substring(0, 3)] : null;
+}
 
 /// Parses [text] by an Oracle date format model [fmt] (a common subset: YYYY,
 /// RRRR, YY, MM, MON, MONTH, DD, HH24/HH, MI, SS). Falls back to ISO parsing

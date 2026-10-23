@@ -108,6 +108,23 @@ class DdlNoopStmt extends Statement {
   DdlNoopStmt(this.kind);
 }
 
+/// `CREATE TYPE <name> AS OBJECT (attrs)` — records the object type's attribute
+/// columns so an object table (`CREATE TABLE t OF <name>`) can resolve them.
+class CreateTypeStmt extends Statement {
+  final String name;
+  final List<ColumnDef> columns;
+  CreateTypeStmt(this.name, this.columns);
+}
+
+/// `CREATE TABLE <name> OF <object_type>` — an object table whose columns come
+/// from the named object type.
+class CreateObjectTableStmt extends Statement {
+  final String name;
+  final String typeName;
+  final bool ifNotExists;
+  CreateObjectTableStmt(this.name, this.typeName, {this.ifNotExists = false});
+}
+
 class CreateIndexStmt extends Statement {
   final String indexName;
   final String table;

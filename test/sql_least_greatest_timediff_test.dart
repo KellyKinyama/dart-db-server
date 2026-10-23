@@ -16,12 +16,14 @@ void main() {
       }
     });
 
-    test('skips NULL values', () async {
+    test('any NULL argument yields NULL', () async {
       final db = await Database.open();
       try {
+        // SQLite/Oracle: the scalar LEAST/GREATEST return NULL if any argument
+        // is NULL (unlike the aggregate min/max, which ignore NULLs).
         final r = await db.execute(
             'SELECT LEAST(NULL, 5, 2, NULL), GREATEST(NULL, 5, 2, NULL)');
-        expect(r.rows.first, [2, 5]);
+        expect(r.rows.first, [null, null]);
       } finally {
         await db.close();
       }
