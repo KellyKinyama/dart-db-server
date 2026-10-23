@@ -7257,10 +7257,107 @@ class Database implements SequenceProvider {
     return combined;
   }
 
+  /// Wraps references to CHAR(n) columns of this single-table query in an RTRIM
+  /// collation so their comparisons are blank-padded (Oracle CHAR semantics).
+  /// Only applied to the simple `FROM <table>` shape.
+  SelectStmt _applyCharPadding(SelectStmt s) {
+    if (s.fromTable == null ||
+        s.joins.isNotEmpty ||
+        s.fromSubquery != null ||
+        s.fromFunction != null) {
+      return s;
+    }
+    final t = _tables[s.fromTable];
+    if (t == null) return s;
+    const charTypes = {'CHAR', 'NCHAR', 'CHARACTER'};
+    final charCols = <String>{
+      for (final c in t.columns)
+        if (charTypes.contains(c.declaredType?.toUpperCase()))
+          c.name.toLowerCase(),
+    };
+    if (charCols.isEmpty) return s;
+    Expr? wrap(Expr? e) => e == null ? null : _rtrimCharCols(e, charCols);
+    return SelectStmt(
+      projection: [
+        for (final p in s.projection)
+          p.expr == null
+              ? p
+              : SelectItem.expr(_rtrimCharCols(p.expr!, charCols),
+                  alias: p.alias),
+      ],
+      fromTable: s.fromTable,
+      fromSubquery: s.fromSubquery,
+      fromAlias: s.fromAlias,
+      joins: s.joins,
+      where: wrap(s.where),
+      groupBy: s.groupBy,
+      having: wrap(s.having),
+      orderBy: s.orderBy,
+      limit: s.limit,
+      offset: s.offset,
+      distinct: s.distinct,
+      limitPercent: s.limitPercent,
+      setOp: s.setOp,
+      setOpRight: s.setOpRight,
+      ctes: s.ctes,
+      cteColumns: s.cteColumns,
+      ctesRecursive: s.ctesRecursive,
+      cteMaterialized: s.cteMaterialized,
+      fromFunction: s.fromFunction,
+      namedWindows: s.namedWindows,
+      indexedBy: s.indexedBy,
+      groupingSets: s.groupingSets,
+      connectBy: s.connectBy,
+      withFunctions: s.withFunctions,
+      rownumLimit: s.rownumLimit,
+    );
+  }
+
+  /// Recursively wraps every `ColumnExpr` naming a CHAR column in [charCols]
+  /// with an RTRIM collation (so comparisons blank-pad trailing spaces).
+  Expr _rtrimCharCols(Expr e, Set<String> charCols) {
+    if (e is ColumnExpr) {
+      return charCols.contains(e.name.toLowerCase())
+          ? CollateExpr(e, 'RTRIM')
+          : e;
+    }
+    if (e is BinaryExpr) {
+      return BinaryExpr(e.op, _rtrimCharCols(e.left, charCols),
+          _rtrimCharCols(e.right, charCols));
+    }
+    if (e is UnaryExpr) {
+      return UnaryExpr(e.op, _rtrimCharCols(e.operand, charCols));
+    }
+    if (e is CaseExpr) {
+      return CaseExpr(
+        [for (final w in e.whens) _rtrimCharCols(w, charCols)],
+        [for (final th in e.thens) _rtrimCharCols(th, charCols)],
+        e.elseExpr == null ? null : _rtrimCharCols(e.elseExpr!, charCols),
+      );
+    }
+    if (e is InExpr) {
+      return InExpr(_rtrimCharCols(e.value, charCols),
+          [for (final v in e.values) _rtrimCharCols(v, charCols)],
+          negated: e.negated);
+    }
+    if (e is BetweenExpr) {
+      return BetweenExpr(
+        _rtrimCharCols(e.value, charCols),
+        _rtrimCharCols(e.low, charCols),
+        _rtrimCharCols(e.high, charCols),
+        negated: e.negated,
+      );
+    }
+    return e;
+  }
+
   QueryResult _selectInnerCore(
     SelectStmt s, [
     Map<String, Object?> outer = const {},
   ]) {
+    // Oracle CHAR(n) comparison is blank-padded: wrap references to this
+    // query's CHAR columns in an RTRIM collation so `CHAR(5) 'ab   ' = 'ab'`.
+    s = _applyCharPadding(s);
     _planTrace = const [];
     _planScanOrderedAsc = const [];
     _planScanEqualityCols = const {};
