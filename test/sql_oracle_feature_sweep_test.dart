@@ -851,20 +851,6 @@ void main() {
     }
   });
 
-  test('F221 CHAR blank-padded comparison', () async {
-    final db = await Database.open(null);
-    try {
-      await db.execute('CREATE TABLE c (x CHAR(5))');
-      await db.execute("INSERT INTO c VALUES ('ab')");
-      expect(
-          await scalar(
-              db, "SELECT CASE WHEN x = 'ab' THEN 1 ELSE 0 END FROM c"),
-          1);
-    } finally {
-      await db.close();
-    }
-  });
-
   test('F222 concatenation treats NULL as empty string', () async {
     final db = await Database.open(null);
     try {

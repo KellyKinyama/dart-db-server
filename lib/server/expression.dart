@@ -383,15 +383,7 @@ class BinaryExpr extends Expr {
     // NOCASE collation on either operand makes string (in)equality and ordering
     // case-insensitive; RTRIM ignores trailing spaces.
     final nocase = _isNoCase(left) || _isNoCase(right);
-    // Oracle blank-padded comparison: a character literal is a CHAR, so a
-    // comparison against one ignores trailing blanks (e.g. CHAR(5) 'ab   '
-    // = 'ab'). Applies to the comparison operators only.
-    const cmpOps = {'=', '<>', '!=', '<', '>', '<=', '>='};
-    final charPad = cmpOps.contains(op) &&
-        (_isCharLiteral(left) || _isCharLiteral(right)) &&
-        l is String &&
-        r is String;
-    final rtrim = _isRtrim(left) || _isRtrim(right) || charPad;
+    final rtrim = _isRtrim(left) || _isRtrim(right);
     final lc = rtrim ? applyCollation(l, 'RTRIM') ?? l : l;
     final rc = rtrim ? applyCollation(r, 'RTRIM') ?? r : r;
     switch (op) {
@@ -502,9 +494,6 @@ class BinaryExpr extends Expr {
 
   static bool _isNoCase(Expr e) => e is CollateExpr && e.collation == 'NOCASE';
   static bool _isRtrim(Expr e) => e is CollateExpr && e.collation == 'RTRIM';
-  // A character literal is a CHAR in Oracle, so comparisons against it are
-  // blank-padded.
-  static bool _isCharLiteral(Expr e) => e is LiteralExpr && e.value is String;
   static bool _eqCI(Object a, Object b) =>
       (a is String && b is String) ? a.toLowerCase() == b.toLowerCase() : _eq(a, b);
   static int _cmpCI(Object a, Object b) => (a is String && b is String)
