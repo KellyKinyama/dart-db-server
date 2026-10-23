@@ -863,6 +863,23 @@ void main() {
     }
   });
 
+  test('F221 CHAR(n) blank-padded comparison; VARCHAR2 non-padded', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE c (x CHAR(5))');
+      await db.execute("INSERT INTO c VALUES ('ab')");
+      expect(
+          await scalar(
+              db, "SELECT CASE WHEN x = 'ab' THEN 1 ELSE 0 END FROM c"),
+          1);
+      await db.execute('CREATE TABLE vc (s VARCHAR2(10))');
+      await db.execute("INSERT INTO vc VALUES ('apple'), ('apple ')");
+      expect(await scalar(db, "SELECT COUNT(*) FROM vc WHERE s = 'apple'"), 1);
+    } finally {
+      await db.close();
+    }
+  });
+
   test('F223 EXTRACT field from an INTERVAL column', () async {
     final db = await Database.open(null);
     try {
