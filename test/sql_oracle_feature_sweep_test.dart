@@ -717,4 +717,28 @@ void main() {
       await db.close();
     }
   });
+
+  // ---- Round 51 (mega-sweep VI): F212–F213 --------------------------------
+
+  test('F212 TO_CLOB', () async {
+    final db = await Database.open(null);
+    try {
+      expect(await scalar(db, "SELECT TO_CHAR(TO_CLOB('hello')) FROM dual"),
+          'hello');
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F213 NLS_UPPER / NLS_LOWER / NLS_INITCAP', () async {
+    final db = await Database.open(null);
+    try {
+      expect(await scalar(db, "SELECT NLS_INITCAP('hello world') FROM dual"),
+          'Hello World');
+      expect(await scalar(db, "SELECT NLS_UPPER('abc') FROM dual"), 'ABC');
+      expect(await scalar(db, "SELECT NLS_LOWER('ABC') FROM dual"), 'abc');
+    } finally {
+      await db.close();
+    }
+  });
 }

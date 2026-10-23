@@ -3197,6 +3197,17 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     final v = a[0];
     return v is num ? v.toDouble() : double.tryParse(v.toString().trim());
   },
+  // CLOB/NCLOB conversions are no-ops in this engine (text is already text).
+  'TO_CLOB': (a) => a.isEmpty || a[0] == null ? null : a[0].toString(),
+  'TO_NCLOB': (a) => a.isEmpty || a[0] == null ? null : a[0].toString(),
+  // NLS case functions: the linguistic parameter is accepted and ignored; the
+  // transform matches UPPER / LOWER / INITCAP.
+  'NLS_UPPER': (a) =>
+      a.isEmpty || a[0] == null ? null : a[0].toString().toUpperCase(),
+  'NLS_LOWER': (a) =>
+      a.isEmpty || a[0] == null ? null : a[0].toString().toLowerCase(),
+  'NLS_INITCAP': (a) =>
+      a.isEmpty || a[0] == null ? null : kScalarFunctions['INITCAP']!([a[0]]),
   // Oracle RAW hex round-trip: HEXTORAW('DEADBEEF') -> bytes, RAWTOHEX -> hex.
   'HEXTORAW': (a) {
     if (a.isEmpty || a[0] == null) return null;
