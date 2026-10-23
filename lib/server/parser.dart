@@ -97,7 +97,10 @@ class Parser {
   /// not be mistaken for a table alias in `FROM t FETCH ...` / `FROM t START
   /// WITH ...`.
   bool _isClauseStartWord() =>
-      _checkWord('FETCH') || _checkWord('START') || _checkWord('CONNECT');
+      _checkWord('FETCH') ||
+      _checkWord('START') ||
+      _checkWord('CONNECT') ||
+      _checkWord('MINUS');
 
   /// Like [_expect] but for a bareword matched by uppercased text (keyword or
   /// identifier), e.g. the non-reserved words in MERGE (USING, MATCHED, ...).
@@ -953,11 +956,31 @@ class Parser {
       _advance();
     }
     // Optional size/precision qualifier: VARCHAR(10), DECIMAL(10,2), etc.
-    // Consumed and ignored — it does not affect affinity.
+    // Captured for VARCHAR2(n) length and NUMBER(p[,s]) precision/scale
+    // enforcement; it does not affect affinity.
+    int? charLength;
+    int? numericPrecision;
+    int? numericScale;
     if (_match(TokType.punct, '(')) {
-      _advance(); // first number
+      final rawType = typeTok.text.toUpperCase();
+      const charTypes = {
+        'VARCHAR', 'VARCHAR2', 'CHAR', 'NCHAR', 'NVARCHAR', 'NVARCHAR2',
+        'CHARACTER',
+      };
+      final firstTok = _advance(); // first number
+      final firstN = int.tryParse(firstTok.text);
+      // Optional CHAR / BYTE length semantics keyword (VARCHAR2(10 CHAR)).
+      if (_check(TokType.ident) || _peek().type == TokType.keyword) {
+        if (_checkWord('CHAR') || _checkWord('BYTE')) _advance();
+      }
       if (_match(TokType.punct, ',')) {
-        _advance(); // second number
+        final secondTok = _advance(); // scale
+        numericPrecision = firstN;
+        numericScale = int.tryParse(secondTok.text);
+      } else if (charTypes.contains(rawType)) {
+        charLength = firstN;
+      } else {
+        numericPrecision = firstN;
       }
       _expect(TokType.punct, ')');
     }
@@ -1008,6 +1031,12 @@ class Parser {
         continue;
       }
       if (_matchKw('DEFAULT')) {
+        // Oracle `DEFAULT ON NULL <expr>`: also applies the default when NULL
+        // is explicitly supplied. Consume the modifier; the expression that
+        // follows is parsed by the branches below.
+        if (_matchWord('ON')) {
+          if (!_matchWord('NULL')) _expectKw('NULL');
+        }
         // 1) DEFAULT (<expr>) — parenthesized expression.
         if (_check(TokType.punct, '(')) {
           _advance(); // consume '('
@@ -1063,8 +1092,31 @@ class Parser {
         continue;
       }
       if (_matchKw('GENERATED')) {
-        _expectKw('ALWAYS');
+        // Oracle identity: GENERATED [ALWAYS | BY DEFAULT [ON NULL]] AS IDENTITY
+        //   [ ( sequence options ) ].  Mapped onto the AUTOINCREMENT engine.
+        if (_matchWord('BY')) {
+          _expectKw('DEFAULT');
+          if (_matchWord('ON')) {
+            if (!_matchWord('NULL')) _expectKw('NULL');
+          }
+        } else {
+          _expectKw('ALWAYS');
+        }
         _expectKw('AS');
+        if (_matchWord('IDENTITY')) {
+          autoInc = true;
+          notNull = true;
+          // Optional "( START WITH n INCREMENT BY n … )" sequence options.
+          if (_check(TokType.punct, '(')) {
+            var depth = 0;
+            do {
+              final tk = _advance();
+              if (tk.type == TokType.punct && tk.text == '(') depth++;
+              if (tk.type == TokType.punct && tk.text == ')') depth--;
+            } while (depth > 0 && !_isAtEnd());
+          }
+          continue;
+        }
         _expect(TokType.punct, '(');
         final start = _peek().offset;
         _parseExpr();
@@ -1127,6 +1179,9 @@ class Parser {
       generatedStored: generatedStored,
       vectorSpec: vectorSpec,
       collate: collate,
+      charLength: charLength,
+      numericPrecision: numericPrecision,
+      numericScale: numericScale,
     );
   }
 
@@ -2787,6 +2842,7 @@ class Parser {
 
     Map<String, Expr>? matchedAssignments;
     Expr? matchedWhere;
+    Expr? matchedDeleteWhere;
     List<String>? insertColumns;
     List<Expr>? insertValues;
     Expr? notMatchedWhere;
@@ -2827,6 +2883,12 @@ class Parser {
           matchedAssignments[col] = _parseExpr();
         } while (_match(TokType.punct, ','));
         if (_matchKw('WHERE')) matchedWhere = _parseExpr();
+        // Oracle `... UPDATE SET … [WHERE …] DELETE WHERE <cond>`: the DELETE
+        // sub-clause removes matched rows that satisfy its predicate.
+        if (_matchKw('DELETE')) {
+          _expectKw('WHERE');
+          matchedDeleteWhere = _parseExpr();
+        }
       }
     }
     if (matchedAssignments == null && insertValues == null) {
@@ -2843,6 +2905,7 @@ class Parser {
       onCondition: on,
       matchedAssignments: matchedAssignments,
       matchedWhere: matchedWhere,
+      matchedDeleteWhere: matchedDeleteWhere,
       insertColumns: insertColumns,
       insertValues: insertValues,
       notMatchedWhere: notMatchedWhere,
@@ -3059,6 +3122,10 @@ class Parser {
       setOp = 'INTERSECT';
       right = _parseSelect();
     } else if (_matchKw('EXCEPT')) {
+      setOp = 'EXCEPT';
+      right = _parseSelect();
+    } else if (_matchWord('MINUS')) {
+      // Oracle MINUS is a synonym for EXCEPT (distinct set difference).
       setOp = 'EXCEPT';
       right = _parseSelect();
     }

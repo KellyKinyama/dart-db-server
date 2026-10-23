@@ -687,6 +687,48 @@ Object? coerceForColumn(Object? value, ColumnDef col,
     }
     return null;
   }
+  // Oracle VARCHAR2(n)/CHAR(n) length enforcement (ORA-12899).
+  if (col.charLength != null && value is String) {
+    if (value.length > col.charLength!) {
+      throw FormatException(
+        'ORA-12899: value too large for column ${col.name} '
+        '(actual: ${value.length}, maximum: ${col.charLength})',
+      );
+    }
+  }
+  // Oracle NUMBER(p[,s]) scale rounding (F110) + precision enforcement
+  // (ORA-01438, F114). Applies to numeric values and numeric strings.
+  if (col.numericPrecision != null || col.numericScale != null) {
+    num? n;
+    if (value is num) {
+      n = value;
+    } else if (value is String) {
+      n = num.tryParse(value.trim());
+    }
+    if (n != null) {
+      final scale = col.numericScale ?? 0;
+      // Round half-away-from-zero to the declared scale.
+      final factor = _pow10(scale);
+      num rounded = scale >= 0
+          ? (n * factor).roundToDouble() / factor
+          : n.toDouble();
+      // Normalize integral doubles back to int.
+      if (rounded is double && rounded == rounded.truncateToDouble()) {
+        rounded = rounded.toInt();
+      }
+      if (col.numericPrecision != null) {
+        final maxDigits = col.numericPrecision! - scale;
+        final limit = _pow10(maxDigits);
+        if (rounded.abs() >= limit) {
+          throw FormatException(
+            'ORA-01438: value larger than specified precision allowed for '
+            'column ${col.name}',
+          );
+        }
+      }
+      value = rounded;
+    }
+  }
   if (strict) {
     final ok = switch (col.type) {
       // SQLite STRICT INTEGER accepts integer-valued REALs; we follow.

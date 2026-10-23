@@ -193,6 +193,15 @@ class ColumnDef {
   /// applied to comparisons, DISTINCT and GROUP BY on this column.
   final String? collate;
 
+  /// Declared character length for `VARCHAR2(n)` / `CHAR(n)` / `NVARCHAR2(n)`;
+  /// enforced on INSERT/UPDATE (Oracle ORA-12899). Null when unconstrained.
+  final int? charLength;
+
+  /// Declared numeric precision/scale for `NUMBER(p[,s])`. [numericScale]
+  /// rounds stored values; [numericPrecision] is enforced (ORA-01438).
+  final int? numericPrecision;
+  final int? numericScale;
+
   const ColumnDef(
     this.name,
     this.type, {
@@ -209,6 +218,9 @@ class ColumnDef {
     this.generatedStored = false,
     this.vectorSpec,
     this.collate,
+    this.charLength,
+    this.numericPrecision,
+    this.numericScale,
   });
 
   Map<String, Object?> toJson() => {
@@ -227,6 +239,9 @@ class ColumnDef {
         if (generatedStored) 'generatedStored': true,
         if (vectorSpec != null) 'vectorSpec': vectorSpec,
         if (collate != null) 'collate': collate,
+        if (charLength != null) 'charLength': charLength,
+        if (numericPrecision != null) 'numericPrecision': numericPrecision,
+        if (numericScale != null) 'numericScale': numericScale,
       };
 
   factory ColumnDef.fromJson(Map<String, Object?> j) => ColumnDef(
@@ -249,6 +264,9 @@ class ColumnDef {
         generatedStored: j['generatedStored'] == true,
         vectorSpec: (j['vectorSpec'] as Map?)?.cast<String, String>(),
         collate: j['collate'] as String?,
+        charLength: j['charLength'] as int?,
+        numericPrecision: j['numericPrecision'] as int?,
+        numericScale: j['numericScale'] as int?,
       );
 }
 

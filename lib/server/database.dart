@@ -5265,6 +5265,8 @@ class Database implements SequenceProvider {
     final on = _bindExpr(s.onCondition);
     final matchedWhere =
         s.matchedWhere == null ? null : _bindExpr(s.matchedWhere!);
+    final matchedDeleteWhere =
+        s.matchedDeleteWhere == null ? null : _bindExpr(s.matchedDeleteWhere!);
     final notMatchedWhere =
         s.notMatchedWhere == null ? null : _bindExpr(s.notMatchedWhere!);
     final boundAssignments = s.matchedAssignments?.map(
@@ -5277,6 +5279,9 @@ class Database implements SequenceProvider {
     // Rows to insert are accumulated and applied after the matched pass so
     // newly inserted rows can't match a later source row (Oracle semantics).
     final toInsert = <List<Object?>>[];
+    // Rows (by identity) deleted by a WHEN MATCHED ... DELETE WHERE sub-clause,
+    // removed after the matched pass.
+    final toDelete = <List<Object?>>[];
 
     for (final srow in sourceRows) {
       _beginSeqRow();
@@ -5331,6 +5336,17 @@ class Database implements SequenceProvider {
             oldRow: old, newRow: row, sourceTable: t);
         _recordChange(t, 'UPDATE', old, row);
         updated++;
+        // Oracle MERGE ... DELETE WHERE: delete the just-updated row when it
+        // satisfies the delete predicate (evaluated on the new values).
+        if (matchedDeleteWhere != null) {
+          final newView = <String, Object?>{
+            ...srow,
+            ...t.rowToMap(row, alias: s.targetAlias),
+          };
+          if (evalPredicate(matchedDeleteWhere, newView)) {
+            toDelete.add(row);
+          }
+        }
       } else if (s.insertValues != null) {
         if (notMatchedWhere != null && !evalPredicate(notMatchedWhere, srow)) {
           continue;
@@ -5364,10 +5380,29 @@ class Database implements SequenceProvider {
       inserted++;
     }
 
-    if (updated > 0) _rebuildIndexes(t);
-    final affected = updated + inserted;
+    // Apply DELETE-sub-clause removals (identity match against the live rows).
+    var deleted = 0;
+    if (toDelete.isNotEmpty) {
+      for (final dead in toDelete) {
+        final idx = t.rows.indexOf(dead);
+        if (idx < 0) continue;
+        final old = List<Object?>.from(dead);
+        _fireTriggers(t.name, 'DELETE', 'BEFORE',
+            oldRow: old, newRow: null, sourceTable: t);
+        _enforceForeignKeysOnDelete(t, dead);
+        t.rows.removeAt(idx);
+        _fireTriggers(t.name, 'DELETE', 'AFTER',
+            oldRow: old, newRow: null, sourceTable: t);
+        _recordChange(t, 'DELETE', old, null);
+        deleted++;
+      }
+    }
+
+    if (updated > 0 || deleted > 0) _rebuildIndexes(t);
+    final affected = updated + inserted + deleted;
     return QueryResult.message(
-      '$affected row(s) merged ($updated updated, $inserted inserted)',
+      '$affected row(s) merged ($updated updated, $inserted inserted, '
+      '$deleted deleted)',
       affected: affected,
     );
   }

@@ -294,6 +294,10 @@ class MergeStmt extends Statement {
   final Map<String, Expr>? matchedAssignments;
   final Expr? matchedWhere;
 
+  /// Oracle `WHEN MATCHED THEN UPDATE SET ... DELETE WHERE <cond>`: after the
+  /// update, matched rows satisfying this predicate are removed (null absent).
+  final Expr? matchedDeleteWhere;
+
   /// WHEN NOT MATCHED THEN INSERT ... (null when the clause is absent).
   /// [insertColumns] may be null to mean "all target columns in order".
   final List<String>? insertColumns;
@@ -309,6 +313,7 @@ class MergeStmt extends Statement {
     required this.onCondition,
     this.matchedAssignments,
     this.matchedWhere,
+    this.matchedDeleteWhere,
     this.insertColumns,
     this.insertValues,
     this.notMatchedWhere,
