@@ -471,4 +471,112 @@ void main() {
       await db.close();
     }
   });
+
+  // ---- Round 47/48 (mega-sweep II/III): F194–F201 -------------------------
+
+  test('F194 INITCAP word-breaks on non-alphanumerics', () async {
+    final db = await Database.open(null);
+    try {
+      expect(await scalar(db, "SELECT INITCAP('o''brien mcleod')"),
+          "O'Brien Mcleod");
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F195 CONNECT BY LEVEL row generator', () async {
+    final db = await Database.open(null);
+    try {
+      expect(
+          await scalar(db, 'SELECT SUM(LEVEL) FROM dual CONNECT BY LEVEL <= 5'),
+          15);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F196 INTERSECT ALL / MINUS ALL', () async {
+    final db = await Database.open(null);
+    try {
+      expect(
+          await scalar(
+              db,
+              'SELECT COUNT(*) FROM (SELECT 1 FROM dual INTERSECT ALL '
+              'SELECT 1 FROM dual)'),
+          1);
+      expect(
+          await scalar(
+              db,
+              'SELECT COUNT(*) FROM (SELECT 1 FROM dual MINUS ALL '
+              'SELECT 2 FROM dual)'),
+          1);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F197 REGEXP case-insensitive match_param', () async {
+    final db = await Database.open(null);
+    try {
+      expect(
+          await scalar(
+              db,
+              "SELECT CASE WHEN REGEXP_LIKE('abc', 'ABC', 'i') THEN 1 ELSE 0 "
+              'END FROM dual'),
+          1);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F198 GROUP BY () grand total', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE a (x NUMBER)');
+      await db.execute('INSERT INTO a VALUES (1), (2)');
+      expect(await scalar(db, 'SELECT COUNT(*) FROM a GROUP BY ()'), 2);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F199 analytic over aggregate SUM(COUNT(*)) OVER ()', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE a (x NUMBER)');
+      await db.execute('INSERT INTO a VALUES (1), (2)');
+      expect(
+          await scalar(
+              db, 'SELECT DISTINCT SUM(COUNT(*)) OVER () FROM a GROUP BY x'),
+          2);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F200 TO_DATE with DDD day-of-year', () async {
+    final db = await Database.open(null);
+    try {
+      expect(
+          await scalar(db,
+              "SELECT TO_CHAR(TO_DATE('2024-060','YYYY-DDD'),'YYYY-MM-DD') "
+              'FROM dual'),
+          '2024-02-29');
+    } finally {
+      await db.close();
+    }
+  });
+
+  test("F201 TRUNC(date, 'IYYY') ISO year", () async {
+    final db = await Database.open(null);
+    try {
+      expect(
+          await scalar(db,
+              "SELECT TO_CHAR(TRUNC(DATE '2024-07-20','IYYY'),'YYYY-MM-DD') "
+              'FROM dual'),
+          '2024-01-01');
+    } finally {
+      await db.close();
+    }
+  });
 }

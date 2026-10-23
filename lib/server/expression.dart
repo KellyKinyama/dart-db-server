@@ -1574,6 +1574,20 @@ class RaiseException implements Exception {
   String toString() => 'RAISE($action${message.isEmpty ? '' : ", '$message'"})';
 }
 
+/// Builds a [RegExp] honouring Oracle's REGEXP `match_param` flags:
+/// `i` case-insensitive, `c` case-sensitive (overrides `i`), `m` multiline
+/// anchors, `n` dot matches newlines. Unknown flags are ignored.
+RegExp _oracleRegex(String pattern, String? matchParam) {
+  final mp = matchParam ?? '';
+  final caseSensitive = mp.contains('c') ? true : !mp.contains('i');
+  return RegExp(
+    pattern,
+    caseSensitive: caseSensitive,
+    multiLine: mp.contains('m'),
+    dotAll: mp.contains('n'),
+  );
+}
+
 final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
   'UPPER': (a) => _propagateNull(a, () => a[0].toString().toUpperCase()),
   'LOWER': (a) => _propagateNull(a, () => a[0].toString().toLowerCase()),
@@ -1924,9 +1938,12 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
         if (s.isEmpty) return s;
         final out = StringBuffer();
         var nextUpper = true;
+        final alnum = RegExp(r'[0-9A-Za-z]');
         for (var i = 0; i < s.length; i++) {
           final c = s[i];
-          if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+          // Oracle word-breaks on any non-alphanumeric (space, apostrophe,
+          // hyphen, …), so the letter after it is capitalised (O'Brien).
+          if (!alnum.hasMatch(c)) {
             out.write(c);
             nextUpper = true;
             continue;
@@ -2262,6 +2279,16 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
             final iwDay = DateTime.utc(dt.year, dt.month, dt.day);
             out = iwDay.subtract(Duration(days: iwDay.weekday - 1));
             break;
+          case 'IYYY':
+          case 'IYY':
+          case 'IY':
+          case 'I':
+            // ISO year start: the Monday beginning ISO week 1 (the week that
+            // contains Jan 4 of the ISO year).
+            final isoY = _isoYear(dt);
+            final jan4 = DateTime.utc(isoY, 1, 4);
+            out = jan4.subtract(Duration(days: jan4.weekday - 1));
+            break;
           case 'WW':
           case 'DAY':
           case 'DY':
@@ -2298,12 +2325,14 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
   },
   'REGEXP_LIKE': (a) {
     if (a.length < 2 || a[0] == null || a[1] == null) return null;
-    return RegExp(a[1].toString()).hasMatch(a[0].toString());
+    final mp = a.length > 2 && a[2] != null ? a[2].toString() : null;
+    return _oracleRegex(a[1].toString(), mp).hasMatch(a[0].toString());
   },
   'REGEXP_SUBSTR': (a) {
     if (a.length < 2 || a[0] == null || a[1] == null) return null;
     final src = a[0].toString();
-    final re = RegExp(a[1].toString());
+    final re = _oracleRegex(
+        a[1].toString(), a.length > 4 && a[4] != null ? a[4].toString() : null);
     // REGEXP_SUBSTR(src, pat [, position [, occurrence [, match_param
     // [, subexpr]]]]): 1-based position/occurrence.
     final position = a.length > 2 && a[2] != null ? _sqlTextToNum(a[2]).toInt() : 1;
@@ -2324,7 +2353,8 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
   'REGEXP_COUNT': (a) {
     if (a.length < 2 || a[0] == null || a[1] == null) return null;
     final src = a[0].toString();
-    final re = RegExp(a[1].toString());
+    final re = _oracleRegex(
+        a[1].toString(), a.length > 3 && a[3] != null ? a[3].toString() : null);
     final position = a.length > 2 && a[2] != null ? _sqlTextToNum(a[2]).toInt() : 1;
     final start = (position - 1).clamp(0, src.length);
     return re.allMatches(src, start).length;
@@ -2332,7 +2362,8 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
   'REGEXP_INSTR': (a) {
     if (a.length < 2 || a[0] == null || a[1] == null) return null;
     final src = a[0].toString();
-    final re = RegExp(a[1].toString());
+    final re = _oracleRegex(
+        a[1].toString(), a.length > 5 && a[5] != null ? a[5].toString() : null);
     // REGEXP_INSTR(src, pat [, position [, occurrence [, return_opt …]]]):
     // return_opt 0 => start of match, 1 => position after the match. 1-based.
     final position = a.length > 2 && a[2] != null ? _sqlTextToNum(a[2]).toInt() : 1;
@@ -2348,7 +2379,8 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
   'REGEXP_REPLACE': (a) {
     if (a.length < 2 || a[0] == null || a[1] == null) return null;
     final src = a[0].toString();
-    final re = RegExp(a[1].toString());
+    final re = _oracleRegex(
+        a[1].toString(), a.length > 5 && a[5] != null ? a[5].toString() : null);
     // Replacement may be omitted (removes matches) and supports Oracle
     // backreferences \1..\9 (and \0 for the whole match).
     final repl = a.length > 2 && a[2] != null ? a[2].toString() : '';
@@ -3988,8 +4020,8 @@ DateTime? _parseOracleDate(String text, String? fmt) {
   final f = fmt.trim().toUpperCase();
   // Longest-first so YYYY beats YY, MONTH beats MON, HH24 beats HH.
   const order = [
-    'YYYY', 'RRRR', 'YYY', 'MONTH', 'MON', 'HH24', 'HH12', 'YY', 'RR', 'MM',
-    'DD', 'HH', 'MI', 'SS',
+    'YYYY', 'RRRR', 'YYY', 'MONTH', 'MON', 'HH24', 'HH12', 'DDD', 'YY', 'RR',
+    'MM', 'DD', 'HH', 'MI', 'SS',
   ];
   final pattern = StringBuffer('^');
   final captured = <String>[];
@@ -4027,6 +4059,9 @@ DateTime? _parseOracleDate(String text, String? fmt) {
         case 'MM':
           pattern.write(r'(\d{1,2})');
           captured.add('MM');
+        case 'DDD':
+          pattern.write(r'(\d{1,3})');
+          captured.add('DDD');
         case 'DD':
           pattern.write(r'(\d{1,2})');
           captured.add('DD');
@@ -4057,6 +4092,7 @@ DateTime? _parseOracleDate(String text, String? fmt) {
   if (m == null) return _parseDateTime(t) ?? DateTime.tryParse(t);
   var year = 2000, month = 1, day = 1, hour = 0, minute = 0, second = 0;
   var millis = 0, micros = 0;
+  int? dayOfYear;
   for (var g = 0; g < captured.length; g++) {
     final v = m.group(g + 1);
     if (v == null) continue;
@@ -4072,6 +4108,8 @@ DateTime? _parseOracleDate(String text, String? fmt) {
         month = _oracleMonthAbbr[v.substring(0, 3).toUpperCase()] ?? month;
       case 'MM':
         month = int.parse(v);
+      case 'DDD':
+        dayOfYear = int.parse(v);
       case 'DD':
         day = int.parse(v);
       case 'HH':
@@ -4087,6 +4125,12 @@ DateTime? _parseOracleDate(String text, String? fmt) {
     }
   }
   try {
+    // DDD (day-of-year) overrides month/day: Jan 1 + (dayOfYear - 1) days.
+    if (dayOfYear != null) {
+      final base = DateTime.utc(year, 1, 1, hour, minute, second, millis, micros)
+          .add(Duration(days: dayOfYear - 1));
+      return base;
+    }
     return DateTime.utc(year, month, day, hour, minute, second, millis, micros);
   } catch (_) {
     return null;

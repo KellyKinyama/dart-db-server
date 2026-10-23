@@ -6901,6 +6901,47 @@ class Database implements SequenceProvider {
           rows: out,
           affected: out.length,
         );
+      case 'INTERSECT ALL':
+        // Multiset intersection: each row appears min(countLeft, countRight)
+        // times. Consume one right-side occurrence per matched left row.
+        final rCounts = <String, int>{};
+        for (final r in right.rows) {
+          rCounts[key(r)] = (rCounts[key(r)] ?? 0) + 1;
+        }
+        final out = <List<Object?>>[];
+        for (final r in left.rows) {
+          final k = key(r);
+          if ((rCounts[k] ?? 0) > 0) {
+            rCounts[k] = rCounts[k]! - 1;
+            out.add(r);
+          }
+        }
+        return QueryResult(
+          columns: left.columns,
+          rows: out,
+          affected: out.length,
+        );
+      case 'EXCEPT ALL':
+        // Multiset difference: each row appears max(countLeft - countRight, 0)
+        // times. Consume one right-side occurrence per removed left row.
+        final rCounts = <String, int>{};
+        for (final r in right.rows) {
+          rCounts[key(r)] = (rCounts[key(r)] ?? 0) + 1;
+        }
+        final out = <List<Object?>>[];
+        for (final r in left.rows) {
+          final k = key(r);
+          if ((rCounts[k] ?? 0) > 0) {
+            rCounts[k] = rCounts[k]! - 1;
+          } else {
+            out.add(r);
+          }
+        }
+        return QueryResult(
+          columns: left.columns,
+          rows: out,
+          affected: out.length,
+        );
     }
     throw StateError('Unknown set op: $op');
   }
@@ -10848,6 +10889,11 @@ class Database implements SequenceProvider {
     final startWith =
         cb.startWith == null ? null : _bindExpr(cb.startWith!, outer);
     final connectBy = _bindExpr(cb.connectBy, outer);
+    // A CONNECT BY with no PRIOR reference is a pure row generator (e.g.
+    // `SELECT LEVEL FROM dual CONNECT BY LEVEL <= 5`): each level re-expands
+    // the base rows, so the identity-based cycle guard must not apply (it would
+    // stop after one level because the same source row object is revisited).
+    final usesPrior = _exprUsesPrior(cb.connectBy);
 
     List<Map<String, Object?>> sortSiblings(List<Map<String, Object?>> rows) {
       if (cb.orderSiblings.isEmpty) return rows;
@@ -10884,9 +10930,14 @@ class Database implements SequenceProvider {
       // Drop children already on the current path (cycle guard).
       final isCycle =
           children.any((c) => pathIds.contains(identityHashCode(c))) ? 1 : 0;
-      final next = sortSiblings(children)
-          .where((c) => !pathIds.contains(identityHashCode(c)))
-          .toList();
+      final next = usesPrior
+          ? sortSiblings(children)
+              .where((c) => !pathIds.contains(identityHashCode(c)))
+              .toList()
+          // Pure generator: a safety cap (matching Oracle's default 1000-level
+          // hierarchy limit, generously bounded) prevents a runaway walk when
+          // the CONNECT BY condition never becomes false.
+          : (level >= 50000 ? const <Map<String, Object?>>[] : sortSiblings(children));
       final chain = [...ancestry, node];
       out.add(<String, Object?>{
         ...node,
@@ -10908,6 +10959,52 @@ class Database implements SequenceProvider {
       visit(root, 1, {identityHashCode(root)}, const []);
     }
     return out;
+  }
+
+  /// True when [e] (a CONNECT BY condition) references a `PRIOR` expression,
+  /// i.e. the walk is a genuine parent/child hierarchy rather than a pure
+  /// `LEVEL`-bounded row generator.
+  static bool _exprUsesPrior(Expr e) {
+    var found = false;
+    void walk(Expr x) {
+      if (found) return;
+      if (x is PriorExpr) {
+        found = true;
+        return;
+      }
+      if (x is BinaryExpr) {
+        walk(x.left);
+        walk(x.right);
+      } else if (x is UnaryExpr) {
+        walk(x.operand);
+      } else if (x is FunctionCallExpr) {
+        for (final a in x.args) {
+          walk(a);
+        }
+      } else if (x is CaseExpr) {
+        for (final w in x.whens) {
+          walk(w);
+        }
+        for (final t in x.thens) {
+          walk(t);
+        }
+        if (x.elseExpr != null) walk(x.elseExpr!);
+      } else if (x is InExpr) {
+        walk(x.value);
+        for (final v in x.values) {
+          walk(v);
+        }
+      } else if (x is BetweenExpr) {
+        walk(x.value);
+        walk(x.low);
+        walk(x.high);
+      } else if (x is CastExpr) {
+        walk(x.expr);
+      }
+    }
+
+    walk(e);
+    return found;
   }
 
   List<Map<String, Object?>> _resolveFromRows(
@@ -14082,9 +14179,25 @@ class Database implements SequenceProvider {
           newOrder.add(ob);
         }
       }
+      // Rewrite aggregate arguments too: an analytic over an aggregate such as
+      // `SUM(COUNT(*)) OVER ()` precomputes the inner aggregate per group into a
+      // synthetic column, so the window pass sums the per-group values.
+      final newArgs = <Expr>[];
+      for (final arg in fn.args) {
+        if (_containsAggregate(arg)) {
+          final key = '__winagg${k++}';
+          for (var i = 0; i < winRows.length; i++) {
+            winRows[i][key] =
+                _evalProjectedWithAggregates(arg, grpRowsList[i], winRows[i]);
+          }
+          newArgs.add(ColumnExpr(key));
+        } else {
+          newArgs.add(arg);
+        }
+      }
       rewritten[fn] = FunctionCallExpr(
         fn.name,
-        fn.args,
+        newArgs,
         isStarArg: fn.isStarArg,
         distinct: fn.distinct,
         window: WindowSpec(

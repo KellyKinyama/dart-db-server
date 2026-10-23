@@ -3350,14 +3350,14 @@ class Parser {
       setOp = _matchKw('ALL') ? 'UNION ALL' : 'UNION';
       right = _parseSelect();
     } else if (_matchKw('INTERSECT')) {
-      setOp = 'INTERSECT';
+      setOp = _matchKw('ALL') ? 'INTERSECT ALL' : 'INTERSECT';
       right = _parseSelect();
     } else if (_matchKw('EXCEPT')) {
-      setOp = 'EXCEPT';
+      setOp = _matchKw('ALL') ? 'EXCEPT ALL' : 'EXCEPT';
       right = _parseSelect();
     } else if (_matchWord('MINUS')) {
       // Oracle MINUS is a synonym for EXCEPT (distinct set difference).
-      setOp = 'EXCEPT';
+      setOp = _matchKw('ALL') ? 'EXCEPT ALL' : 'EXCEPT';
       right = _parseSelect();
     }
     if (setOp == null) return base;
@@ -3687,7 +3687,13 @@ class Parser {
       _expectKw('BY');
       // SQL extension: ROLLUP / CUBE / GROUPING SETS desugar into a
       // list of grouping-key sets that the executor iterates.
-      if (_matchKw('ROLLUP')) {
+      if (_check(TokType.punct, '(') && _peek(1).text == ')') {
+        // `GROUP BY ()` — the explicit empty grouping is a single
+        // grand-total group (one grouping set with no keys).
+        _advance(); // (
+        _advance(); // )
+        groupingSets = <List<Expr>>[<Expr>[]];
+      } else if (_matchKw('ROLLUP')) {
         _expect(TokType.punct, '(');
         final keys = <Expr>[_parseExpr()];
         while (_match(TokType.punct, ',')) {
