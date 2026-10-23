@@ -3112,6 +3112,14 @@ class Parser {
     if (_checkKw('VALUES')) {
       return _parseValuesAsSelect();
     }
+    // A subquery / derived table may itself start with a WITH clause
+    // (`FROM (WITH x AS (...) SELECT ... FROM x)`). Delegate to the WITH parser
+    // and keep the resulting SELECT (with its CTE bindings attached).
+    if (_checkKw('WITH')) {
+      final w = _parseWith();
+      if (w is SelectStmt) return w;
+      throw FormatException('Expected SELECT after WITH in subquery');
+    }
     final base = _parseSimpleSelect();
     String? setOp;
     SelectStmt? right;

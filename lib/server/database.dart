@@ -6679,7 +6679,11 @@ class Database implements SequenceProvider {
     for (final entry in ctes.entries) {
       final body = entry.value;
       _CteRel rel;
-      if (recursive && _isRecursiveCte(entry.key, body)) {
+      // Oracle auto-detects recursion from a self-reference in a UNION [ALL]
+      // arm; the SQLite-style RECURSIVE keyword is optional. [_isRecursiveCte]
+      // only fires on a genuine self-reference, so honouring it unconditionally
+      // is safe for both dialects.
+      if (_isRecursiveCte(entry.key, body)) {
         rel = _materializeRecursive(
           entry.key,
           body,
