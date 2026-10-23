@@ -180,6 +180,19 @@ class ColumnExpr extends Expr {
       final ql = q.toLowerCase();
       if (scope.containsKey(ql)) return scope[ql];
     }
+    // A qualified `pkg.func` with no arguments: Oracle allows calling a
+    // parameterless package function without parentheses. Fall back to the
+    // stored-function resolver before failing.
+    if (table != null) {
+      final resolver = FunctionCallExpr.storedFunctionResolver;
+      if (resolver != null) {
+        try {
+          return resolver('$table.$name', const []);
+        } on StateError {
+          // Not a known function — fall through to the column error.
+        }
+      }
+    }
     throw StateError(
       'Unknown column: ${table == null ? name : '$table.$name'}',
     );
@@ -1484,6 +1497,71 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
         if (v is List<int>) return v.length * 8;
         return utf8.encode(v.toString()).length * 8;
       }),
+  // Oracle byte-semantics string functions (UTF-8 byte offsets/lengths).
+  'LENGTHB': (a) =>
+      _propagateNull(a, () => utf8.encode(a[0].toString()).length),
+  'SUBSTRB': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final bytes = utf8.encode(a[0].toString());
+    if (a.length < 2) return a[0].toString();
+    final start = _sqlTextToNum(a[1]).toInt();
+    var idx = start > 0
+        ? start - 1
+        : (start == 0 ? 0 : bytes.length + start);
+    if (idx < 0) idx = 0;
+    if (idx >= bytes.length) return '';
+    var end = bytes.length;
+    if (a.length >= 3 && a[2] != null) {
+      final len = _sqlTextToNum(a[2]).toInt();
+      end = (idx + (len < 0 ? 0 : len)).clamp(0, bytes.length);
+    }
+    return utf8.decode(bytes.sublist(idx, end), allowMalformed: true);
+  },
+  'INSTRB': (a) {
+    if (a.length < 2 || a[0] == null || a[1] == null) return null;
+    final hay = utf8.encode(a[0].toString());
+    final needle = utf8.encode(a[1].toString());
+    if (needle.isEmpty) return 1;
+    for (var i = 0; i + needle.length <= hay.length; i++) {
+      var match = true;
+      for (var j = 0; j < needle.length; j++) {
+        if (hay[i + j] != needle[j]) {
+          match = false;
+          break;
+        }
+      }
+      if (match) return i + 1;
+    }
+    return 0;
+  },
+  // BITAND(a, b): bitwise AND of two integers.
+  'BITAND': (a) {
+    if (a.length < 2 || a[0] == null || a[1] == null) return null;
+    return _sqlTextToNum(a[0]).toInt() & _sqlTextToNum(a[1]).toInt();
+  },
+  // BIN_TO_NUM(bit, …): interpret the arguments as a binary vector (MSB first).
+  'BIN_TO_NUM': (a) {
+    if (a.isEmpty || a.any((x) => x == null)) return null;
+    var result = 0;
+    for (final x in a) {
+      result = (result << 1) | (_sqlTextToNum(x).toInt() != 0 ? 1 : 0);
+    }
+    return result;
+  },
+  // ORA_HASH(expr [, max_bucket [, seed]]): deterministic bucket hash.
+  'ORA_HASH': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final maxBucket = a.length > 1 && a[1] != null
+        ? _sqlTextToNum(a[1]).toInt()
+        : 4294967295;
+    final seed = a.length > 2 && a[2] != null ? _sqlTextToNum(a[2]).toInt() : 0;
+    var h = 0x811c9dc5; // FNV-1a 32-bit.
+    for (final c in utf8.encode('${a[0]}|$seed')) {
+      h ^= c;
+      h = (h * 0x01000193) & 0xFFFFFFFF;
+    }
+    return maxBucket <= 0 ? 0 : h % (maxBucket + 1);
+  },
   // LEAST(a, b, ...) -- smallest non-NULL value; returns NULL if all NULL.
   'LEAST': (a) {
     if (a.any((v) => v == null)) return null; // any NULL -> NULL (Oracle/SQLite)
@@ -2706,6 +2784,29 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
   'EXTRACT': (a) {
     if (a.length != 2 || a[0] == null) return null;
     final field = a[0].toString().toUpperCase();
+    // A numeric operand is a day-to-second INTERVAL (e.g. TIMESTAMP - TIMESTAMP
+    // yields a day count). Extract its day/hour/minute/second components.
+    if (a[1] is num) {
+      final totalDays = (a[1] as num).toDouble();
+      final days = totalDays.truncate();
+      final hoursF = (totalDays - days) * 24;
+      final hours = hoursF.truncate();
+      final minsF = (hoursF - hours) * 60;
+      final mins = minsF.truncate();
+      final secs = ((minsF - mins) * 60).round();
+      switch (field) {
+        case 'DAY':
+          return days;
+        case 'HOUR':
+          return hours;
+        case 'MINUTE':
+          return mins;
+        case 'SECOND':
+          return secs;
+        default:
+          return 0;
+      }
+    }
     final dt = _resolveDateTime([a[1]]);
     if (dt == null) return null;
     switch (field) {
@@ -3131,9 +3232,8 @@ double _intPow(double base, double exp) {
     }
     return result;
   }
-  // For non-integer exponents we'd ideally use math.pow; do log/exp series.
-  // Tests only exercise integer exponents.
-  throw StateError('POWER with non-integer exponent not supported');
+  // Non-integer exponents: use the platform pow (Oracle computes these).
+  return math.pow(base, exp).toDouble();
 }
 
 enum _DTKind { date, time, full }

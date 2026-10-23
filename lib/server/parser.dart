@@ -984,6 +984,17 @@ class Parser {
       }
       _expect(TokType.punct, ')');
     }
+    // Oracle TIMESTAMP / TIME [WITH [LOCAL] TIME ZONE]. The zone qualifier is
+    // consumed (the engine stores timestamps as text); the column keeps its
+    // TIMESTAMP affinity.
+    if (_checkWord('WITH') &&
+        (typeTok.text.toUpperCase() == 'TIMESTAMP' ||
+            typeTok.text.toUpperCase() == 'TIME')) {
+      _advance(); // WITH
+      _matchWord('LOCAL');
+      _expectWord('TIME');
+      _expectWord('ZONE');
+    }
     bool primaryKey = false;
     bool notNull = false;
     bool unique = false;
@@ -1874,6 +1885,16 @@ class Parser {
   String _consumeRoutineType() {
     final start = _peek().offset;
     _advance(); // base type word
+    // Anchored declarations: table.column%TYPE / var%ROWTYPE. Consume any
+    // dotted name parts followed by the %TYPE / %ROWTYPE suffix.
+    while (_check(TokType.punct, '.')) {
+      _advance(); // .
+      if (!_isAtEnd()) _advance(); // name part
+    }
+    if (_peek().text == '%') {
+      _advance(); // %
+      if (!_isAtEnd()) _advance(); // TYPE / ROWTYPE
+    }
     if (_check(TokType.punct, '(')) {
       var depth = 0;
       do {
@@ -2252,6 +2273,7 @@ class Parser {
       return null;
     }
     if (_matchWord('IF')) return _parsePlsqlIf();
+    if (_matchWord('CASE')) return _parsePlsqlCase();
     if (_matchWord('WHILE')) return _parsePlsqlWhile();
     if (_matchWord('FOR')) return _parsePlsqlFor();
     if (_matchWord('LOOP')) {
@@ -2361,6 +2383,37 @@ class Parser {
   List<RoutineStmt> _plsqlThen() {
     _expectWord('THEN');
     return _parsePlsqlStmtsUntil({'ELSIF', 'ELSE', 'END'});
+  }
+
+  /// PL/SQL `CASE [selector] WHEN … THEN … [ELSE …] END CASE;` statement.
+  /// Simple CASE (with a selector) is lowered to searched branches of the
+  /// form `(selector) = (value)`. Reuses [RoutineIf] semantics.
+  RoutineStmt _parsePlsqlCase() {
+    String? selector;
+    if (!_checkWord('WHEN')) {
+      selector = _captureRoutineExpr({'WHEN'});
+    }
+    final branches = <RoutineBranch>[];
+    while (_matchWord('WHEN')) {
+      String cond;
+      if (selector != null) {
+        final val = _captureRoutineExpr({'THEN'});
+        cond = '($selector) = ($val)';
+      } else {
+        cond = _captureRoutineExpr({'THEN'});
+      }
+      _expectWord('THEN');
+      branches
+          .add(RoutineBranch(cond, _parsePlsqlStmtsUntil({'WHEN', 'ELSE', 'END'})));
+    }
+    var elseBody = const <RoutineStmt>[];
+    if (_matchWord('ELSE')) {
+      elseBody = _parsePlsqlStmtsUntil({'END'});
+    }
+    _expectWord('END');
+    _expectWord('CASE');
+    _match(TokType.punct, ';');
+    return RoutineIf(branches, elseBody: elseBody);
   }
 
   RoutineStmt _parsePlsqlWhile() {
