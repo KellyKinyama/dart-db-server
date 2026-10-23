@@ -968,4 +968,79 @@ void main() {
       await db.close();
     }
   });
+
+  // ---- Round 57-58 (ALTER TABLE, PL/SQL routines): F235-F240 --------------
+
+  test('F235 ALTER TABLE ADD (multiple columns)', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE t (id NUMBER)');
+      await db.execute('ALTER TABLE t ADD (a NUMBER, b NUMBER)');
+      await db.execute('INSERT INTO t VALUES (1, 2, 3)');
+      expect(await scalar(db, 'SELECT a FROM t'), 2);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F236 ALTER TABLE MODIFY applies the change', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE t (v VARCHAR2(3))');
+      await db.execute('ALTER TABLE t MODIFY (v VARCHAR2(10))');
+      await db.execute("INSERT INTO t VALUES ('abcdef')");
+      expect(await scalar(db, 'SELECT LENGTH(v) FROM t'), 6);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F237 ALTER TABLE DROP CONSTRAINT removes it', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute(
+          'CREATE TABLE t (v NUMBER CONSTRAINT t_ck CHECK (v > 0))');
+      await db.execute('ALTER TABLE t DROP CONSTRAINT t_ck');
+      await db.execute('INSERT INTO t VALUES (-5)');
+      expect(await scalar(db, 'SELECT v FROM t'), -5);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F238 parameterless function call without parentheses', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute(
+          'CREATE OR REPLACE FUNCTION f0 RETURN NUMBER IS BEGIN RETURN 42; '
+          'END;');
+      expect(await scalar(db, 'SELECT f0 FROM dual'), 42);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F239 CREATE FUNCTION ... DETERMINISTIC', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute(
+          'CREATE OR REPLACE FUNCTION inc(x NUMBER) RETURN NUMBER '
+          'DETERMINISTIC IS BEGIN RETURN x + 1; END;');
+      expect(await scalar(db, 'SELECT inc(1) FROM dual'), 2);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F240 function parameter DEFAULT value', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute(
+          'CREATE OR REPLACE FUNCTION addn(x NUMBER, y NUMBER DEFAULT 10) '
+          'RETURN NUMBER IS BEGIN RETURN x + y; END;');
+      expect(await scalar(db, 'SELECT addn(5) FROM dual'), 15);
+    } finally {
+      await db.close();
+    }
+  });
 }

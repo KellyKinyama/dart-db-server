@@ -50,14 +50,29 @@ class TruncateTableStmt extends Statement {
 
 class AlterTableAddColumnStmt extends Statement {
   final String table;
-  final ColumnDef column;
-  AlterTableAddColumnStmt(this.table, this.column);
+  final List<ColumnDef> columns;
+  AlterTableAddColumnStmt(this.table, this.columns);
+}
+
+/// `ALTER TABLE t MODIFY [(] col <new-attrs>[, …] [)]` — changes attributes
+/// (type/size, DEFAULT, NOT NULL) of existing columns.
+class AlterTableModifyColumnStmt extends Statement {
+  final String table;
+  final List<ColumnDef> columns;
+  AlterTableModifyColumnStmt(this.table, this.columns);
 }
 
 class AlterTableDropColumnStmt extends Statement {
   final String table;
   final String column;
   AlterTableDropColumnStmt(this.table, this.column);
+}
+
+/// `ALTER TABLE t DROP CONSTRAINT <name>` — removes a named constraint.
+class AlterTableDropConstraintStmt extends Statement {
+  final String table;
+  final String constraint;
+  AlterTableDropConstraintStmt(this.table, this.constraint);
 }
 
 class AlterTableRenameColumnStmt extends Statement {

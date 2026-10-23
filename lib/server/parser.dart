@@ -1146,11 +1146,13 @@ class Parser {
     bool generatedStored = false;
     Map<String, String>? vectorSpec;
     String? collate;
+    String? pendingConstraintName;
+    String? checkName;
     while (true) {
       // Inline named constraint prefix: `CONSTRAINT <name> <constraint>`. The
-      // name is consumed; the constraint that follows is parsed by the loop.
+      // name is remembered so a following CHECK can be dropped by name later.
       if (_matchWord('CONSTRAINT')) {
-        _expectName();
+        pendingConstraintName = _expectName();
         continue;
       }
       if (_matchKw('COLLATE')) {
@@ -1242,6 +1244,7 @@ class Parser {
         final end = _peek().offset;
         _expect(TokType.punct, ')');
         checkSql = _sliceSource(start, end);
+        checkName = pendingConstraintName;
         continue;
       }
       if (_checkKw('REFERENCES')) {
@@ -1331,6 +1334,7 @@ class Parser {
       defaultValue: defaultValue,
       defaultExprSql: defaultExprSql,
       checkExprSql: checkSql,
+      checkName: checkName,
       references: references,
       generatedExprSql: generatedSql,
       generatedStored: generatedStored,
@@ -1852,6 +1856,15 @@ class Parser {
       if (!_matchWord('RETURNS')) _matchWord('RETURN');
       returnType = _consumeRoutineType();
     }
+    // Oracle function options before IS/AS: DETERMINISTIC, PARALLEL_ENABLE,
+    // PIPELINED, RESULT_CACHE, AUTHID …. Accepted and ignored.
+    while (_matchWord('DETERMINISTIC') ||
+        _matchWord('PARALLEL_ENABLE') ||
+        _matchWord('PIPELINED') ||
+        _matchWord('RESULT_CACHE')) {}
+    if (_matchWord('AUTHID')) {
+      _advance(); // CURRENT_USER / DEFINER
+    }
     final RoutineBlock block;
     if (_matchWord('IS') || _matchWord('AS')) {
       // Oracle PL/SQL: declarations between IS/AS and BEGIN, then the body.
@@ -1903,7 +1916,14 @@ class Parser {
             }
           }
           final type = _consumeRoutineType();
-          params.add(RoutineParam(pname, mode, type));
+          // Optional parameter default: `DEFAULT <expr>` or `:= <expr>`.
+          String? defaultSql;
+          if (_matchWord('DEFAULT') || _match(TokType.op, ':=')) {
+            final start = _peek().offset;
+            _parseExpr();
+            defaultSql = _sliceSource(start, _peek().offset).trim();
+          }
+          params.add(RoutineParam(pname, mode, type, defaultSql: defaultSql));
         } while (_match(TokType.punct, ','));
       }
       _expect(TokType.punct, ')');
@@ -2675,7 +2695,7 @@ class Parser {
     }
     if (_matchWord('MODIFY')) {
       // MODIFY CONSTRAINT <name> ENABLE/DISABLE … toggles constraint state;
-      // MODIFY (col …) / MODIFY col … changes column attributes (accepted).
+      // MODIFY (col …) / MODIFY col … changes column attributes.
       if (_matchWord('CONSTRAINT')) {
         final cname = _expectName();
         bool? enable;
@@ -2690,10 +2710,13 @@ class Parser {
         }
         return DdlNoopStmt('ALTER TABLE MODIFY');
       }
-      while (!_isAtEnd() && !_check(TokType.punct, ';')) {
-        _advance();
+      final mparen = _match(TokType.punct, '(');
+      final mcols = <ColumnDef>[_parseColumnDef()];
+      while (_match(TokType.punct, ',')) {
+        mcols.add(_parseColumnDef());
       }
-      return DdlNoopStmt('ALTER TABLE MODIFY');
+      if (mparen) _expect(TokType.punct, ')');
+      return AlterTableModifyColumnStmt(table, mcols);
     }
     if (_checkWord('DISABLE') || _checkWord('ENABLE')) {
       final enable = _peek().upper == 'ENABLE';
@@ -2714,6 +2737,14 @@ class Parser {
       return DdlNoopStmt('ALTER TABLE');
     }
     if (_matchKw('DROP')) {
+      if (_matchWord('CONSTRAINT')) {
+        return AlterTableDropConstraintStmt(table, _expectName());
+      }
+      // DROP PRIMARY KEY — remove the table's primary-key constraint.
+      if (_matchKw('PRIMARY')) {
+        _expectKw('KEY');
+        return AlterTableDropConstraintStmt(table, '__PRIMARY__');
+      }
       _matchKw('COLUMN');
       return AlterTableDropColumnStmt(table, _expectIdent().text);
     }
@@ -2738,9 +2769,13 @@ class Parser {
       return AlterTableAddConstraintStmt(table, cons);
     }
     _matchKw('COLUMN');
-    final col = _parseColumnDef();
+    final cols = <ColumnDef>[_parseColumnDef()];
+    // `ADD (a …, b …)` adds every column in the parenthesised list.
+    while (paren && _match(TokType.punct, ',')) {
+      cols.add(_parseColumnDef());
+    }
     if (paren) _expect(TokType.punct, ')');
-    return AlterTableAddColumnStmt(table, col);
+    return AlterTableAddColumnStmt(table, cols);
   }
 
   /// `COMMENT ON TABLE/COLUMN <name> IS '<text>'` — accepted as a no-op.

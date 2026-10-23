@@ -176,6 +176,11 @@ class ColumnDef {
   /// this on demand. Stored as text so it survives JSON serialization.
   final String? checkExprSql;
 
+  /// Name of the column-level CHECK constraint (`CONSTRAINT <name> CHECK ...`),
+  /// so `ALTER TABLE ... DROP CONSTRAINT <name>` can remove it. Null when the
+  /// check was unnamed.
+  final String? checkName;
+
   /// FOREIGN KEY target ("table" or "table(column)") for column-level FK.
   final ForeignKeyRef? references;
 
@@ -213,6 +218,7 @@ class ColumnDef {
     this.defaultValue,
     this.defaultExprSql,
     this.checkExprSql,
+    this.checkName,
     this.references,
     this.generatedExprSql,
     this.generatedStored = false,
@@ -234,6 +240,7 @@ class ColumnDef {
         if (defaultValue != null) 'default': defaultValue,
         if (defaultExprSql != null) 'defaultExpr': defaultExprSql,
         if (checkExprSql != null) 'check': checkExprSql,
+        if (checkName != null) 'checkName': checkName,
         if (references != null) 'references': references!.toJson(),
         if (generatedExprSql != null) 'generated': generatedExprSql,
         if (generatedStored) 'generatedStored': true,
@@ -255,6 +262,7 @@ class ColumnDef {
         defaultValue: j['default'],
         defaultExprSql: j['defaultExpr'] as String?,
         checkExprSql: j['check'] as String?,
+        checkName: j['checkName'] as String?,
         references: j['references'] == null
             ? null
             : ForeignKeyRef.fromJson(

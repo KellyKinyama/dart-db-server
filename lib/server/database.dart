@@ -2446,8 +2446,12 @@ class Database implements SequenceProvider {
         result = _truncate(stmt);
       } else if (stmt is AlterTableAddColumnStmt) {
         result = _alterAddColumn(stmt);
+      } else if (stmt is AlterTableModifyColumnStmt) {
+        result = _alterModifyColumn(stmt);
       } else if (stmt is AlterTableDropColumnStmt) {
         result = _alterDropColumn(stmt);
+      } else if (stmt is AlterTableDropConstraintStmt) {
+        result = _alterDropConstraint(stmt);
       } else if (stmt is AlterTableRenameColumnStmt) {
         result = _alterRenameColumn(stmt);
       } else if (stmt is AlterTableRenameStmt) {
@@ -4776,19 +4780,99 @@ class Database implements SequenceProvider {
     );
   }
 
+  /// Evaluates a routine parameter's `DEFAULT <expr>` (used when the argument
+  /// is omitted at the call site), or null when the parameter has no default.
+  Object? _routineParamDefault(RoutineParam p) {
+    if (p.defaultSql == null) return null;
+    try {
+      return _bindExpr(_parseSelectExprCached(p.defaultSql!)).eval(const {});
+    } catch (_) {
+      return null;
+    }
+  }
+
   QueryResult _alterAddColumn(AlterTableAddColumnStmt s) {
     final t = _requireTable(s.table);
-    t.addColumn(s.column);
-    if (s.column.primaryKey || s.column.unique) {
-      t.createIndex(
-        IndexDef('${t.name}__${s.column.name}', s.column.name, unique: true),
+    for (final col in s.columns) {
+      t.addColumn(col);
+      if (col.primaryKey || col.unique) {
+        t.createIndex(
+          IndexDef('${t.name}__${col.name}', col.name, unique: true),
+        );
+      }
+      // Backfill GENERATED ALWAYS values for existing rows.
+      if (col.generatedExprSql != null) {
+        _recomputeGenerated(t, col);
+      }
+    }
+    return QueryResult.message(
+        '${s.columns.length} column(s) added to ${s.table}');
+  }
+
+  QueryResult _alterModifyColumn(AlterTableModifyColumnStmt s) {
+    final t = _requireTable(s.table);
+    for (final mod in s.columns) {
+      final idx = t.columnIndex(mod.name);
+      final old = t.columns[idx];
+      // Apply the modified attributes, keeping existing ones the modifier
+      // didn't restate (DEFAULT / NOT NULL default to the old values).
+      t.columns[idx] = ColumnDef(
+        old.name,
+        mod.type,
+        primaryKey: old.primaryKey,
+        notNull: mod.notNull || old.notNull,
+        unique: old.unique,
+        autoIncrement: old.autoIncrement,
+        defaultValue: mod.defaultValue ?? old.defaultValue,
+        defaultExprSql: mod.defaultExprSql ?? old.defaultExprSql,
+        checkExprSql: old.checkExprSql,
+        references: old.references,
+        generatedExprSql: old.generatedExprSql,
+        generatedStored: old.generatedStored,
+        collate: old.collate,
+        charLength: mod.charLength,
+        numericPrecision: mod.numericPrecision,
+        numericScale: mod.numericScale,
+        declaredType: mod.declaredType ?? old.declaredType,
       );
     }
-    // Backfill GENERATED ALWAYS values for existing rows.
-    if (s.column.generatedExprSql != null) {
-      _recomputeGenerated(t, s.column);
+    t.invalidateKeyCache();
+    return QueryResult.message('Column(s) modified on ${s.table}');
+  }
+
+  QueryResult _alterDropConstraint(AlterTableDropConstraintStmt s) {
+    final t = _requireTable(s.table);
+    if (s.constraint == '__PRIMARY__') {
+      t.constraints.removeWhere((c) => c is PrimaryKeyConstraint);
     }
-    return QueryResult.message('Column ${s.column.name} added to ${s.table}');
+    // Clear a column-level CHECK recorded under this constraint name.
+    for (var i = 0; i < t.columns.length; i++) {
+      final c = t.columns[i];
+      if (c.checkName != null &&
+          c.checkName!.toLowerCase() == s.constraint.toLowerCase()) {
+        t.columns[i] = ColumnDef(
+          c.name,
+          c.type,
+          declaredType: c.declaredType,
+          primaryKey: c.primaryKey,
+          notNull: c.notNull,
+          unique: c.unique,
+          autoIncrement: c.autoIncrement,
+          defaultValue: c.defaultValue,
+          defaultExprSql: c.defaultExprSql,
+          references: c.references,
+          generatedExprSql: c.generatedExprSql,
+          generatedStored: c.generatedStored,
+          collate: c.collate,
+          charLength: c.charLength,
+          numericPrecision: c.numericPrecision,
+          numericScale: c.numericScale,
+        );
+      }
+    }
+    t.invalidateKeyCache();
+    return QueryResult.message(
+        'Constraint ${s.constraint} dropped from ${s.table}');
   }
 
   QueryResult _alterAddConstraint(AlterTableAddConstraintStmt s) {
@@ -5142,8 +5226,9 @@ class Database implements SequenceProvider {
     final pkgState = _packageStateFor(s.name);
     if (pkgState != null) scope.addAll(pkgState);
     for (var i = 0; i < routine.params.length; i++) {
-      scope[routine.params[i].name] =
-          i < argValues.length ? argValues[i] : null;
+      scope[routine.params[i].name] = i < argValues.length
+          ? argValues[i]
+          : _routineParamDefault(routine.params[i]);
     }
     final out = await runRoutine(routine.block, args: scope);
     _writeBackPackageState(pkgState, out.variables);
@@ -5211,7 +5296,9 @@ class Database implements SequenceProvider {
     final pkgState = _packageStateFor(name);
     if (pkgState != null) scope.addAll(pkgState);
     for (var i = 0; i < r.params.length; i++) {
-      scope[r.params[i].name] = i < args.length ? args[i] : null;
+      scope[r.params[i].name] = i < args.length
+          ? args[i]
+          : _routineParamDefault(r.params[i]);
     }
     final runner = SyncRoutineRunner(
       (sql, sc) {

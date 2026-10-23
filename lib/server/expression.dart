@@ -195,6 +195,18 @@ class ColumnExpr extends Expr {
         }
       }
     }
+    // An unqualified name that is not a column may be a parameterless stored
+    // function called without parentheses (Oracle: `SELECT f0 FROM dual`).
+    if (table == null) {
+      final resolver = FunctionCallExpr.storedFunctionResolver;
+      if (resolver != null) {
+        try {
+          return resolver(name, const []);
+        } on StateError {
+          // Not a known function — fall through to the column error.
+        }
+      }
+    }
     throw StateError(
       'Unknown column: ${table == null ? name : '$table.$name'}',
     );

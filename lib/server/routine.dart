@@ -161,7 +161,11 @@ class RoutineParam {
   final String name;
   final RoutineParamMode mode;
   final String typeText;
-  RoutineParam(this.name, this.mode, this.typeText);
+
+  /// Optional `DEFAULT <expr>` / `:= <expr>` source text; used when the
+  /// argument is omitted at the call site.
+  final String? defaultSql;
+  RoutineParam(this.name, this.mode, this.typeText, {this.defaultSql});
 }
 
 /// A named stored routine (MySQL `CREATE PROCEDURE` / `CREATE FUNCTION`).
