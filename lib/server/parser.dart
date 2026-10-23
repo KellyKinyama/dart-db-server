@@ -683,20 +683,24 @@ class Parser {
   }
 
   /// Parses `JSON_TABLE(src, 'path' COLUMNS (col type [PATH 'p'], …))` (the
-  /// opening `JSON_TABLE` word is already consumed) into a placeholder derived
-  /// table exposing the declared column names, so views/queries that lateral-
-  /// join JSON_TABLE parse. Row extraction is not modelled.
+  /// opening `JSON_TABLE` word is already consumed) into a derived table whose
+  /// FROM is a `JSON_TABLE` table-function call the executor materialises:
+  /// args are `[src, rowPath, name1, colPath1, name2, colPath2, …]`.
   SelectStmt _parseJsonTableClause() {
     _expect(TokType.punct, '(');
-    _parseExpr(); // JSON source expression
+    final src = _parseExpr(); // JSON source expression
+    var rowPath = r'$';
     if (_match(TokType.punct, ',')) {
-      if (_check(TokType.string)) _advance(); // row path
+      if (_check(TokType.string)) rowPath = _advance().text; // row path
     }
     final cols = <String>[];
+    final fnArgs = <Expr>[src, LiteralExpr(rowPath)];
     if (_matchWord('COLUMNS')) {
       _expect(TokType.punct, '(');
       do {
-        cols.add(_expectName());
+        final name = _expectName();
+        cols.add(name);
+        String? colPath;
         var depth = 0;
         while (!_isAtEnd()) {
           final tk = _peek();
@@ -712,16 +716,28 @@ class Parser {
             continue;
           }
           if (depth == 0 && tk.type == TokType.punct && tk.text == ',') break;
+          // Capture the column's `PATH '<p>'` if present.
+          if (depth == 0 && tk.type == TokType.keyword && tk.upper == 'PATH' ||
+              (depth == 0 &&
+                  tk.type == TokType.ident &&
+                  tk.upper == 'PATH')) {
+            _advance();
+            if (_check(TokType.string)) colPath = _advance().text;
+            continue;
+          }
           _advance();
         }
+        fnArgs.add(LiteralExpr(name));
+        fnArgs.add(LiteralExpr(colPath ?? '\$.$name'));
       } while (_match(TokType.punct, ','));
       _expect(TokType.punct, ')'); // COLUMNS list
     }
     _expect(TokType.punct, ')'); // JSON_TABLE
     return SelectStmt(
       projection: [
-        for (final c in cols) SelectItem.expr(LiteralExpr(null), alias: c)
+        for (final c in cols) SelectItem.expr(ColumnExpr(c)),
       ],
+      fromFunction: FunctionCallExpr('JSON_TABLE', fnArgs),
       orderBy: const [],
     );
   }
@@ -3685,73 +3701,96 @@ class Parser {
     Expr? having;
     if (_matchKw('GROUP')) {
       _expectKw('BY');
-      // SQL extension: ROLLUP / CUBE / GROUPING SETS desugar into a
-      // list of grouping-key sets that the executor iterates.
-      if (_check(TokType.punct, '(') && _peek(1).text == ')') {
-        // `GROUP BY ()` — the explicit empty grouping is a single
-        // grand-total group (one grouping set with no keys).
-        _advance(); // (
-        _advance(); // )
-        groupingSets = <List<Expr>>[<Expr>[]];
-      } else if (_matchKw('ROLLUP')) {
-        _expect(TokType.punct, '(');
-        final keys = <Expr>[_parseExpr()];
-        while (_match(TokType.punct, ',')) {
-          keys.add(_parseExpr());
-        }
-        _expect(TokType.punct, ')');
-        groupingSets = <List<Expr>>[
-          for (var i = keys.length; i >= 0; i--) keys.sublist(0, i),
-        ];
-        groupBy.addAll(keys);
-      } else if (_matchKw('CUBE')) {
-        _expect(TokType.punct, '(');
-        final keys = <Expr>[_parseExpr()];
-        while (_match(TokType.punct, ',')) {
-          keys.add(_parseExpr());
-        }
-        _expect(TokType.punct, ')');
-        groupingSets = <List<Expr>>[];
-        for (var mask = (1 << keys.length) - 1; mask >= 0; mask--) {
-          final set = <Expr>[
-            for (var i = 0; i < keys.length; i++)
-              if ((mask >> i) & 1 == 1) keys[i],
-          ];
-          groupingSets.add(set);
-        }
-        groupBy.addAll(keys);
-      } else if (_matchKw('GROUPING')) {
-        _expectKw('SETS');
-        _expect(TokType.punct, '(');
-        groupingSets = <List<Expr>>[];
-        do {
-          if (_match(TokType.punct, '(')) {
-            final set = <Expr>[];
-            if (!_check(TokType.punct, ')')) {
-              set.add(_parseExpr());
-              while (_match(TokType.punct, ',')) {
-                set.add(_parseExpr());
-              }
-            }
-            _expect(TokType.punct, ')');
-            groupingSets.add(set);
-            // groupBy holds the union of every set's keys; we don't
-            // dedup here because a structural Expr equality is brittle
-            // and the executor only treats this list as a "known keys"
-            // membership probe via its own structural string key.
-            groupBy.addAll(set);
-          } else {
-            final k = _parseExpr();
-            groupingSets.add([k]);
-            groupBy.add(k);
+      // A GROUP BY is a comma-separated list of factors; each factor is either
+      // a plain key or a ROLLUP / CUBE / GROUPING SETS / () set-generator. The
+      // effective grouping sets are the cross-product (concatenation) of every
+      // factor's alternative key-sets, so `GROUP BY a, ROLLUP(b)` yields
+      // {a,b} and {a}.
+      final factors = <List<List<Expr>>>[];
+      var sawSetFn = false;
+      do {
+        if (_check(TokType.punct, '(') && _peek(1).text == ')') {
+          // Explicit empty grouping `()` — a single grand-total group.
+          _advance(); // (
+          _advance(); // )
+          factors.add(<List<Expr>>[<Expr>[]]);
+          sawSetFn = true;
+        } else if (_matchKw('ROLLUP')) {
+          _expect(TokType.punct, '(');
+          final keys = <Expr>[_parseExpr()];
+          while (_match(TokType.punct, ',')) {
+            keys.add(_parseExpr());
           }
-        } while (_match(TokType.punct, ','));
-        _expect(TokType.punct, ')');
-      } else {
-        groupBy.add(_parseExpr());
-        while (_match(TokType.punct, ',')) {
-          groupBy.add(_parseExpr());
+          _expect(TokType.punct, ')');
+          factors.add(<List<Expr>>[
+            for (var i = keys.length; i >= 0; i--) keys.sublist(0, i),
+          ]);
+          groupBy.addAll(keys);
+          sawSetFn = true;
+        } else if (_matchKw('CUBE')) {
+          _expect(TokType.punct, '(');
+          final keys = <Expr>[_parseExpr()];
+          while (_match(TokType.punct, ',')) {
+            keys.add(_parseExpr());
+          }
+          _expect(TokType.punct, ')');
+          final sets = <List<Expr>>[];
+          for (var mask = (1 << keys.length) - 1; mask >= 0; mask--) {
+            sets.add(<Expr>[
+              for (var i = 0; i < keys.length; i++)
+                if ((mask >> i) & 1 == 1) keys[i],
+            ]);
+          }
+          factors.add(sets);
+          groupBy.addAll(keys);
+          sawSetFn = true;
+        } else if (_matchKw('GROUPING')) {
+          _expectKw('SETS');
+          _expect(TokType.punct, '(');
+          final sets = <List<Expr>>[];
+          do {
+            if (_match(TokType.punct, '(')) {
+              final set = <Expr>[];
+              if (!_check(TokType.punct, ')')) {
+                set.add(_parseExpr());
+                while (_match(TokType.punct, ',')) {
+                  set.add(_parseExpr());
+                }
+              }
+              _expect(TokType.punct, ')');
+              sets.add(set);
+              groupBy.addAll(set);
+            } else {
+              final k = _parseExpr();
+              sets.add([k]);
+              groupBy.add(k);
+            }
+          } while (_match(TokType.punct, ','));
+          _expect(TokType.punct, ')');
+          factors.add(sets);
+          sawSetFn = true;
+        } else {
+          final k = _parseExpr();
+          factors.add(<List<Expr>>[
+            [k]
+          ]);
+          groupBy.add(k);
         }
+      } while (_match(TokType.punct, ','));
+      // Only materialise groupingSets when a set-generator was present; a plain
+      // key list stays a normal GROUP BY (groupBy already holds the keys).
+      if (sawSetFn) {
+        var combined = <List<Expr>>[<Expr>[]];
+        for (final factor in factors) {
+          final next = <List<Expr>>[];
+          for (final acc in combined) {
+            for (final set in factor) {
+              next.add(<Expr>[...acc, ...set]);
+            }
+          }
+          combined = next;
+        }
+        groupingSets = combined;
       }
     }
     // HAVING is accepted with or without GROUP BY (SQLite/MySQL apply it to the
@@ -3821,10 +3860,12 @@ class Parser {
     // equivalent LIMIT so they flow through the normal row-limit machinery
     // (which, combined with ORDER BY / a subquery, matches the common
     // top-N / pagination idioms).
+    int? rownumLimit;
     if (where != null) {
       final rr = _rewriteRownumWhere(where, limit);
       where = rr.$1;
       limit = rr.$2;
+      rownumLimit = rr.$3;
     }
     return SelectStmt(
       projection: projection,
@@ -3845,6 +3886,7 @@ class Parser {
       indexedBy: fromIndexHint,
       groupingSets: groupingSets,
       connectBy: connectBy,
+      rownumLimit: rownumLimit,
     );
   }
 
@@ -3895,11 +3937,13 @@ class Parser {
   /// folds them into an equivalent row limit. Returns the residual WHERE (with
   /// the ROWNUM conjuncts removed, or null if none remain) and the effective
   /// limit (the tightest of [existingLimit] and any ROWNUM-implied limit).
-  (Expr?, int?) _rewriteRownumWhere(Expr where, int? existingLimit) {
+  (Expr?, int?, int?) _rewriteRownumWhere(Expr where, int? existingLimit) {
     var limit = existingLimit;
+    int? rownumLimit;
     void tighten(int implied) {
       final v = implied < 0 ? 0 : implied;
       limit = (limit == null) ? v : (v < limit! ? v : limit);
+      rownumLimit = (rownumLimit == null) ? v : (v < rownumLimit! ? v : rownumLimit);
     }
 
     // Returns the replacement for a single (sub)expression, or `_keep` if it
@@ -3951,7 +3995,7 @@ class Parser {
     }
 
     final residual = visit(where);
-    return (residual, limit);
+    return (residual, limit, rownumLimit);
   }
 
   bool _isRownum(Expr e) {
@@ -4427,6 +4471,26 @@ class Parser {
       _expectWord('TIME');
       _expectWord('ZONE');
       e = FunctionCallExpr('__AT_TIME_ZONE', [e, _parsePrimary()]);
+    }
+    // Postfix interval-cast qualifier: `<expr> DAY[(p)] TO SECOND[(p)]` /
+    // `YEAR[(p)] TO MONTH`. A no-op — the engine already models the value as a
+    // day/second (or month) magnitude. Only consumed when a `TO <field>` tail
+    // follows so a bare trailing identifier (a column alias) is left alone.
+    const intervalFields = {
+      'DAY', 'YEAR', 'HOUR', 'MINUTE', 'SECOND', 'MONTH',
+    };
+    while (intervalFields.contains(_peek().upper) && _peek(1).upper == 'TO') {
+      _advance(); // leading field
+      _advance(); // TO
+      if (_check(TokType.ident) || _peek().type == TokType.keyword) {
+        _advance(); // trailing field
+      }
+      if (_check(TokType.punct, '(')) {
+        while (!_check(TokType.punct, ')') && !_isAtEnd()) {
+          _advance();
+        }
+        _match(TokType.punct, ')');
+      }
     }
     return e;
   }

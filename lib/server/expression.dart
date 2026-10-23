@@ -2074,8 +2074,13 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     final p = _pow10(-digits);
     return (v / p).round() * p;
   },
-  'MOD': (a) => _propagateNull(
-      a, () => _sqlTextToNum(a[0]).remainder(_sqlTextToNum(a[1]))),
+  'MOD': (a) => _propagateNull(a, () {
+        final n = _sqlTextToNum(a[0]);
+        final m = _sqlTextToNum(a[1]);
+        // Oracle: MOD(n, 0) returns n (no divide-by-zero error).
+        if (m == 0) return n;
+        return n.remainder(m);
+      }),
   // Oracle REMAINDER(n, m) = n - m * ROUND(n/m) — rounds the quotient (ties to
   // even) rather than flooring like MOD: REMAINDER(17, 6) = -1.
   'REMAINDER': (a) => _propagateNull(a, () {
@@ -3132,6 +3137,17 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     }
     return num.tryParse(s);
   },
+  // TO_BINARY_FLOAT / TO_BINARY_DOUBLE: parse to a floating-point number.
+  'TO_BINARY_FLOAT': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final v = a[0];
+    return v is num ? v.toDouble() : double.tryParse(v.toString().trim());
+  },
+  'TO_BINARY_DOUBLE': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final v = a[0];
+    return v is num ? v.toDouble() : double.tryParse(v.toString().trim());
+  },
   // Oracle RAW hex round-trip: HEXTORAW('DEADBEEF') -> bytes, RAWTOHEX -> hex.
   'HEXTORAW': (a) {
     if (a.isEmpty || a[0] == null) return null;
@@ -3289,6 +3305,18 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
   'EXTRACT': (a) {
     if (a.length != 2 || a[0] == null) return null;
     final field = a[0].toString().toUpperCase();
+    // TIMEZONE_HOUR / TIMEZONE_MINUTE read the signed offset off the raw
+    // TIMESTAMP WITH TIME ZONE text (e.g. '… +05:30'); the minute field carries
+    // the offset's sign (so -05:30 -> -30).
+    if (field == 'TIMEZONE_HOUR' || field == 'TIMEZONE_MINUTE') {
+      final m = RegExp(r'([+-])(\d{1,2}):(\d{2})\s*$')
+          .firstMatch(a[1]?.toString() ?? '');
+      if (m == null) return 0;
+      final sign = m[1] == '-' ? -1 : 1;
+      return field == 'TIMEZONE_HOUR'
+          ? sign * int.parse(m[2]!)
+          : sign * int.parse(m[3]!);
+    }
     // A numeric operand is a day-to-second INTERVAL (e.g. TIMESTAMP - TIMESTAMP
     // yields a day count). Extract its day/hour/minute/second components.
     if (a[1] is num) {

@@ -522,6 +522,12 @@ class SelectStmt extends Statement {
   /// registered for the duration of this query.
   final List<StoredRoutine> withFunctions;
 
+  /// Oracle `ROWNUM <= n` limit lifted from the WHERE clause. Unlike [limit]
+  /// (a post-aggregate result cap), a ROWNUM limit restricts the *input* rows
+  /// before aggregation / GROUP BY, so `SELECT COUNT(*) FROM t WHERE ROWNUM <=
+  /// n` counts at most n rows.
+  final int? rownumLimit;
+
   SelectStmt({
     required this.projection,
     this.fromTable,
@@ -548,6 +554,7 @@ class SelectStmt extends Statement {
     this.groupingSets,
     this.connectBy,
     this.withFunctions = const [],
+    this.rownumLimit,
   });
 }
 

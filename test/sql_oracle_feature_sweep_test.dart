@@ -579,4 +579,100 @@ void main() {
       await db.close();
     }
   });
+
+  // ---- Round 49 (mega-sweep IV): F202–F208 --------------------------------
+
+  test('F202 MOD(n, 0) returns n', () async {
+    final db = await Database.open(null);
+    try {
+      expect(await scalar(db, 'SELECT MOD(5, 0) FROM dual'), 5);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F203 ROLLUP in a composite GROUP BY', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE g (a NUMBER, b NUMBER)');
+      await db.execute('INSERT INTO g VALUES (1, 10), (1, 20), (2, 30)');
+      expect(
+          await scalar(db,
+              'SELECT COUNT(*) FROM (SELECT a FROM g GROUP BY a, ROLLUP(b))'),
+          5);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test(r'F204 JSON_TABLE array wildcard $[*]', () async {
+    final db = await Database.open(null);
+    try {
+      expect(
+          await scalar(
+              db,
+              'SELECT COUNT(*) FROM (SELECT * FROM JSON_TABLE('
+              "'[{\"a\":1},{\"a\":2}]', '\$[*]' COLUMNS (a NUMBER PATH "
+              "'\$.a')))"),
+          2);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F205 COUNT(*) with WHERE ROWNUM <= n', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE t (id NUMBER)');
+      for (var i = 1; i <= 10; i++) {
+        await db.execute('INSERT INTO t VALUES ($i)');
+      }
+      expect(await scalar(db, 'SELECT COUNT(*) FROM t WHERE ROWNUM <= 3'), 3);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F206 TO_BINARY_FLOAT / TO_BINARY_DOUBLE', () async {
+    final db = await Database.open(null);
+    try {
+      expect(
+          await scalar(
+              db,
+              "SELECT CASE WHEN TO_BINARY_FLOAT('3.14') > 3 THEN 1 ELSE 0 END "
+              'FROM dual'),
+          1);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F207 EXTRACT(TIMEZONE_MINUTE FROM ts)', () async {
+    final db = await Database.open(null);
+    try {
+      expect(
+          await scalar(
+              db,
+              'SELECT EXTRACT(TIMEZONE_MINUTE FROM '
+              "TIMESTAMP '2024-01-01 00:00:00 +05:30') FROM dual"),
+          30);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F208 (expr) DAY TO SECOND interval cast', () async {
+    final db = await Database.open(null);
+    try {
+      expect(
+          await scalar(
+              db,
+              'SELECT EXTRACT(DAY FROM '
+              "(DATE '2024-03-01' - DATE '2024-01-01') DAY TO SECOND) "
+              'FROM dual'),
+          60);
+    } finally {
+      await db.close();
+    }
+  });
 }

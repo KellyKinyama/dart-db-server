@@ -7136,37 +7136,43 @@ class Database implements SequenceProvider {
     // touching the row store.
     //
     // A hierarchical (CONNECT BY) query changes the row multiset, so none of
-    // the table-level fast paths below are valid for it.
+    // the table-level fast paths below are valid for it. A ROWNUM input limit
+    // also disables the aggregate fast paths so the row cap is applied before
+    // the aggregate (see the truncation after WHERE below).
     if (s.connectBy == null) {
       final cov = _tryCoveringScan(s);
       if (cov != null) return cov;
 
-      // Phase 1.2: bare COUNT(*) fast path on in-memory tables. Avoids
-      // hydrating any row map — counts directly from the index posting
-      // lists (when WHERE is index-classifiable) or from t.rows.length
-      // (when there is no WHERE). Falls through to the generic aggregate
-      // path on any shape mismatch.
-      final cnt = _tryCountStarFast(s, outer);
-      if (cnt != null) return cnt;
+      if (s.rownumLimit == null) {
+        // Phase 1.2: bare COUNT(*) fast path on in-memory tables. Avoids
+        // hydrating any row map — counts directly from the index posting
+        // lists (when WHERE is index-classifiable) or from t.rows.length
+        // (when there is no WHERE). Falls through to the generic aggregate
+        // path on any shape mismatch.
+        final cnt = _tryCountStarFast(s, outer);
+        if (cnt != null) return cnt;
 
-      // Phase 1.3: bare MIN(col) / MAX(col) fast path on in-memory tables
-      // backed by a single-column non-partial, non-NOCASE index. Reads
-      // the first / last non-null entry of the SplayTreeMap directly
-      // instead of scanning every row.
-      final mm = _tryMinMaxFast(s);
-      if (mm != null) return mm;
+        // Phase 1.3: bare MIN(col) / MAX(col) fast path on in-memory tables
+        // backed by a single-column non-partial, non-NOCASE index. Reads
+        // the first / last non-null entry of the SplayTreeMap directly
+        // instead of scanning every row.
+        final mm = _tryMinMaxFast(s);
+        if (mm != null) return mm;
 
-      // Phase 2.4: bare aggregate with WHERE on the same indexed column.
-      // Walks only the matching subrange of the index — no row hydration.
-      final agw = _tryAggregateWithWhereFast(s);
-      if (agw != null) return agw;
+        // Phase 2.4: bare aggregate with WHERE on the same indexed column.
+        // Walks only the matching subrange of the index — no row hydration.
+        final agw = _tryAggregateWithWhereFast(s);
+        if (agw != null) return agw;
+      }
     }
 
     // Phase 3.1: `SELECT col, COUNT(*) FROM t GROUP BY col` on a
     // single-column non-NOCASE non-partial index — one row per index
     // key with `posting.length`, in ascending key order.
-    final gbc = _tryGroupByCountFast(s);
-    if (gbc != null) return gbc;
+    if (s.rownumLimit == null) {
+      final gbc = _tryGroupByCountFast(s);
+      if (gbc != null) return gbc;
+    }
 
     // Phase 3.8: `SELECT DISTINCT col1, col2[, ...] FROM t
     // [ORDER BY col1[, col2[, ...]]] [LIMIT/OFFSET]` covered by a
@@ -7201,6 +7207,13 @@ class Database implements SequenceProvider {
       // calling it per row turns an O(N) scan into O(N * depth(expr)).
       final boundWhere = _bindExpr(s.where!, outer);
       working = fromRows.where((r) => evalPredicate(boundWhere, r)).toList();
+    }
+
+    // Oracle ROWNUM input cap (`WHERE ROWNUM <= n`): restrict the input rows
+    // BEFORE aggregation / GROUP BY, so `SELECT COUNT(*) FROM t WHERE ROWNUM <=
+    // n` counts at most n rows (unlike a post-aggregate LIMIT).
+    if (s.rownumLimit != null && working.length > s.rownumLimit!) {
+      working = working.sublist(0, s.rownumLimit!);
     }
 
     // Detect aggregates anywhere in projection or HAVING.
@@ -11803,6 +11816,9 @@ class Database implements SequenceProvider {
       case 'JSON_TREE':
         rows = _jsonEachRows(args, recursive: true);
         break;
+      case 'JSON_TABLE':
+        rows = _jsonTableRows(args, qual);
+        break;
       case 'GENERATE_SERIES':
         rows = _generateSeriesRows(args);
         break;
@@ -13705,6 +13721,57 @@ class Database implements SequenceProvider {
       for (var v = start; v >= stop; v += step) {
         out.add({'value': v});
       }
+    }
+    return out;
+  }
+
+  /// Implementation of Oracle `JSON_TABLE(src, rowPath COLUMNS (…))`. [args] is
+  /// `[src, rowPath, name1, colPath1, name2, colPath2, …]`. Produces one row
+  /// per node selected by [rowPath] (a trailing `[*]` iterates array elements),
+  /// each exposing the declared columns (bare and `qual.col` qualified).
+  List<Map<String, Object?>> _jsonTableRows(List<Object?> args, String qual) {
+    if (args.isEmpty || args[0] == null) return const [];
+    Object? root;
+    try {
+      final src = args[0];
+      final text = src is List<int> ? utf8.decode(src) : src.toString();
+      root = jsonDecode(text);
+    } catch (_) {
+      return const [];
+    }
+    if (root == null) return const [];
+    final rowPath =
+        args.length >= 2 && args[1] != null ? args[1].toString() : r'$';
+    // Column (name, path) pairs follow the first two positional args.
+    final colNames = <String>[];
+    final colPaths = <String>[];
+    for (var i = 2; i + 1 < args.length; i += 2) {
+      colNames.add(args[i].toString());
+      colPaths.add(args[i + 1].toString());
+    }
+    // Resolve the row path. A trailing `[*]` selects each element of the
+    // addressed array; otherwise the path yields a single node.
+    List<Object?> nodes;
+    if (rowPath.endsWith('[*]')) {
+      final prefix = rowPath.substring(0, rowPath.length - 3);
+      final arr = prefix.isEmpty || prefix == r'$'
+          ? root
+          : jsonPathLookup(root, prefix);
+      nodes = arr is List ? List<Object?>.from(arr) : const [];
+    } else {
+      final node = rowPath == r'$' ? root : jsonPathLookup(root, rowPath);
+      nodes = node == null ? const [] : [node];
+    }
+    final out = <Map<String, Object?>>[];
+    for (final node in nodes) {
+      final m = <String, Object?>{};
+      for (var c = 0; c < colNames.length; c++) {
+        final raw = jsonPathLookup(node, colPaths[c]);
+        final v = (raw is List || raw is Map) ? jsonEncode(raw) : raw;
+        m[colNames[c]] = v;
+        m['$qual.${colNames[c]}'] = v;
+      }
+      out.add(m);
     }
     return out;
   }
