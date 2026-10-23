@@ -1235,4 +1235,121 @@ void main() {
       await db.close();
     }
   });
+
+  // ---- Round 64 (datetime / numeric fidelity): F254-F263 ------------------
+
+  test('F254 ADD_MONTHS preserves last-day-of-month (extend up)', () async {
+    final db = await Database.open(null);
+    try {
+      expect(
+          await scalar(db,
+              "SELECT TO_CHAR(ADD_MONTHS(DATE '2021-02-28',1),'YYYY-MM-DD') "
+              'FROM dual'),
+          '2021-03-31');
+    } finally {
+      await db.close();
+    }
+  });
+
+  test("F255 ROUND(date, 'DAY') rounds to nearest week start", () async {
+    final db = await Database.open(null);
+    try {
+      expect(
+          await scalar(db,
+              "SELECT TO_CHAR(ROUND(DATE '2020-05-20','DAY'),'YYYY-MM-DD') "
+              'FROM dual'),
+          '2020-05-17');
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F256 YEAR-MONTH interval multiplied by a scalar', () async {
+    final db = await Database.open(null);
+    try {
+      expect(
+          await scalar(db,
+              "SELECT TO_CHAR(DATE '2020-01-01' + INTERVAL '1' YEAR * 2,"
+              "'YYYY-MM-DD') FROM dual"),
+          '2022-01-01');
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F257 NUMTOYMINTERVAL returns a year-month interval', () async {
+    final db = await Database.open(null);
+    try {
+      expect(
+          await scalar(db,
+              "SELECT TO_CHAR(DATE '2020-01-01' + NUMTOYMINTERVAL(14,'MONTH'),"
+              "'YYYY-MM-DD') FROM dual"),
+          '2021-03-01');
+    } finally {
+      await db.close();
+    }
+  });
+
+  test("F258 TO_DATE with the J (Julian) mask", () async {
+    final db = await Database.open(null);
+    try {
+      expect(
+          await scalar(db,
+              "SELECT TO_CHAR(TO_DATE('2458850','J'),'YYYY-MM-DD') FROM dual"),
+          '2020-01-01');
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F259 LOCALTIMESTAMP is supported', () async {
+    final db = await Database.open(null);
+    try {
+      expect(
+          await scalar(
+              db,
+              'SELECT CASE WHEN LOCALTIMESTAMP IS NOT NULL THEN 1 ELSE 0 END '
+              'FROM dual'),
+          1);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F260 REMAINDER tie-break rounds half-to-even', () async {
+    final db = await Database.open(null);
+    try {
+      expect(await scalar(db, 'SELECT REMAINDER(5,2) FROM dual'), 1);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test("F261 TO_CHAR leading-zero (0) format element", () async {
+    final db = await Database.open(null);
+    try {
+      expect(await scalar(db, "SELECT TO_CHAR(7,'000') FROM dual"), ' 007');
+    } finally {
+      await db.close();
+    }
+  });
+
+  test("F262 TO_CHAR S sign element renders +", () async {
+    final db = await Database.open(null);
+    try {
+      expect(await scalar(db, "SELECT TO_CHAR(123,'S999') FROM dual"), '+123');
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F263 CAST AS NUMBER(p,s) rounds in exact decimal', () async {
+    final db = await Database.open(null);
+    try {
+      expect(
+          await scalar(db, 'SELECT CAST(1.005 AS NUMBER(5,2)) FROM dual'), 1.01);
+    } finally {
+      await db.close();
+    }
+  });
 }

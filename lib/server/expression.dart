@@ -405,6 +405,15 @@ class BinaryExpr extends Expr {
           (r == null ? '' : _stringify(r));
       return out.isEmpty ? null : out;
     }
+    // YEAR-MONTH interval scaled by a number: INTERVAL '1' YEAR * 2 -> +02-00.
+    if ((l is YmInterval || r is YmInterval) && (op == '*' || op == '/')) {
+      final iv = (l is YmInterval ? l : r) as YmInterval;
+      final factor = _toNum(l is YmInterval ? r : l);
+      if (factor == null) return null;
+      final months =
+          op == '*' ? (iv.months * factor).round() : (iv.months / factor).round();
+      return YmInterval(months);
+    }
     if (l == null || r == null) {
       // SQL three-valued logic: comparisons with NULL yield NULL (treated as false).
       return null;
@@ -1032,13 +1041,13 @@ class CastExpr extends Expr {
     if (v == null) return null;
     final result = _convert(v);
     if (result is num && numericScale != null) {
-      final factor = _pow10(numericScale!);
-      final r = numericScale! >= 0
-          ? (result * factor).round() / factor
-          : (result / _pow10(-numericScale!)).round() * _pow10(-numericScale!);
-      return r is double && r == r.truncateToDouble() && numericScale! <= 0
-          ? r.toInt()
-          : r;
+      if (numericScale! >= 0) {
+        // Oracle NUMBER is exact decimal: CAST(1.005 AS NUMBER(5,2)) = 1.01.
+        return _roundHalfUpDecimal(result.toDouble(), numericScale!);
+      }
+      final p = _pow10(-numericScale!);
+      final r = (result / p).round() * p;
+      return r is double && r == r.truncateToDouble() ? r.toInt() : r;
     }
     if (result is String && charLength != null && result.length > charLength!) {
       return result.substring(0, charLength!);
@@ -2203,6 +2212,16 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
             out = DateTime.utc(dt.year, dt.month, dt.day, dt.hour, dt.minute)
                 .add(Duration(minutes: dt.second >= 30 ? 1 : 0));
             break;
+          case 'DAY':
+          case 'DY':
+          case 'D':
+            // Round to the nearest week start (Sunday).
+            final day = DateTime.utc(dt.year, dt.month, dt.day);
+            final sinceSun = day.weekday % 7; // Sun=0 .. Sat=6
+            out = sinceSun <= 3
+                ? day.subtract(Duration(days: sinceSun))
+                : day.add(Duration(days: 7 - sinceSun));
+            break;
           default:
             final day = DateTime.utc(dt.year, dt.month, dt.day);
             out = dt.hour >= 12 ? day.add(const Duration(days: 1)) : day;
@@ -2237,7 +2256,15 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
         final n = _sqlTextToNum(a[0]).toDouble();
         final m = _sqlTextToNum(a[1]).toDouble();
         if (m == 0) return null;
-        final q = (n / m).roundToDouble();
+        // Oracle rounds the quotient half-to-even (banker's rounding).
+        final x = n / m;
+        final fl = x.floorToDouble();
+        final diff = x - fl;
+        final q = diff < 0.5
+            ? fl
+            : diff > 0.5
+                ? fl + 1
+                : (fl % 2 == 0 ? fl : fl + 1);
         final r = n - m * q;
         return r == r.truncateToDouble() ? r.toInt() : r;
       }),
@@ -3201,6 +3228,7 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
   'NOW': (a) => _fmtDateTime(DateTime.now().toUtc(), full: true),
   'SYSDATE': (a) => _fmtDateTime(DateTime.now().toUtc(), full: true),
   'SYSTIMESTAMP': (a) => _fmtDateTime(DateTime.now().toUtc(), full: true),
+  'LOCALTIMESTAMP': (a) => _fmtDateTime(DateTime.now().toUtc(), full: true),
   // Oracle FROM_TZ(ts, tz): tag a naive timestamp with a UTC offset; encoded
   // as "<ts><±HH:MM>" so AT TIME ZONE can read the source offset.
   'FROM_TZ': (a) {
@@ -3370,10 +3398,11 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
   },
   'NUMTOYMINTERVAL': (a) {
     if (a.length < 2 || a[0] == null || a[1] == null) return null;
-    final n = _sqlTextToNum(a[0]).toDouble();
-    const per = {'YEAR': 365.0, 'MONTH': 30.0};
-    final days = n * (per[a[1].toString().toUpperCase()] ?? 30);
-    return days == days.roundToDouble() ? days.toInt() : days;
+    final n = _sqlTextToNum(a[0]).toInt();
+    // A YEAR-TO-MONTH interval (months), so DATE arithmetic adds calendar
+    // months rather than ~30-day approximations.
+    final months = a[1].toString().toUpperCase() == 'YEAR' ? n * 12 : n;
+    return YmInterval(months);
   },
   // TO_DATE(text [, fmt]) parses [text] by the Oracle format model [fmt] (a
   // useful subset) and returns the engine's ISO text date/datetime.
@@ -3448,7 +3477,10 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     final y = total ~/ 12;
     final mo = total % 12 + 1;
     final lastDay = DateTime.utc(y, mo + 1, 0).day;
-    final day = dt.day > lastDay ? lastDay : dt.day;
+    // Oracle: if the input is the last day of its month, the result is the last
+    // day of the target month (clamp down AND extend up).
+    final inputEom = dt.day == DateTime.utc(dt.year, dt.month + 1, 0).day;
+    final day = inputEom || dt.day > lastDay ? lastDay : dt.day;
     final r = DateTime.utc(y, mo, day, dt.hour, dt.minute, dt.second);
     final hasTime = dt.hour != 0 || dt.minute != 0 || dt.second != 0;
     return hasTime ? _fmtDateTime(r) : _fmtDate(r);
@@ -4271,6 +4303,11 @@ DateTime? _parseOracleDate(String text, String? fmt) {
     return _parseDateTime(t) ?? DateTime.tryParse(t);
   }
   final f = fmt.trim().toUpperCase();
+  // Julian day number mask: the whole text is a JDN.
+  if (f == 'J') {
+    final jdn = int.tryParse(t);
+    return jdn == null ? null : _dateFromJulianDayNumber(jdn);
+  }
   // Longest-first so YYYY beats YY, MONTH beats MON, HH24 beats HH.
   const order = [
     'YYYY', 'RRRR', 'YYY', 'MONTH', 'MON', 'HH24', 'HH12', 'DDD', 'YY', 'RR',
@@ -4659,6 +4696,21 @@ int _julianDay(DateTime d) {
       32045;
 }
 
+/// Inverse of [_julianDay]: a Julian day number back to a proleptic-Gregorian
+/// UTC date.
+DateTime _dateFromJulianDayNumber(int jdn) {
+  final a = jdn + 32044;
+  final b = (4 * a + 3) ~/ 146097;
+  final c = a - (146097 * b) ~/ 4;
+  final d = (4 * c + 3) ~/ 1461;
+  final e = c - (1461 * d) ~/ 4;
+  final m = (5 * e + 2) ~/ 153;
+  final day = e - (153 * m + 2) ~/ 5 + 1;
+  final month = m + 3 - 12 * (m ~/ 10);
+  final year = 100 * b + d - 4800 + m ~/ 10;
+  return DateTime.utc(year, month, day);
+}
+
 /// ISO-8601 week number (weeks start Monday; week 1 contains the first
 /// Thursday of the year).
 int _isoWeek(DateTime d) {
@@ -4749,11 +4801,26 @@ String _formatOracleNumber(num n, String fmt,
   // MI: trailing sign for negatives (space for positives).
   final trailingSign = f.toUpperCase().endsWith('MI');
   if (trailingSign) f = f.substring(0, f.length - 2);
+  // S: explicit sign (+/-), leading or trailing.
+  var signElem = false;
+  var signTrailing = false;
+  if (f.toUpperCase().startsWith('S')) {
+    signElem = true;
+    f = f.substring(1);
+  } else if (f.toUpperCase().endsWith('S')) {
+    signElem = true;
+    signTrailing = true;
+    f = f.substring(0, f.length - 1);
+  }
   // G / D are locale group/decimal placeholders for , / .
   f = f.replaceAll(RegExp('G', caseSensitive: false), ',');
   f = f.replaceAll(RegExp('D', caseSensitive: false), '.');
   final grouping = f.contains(',');
   final dotIdx = f.indexOf('.');
+  final intFmt = dotIdx >= 0 ? f.substring(0, dotIdx) : f;
+  // `0` elements zero-pad the integer part to the format's digit width.
+  final zeroPad = intFmt.contains('0');
+  final intWidth = intFmt.replaceAll(RegExp('[^90]'), '').length;
   final decimals = dotIdx >= 0
       ? f.substring(dotIdx + 1).replaceAll(RegExp('[^90]'), '').length
       : 0;
@@ -4762,6 +4829,9 @@ String _formatOracleNumber(num n, String fmt,
   final parts = fixed.split('.');
   var intPart = parts[0];
   final decPart = parts.length > 1 ? parts[1] : '';
+  if (zeroPad && intPart.length < intWidth) {
+    intPart = intPart.padLeft(intWidth, '0');
+  }
   if (grouping) {
     final buf = StringBuffer();
     for (var i = 0; i < intPart.length; i++) {
@@ -4774,6 +4844,9 @@ String _formatOracleNumber(num n, String fmt,
   if (decimals > 0) out = '$out$decimalChar$decPart';
   if (trailingSign) {
     out = neg ? '$out-' : (fm ? out : '$out ');
+  } else if (signElem) {
+    final sign = neg ? '-' : '+';
+    out = signTrailing ? '$out$sign' : '$sign$out';
   } else if (neg) {
     out = '-$out';
   } else if (!fm) {

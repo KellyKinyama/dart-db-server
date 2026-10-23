@@ -5039,6 +5039,7 @@ class Parser {
         'CURRENT_TIME',
         'SYSDATE',
         'SYSTIMESTAMP',
+        'LOCALTIMESTAMP',
         'ROWID',
         'SESSIONTIMEZONE',
         'DBTIMEZONE',
