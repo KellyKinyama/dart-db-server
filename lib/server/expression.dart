@@ -1802,6 +1802,21 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
       }),
   // GROUP_ID distinguishes duplicate rows in GROUPING SETS; 0 here.
   'GROUP_ID': (a) => 0,
+  // LNNVL(condition): TRUE when the condition is FALSE or UNKNOWN (NULL).
+  'LNNVL': (a) {
+    if (a.isEmpty) return true;
+    final v = a[0];
+    final isTrue = v == true || (v is num && v != 0);
+    return !isTrue;
+  },
+  // XMLELEMENT("name", content…): a minimal XML element string.
+  'XMLELEMENT': (a) {
+    if (a.isEmpty) return null;
+    final name = a[0]?.toString() ?? '';
+    final content =
+        a.length > 1 ? a.sublist(1).map((x) => x?.toString() ?? '').join() : '';
+    return '<$name>$content</$name>';
+  },
   // SPACE(n) -- string of n spaces.
   'SPACE': (a) => _propagateNull(a, () {
         final n = (a[0] as num).toInt();
@@ -2139,6 +2154,10 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
             out = DateTime.utc(dt.year, dt.month, 1);
             break;
           case 'IW':
+            // ISO week starts on Monday.
+            final iwDay = DateTime.utc(dt.year, dt.month, dt.day);
+            out = iwDay.subtract(Duration(days: iwDay.weekday - 1));
+            break;
           case 'WW':
           case 'DAY':
           case 'DY':

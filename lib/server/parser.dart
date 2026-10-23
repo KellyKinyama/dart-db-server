@@ -4334,6 +4334,21 @@ class Parser {
       return UnaryExpr('~', _parseUnary());
     }
     var e = _parsePrimary();
+    // Postfix object method calls — `XMLELEMENT(...).getStringVal()`,
+    // `.getClobVal()`, etc. The value is already the underlying text, so the
+    // method call is transparent (consumed and ignored).
+    while (_check(TokType.punct, '.') &&
+        _peek(1).type == TokType.ident &&
+        _peek(2).type == TokType.punct &&
+        _peek(2).text == '(') {
+      _advance(); // .
+      _advance(); // method name
+      _expect(TokType.punct, '(');
+      while (!_check(TokType.punct, ')') && !_isAtEnd()) {
+        _advance();
+      }
+      _expect(TokType.punct, ')');
+    }
     // Postfix `COLLATE <name>` binds tightly to its operand.
     while (_matchKw('COLLATE')) {
       e = CollateExpr(e, _expectName().toUpperCase());
@@ -4424,7 +4439,32 @@ class Parser {
         'MINUTE': 1 / 1440,
         'SECOND': 1 / 86400,
       };
-      final days = sign * lead * (daysPerUnit[unit] ?? 1);
+      // Compute the interval magnitude in days. A compound literal carries its
+      // own fields: 'D HH:MI:SS[.ff]' (day-to-second) or 'Y-M' (year-to-month).
+      double magnitude;
+      final body = raw.trim();
+      if (body.contains(':')) {
+        var dayPart = 0;
+        var timePart = body;
+        if (body.contains(' ')) {
+          final sp = body.split(RegExp(r'\s+'));
+          dayPart = int.tryParse(sp[0]) ?? 0;
+          timePart = sp[1];
+        }
+        final tp = timePart.split(':');
+        final h = tp.isNotEmpty ? (int.tryParse(tp[0]) ?? 0) : 0;
+        final mi = tp.length > 1 ? (int.tryParse(tp[1]) ?? 0) : 0;
+        final s = tp.length > 2 ? (double.tryParse(tp[2]) ?? 0) : 0;
+        magnitude = dayPart + h / 24 + mi / 1440 + s / 86400;
+      } else if (body.contains('-')) {
+        final ym = body.split('-');
+        final y = int.tryParse(ym[0]) ?? 0;
+        final mo = ym.length > 1 ? (int.tryParse(ym[1]) ?? 0) : 0;
+        magnitude = y * 365 + mo * 30;
+      } else {
+        magnitude = lead * (daysPerUnit[unit] ?? 1);
+      }
+      final days = sign * magnitude;
       return LiteralExpr(days == days.roundToDouble() ? days.toInt() : days);
     }
     if (t.type == TokType.param) {
@@ -4702,6 +4742,15 @@ class Parser {
               _peek().type == TokType.ident)) {
         final actionTok = _advance();
         args.add(LiteralExpr(actionTok.text.toUpperCase()));
+        while (_match(TokType.punct, ',')) {
+          args.add(_parseExpr());
+        }
+      } else if (upper == 'XMLELEMENT') {
+        // XMLELEMENT([NAME] ename, content…): the element name is an
+        // identifier/string treated as a literal.
+        _matchWord('NAME');
+        args.add(LiteralExpr(
+            _check(TokType.string) ? _advance().text : _expectName()));
         while (_match(TokType.punct, ',')) {
           args.add(_parseExpr());
         }

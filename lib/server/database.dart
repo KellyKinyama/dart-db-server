@@ -7076,28 +7076,33 @@ class Database implements SequenceProvider {
     // shape `SELECT [DISTINCT] <indexed_col> FROM <table> [ORDER BY ... ]
     // [LIMIT ...]`, we can answer entirely from the index without
     // touching the row store.
-    final cov = _tryCoveringScan(s);
-    if (cov != null) return cov;
+    //
+    // A hierarchical (CONNECT BY) query changes the row multiset, so none of
+    // the table-level fast paths below are valid for it.
+    if (s.connectBy == null) {
+      final cov = _tryCoveringScan(s);
+      if (cov != null) return cov;
 
-    // Phase 1.2: bare COUNT(*) fast path on in-memory tables. Avoids
-    // hydrating any row map — counts directly from the index posting
-    // lists (when WHERE is index-classifiable) or from t.rows.length
-    // (when there is no WHERE). Falls through to the generic aggregate
-    // path on any shape mismatch.
-    final cnt = _tryCountStarFast(s, outer);
-    if (cnt != null) return cnt;
+      // Phase 1.2: bare COUNT(*) fast path on in-memory tables. Avoids
+      // hydrating any row map — counts directly from the index posting
+      // lists (when WHERE is index-classifiable) or from t.rows.length
+      // (when there is no WHERE). Falls through to the generic aggregate
+      // path on any shape mismatch.
+      final cnt = _tryCountStarFast(s, outer);
+      if (cnt != null) return cnt;
 
-    // Phase 1.3: bare MIN(col) / MAX(col) fast path on in-memory tables
-    // backed by a single-column non-partial, non-NOCASE index. Reads
-    // the first / last non-null entry of the SplayTreeMap directly
-    // instead of scanning every row.
-    final mm = _tryMinMaxFast(s);
-    if (mm != null) return mm;
+      // Phase 1.3: bare MIN(col) / MAX(col) fast path on in-memory tables
+      // backed by a single-column non-partial, non-NOCASE index. Reads
+      // the first / last non-null entry of the SplayTreeMap directly
+      // instead of scanning every row.
+      final mm = _tryMinMaxFast(s);
+      if (mm != null) return mm;
 
-    // Phase 2.4: bare aggregate with WHERE on the same indexed column.
-    // Walks only the matching subrange of the index — no row hydration.
-    final agw = _tryAggregateWithWhereFast(s);
-    if (agw != null) return agw;
+      // Phase 2.4: bare aggregate with WHERE on the same indexed column.
+      // Walks only the matching subrange of the index — no row hydration.
+      final agw = _tryAggregateWithWhereFast(s);
+      if (agw != null) return agw;
+    }
 
     // Phase 3.1: `SELECT col, COUNT(*) FROM t GROUP BY col` on a
     // single-column non-NOCASE non-partial index — one row per index
@@ -7356,6 +7361,7 @@ class Database implements SequenceProvider {
     if (s.fromTable == null) return null;
     if (s.joins.isNotEmpty) return null;
     if (s.fromSubquery != null || s.fromFunction != null) return null;
+    if (s.connectBy != null) return null; // hierarchical walk changes the count
     if (s.groupBy.isNotEmpty || s.having != null) return null;
     if (s.orderBy.isNotEmpty) return null;
     if (s.setOp != null) return null;
@@ -10847,9 +10853,14 @@ class Database implements SequenceProvider {
       for (final cand in base) {
         final scope = <String, Object?>{...cand};
         node.forEach((k, v) => scope['PRIOR.$k'] = v);
+        // LEVEL of the candidate child, so `CONNECT BY ... AND LEVEL <= n`
+        // limits the walk.
+        scope['LEVEL'] = level + 1;
         if (evalPredicate(connectBy, scope)) children.add(cand);
       }
       // Drop children already on the current path (cycle guard).
+      final isCycle =
+          children.any((c) => pathIds.contains(identityHashCode(c))) ? 1 : 0;
       final next = sortSiblings(children)
           .where((c) => !pathIds.contains(identityHashCode(c)))
           .toList();
@@ -10858,6 +10869,7 @@ class Database implements SequenceProvider {
         ...node,
         'LEVEL': level,
         'CONNECT_BY_ISLEAF': next.isEmpty ? 1 : 0,
+        'CONNECT_BY_ISCYCLE': isCycle,
         '__CBP': chain, // ancestor chain for SYS_CONNECT_BY_PATH
       });
       for (final c in next) {
@@ -14379,9 +14391,11 @@ class Database implements SequenceProvider {
         for (final (ex, ob) in bound) {
           final av = ex.eval(a);
           final bv = ex.eval(b);
+          // Oracle default null ordering: NULLS LAST for ASC, FIRST for DESC.
+          final nullsFirst = ob.nullsFirst ?? ob.descending;
           if (av == null && bv == null) continue;
-          if (av == null) return ob.descending ? 1 : -1;
-          if (bv == null) return ob.descending ? -1 : 1;
+          if (av == null) return nullsFirst ? -1 : 1;
+          if (bv == null) return nullsFirst ? 1 : -1;
           final c = sqlCompare(av, bv);
           if (c != 0) return ob.descending ? -c : c;
         }

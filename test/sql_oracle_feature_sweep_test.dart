@@ -192,4 +192,77 @@ void main() {
       await db.close();
     }
   });
+
+  test('EXTRACT from an INTERVAL literal', () async {
+    final db = await Database.open(null);
+    try {
+      expect(
+          await scalar(db,
+              "SELECT EXTRACT(HOUR FROM INTERVAL '2 03:04:05' DAY TO SECOND)"),
+          3);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('TRUNC(date, IW) starts the ISO week on Monday', () async {
+    final db = await Database.open(null);
+    try {
+      expect(
+          await scalar(db,
+              "SELECT TO_CHAR(TRUNC(DATE '2024-07-20','IW'),'YYYY-MM-DD')"),
+          '2024-07-15');
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('LEVEL and CONNECT_BY_ISCYCLE in a hierarchy', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE emp (id NUMBER, mgr NUMBER)');
+      await db.execute('INSERT INTO emp VALUES (1, NULL), (2, 1), (3, 2)');
+      expect(
+          await scalar(db,
+              'SELECT COUNT(*) FROM emp START WITH mgr IS NULL '
+              'CONNECT BY PRIOR id = mgr AND LEVEL <= 2'),
+          2);
+      expect(
+          await scalar(db,
+              'SELECT MAX(CONNECT_BY_ISCYCLE) FROM emp START WITH mgr IS NULL '
+              'CONNECT BY NOCYCLE PRIOR id = mgr'),
+          0);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('KEEP (DENSE_RANK FIRST) sorts NULLs last for ASC', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE k (g NUMBER, v NUMBER)');
+      await db.execute('INSERT INTO k VALUES (NULL, 99), (1, 10), (1, 30)');
+      expect(
+          await scalar(
+              db, 'SELECT MAX(v) KEEP (DENSE_RANK FIRST ORDER BY g) FROM k'),
+          30);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('XMLELEMENT with .getStringVal() and LNNVL', () async {
+    final db = await Database.open(null);
+    try {
+      expect(
+          await scalar(db, "SELECT XMLELEMENT(\"e\", 'hi').getStringVal()"),
+          '<e>hi</e>');
+      expect(
+          await scalar(
+              db, "SELECT CASE WHEN LNNVL(1=2) THEN 'y' ELSE 'n' END"),
+          'y');
+    } finally {
+      await db.close();
+    }
+  });
 }
