@@ -4163,6 +4163,31 @@ class Parser {
     while (_check(TokType.op) &&
         const {'=', '!=', '<>', '<', '<=', '>', '>='}.contains(_peek().text)) {
       final op = _advance().text;
+      // Quantified comparison `op {ALL|ANY|SOME} (subquery)`: rewrite an
+      // ordering comparison to a MAX/MIN scalar subquery.
+      if (const {'<', '<=', '>', '>='}.contains(op) &&
+          (_checkWord('ALL') || _checkWord('ANY') || _checkWord('SOME')) &&
+          _peek(1).type == TokType.punct &&
+          _peek(1).text == '(') {
+        final quant = _advance().text.toUpperCase();
+        _expect(TokType.punct, '(');
+        final sub = _parseSelect();
+        _expect(TokType.punct, ')');
+        final gt = op == '>' || op == '>=';
+        final all = quant == 'ALL';
+        final aggName = all ? (gt ? 'MAX' : 'MIN') : (gt ? 'MIN' : 'MAX');
+        final first = sub.projection.first;
+        final label = first.alias ??
+            (first.expr is ColumnExpr ? (first.expr as ColumnExpr).name : 'c');
+        final aggSel = SelectStmt(
+          projection: [
+            SelectItem.expr(FunctionCallExpr(aggName, [ColumnExpr(label)]))
+          ],
+          fromSubquery: sub,
+        );
+        left = BinaryExpr(op, left, SubquerySelectExpr(aggSel));
+        continue;
+      }
       left = BinaryExpr(op, left, _parseConcat());
     }
     return left;
@@ -4607,6 +4632,14 @@ class Parser {
           args.add(_parseExpr());
         }
       }
+    }
+    // Oracle LISTAGG overflow clause: `ON OVERFLOW {TRUNCATE ['txt'] | ERROR}
+    // [WITH|WITHOUT COUNT]`. Consumed (overflow truncation is not modelled).
+    if (_matchWord('ON')) {
+      _expectWord('OVERFLOW');
+      if (!_matchWord('TRUNCATE')) _matchWord('ERROR');
+      if (_check(TokType.string)) _advance();
+      if (_matchWord('WITH') || _matchWord('WITHOUT')) _matchWord('COUNT');
     }
     // Oracle `IGNORE NULLS` / `RESPECT NULLS` modifier (FIRST_VALUE,
     // LAST_VALUE, LAG, LEAD, NTH_VALUE).

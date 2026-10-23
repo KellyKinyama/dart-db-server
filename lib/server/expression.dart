@@ -1980,10 +1980,58 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
   'TRUNC': (a) {
     if (a.isEmpty || a[0] == null) return null;
     final v0 = a[0];
-    // TRUNC(date[, fmt]) truncates a date to the start of day (fmt ignored).
+    // TRUNC(date[, fmt]) truncates a date to the unit implied by [fmt]
+    // (default: start of day).
     if (v0 is String && RegExp(r'^\d{4}-\d{2}-\d{2}').hasMatch(v0.trim())) {
       final dt = _parseDateTime(v0);
-      if (dt != null) return _fmtDate(DateTime.utc(dt.year, dt.month, dt.day));
+      if (dt != null) {
+        final fmt = a.length > 1 && a[1] != null
+            ? a[1].toString().toUpperCase()
+            : 'DD';
+        DateTime out;
+        switch (fmt) {
+          case 'YYYY':
+          case 'YYY':
+          case 'YY':
+          case 'Y':
+          case 'YEAR':
+          case 'SYYYY':
+          case 'SYEAR':
+          case 'CC':
+          case 'SCC':
+            out = DateTime.utc(dt.year, 1, 1);
+            break;
+          case 'Q':
+            out = DateTime.utc(dt.year, ((dt.month - 1) ~/ 3) * 3 + 1, 1);
+            break;
+          case 'MM':
+          case 'MON':
+          case 'MONTH':
+          case 'RM':
+            out = DateTime.utc(dt.year, dt.month, 1);
+            break;
+          case 'IW':
+          case 'WW':
+          case 'DAY':
+          case 'DY':
+          case 'D':
+            final day = DateTime.utc(dt.year, dt.month, dt.day);
+            out = day.subtract(Duration(days: day.weekday % 7)); // week start Sun
+            break;
+          case 'HH':
+          case 'HH12':
+          case 'HH24':
+            out = DateTime.utc(dt.year, dt.month, dt.day, dt.hour);
+            break;
+          case 'MI':
+            out = DateTime.utc(dt.year, dt.month, dt.day, dt.hour, dt.minute);
+            break;
+          default:
+            out = DateTime.utc(dt.year, dt.month, dt.day);
+        }
+        final hasTime = out.hour != 0 || out.minute != 0 || out.second != 0;
+        return hasTime ? _fmtDateTime(out) : _fmtDate(out);
+      }
     }
     final n = _sqlTextToNum(v0).toDouble();
     final places = a.length > 1 && a[1] != null ? _sqlTextToNum(a[1]).toInt() : 0;
@@ -2453,6 +2501,30 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     return jsonEncode(out);
   },
   'JSON_ARRAY': (a) => jsonEncode(a.map(_jsonValueOf).toList()),
+  // Oracle JSON_VALUE(json, path): the scalar at [path] (NULL for object/array
+  // results, matching Oracle). JSON_QUERY returns the object/array fragment.
+  'JSON_VALUE': (a) {
+    if (a.length < 2 || a[0] == null || a[1] == null) return null;
+    Object? root;
+    try {
+      root = jsonDecode(a[0].toString());
+    } catch (_) {
+      return null;
+    }
+    final v = jsonPathLookup(root, a[1].toString());
+    return (v is List || v is Map) ? null : v;
+  },
+  'JSON_QUERY': (a) {
+    if (a.length < 2 || a[0] == null || a[1] == null) return null;
+    Object? root;
+    try {
+      root = jsonDecode(a[0].toString());
+    } catch (_) {
+      return null;
+    }
+    final v = jsonPathLookup(root, a[1].toString());
+    return (v is List || v is Map) ? jsonEncode(v) : null;
+  },
   'JSON_OBJECT': (a) {
     if (a.length.isOdd) {
       throw StateError('json_object requires an even number of arguments');
@@ -2718,6 +2790,17 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     return bytes
         .map((b) => b.toRadixString(16).padLeft(2, '0').toUpperCase())
         .join();
+  },
+  // Oracle UTL_RAW package: byte/RAW conversions.
+  'UTL_RAW.CAST_TO_RAW': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final v = a[0];
+    return v is List<int> ? v : utf8.encode(v.toString());
+  },
+  'UTL_RAW.CAST_TO_VARCHAR2': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final v = a[0];
+    return v is List<int> ? utf8.decode(v, allowMalformed: true) : v.toString();
   },
   // Oracle interval constructors, modelled as a day count so they compose with
   // DATE arithmetic (DATE + NUMTODSINTERVAL(5,'DAY')).
