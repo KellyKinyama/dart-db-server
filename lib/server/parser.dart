@@ -580,9 +580,13 @@ class Parser {
     final measure = _parseExpr();
     final aggName =
         measure is FunctionCallExpr ? measure.name.toUpperCase() : 'MAX';
-    final measureArg = measure is FunctionCallExpr && measure.args.isNotEmpty
-        ? measure.args.first
-        : measure;
+    // COUNT(*) has no measure column; the per-value CASE yields a constant 1 so
+    // COUNT counts the matching rows (not a nested COUNT(COUNT(*))).
+    final measureArg = measure is FunctionCallExpr && measure.isStarArg
+        ? LiteralExpr(1)
+        : measure is FunctionCallExpr && measure.args.isNotEmpty
+            ? measure.args.first
+            : measure;
     if (_matchKw('AS')) {
       _expectName();
     } else if (_check(TokType.ident) && !_checkWord('FOR')) {

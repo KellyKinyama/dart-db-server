@@ -6985,6 +6985,37 @@ class Database implements SequenceProvider {
     }
 
     final allKeyStrings = allKeys.map(key).toSet();
+    // Rewrite GROUPING(expr) / GROUPING_ID(...) calls in a HAVING predicate to
+    // the literal flag for the current grouping set, so HAVING can filter
+    // ROLLUP/CUBE superaggregate rows (the default scalar always returns 0).
+    Expr rewriteGrouping(Expr e, Set<String> setKeys) {
+      if (e is FunctionCallExpr) {
+        final nm = e.name.toUpperCase();
+        if (nm == 'GROUPING' && e.args.length == 1) {
+          final ak = key(e.args.first);
+          final rolled = allKeyStrings.contains(ak) && !setKeys.contains(ak);
+          return LiteralExpr(rolled ? 1 : 0);
+        }
+        if (nm == 'GROUPING_ID' && e.args.isNotEmpty) {
+          var bits = 0;
+          for (final arg in e.args) {
+            final ak = key(arg);
+            final rolled = allKeyStrings.contains(ak) && !setKeys.contains(ak);
+            bits = (bits << 1) | (rolled ? 1 : 0);
+          }
+          return LiteralExpr(bits);
+        }
+        return e;
+      }
+      if (e is BinaryExpr) {
+        return BinaryExpr(e.op, rewriteGrouping(e.left, setKeys),
+            rewriteGrouping(e.right, setKeys));
+      }
+      if (e is UnaryExpr) {
+        return UnaryExpr(e.op, rewriteGrouping(e.operand, setKeys));
+      }
+      return e;
+    }
     // ORDER BY on a grouping column that isn't projected (allowed under plain
     // GROUP BY): project it as a hidden trailing sort column, then trim it.
     final projectedKeys = {
@@ -7011,6 +7042,9 @@ class Database implements SequenceProvider {
     List<String>? cols;
     for (final set in s.groupingSets!) {
       final setKeyStrings = set.map(key).toSet();
+      final perSetHaving = s.having == null
+          ? null
+          : rewriteGrouping(s.having!, setKeyStrings);
       // Build a copy with this set's GROUP BY active and groupingSets
       // cleared so we hit the normal aggregation path.
       final perSet = SelectStmt(
@@ -7021,7 +7055,7 @@ class Database implements SequenceProvider {
         joins: s.joins,
         where: s.where,
         groupBy: List<Expr>.from(set),
-        having: s.having,
+        having: perSetHaving,
         orderBy: const [],
         limit: null,
         offset: null,
@@ -7091,6 +7125,14 @@ class Database implements SequenceProvider {
       // projection has no aggregate to collapse it, keep just one row.
       final setRows =
           set.isEmpty && res.rows.length > 1 ? res.rows.take(1) : res.rows;
+      // An empty grouping set with a non-aggregate HAVING (e.g. filtering by
+      // GROUPING(g)) isn't run through the aggregate HAVING path, so apply the
+      // rewritten predicate to the grand-total row here.
+      final postFilterHaving = set.isEmpty &&
+              perSetHaving != null &&
+              !_containsAggregate(perSetHaving)
+          ? _bindExpr(perSetHaving)
+          : null;
       for (final row in setRows) {
         final r = List<Object?>.from(row);
         for (final i in blank) {
@@ -7102,6 +7144,13 @@ class Database implements SequenceProvider {
         groupingIdVals.forEach((i, bits) {
           r[i] = bits;
         });
+        if (postFilterHaving != null) {
+          final rowMap = <String, Object?>{
+            for (var ci = 0; ci < (cols?.length ?? 0) && ci < r.length; ci++)
+              cols![ci]: r[ci],
+          };
+          if (!evalPredicate(postFilterHaving, rowMap)) continue;
+        }
         unionRows.add(r);
       }
     }
@@ -15500,9 +15549,12 @@ class Database implements SequenceProvider {
             final offset = fn.args.length >= 2
                 ? (fn.args[1].eval(const {}) as num).toInt()
                 : 1;
-            final defaultVal =
-                fn.args.length >= 3 ? fn.args[2].eval(const {}) : null;
             for (var k = 0; k < ordered.length; k++) {
+              // The default (3rd) argument is evaluated against the current
+              // row, so a column reference (e.g. LAG(v,1,v)) resolves.
+              final defaultVal = fn.args.length >= 3
+                  ? fn.args[2].eval(rows[ordered[k]])
+                  : null;
               if (fn.ignoreNulls && fn.args.isNotEmpty) {
                 // Step over NULL-valued rows when counting the offset.
                 var remaining = offset;

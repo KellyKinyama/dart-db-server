@@ -369,6 +369,13 @@ class BinaryExpr extends Expr {
     if (l is List && r is List) {
       return _rowValueCompare(op, l, r);
     }
+    // Oracle concatenation treats a NULL operand as the empty string (and an
+    // all-empty result collapses back to NULL, since '' IS NULL in Oracle).
+    if (op == '||') {
+      final out = (l == null ? '' : _stringify(l)) +
+          (r == null ? '' : _stringify(r));
+      return out.isEmpty ? null : out;
+    }
     if (l == null || r == null) {
       // SQL three-valued logic: comparisons with NULL yield NULL (treated as false).
       return null;
@@ -376,7 +383,15 @@ class BinaryExpr extends Expr {
     // NOCASE collation on either operand makes string (in)equality and ordering
     // case-insensitive; RTRIM ignores trailing spaces.
     final nocase = _isNoCase(left) || _isNoCase(right);
-    final rtrim = _isRtrim(left) || _isRtrim(right);
+    // Oracle blank-padded comparison: a character literal is a CHAR, so a
+    // comparison against one ignores trailing blanks (e.g. CHAR(5) 'ab   '
+    // = 'ab'). Applies to the comparison operators only.
+    const cmpOps = {'=', '<>', '!=', '<', '>', '<=', '>='};
+    final charPad = cmpOps.contains(op) &&
+        (_isCharLiteral(left) || _isCharLiteral(right)) &&
+        l is String &&
+        r is String;
+    final rtrim = _isRtrim(left) || _isRtrim(right) || charPad;
     final lc = rtrim ? applyCollation(l, 'RTRIM') ?? l : l;
     final rc = rtrim ? applyCollation(r, 'RTRIM') ?? r : r;
     switch (op) {
@@ -487,6 +502,9 @@ class BinaryExpr extends Expr {
 
   static bool _isNoCase(Expr e) => e is CollateExpr && e.collation == 'NOCASE';
   static bool _isRtrim(Expr e) => e is CollateExpr && e.collation == 'RTRIM';
+  // A character literal is a CHAR in Oracle, so comparisons against it are
+  // blank-padded.
+  static bool _isCharLiteral(Expr e) => e is LiteralExpr && e.value is String;
   static bool _eqCI(Object a, Object b) =>
       (a is String && b is String) ? a.toLowerCase() == b.toLowerCase() : _eq(a, b);
   static int _cmpCI(Object a, Object b) => (a is String && b is String)
@@ -3380,13 +3398,13 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     // A numeric operand is a day-to-second INTERVAL (e.g. TIMESTAMP - TIMESTAMP
     // yields a day count). Extract its day/hour/minute/second components.
     if (a[1] is num) {
-      final totalDays = (a[1] as num).toDouble();
-      final days = totalDays.truncate();
-      final hoursF = (totalDays - days) * 24;
-      final hours = hoursF.truncate();
-      final minsF = (hoursF - hours) * 60;
-      final mins = minsF.truncate();
-      final secs = ((minsF - mins) * 60).round();
+      // Work in whole seconds to avoid binary-fraction drift (e.g. 1.0833…
+      // days * 24 = 1.9999… truncating to 1 instead of 2 hours).
+      final totalSecs = ((a[1] as num).toDouble() * 86400).round();
+      final days = totalSecs ~/ 86400;
+      final hours = (totalSecs % 86400) ~/ 3600;
+      final mins = (totalSecs % 3600) ~/ 60;
+      final secs = totalSecs % 60;
       switch (field) {
         case 'DAY':
           return days;

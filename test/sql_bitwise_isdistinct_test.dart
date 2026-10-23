@@ -75,11 +75,11 @@ void main() {
   });
 
   group('|| concatenation NULL semantics', () {
-    test("'a' || NULL returns NULL", () async {
+    test("'a' || NULL treats NULL as empty (Oracle)", () async {
       final db = await Database.open();
       try {
         final r = await db.execute("SELECT 'a' || NULL, NULL || 'b'");
-        expect(r.rows.first, [null, null]);
+        expect(r.rows.first, ['a', 'b']);
       } finally {
         await db.close();
       }

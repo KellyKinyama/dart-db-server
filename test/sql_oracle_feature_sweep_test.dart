@@ -800,4 +800,92 @@ void main() {
       await db.close();
     }
   });
+
+  // ---- Round 53/54 (complex queries, data-type fidelity): F218–F223 -------
+
+  test('F218 LAG/LEAD with a column default argument', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE t (v NUMBER)');
+      await db.execute('INSERT INTO t VALUES (10), (30)');
+      expect(
+          await scalar(
+              db,
+              'SELECT LAG(v, 1, v) OVER (ORDER BY v) FROM t '
+              'FETCH FIRST 1 ROW ONLY'),
+          10);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F219 GROUPING() marks ROLLUP superaggregate rows', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE t (g NUMBER)');
+      await db.execute('INSERT INTO t VALUES (1), (1), (2)');
+      expect(
+          await scalar(
+              db,
+              'SELECT COUNT(*) FROM (SELECT g FROM t GROUP BY ROLLUP(g) '
+              'HAVING GROUPING(g) = 0)'),
+          2);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F220 PIVOT row count', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE t (g NUMBER, v NUMBER)');
+      await db.execute('INSERT INTO t VALUES (1, 10), (1, 30), (2, 50)');
+      expect(
+          await scalar(
+              db,
+              'SELECT COUNT(*) FROM (SELECT * FROM (SELECT g, v FROM t) '
+              'PIVOT (COUNT(*) FOR g IN (1, 2)))'),
+          3);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F221 CHAR blank-padded comparison', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE c (x CHAR(5))');
+      await db.execute("INSERT INTO c VALUES ('ab')");
+      expect(
+          await scalar(
+              db, "SELECT CASE WHEN x = 'ab' THEN 1 ELSE 0 END FROM c"),
+          1);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F222 concatenation treats NULL as empty string', () async {
+    final db = await Database.open(null);
+    try {
+      expect(
+          await scalar(
+              db, "SELECT 'x' || CAST(NULL AS VARCHAR2(5)) || 'y' FROM dual"),
+          'xy');
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('F223 EXTRACT field from an INTERVAL column', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE i (v INTERVAL DAY TO SECOND)');
+      await db.execute(
+          "INSERT INTO i VALUES (INTERVAL '1 02:00:00' DAY TO SECOND)");
+      expect(await scalar(db, 'SELECT EXTRACT(HOUR FROM v) FROM i'), 2);
+    } finally {
+      await db.close();
+    }
+  });
 }
