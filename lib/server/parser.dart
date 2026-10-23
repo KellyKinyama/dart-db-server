@@ -4743,6 +4743,33 @@ class Parser {
       if (_check(TokType.string)) _advance();
       if (_matchWord('WITH') || _matchWord('WITHOUT')) _matchWord('COUNT');
     }
+    // Oracle JSON_VALUE/JSON_QUERY `RETURNING <type>` and ON ERROR/EMPTY
+    // clauses. Consumed (the value is returned as parsed).
+    if (_matchWord('RETURNING')) {
+      _advance(); // return type word
+      if (_check(TokType.punct, '(')) {
+        var depth = 0;
+        do {
+          final tk = _advance();
+          if (tk.type == TokType.punct && tk.text == '(') depth++;
+          if (tk.type == TokType.punct && tk.text == ')') depth--;
+        } while (depth > 0 && !_isAtEnd());
+      }
+    }
+    while (_checkWord('ERROR') ||
+        _checkWord('NULL') ||
+        _checkWord('DEFAULT') ||
+        _checkWord('EMPTY') ||
+        _checkWord('TRUE') ||
+        _checkWord('FALSE') ||
+        (_checkWord('ON') &&
+            (_peek(1).upper == 'ERROR' || _peek(1).upper == 'EMPTY'))) {
+      if (_matchWord('DEFAULT')) {
+        _parseExpr();
+      } else {
+        _advance();
+      }
+    }
     // Oracle `IGNORE NULLS` / `RESPECT NULLS` modifier (FIRST_VALUE,
     // LAST_VALUE, LAG, LEAD, NTH_VALUE).
     bool ignoreNulls = false;

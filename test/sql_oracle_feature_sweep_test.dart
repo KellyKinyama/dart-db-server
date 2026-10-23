@@ -69,4 +69,54 @@ void main() {
       await db.close();
     }
   });
+
+  test('TO_CHAR(date) week / Julian / day-of-year elements', () async {
+    final db = await Database.open(null);
+    try {
+      expect(await scalar(db, "SELECT TO_CHAR(DATE '2024-07-20','WW')"), '29');
+      expect(await scalar(db, "SELECT TO_CHAR(DATE '2024-07-20','J')"),
+          '2460512');
+      expect(await scalar(db, "SELECT TO_CHAR(DATE '2024-01-01','DDD')"), '001');
+      expect(await scalar(db, "SELECT TO_CHAR(DATE '2024-07-20','DDD')"), '202');
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('JSON_EXISTS predicate', () async {
+    final db = await Database.open(null);
+    try {
+      expect(
+          await scalar(db, "SELECT CASE WHEN JSON_EXISTS('{\"a\":1}', '\$.a') "
+              'THEN 1 ELSE 0 END'),
+          1);
+      expect(
+          await scalar(db, "SELECT CASE WHEN JSON_EXISTS('{\"a\":1}', '\$.b') "
+              'THEN 1 ELSE 0 END'),
+          0);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('JSON_VALUE with a RETURNING clause', () async {
+    final db = await Database.open(null);
+    try {
+      expect(
+          await scalar(
+              db, "SELECT JSON_VALUE('{\"n\":12.5}', '\$.n' RETURNING NUMBER)"),
+          12.5);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('VSIZE reports the internal storage size', () async {
+    final db = await Database.open(null);
+    try {
+      expect(await scalar(db, 'SELECT VSIZE(123)'), 3);
+    } finally {
+      await db.close();
+    }
+  });
 }

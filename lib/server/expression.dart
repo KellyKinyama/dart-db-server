@@ -2601,6 +2601,35 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     final v = jsonPathLookup(root, a[1].toString());
     return (v is List || v is Map) ? jsonEncode(v) : null;
   },
+  // Oracle JSON_EXISTS(json, path): true when the path matches a value.
+  'JSON_EXISTS': (a) {
+    if (a.length < 2 || a[0] == null || a[1] == null) return false;
+    final root = _decodeJsonSource(a[0]);
+    if (root == null) return false;
+    return jsonPathLookup(root, a[1].toString()) != null;
+  },
+  // Oracle VSIZE / DUMP datatype-introspection. VSIZE returns the internal
+  // storage size in bytes (NUMBER ≈ 1 + ceil(significant digits / 2)).
+  'VSIZE': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final v = a[0];
+    if (v is List<int>) return v.length;
+    if (v is num) {
+      final digits = v
+          .toString()
+          .replaceAll(RegExp(r'[-.]'), '')
+          .replaceAll(RegExp(r'^0+(?=\d)|0+$'), '');
+      final d = digits.isEmpty ? 1 : digits.length;
+      return 1 + ((d + 1) ~/ 2);
+    }
+    return utf8.encode(v.toString()).length;
+  },
+  'DUMP': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final v = a[0];
+    final bytes = v is List<int> ? v : utf8.encode(v.toString());
+    return 'Len=${bytes.length}: ${bytes.join(',')}';
+  },
   'JSON_OBJECT': (a) {
     if (a.length.isOdd) {
       throw StateError('json_object requires an even number of arguments');
@@ -3875,7 +3904,8 @@ String _applyNameCase(String value, String token) {
 }
 
 bool _looksLikeDateFormat(String fmt) =>
-    RegExp(r'Y{2,4}|MON|MM|DD|DAY|DY|HH|MI|SS|FF|\bQ\b', caseSensitive: false)
+    RegExp(r'Y{2,4}|MON|MM|DD|DAY|DY|HH|MI|SS|FF|WW|IW|\bQ\b|\bJ\b',
+            caseSensitive: false)
         .hasMatch(fmt);
 
 bool _looksLikeNumberFormat(String fmt) =>
@@ -3886,10 +3916,10 @@ bool _looksLikeNumberFormat(String fmt) =>
 /// Formats [d] by an Oracle date format model [fmt] (a common subset). Honours
 /// token case for alphabetic names (MON -> JUN, Mon -> Jun, mon -> jun).
 String _formatOracleDate(DateTime d, String fmt) {
-  // Longest tokens first so e.g. MONTH wins over MON over MM.
+  // Longest tokens first so e.g. MONTH wins over MON over MM, DDD over DD.
   const tokens = [
-    'YYYY', 'MONTH', 'HH24', 'HH12', 'MON', 'DAY', 'YY', 'MM', 'DD', 'DY',
-    'HH', 'MI', 'SS', 'AM', 'PM', 'Q', 'D',
+    'YYYY', 'MONTH', 'HH24', 'HH12', 'DDD', 'MON', 'DAY', 'YY', 'MM', 'DD',
+    'DY', 'HH', 'MI', 'WW', 'IW', 'SS', 'AM', 'PM', 'Q', 'J', 'D',
   ];
   final sb = StringBuffer();
   var i = 0;
@@ -3968,6 +3998,26 @@ String _formatOracleDate(DateTime d, String fmt) {
       case 'Q':
         sb.write(((d.month - 1) ~/ 3 + 1).toString());
         break;
+      case 'DDD':
+        final doy = DateTime.utc(d.year, d.month, d.day)
+                .difference(DateTime.utc(d.year, 1, 1))
+                .inDays +
+            1;
+        sb.write(doy.toString().padLeft(3, '0'));
+        break;
+      case 'WW':
+        final doy = DateTime.utc(d.year, d.month, d.day)
+                .difference(DateTime.utc(d.year, 1, 1))
+                .inDays +
+            1;
+        sb.write(((doy - 1) ~/ 7 + 1).toString().padLeft(2, '0'));
+        break;
+      case 'IW':
+        sb.write(_isoWeek(d).toString().padLeft(2, '0'));
+        break;
+      case 'J':
+        sb.write(_julianDay(d).toString());
+        break;
       case 'D':
         // Oracle day-of-week: 1=Sunday..7=Saturday.
         sb.write((d.weekday % 7 + 1).toString());
@@ -3976,6 +4026,29 @@ String _formatOracleDate(DateTime d, String fmt) {
     i += matched.length;
   }
   return sb.toString();
+}
+
+/// Oracle Julian day number (days since 4712 BC); J for 2024-07-20 is 2460512.
+int _julianDay(DateTime d) {
+  final a = (14 - d.month) ~/ 12;
+  final y = d.year + 4800 - a;
+  final m = d.month + 12 * a - 3;
+  return d.day +
+      (153 * m + 2) ~/ 5 +
+      365 * y +
+      y ~/ 4 -
+      y ~/ 100 +
+      y ~/ 400 -
+      32045;
+}
+
+/// ISO-8601 week number (weeks start Monday; week 1 contains the first
+/// Thursday of the year).
+int _isoWeek(DateTime d) {
+  final day = DateTime.utc(d.year, d.month, d.day);
+  final thursday = day.add(Duration(days: 4 - day.weekday));
+  final week1 = DateTime.utc(thursday.year, 1, 1);
+  return thursday.difference(week1).inDays ~/ 7 + 1;
 }
 
 /// Formats [n] by an Oracle number format model [fmt] (9/0 digits, comma
