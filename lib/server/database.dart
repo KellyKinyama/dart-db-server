@@ -7681,6 +7681,7 @@ class Database implements SequenceProvider {
       }
       if (e.window != null) return null;
       if (e.filterExpr != null) return null;
+      if (e.keepOrderBy != null) return null; // KEEP needs the general path
       if (name == 'COUNT' && e.isStarArg) {
         if (dist) return null; // COUNT(DISTINCT *) is invalid SQL
         cols.add(p.alias ?? 'count(*)');
@@ -7833,6 +7834,7 @@ class Database implements SequenceProvider {
     }
     if (e.window != null) return null;
     if (e.filterExpr != null) return null;
+    if (e.keepOrderBy != null) return null; // KEEP needs the general path
     if (e.isStarArg) return null;
     if (name != 'MIN' &&
         name != 'MAX' &&
@@ -10745,7 +10747,8 @@ class Database implements SequenceProvider {
 
     final out = <Map<String, Object?>>[];
 
-    void visit(Map<String, Object?> node, int level, Set<int> pathIds) {
+    void visit(Map<String, Object?> node, int level, Set<int> pathIds,
+        List<Map<String, Object?>> ancestry) {
       final children = <Map<String, Object?>>[];
       for (final cand in base) {
         final scope = <String, Object?>{...cand};
@@ -10756,13 +10759,15 @@ class Database implements SequenceProvider {
       final next = sortSiblings(children)
           .where((c) => !pathIds.contains(identityHashCode(c)))
           .toList();
+      final chain = [...ancestry, node];
       out.add(<String, Object?>{
         ...node,
         'LEVEL': level,
         'CONNECT_BY_ISLEAF': next.isEmpty ? 1 : 0,
+        '__CBP': chain, // ancestor chain for SYS_CONNECT_BY_PATH
       });
       for (final c in next) {
-        visit(c, level + 1, {...pathIds, identityHashCode(c)});
+        visit(c, level + 1, {...pathIds, identityHashCode(c)}, chain);
       }
     }
 
@@ -10771,7 +10776,7 @@ class Database implements SequenceProvider {
       if (startWith == null || evalPredicate(startWith, r)) roots.add(r);
     }
     for (final root in sortSiblings(roots)) {
-      visit(root, 1, {identityHashCode(root)});
+      visit(root, 1, {identityHashCode(root)}, const []);
     }
     return out;
   }
@@ -14135,6 +14140,27 @@ class Database implements SequenceProvider {
         return v == true || (v is num && v != 0);
       }).toList();
     }
+    // KEEP (DENSE_RANK FIRST|LAST ORDER BY …): restrict the group to the rows
+    // holding the first/last rank, then aggregate over those.
+    if (e.keepOrderBy != null && e.keepOrderBy!.isNotEmpty && grp.isNotEmpty) {
+      final bound = [for (final ob in e.keepOrderBy!) (_bindExpr(ob.expr), ob)];
+      int cmpKeep(Map<String, Object?> a, Map<String, Object?> b) {
+        for (final (ex, ob) in bound) {
+          final av = ex.eval(a);
+          final bv = ex.eval(b);
+          if (av == null && bv == null) continue;
+          if (av == null) return ob.descending ? 1 : -1;
+          if (bv == null) return ob.descending ? -1 : 1;
+          final c = sqlCompare(av, bv);
+          if (c != 0) return ob.descending ? -c : c;
+        }
+        return 0;
+      }
+      final first = e.keepFirst ?? true;
+      final extreme = grp.reduce((a, b) =>
+          (first ? cmpKeep(a, b) <= 0 : cmpKeep(a, b) >= 0) ? a : b);
+      grp = grp.where((r) => cmpKeep(r, extreme) == 0).toList();
+    }
     if (e.aggOrderBy != null && e.aggOrderBy!.isNotEmpty) {
       final bound = [for (final ob in e.aggOrderBy!) (_bindExpr(ob.expr), ob)];
       grp = List<Map<String, Object?>>.from(grp)
@@ -15052,6 +15078,8 @@ class Database implements SequenceProvider {
         filterExpr:
             e.filterExpr == null ? null : _bindExpr(e.filterExpr!, outerScope),
         aggOrderBy: e.aggOrderBy,
+        keepFirst: e.keepFirst,
+        keepOrderBy: e.keepOrderBy,
       );
     }
     return e;

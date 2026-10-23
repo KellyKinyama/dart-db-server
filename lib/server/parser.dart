@@ -570,6 +570,91 @@ class Parser {
     return CreateVirtualTableStmt(name, module, args, ifNotExists: ifNotExists);
   }
 
+  /// Parses an Oracle `PIVOT (agg(measure) [alias] FOR col IN (v1 [alias], …))`
+  /// and rewrites it into a grouped CASE-aggregate SELECT over [src].
+  SelectStmt _parsePivotClause(SelectStmt src) {
+    _expect(TokType.punct, '(');
+    final measure = _parseExpr();
+    final aggName =
+        measure is FunctionCallExpr ? measure.name.toUpperCase() : 'MAX';
+    final measureArg = measure is FunctionCallExpr && measure.args.isNotEmpty
+        ? measure.args.first
+        : measure;
+    if (_matchKw('AS')) {
+      _expectName();
+    } else if (_check(TokType.ident) && !_checkWord('FOR')) {
+      _advance();
+    }
+    _expectWord('FOR');
+    final pivotCol = _expectName();
+    _expectKw('IN');
+    _expect(TokType.punct, '(');
+    final values = <(Expr, String)>[];
+    do {
+      final startOff = _peek().offset;
+      final v = _parseExpr();
+      final endOff = _peek().offset;
+      String label;
+      if (_matchKw('AS')) {
+        label = _expectName();
+      } else if (_check(TokType.ident)) {
+        label = _advance().text;
+      } else {
+        label = _sliceSource(startOff, endOff).trim().replaceAll("'", '');
+      }
+      values.add((v, label));
+    } while (_match(TokType.punct, ','));
+    _expect(TokType.punct, ')'); // IN list
+    _expect(TokType.punct, ')'); // PIVOT
+
+    final measureCols = <String>{};
+    _columnNamesInto(measureArg, measureCols);
+    final srcCols = <String>[];
+    for (final it in src.projection) {
+      if (it.alias != null) {
+        srcCols.add(it.alias!);
+      } else if (it.expr is ColumnExpr) {
+        srcCols.add((it.expr as ColumnExpr).name);
+      }
+    }
+    final groupCols = srcCols
+        .where((c) =>
+            c.toLowerCase() != pivotCol.toLowerCase() &&
+            !measureCols.contains(c.toLowerCase()))
+        .toList();
+    final proj = <SelectItem>[
+      for (final g in groupCols) SelectItem.expr(ColumnExpr(g)),
+    ];
+    for (final (v, label) in values) {
+      final cond = BinaryExpr('=', ColumnExpr(pivotCol), v);
+      proj.add(SelectItem.expr(
+        FunctionCallExpr(aggName, [CaseExpr([cond], [measureArg], null)]),
+        alias: label,
+      ));
+    }
+    return SelectStmt(
+      projection: proj,
+      fromSubquery: src,
+      groupBy: [for (final g in groupCols) ColumnExpr(g)],
+      orderBy: const [],
+    );
+  }
+
+  void _columnNamesInto(Expr e, Set<String> out) {
+    if (e is ColumnExpr) {
+      out.add(e.name.toLowerCase());
+    } else if (e is FunctionCallExpr) {
+      for (final a in e.args) {
+        _columnNamesInto(a, out);
+      }
+    } else if (e is BinaryExpr) {
+      _columnNamesInto(e.left, out);
+      _columnNamesInto(e.right, out);
+    } else if (e is UnaryExpr) {
+      _columnNamesInto(e.operand, out);
+    }
+  }
+
   Statement _parseCreateTableTail() {
     bool ifNotExists = false;
     if (_matchKw('IF')) {
@@ -3122,10 +3207,25 @@ class Parser {
       }
       if (_matchKw('AS')) {
         fromAlias = _expectName();
-      } else if (_check(TokType.ident) && !_isClauseStartWord()) {
+      } else if (_check(TokType.ident) &&
+          !_isClauseStartWord() &&
+          !_checkWord('PIVOT')) {
         fromAlias = _advance().text;
       }
       fromIndexHint = _consumeIndexedHint();
+      // Oracle PIVOT: rewrite `FROM src PIVOT (agg FOR col IN (vals))` into a
+      // grouped CASE-aggregate subquery the outer SELECT reads from.
+      if (_checkWord('PIVOT') && (fromSub != null || fromTable != null)) {
+        _advance(); // PIVOT
+        fromSub = _parsePivotClause(fromSub ??
+            SelectStmt(
+              projection: [SelectItem.star()],
+              fromTable: fromTable,
+              orderBy: const [],
+            ));
+        fromTable = null;
+        fromFunc = null;
+      }
       while (true) {
         // Comma join: `FROM a, b` is a CROSS JOIN; any join predicate lives
         // in the WHERE clause (and Oracle (+) markers there turn it outer).
@@ -4214,6 +4314,23 @@ class Parser {
       filterExpr = _parseExpr();
       _expect(TokType.punct, ')');
     }
+    // Oracle `KEEP (DENSE_RANK FIRST|LAST ORDER BY …)` ordered-set modifier.
+    bool? keepFirst;
+    List<WindowOrderItem>? keepOrderBy;
+    if (_matchWord('KEEP')) {
+      _expect(TokType.punct, '(');
+      _matchWord('DENSE_RANK');
+      final sawFirst = _matchWord('FIRST') || _matchKw('FIRST');
+      final sawLast = !sawFirst && (_matchWord('LAST') || _matchKw('LAST'));
+      keepFirst = !sawLast;
+      _expectKw('ORDER');
+      _expectKw('BY');
+      keepOrderBy = <WindowOrderItem>[_parseWindowOrderItem()];
+      while (_match(TokType.punct, ',')) {
+        keepOrderBy.add(_parseWindowOrderItem());
+      }
+      _expect(TokType.punct, ')');
+    }
     WindowSpec? window;
     if (_matchKw('OVER')) {
       // OVER w   |   OVER (...)
@@ -4232,6 +4349,8 @@ class Parser {
       window: window,
       filterExpr: filterExpr,
       aggOrderBy: aggOrderBy,
+      keepFirst: keepFirst,
+      keepOrderBy: keepOrderBy,
     );
   }
 

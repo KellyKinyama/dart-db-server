@@ -137,4 +137,60 @@ void main() {
       await db.close();
     }
   });
+
+  group('F94 advanced SQL', () {
+    Future<Database> emp() async {
+      final db = await Database.open(null);
+      await db.execute('CREATE TABLE emp (id NUMBER, mgr NUMBER, '
+          'name VARCHAR2(10), dept NUMBER, sal NUMBER)');
+      await db.execute("INSERT INTO emp VALUES (1, NULL, 'A', 10, 100)");
+      await db.execute("INSERT INTO emp VALUES (2, 1, 'B', 20, 70)");
+      return db;
+    }
+
+    test('SYS_CONNECT_BY_PATH builds the hierarchy path', () async {
+      final db = await emp();
+      try {
+        final r = await db.execute(
+            "SELECT SYS_CONNECT_BY_PATH(name, '/') AS p FROM emp "
+            'START WITH mgr IS NULL CONNECT BY PRIOR id = mgr');
+        expect(r.rows, [
+          ['/A'],
+          ['/A/B'],
+        ]);
+      } finally {
+        await db.close();
+      }
+    });
+
+    test('PIVOT transposes rows to columns', () async {
+      final db = await emp();
+      try {
+        final r = await db.execute('SELECT * FROM (SELECT dept, sal FROM emp) '
+            'PIVOT (SUM(sal) FOR dept IN (10, 20))');
+        expect(r.columns, ['10', '20']);
+        expect(r.rows, [
+          [100, 70]
+        ]);
+      } finally {
+        await db.close();
+      }
+    });
+
+    test('KEEP (DENSE_RANK FIRST/LAST) ordered-set aggregate', () async {
+      final db = await emp();
+      try {
+        expect(
+            await scalar(db,
+                'SELECT MAX(sal) KEEP (DENSE_RANK FIRST ORDER BY id) FROM emp'),
+            100);
+        expect(
+            await scalar(db,
+                'SELECT MAX(sal) KEEP (DENSE_RANK LAST ORDER BY id) FROM emp'),
+            70);
+      } finally {
+        await db.close();
+      }
+    });
+  });
 }

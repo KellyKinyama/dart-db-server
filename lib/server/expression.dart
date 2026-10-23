@@ -888,7 +888,14 @@ class FunctionCallExpr extends Expr {
     this.window,
     this.filterExpr,
     this.aggOrderBy,
+    this.keepFirst,
+    this.keepOrderBy,
   });
+
+  /// Oracle `KEEP (DENSE_RANK FIRST|LAST ORDER BY …)` ordered-set modifier:
+  /// true = FIRST, false = LAST, null = no KEEP. [keepOrderBy] ranks the group.
+  final bool? keepFirst;
+  final List<WindowOrderItem>? keepOrderBy;
 
   bool get isAggregate => kAggregateFunctions.contains(name);
   bool get isWindow => window != null;
@@ -923,6 +930,19 @@ class FunctionCallExpr extends Expr {
     }
     final fn = kScalarFunctions[name];
     if (fn == null) {
+      // SYS_CONNECT_BY_PATH(col, sep): build the root→node path from the
+      // ancestor chain the CONNECT BY executor stores under `__CBP`.
+      if (name == 'SYS_CONNECT_BY_PATH') {
+        final sep = args.length > 1 ? (args[1].eval(row)?.toString() ?? '') : '';
+        final chain = row['__CBP'];
+        final nodes = chain is List ? chain : <Object?>[row];
+        final buf = StringBuffer();
+        for (final n in nodes) {
+          final v = args[0].eval(n is Map<String, Object?> ? n : row);
+          buf..write(sep)..write(v ?? '');
+        }
+        return buf.toString();
+      }
       final resolver = storedFunctionResolver;
       if (resolver != null) {
         return resolver(name, args.map((a) => a.eval(row)).toList());
