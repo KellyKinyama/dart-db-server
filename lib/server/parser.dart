@@ -1013,15 +1013,51 @@ class Parser {
         if (_checkWord('CHAR') || _checkWord('BYTE')) _advance();
       }
       if (_match(TokType.punct, ',')) {
+        // Negative scale is allowed: NUMBER(5,-2).
+        var scaleNeg = false;
+        if (_check(TokType.op, '-')) {
+          scaleNeg = true;
+          _advance();
+        }
         final secondTok = _advance(); // scale
         numericPrecision = firstN;
-        numericScale = int.tryParse(secondTok.text);
+        final sc = int.tryParse(secondTok.text);
+        numericScale = sc == null ? null : (scaleNeg ? -sc : sc);
       } else if (charTypes.contains(rawType)) {
         charLength = firstN;
       } else {
         numericPrecision = firstN;
       }
       _expect(TokType.punct, ')');
+    }
+    // Oracle INTERVAL YEAR [(p)] TO MONTH / INTERVAL DAY [(p)] TO SECOND [(p)]
+    // column types. Consumed (the engine stores intervals as text/number).
+    if (typeTok.text.toUpperCase() == 'INTERVAL') {
+      void consumeParen() {
+        if (_check(TokType.punct, '(')) {
+          var depth = 0;
+          do {
+            final tk = _advance();
+            if (tk.type == TokType.punct && tk.text == '(') depth++;
+            if (tk.type == TokType.punct && tk.text == ')') depth--;
+          } while (depth > 0 && !_isAtEnd());
+        }
+      }
+
+      if (_matchWord('YEAR') ||
+          _matchWord('MONTH') ||
+          _matchWord('DAY') ||
+          _matchWord('HOUR') ||
+          _matchWord('MINUTE') ||
+          _matchWord('SECOND')) {
+        consumeParen();
+        if (_matchWord('TO')) {
+          if (_check(TokType.ident) || _peek().type == TokType.keyword) {
+            _advance(); // trailing unit
+          }
+          consumeParen();
+        }
+      }
     }
     // Oracle TIMESTAMP / TIME [WITH [LOCAL] TIME ZONE]. The zone qualifier is
     // consumed (the engine stores timestamps as text); the column keeps its

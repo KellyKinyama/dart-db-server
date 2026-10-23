@@ -758,8 +758,16 @@ Object? coerceForColumn(Object? value, ColumnDef col,
     if (n != null) {
       final scale = col.numericScale ?? 0;
       // Exact-decimal half-up rounding to the declared scale (Oracle NUMBER is
-      // decimal, not binary — 1.005 -> 1.01, not the double's 1.00).
-      num rounded = scale >= 0 ? _roundHalfUpDecimal(n, scale) : n.toDouble();
+      // decimal, not binary — 1.005 -> 1.01, not the double's 1.00). A negative
+      // scale rounds to the left of the decimal point (NUMBER(5,-2): 12345 ->
+      // 12300).
+      num rounded;
+      if (scale >= 0) {
+        rounded = _roundHalfUpDecimal(n, scale);
+      } else {
+        final factor = _pow10(-scale);
+        rounded = (n / factor).roundToDouble() * factor;
+      }
       // Normalize integral doubles back to int.
       if (rounded is double && rounded == rounded.truncateToDouble()) {
         rounded = rounded.toInt();
@@ -2690,6 +2698,27 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     if (v is String) return num.tryParse(v.trim());
     return null;
   },
+  // Oracle RAW hex round-trip: HEXTORAW('DEADBEEF') -> bytes, RAWTOHEX -> hex.
+  'HEXTORAW': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final hex = a[0].toString();
+    if (hex.isEmpty || hex.length.isOdd) return null;
+    final out = <int>[];
+    for (var i = 0; i < hex.length; i += 2) {
+      final b = int.tryParse(hex.substring(i, i + 2), radix: 16);
+      if (b == null) return null;
+      out.add(b);
+    }
+    return out;
+  },
+  'RAWTOHEX': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final v = a[0];
+    final bytes = v is List<int> ? v : utf8.encode(v.toString());
+    return bytes
+        .map((b) => b.toRadixString(16).padLeft(2, '0').toUpperCase())
+        .join();
+  },
   // Oracle interval constructors, modelled as a day count so they compose with
   // DATE arithmetic (DATE + NUMTODSINTERVAL(5,'DAY')).
   'NUMTODSINTERVAL': (a) {
@@ -3642,7 +3671,7 @@ String _applyNameCase(String value, String token) {
 }
 
 bool _looksLikeDateFormat(String fmt) =>
-    RegExp(r'Y{2,4}|MON|MM|DD|DAY|DY|HH|MI|SS|\bQ\b', caseSensitive: false)
+    RegExp(r'Y{2,4}|MON|MM|DD|DAY|DY|HH|MI|SS|FF|\bQ\b', caseSensitive: false)
         .hasMatch(fmt);
 
 bool _looksLikeNumberFormat(String fmt) =>
@@ -3661,6 +3690,20 @@ String _formatOracleDate(DateTime d, String fmt) {
   final sb = StringBuffer();
   var i = 0;
   while (i < fmt.length) {
+    // Fractional seconds FF[1-9]: emit that many leading fraction digits.
+    if (i + 1 < fmt.length &&
+        fmt.substring(i, i + 2).toUpperCase() == 'FF') {
+      i += 2;
+      var n = 6;
+      if (i < fmt.length && '0123456789'.contains(fmt[i])) {
+        n = int.parse(fmt[i]);
+        i++;
+      }
+      final micros = d.millisecond * 1000 + d.microsecond;
+      final frac = micros.toString().padLeft(6, '0');
+      sb.write(frac.substring(0, n.clamp(0, 6)));
+      continue;
+    }
     String? matched;
     for (final t in tokens) {
       if (i + t.length <= fmt.length &&

@@ -120,4 +120,47 @@ void main() {
       await db.close();
     }
   });
+
+  test('HEXTORAW / RAWTOHEX round-trip', () async {
+    final db = await Database.open(null);
+    try {
+      expect(await scalar(db, "SELECT RAWTOHEX(HEXTORAW('DEADBEEF'))"),
+          'DEADBEEF');
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('TO_CHAR fractional-seconds format FF[n]', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE t (ts TIMESTAMP(3))');
+      await db.execute(
+          "INSERT INTO t VALUES (TIMESTAMP '2021-06-15 13:45:30.123')");
+      expect(await scalar(db, "SELECT TO_CHAR(ts, 'FF3') FROM t"), '123');
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('INTERVAL column types parse', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE t (v INTERVAL DAY TO SECOND)');
+      await db.execute('CREATE TABLE u (w INTERVAL YEAR TO MONTH)');
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('NUMBER(p, -s) negative scale rounds left of the point', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE t (v NUMBER(5,-2))');
+      await db.execute('INSERT INTO t VALUES (12345)');
+      expect(await scalar(db, 'SELECT v FROM t'), 12300);
+    } finally {
+      await db.close();
+    }
+  });
 }
