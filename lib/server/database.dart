@@ -6958,6 +6958,9 @@ class Database implements SequenceProvider {
       // (i.e. NOT in setKeyStrings). If so, overwrite the column's
       // value with 1 instead of the default 0.
       final groupingOne = <int>[];
+      // GROUPING_ID(a, b, …) bit vector: MSB is the first argument. Each arg
+      // contributes 1 when rolled up in the current set.
+      final groupingIdVals = <int, int>{};
       for (var i = 0; i < s.projection.length; i++) {
         final p = s.projection[i];
         if (p.expr == null) continue;
@@ -6974,6 +6977,18 @@ class Database implements SequenceProvider {
             groupingOne.add(i);
           }
         }
+        if (pe is FunctionCallExpr &&
+            pe.name.toUpperCase() == 'GROUPING_ID' &&
+            pe.args.isNotEmpty) {
+          var bits = 0;
+          for (final arg in pe.args) {
+            final ak = key(arg);
+            final rolledUp =
+                allKeyStrings.contains(ak) && !setKeyStrings.contains(ak);
+            bits = (bits << 1) | (rolledUp ? 1 : 0);
+          }
+          groupingIdVals[i] = bits;
+        }
       }
       // Hidden sort columns are NULL for the sets that roll their key up.
       for (var h = 0; h < hiddenExprs.length; h++) {
@@ -6989,6 +7004,9 @@ class Database implements SequenceProvider {
         for (final i in groupingOne) {
           r[i] = 1;
         }
+        groupingIdVals.forEach((i, bits) {
+          r[i] = bits;
+        });
         unionRows.add(r);
       }
     }
@@ -14446,6 +14464,40 @@ class Database implements SequenceProvider {
           if (nums.length.isOdd) return nums[mid];
           return (nums[mid - 1] + nums[mid]) / 2;
         }
+      case 'PERCENTILE_CONT':
+      case 'PERCENTILE_DISC':
+        {
+          // PERCENTILE_x(frac) WITHIN GROUP (ORDER BY expr): the fraction is
+          // the first arg; the ordered-by expression supplies the values.
+          final p = e.args.isNotEmpty ? e.args.first.eval(const {}) : null;
+          final frac = (p is num ? p.toDouble() : 0.5).clamp(0.0, 1.0);
+          final orderExpr = (e.aggOrderBy != null && e.aggOrderBy!.isNotEmpty)
+              ? _bindExpr(e.aggOrderBy!.first.expr)
+              : null;
+          final nums = <double>[];
+          for (final row in grp) {
+            final v = orderExpr?.eval(row);
+            if (v is num) {
+              nums.add(v.toDouble());
+            } else if (v is String) {
+              final n = num.tryParse(v.trim());
+              if (n != null) nums.add(n.toDouble());
+            }
+          }
+          if (nums.isEmpty) return null;
+          nums.sort();
+          if (e.name == 'PERCENTILE_DISC') {
+            // Smallest value whose cumulative distribution >= frac.
+            final idx =
+                (frac * nums.length).ceil().clamp(1, nums.length) - 1;
+            return nums[idx];
+          }
+          final rank = frac * (nums.length - 1);
+          final lo = rank.floor();
+          final hi = rank.ceil();
+          if (lo == hi) return nums[lo];
+          return nums[lo] + (nums[hi] - nums[lo]) * (rank - lo);
+        }
       case 'STDDEV':
       case 'STDDEV_SAMP':
       case 'STDDEV_POP':
@@ -14929,13 +14981,39 @@ class Database implements SequenceProvider {
         case 'FIRST_VALUE':
           for (var k = 0; k < ordered.length; k++) {
             final fr = frameRows(k);
-            out[ordered[k]] = fr.isEmpty ? null : fn.args.first.eval(fr.first);
+            if (fn.ignoreNulls) {
+              Object? val;
+              for (final row in fr) {
+                final x = fn.args.first.eval(row);
+                if (x != null) {
+                  val = x;
+                  break;
+                }
+              }
+              out[ordered[k]] = val;
+            } else {
+              out[ordered[k]] =
+                  fr.isEmpty ? null : fn.args.first.eval(fr.first);
+            }
           }
           break;
         case 'LAST_VALUE':
           for (var k = 0; k < ordered.length; k++) {
             final fr = frameRows(k);
-            out[ordered[k]] = fr.isEmpty ? null : fn.args.first.eval(fr.last);
+            if (fn.ignoreNulls) {
+              Object? val;
+              for (final row in fr.reversed) {
+                final x = fn.args.first.eval(row);
+                if (x != null) {
+                  val = x;
+                  break;
+                }
+              }
+              out[ordered[k]] = val;
+            } else {
+              out[ordered[k]] =
+                  fr.isEmpty ? null : fn.args.first.eval(fr.last);
+            }
           }
           break;
         case 'NTH_VALUE':
@@ -14982,6 +15060,20 @@ class Database implements SequenceProvider {
             for (var k = 0; k < ordered.length; k++) {
               final slice = frameRows(k);
               out[ordered[k]] = _aggregateValue(fn, slice);
+            }
+          }
+          break;
+        case 'RATIO_TO_REPORT':
+          {
+            // value / SUM(value) over the whole partition (framing ignored).
+            num total = 0;
+            for (final idx in ordered) {
+              final v = fn.args.first.eval(rows[idx]);
+              if (v is num) total += v;
+            }
+            for (final idx in ordered) {
+              final v = fn.args.first.eval(rows[idx]);
+              out[idx] = (v is num && total != 0) ? v / total : null;
             }
           }
           break;
@@ -15119,6 +15211,7 @@ class Database implements SequenceProvider {
         aggOrderBy: e.aggOrderBy,
         keepFirst: e.keepFirst,
         keepOrderBy: e.keepOrderBy,
+        ignoreNulls: e.ignoreNulls,
       );
     }
     return e;

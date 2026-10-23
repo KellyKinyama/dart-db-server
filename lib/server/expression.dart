@@ -345,9 +345,27 @@ class BinaryExpr extends Expr {
       case '>=':
         return (nocase ? _cmpCI(lc, rc) : _cmp(lc, rc)) >= 0;
       case '+':
-        return _arith(_toNum(l)!, _toNum(r)!, '+');
+        {
+          // Oracle date arithmetic: DATE + n (days) shifts the date; numbers
+          // on both sides fall through to numeric addition.
+          final ld = _asSqlDate(l);
+          if (ld != null && r is num) return _shiftDate(ld, r.toDouble(), l);
+          final rd = _asSqlDate(r);
+          if (rd != null && l is num) return _shiftDate(rd, l.toDouble(), r);
+          return _arith(_toNum(l)!, _toNum(r)!, '+');
+        }
       case '-':
-        return _arith(_toNum(l)!, _toNum(r)!, '-');
+        {
+          // Oracle date arithmetic: DATE - DATE = day count; DATE - n shifts.
+          final ld = _asSqlDate(l);
+          final rd = _asSqlDate(r);
+          if (ld != null && rd != null) {
+            final diff = ld.difference(rd).inSeconds / 86400.0;
+            return diff == diff.roundToDouble() ? diff.toInt() : diff;
+          }
+          if (ld != null && r is num) return _shiftDate(ld, -r.toDouble(), l);
+          return _arith(_toNum(l)!, _toNum(r)!, '-');
+        }
       case '*':
         return _arith(_toNum(l)!, _toNum(r)!, '*');
       case '/':
@@ -932,12 +950,17 @@ class FunctionCallExpr extends Expr {
     this.aggOrderBy,
     this.keepFirst,
     this.keepOrderBy,
+    this.ignoreNulls = false,
   });
 
   /// Oracle `KEEP (DENSE_RANK FIRST|LAST ORDER BY …)` ordered-set modifier:
   /// true = FIRST, false = LAST, null = no KEEP. [keepOrderBy] ranks the group.
   final bool? keepFirst;
   final List<WindowOrderItem>? keepOrderBy;
+
+  /// `IGNORE NULLS` modifier (FIRST_VALUE/LAST_VALUE/LAG/LEAD): skip NULLs when
+  /// picking the value. Default false = RESPECT NULLS.
+  final bool ignoreNulls;
 
   bool get isAggregate => kAggregateFunctions.contains(name);
   bool get isWindow => window != null;
@@ -984,6 +1007,17 @@ class FunctionCallExpr extends Expr {
           buf..write(sep)..write(v ?? '');
         }
         return buf.toString();
+      }
+      // CONNECT_BY_ROOT expr: evaluate [expr] against the hierarchy root (the
+      // first ancestor in the `__CBP` chain the CONNECT BY executor stores).
+      if (name == 'CONNECT_BY_ROOT') {
+        final chain = row['__CBP'];
+        final rootRow = (chain is List && chain.isNotEmpty)
+            ? chain.first
+            : row;
+        return args.isEmpty
+            ? null
+            : args[0].eval(rootRow is Map<String, Object?> ? rootRow : row);
       }
       final resolver = storedFunctionResolver;
       if (resolver != null) {
@@ -1702,6 +1736,28 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
   // results from GROUPING SETS / ROLLUP / CUBE so this default 0
   // applies only when the expression IS in the current grouping set.
   'GROUPING': (a) => 0,
+  // Default 0; overwritten to the per-set bit vector by _selectGroupingSets.
+  'GROUPING_ID': (a) => 0,
+  // WIDTH_BUCKET(expr, min, max, buckets): equi-width histogram bucket.
+  // 0 for below-range, buckets+1 for at/above max.
+  'WIDTH_BUCKET': (a) {
+    if (a.length < 4 || a[0] == null || a[1] == null || a[2] == null ||
+        a[3] == null) {
+      return null;
+    }
+    final e = _sqlTextToNum(a[0]).toDouble();
+    final lo = _sqlTextToNum(a[1]).toDouble();
+    final hi = _sqlTextToNum(a[2]).toDouble();
+    final n = _sqlTextToNum(a[3]).toInt();
+    if (lo == hi || n <= 0) return null;
+    final asc = hi > lo;
+    final mn = asc ? lo : hi;
+    final mx = asc ? hi : lo;
+    if (e < mn) return asc ? 0 : n + 1;
+    if (e >= mx) return asc ? n + 1 : 0;
+    final b = ((e - lo) / (hi - lo) * n).floor() + 1;
+    return b.clamp(1, n);
+  },
   'IIF': (a) {
     if (a.length < 3) return null;
     final c = a[0];
@@ -1835,14 +1891,95 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
   },
   'REGEXP_SUBSTR': (a) {
     if (a.length < 2 || a[0] == null || a[1] == null) return null;
-    final m = RegExp(a[1].toString()).firstMatch(a[0].toString());
-    return m?.group(0);
+    final src = a[0].toString();
+    final re = RegExp(a[1].toString());
+    // REGEXP_SUBSTR(src, pat [, position [, occurrence [, match_param
+    // [, subexpr]]]]): 1-based position/occurrence.
+    final position = a.length > 2 && a[2] != null ? _sqlTextToNum(a[2]).toInt() : 1;
+    final occurrence = a.length > 3 && a[3] != null ? _sqlTextToNum(a[3]).toInt() : 1;
+    if (position < 1 || occurrence < 1) return null;
+    final start = (position - 1).clamp(0, src.length);
+    final matches = re.allMatches(src, start).toList();
+    if (occurrence > matches.length) return null;
+    return matches[occurrence - 1].group(0);
+  },
+  'REGEXP_COUNT': (a) {
+    if (a.length < 2 || a[0] == null || a[1] == null) return null;
+    final src = a[0].toString();
+    final re = RegExp(a[1].toString());
+    final position = a.length > 2 && a[2] != null ? _sqlTextToNum(a[2]).toInt() : 1;
+    final start = (position - 1).clamp(0, src.length);
+    return re.allMatches(src, start).length;
+  },
+  'REGEXP_INSTR': (a) {
+    if (a.length < 2 || a[0] == null || a[1] == null) return null;
+    final src = a[0].toString();
+    final re = RegExp(a[1].toString());
+    // REGEXP_INSTR(src, pat [, position [, occurrence [, return_opt …]]]):
+    // return_opt 0 => start of match, 1 => position after the match. 1-based.
+    final position = a.length > 2 && a[2] != null ? _sqlTextToNum(a[2]).toInt() : 1;
+    final occurrence = a.length > 3 && a[3] != null ? _sqlTextToNum(a[3]).toInt() : 1;
+    final returnOpt = a.length > 4 && a[4] != null ? _sqlTextToNum(a[4]).toInt() : 0;
+    if (position < 1 || occurrence < 1) return 0;
+    final start = (position - 1).clamp(0, src.length);
+    final matches = re.allMatches(src, start).toList();
+    if (occurrence > matches.length) return 0;
+    final m = matches[occurrence - 1];
+    return (returnOpt == 0 ? m.start : m.end) + 1;
   },
   'REGEXP_REPLACE': (a) {
-    if (a.length < 3 || a[0] == null || a[1] == null || a[2] == null) {
-      return null;
+    if (a.length < 2 || a[0] == null || a[1] == null) return null;
+    final src = a[0].toString();
+    final re = RegExp(a[1].toString());
+    // Replacement may be omitted (removes matches) and supports Oracle
+    // backreferences \1..\9 (and \0 for the whole match).
+    final repl = a.length > 2 && a[2] != null ? a[2].toString() : '';
+    final position =
+        a.length > 3 && a[3] != null ? _sqlTextToNum(a[3]).toInt() : 1;
+    // Occurrence 0 (default) replaces every match; n replaces only the nth.
+    final occurrence =
+        a.length > 4 && a[4] != null ? _sqlTextToNum(a[4]).toInt() : 0;
+    String expand(Match m) {
+      final sb = StringBuffer();
+      for (var i = 0; i < repl.length; i++) {
+        final ch = repl[i];
+        if (ch == r'\' && i + 1 < repl.length) {
+          final nx = repl[i + 1];
+          if (nx == r'\') {
+            sb.write(r'\');
+            i++;
+            continue;
+          }
+          final d = int.tryParse(nx);
+          if (d != null) {
+            if (d == 0) {
+              sb.write(m.group(0) ?? '');
+            } else {
+              sb.write(d <= m.groupCount ? (m.group(d) ?? '') : '');
+            }
+            i++;
+            continue;
+          }
+        }
+        sb.write(ch);
+      }
+      return sb.toString();
     }
-    return a[0].toString().replaceAll(RegExp(a[1].toString()), a[2].toString());
+
+    final cut = (position - 1).clamp(0, src.length);
+    final prefix = src.substring(0, cut);
+    final rest = src.substring(cut);
+    String result;
+    if (occurrence == 0) {
+      result = rest.replaceAllMapped(re, expand);
+    } else {
+      var count = 0;
+      result = rest.replaceAllMapped(re, (m) {
+        count++;
+        return count == occurrence ? expand(m) : m.group(0)!;
+      });
+    }
+    return prefix + result;
   },
   'RANDOM': (a) => _rng.nextInt(1 << 31),
   'INSTR': (a) {
@@ -2420,6 +2557,26 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
   'TO_CHAR': (a) {
     if (a.isEmpty || a[0] == null) return null;
     final v = a[0];
+    final fmt = a.length > 1 && a[1] != null ? a[1].toString() : null;
+    if (fmt != null && fmt.isNotEmpty) {
+      // Date/datetime value with a date format model.
+      if (v is String) {
+        final dt = DateTime.tryParse(v.replaceFirst(' ', 'T'));
+        if (dt != null && _looksLikeDateFormat(fmt)) {
+          return _formatOracleDate(dt, fmt);
+        }
+      }
+      // Numeric value with a number format model.
+      num? n;
+      if (v is num) {
+        n = v;
+      } else if (v is String) {
+        n = num.tryParse(v.trim());
+      }
+      if (n != null && _looksLikeNumberFormat(fmt)) {
+        return _formatOracleNumber(n, fmt);
+      }
+    }
     return v is String ? v : v.toString();
   },
   'TO_NUMBER': (a) {
@@ -2428,6 +2585,24 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     if (v is num) return v;
     if (v is String) return num.tryParse(v.trim());
     return null;
+  },
+  // Oracle interval constructors, modelled as a day count so they compose with
+  // DATE arithmetic (DATE + NUMTODSINTERVAL(5,'DAY')).
+  'NUMTODSINTERVAL': (a) {
+    if (a.length < 2 || a[0] == null || a[1] == null) return null;
+    final n = _sqlTextToNum(a[0]).toDouble();
+    const per = {
+      'DAY': 1.0, 'HOUR': 1 / 24, 'MINUTE': 1 / 1440, 'SECOND': 1 / 86400,
+    };
+    final days = n * (per[a[1].toString().toUpperCase()] ?? 1);
+    return days == days.roundToDouble() ? days.toInt() : days;
+  },
+  'NUMTOYMINTERVAL': (a) {
+    if (a.length < 2 || a[0] == null || a[1] == null) return null;
+    final n = _sqlTextToNum(a[0]).toDouble();
+    const per = {'YEAR': 365.0, 'MONTH': 30.0};
+    final days = n * (per[a[1].toString().toUpperCase()] ?? 30);
+    return days == days.roundToDouble() ? days.toInt() : days;
   },
   // TO_DATE(text [, fmt]) parses [text] by the Oracle format model [fmt] (a
   // useful subset) and returns the engine's ISO text date/datetime.
@@ -3175,11 +3350,34 @@ const Map<String, int> _oracleMonthAbbr = {
   'JUL': 7, 'AUG': 8, 'SEP': 9, 'OCT': 10, 'NOV': 11, 'DEC': 12,
 };
 
+final RegExp _isoDateRe =
+    RegExp(r'^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2})?)?$');
+
+/// Returns the [DateTime] for an ISO date / datetime string, or null for any
+/// other value (including bare numbers). Used to drive Oracle date arithmetic.
+DateTime? _asSqlDate(Object? v) {
+  if (v is! String) return null;
+  if (!_isoDateRe.hasMatch(v.trim())) return null;
+  return DateTime.tryParse(v.trim().replaceFirst(' ', 'T'));
+}
+
+/// Shifts [d] by [days] (fractional days become hours/seconds) and formats the
+/// result as ISO date or datetime depending on whether a time component is
+/// present in [original] or the shifted value.
+Object _shiftDate(DateTime d, double days, Object? original) {
+  final wholeDays = days.truncate();
+  final fracSeconds = ((days - wholeDays) * 86400).round();
+  final shifted = d.add(Duration(days: wholeDays, seconds: fracSeconds));
+  final hadTime = original is String && original.contains(RegExp(r'\d:\d'));
+  final hasTime =
+      shifted.hour != 0 || shifted.minute != 0 || shifted.second != 0;
+  return (hadTime || hasTime) ? _fmtDateTime(shifted) : _fmtDate(shifted);
+}
+
 /// Maps a day name (full or 3-letter, any case) to a Dart weekday (Mon=1..Sun=7).
 int? _weekdayFromName(String name) {
   const days = {
-    'MON': 1, 'TUE': 2, 'WED': 3, 'THU': 4, 'FRI': 5, 'SAT': 6, 'SUN': 7,
-  };
+    'MON': 1, 'TUE': 2, 'WED': 3, 'THU': 4, 'FRI': 5, 'SAT': 6, 'SUN': 7,  };
   final k = name.trim().toUpperCase();
   return k.length >= 3 ? days[k.substring(0, 3)] : null;
 }
@@ -3289,6 +3487,157 @@ DateTime? _parseOracleDate(String text, String? fmt) {
 
 String _fmtDateTime(DateTime d, {bool full = false}) =>
     '${_fmtDate(d)} ${_fmtTime(d)}';
+
+const List<String> _monthFullNames = [
+  'JANUARY', 'FEBRUARY', 'MARCH', 'APRIL', 'MAY', 'JUNE', //
+  'JULY', 'AUGUST', 'SEPTEMBER', 'OCTOBER', 'NOVEMBER', 'DECEMBER',
+];
+const List<String> _monthAbbrNames = [
+  'JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', //
+  'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC',
+];
+// Indexed by Dart weekday (Mon=1..Sun=7).
+const List<String> _weekdayFullNames = [
+  '', 'MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY', 'SATURDAY',
+  'SUNDAY',
+];
+const List<String> _weekdayAbbrNames = [
+  '', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN',
+];
+
+/// Re-cases [value] (an all-uppercase name) to mirror [token]'s case style:
+/// all-caps -> caps, all-lower -> lower, otherwise title-case.
+String _applyNameCase(String value, String token) {
+  if (token == token.toUpperCase()) return value;
+  if (token == token.toLowerCase()) return value.toLowerCase();
+  return value.isEmpty
+      ? value
+      : value[0].toUpperCase() + value.substring(1).toLowerCase();
+}
+
+bool _looksLikeDateFormat(String fmt) =>
+    RegExp(r'Y{2,4}|MON|MM|DD|DAY|DY|HH|MI|SS|\bQ\b', caseSensitive: false)
+        .hasMatch(fmt);
+
+bool _looksLikeNumberFormat(String fmt) =>
+    RegExp(r'[90]').hasMatch(fmt) &&
+    !RegExp(r'Y{2,4}|MON|DD|DAY|DY|HH|MI|SS', caseSensitive: false)
+        .hasMatch(fmt);
+
+/// Formats [d] by an Oracle date format model [fmt] (a common subset). Honours
+/// token case for alphabetic names (MON -> JUN, Mon -> Jun, mon -> jun).
+String _formatOracleDate(DateTime d, String fmt) {
+  // Longest tokens first so e.g. MONTH wins over MON over MM.
+  const tokens = [
+    'YYYY', 'MONTH', 'HH24', 'HH12', 'MON', 'DAY', 'YY', 'MM', 'DD', 'DY',
+    'HH', 'MI', 'SS', 'AM', 'PM', 'Q', 'D',
+  ];
+  final sb = StringBuffer();
+  var i = 0;
+  while (i < fmt.length) {
+    String? matched;
+    for (final t in tokens) {
+      if (i + t.length <= fmt.length &&
+          fmt.substring(i, i + t.length).toUpperCase() == t) {
+        matched = fmt.substring(i, i + t.length);
+        break;
+      }
+    }
+    if (matched == null) {
+      sb.write(fmt[i]);
+      i++;
+      continue;
+    }
+    final up = matched.toUpperCase();
+    switch (up) {
+      case 'YYYY':
+        sb.write(d.year.toString().padLeft(4, '0'));
+        break;
+      case 'YY':
+        sb.write((d.year % 100).toString().padLeft(2, '0'));
+        break;
+      case 'MM':
+        sb.write(d.month.toString().padLeft(2, '0'));
+        break;
+      case 'MON':
+        sb.write(_applyNameCase(_monthAbbrNames[d.month - 1], matched));
+        break;
+      case 'MONTH':
+        sb.write(_applyNameCase(_monthFullNames[d.month - 1], matched));
+        break;
+      case 'DD':
+        sb.write(d.day.toString().padLeft(2, '0'));
+        break;
+      case 'DY':
+        sb.write(_applyNameCase(_weekdayAbbrNames[d.weekday], matched));
+        break;
+      case 'DAY':
+        sb.write(_applyNameCase(_weekdayFullNames[d.weekday], matched));
+        break;
+      case 'HH24':
+        sb.write(d.hour.toString().padLeft(2, '0'));
+        break;
+      case 'HH':
+      case 'HH12':
+        final h = d.hour % 12 == 0 ? 12 : d.hour % 12;
+        sb.write(h.toString().padLeft(2, '0'));
+        break;
+      case 'MI':
+        sb.write(d.minute.toString().padLeft(2, '0'));
+        break;
+      case 'SS':
+        sb.write(d.second.toString().padLeft(2, '0'));
+        break;
+      case 'AM':
+      case 'PM':
+        sb.write(d.hour < 12 ? 'AM' : 'PM');
+        break;
+      case 'Q':
+        sb.write(((d.month - 1) ~/ 3 + 1).toString());
+        break;
+      case 'D':
+        // Oracle day-of-week: 1=Sunday..7=Saturday.
+        sb.write((d.weekday % 7 + 1).toString());
+        break;
+    }
+    i += matched.length;
+  }
+  return sb.toString();
+}
+
+/// Formats [n] by an Oracle number format model [fmt] (9/0 digits, comma
+/// grouping, decimal point, optional leading FM to drop the sign blank).
+String _formatOracleNumber(num n, String fmt) {
+  var f = fmt;
+  final fm = f.toUpperCase().startsWith('FM');
+  if (fm) f = f.substring(2);
+  final grouping = f.contains(',');
+  final dotIdx = f.indexOf('.');
+  final decimals = dotIdx >= 0
+      ? f.substring(dotIdx + 1).replaceAll(RegExp('[^90]'), '').length
+      : 0;
+  final neg = n < 0;
+  final fixed = n.abs().toStringAsFixed(decimals);
+  final parts = fixed.split('.');
+  var intPart = parts[0];
+  final decPart = parts.length > 1 ? parts[1] : '';
+  if (grouping) {
+    final buf = StringBuffer();
+    for (var i = 0; i < intPart.length; i++) {
+      if (i > 0 && (intPart.length - i) % 3 == 0) buf.write(',');
+      buf.write(intPart[i]);
+    }
+    intPart = buf.toString();
+  }
+  var out = intPart;
+  if (decimals > 0) out = '$out.$decPart';
+  if (neg) {
+    out = '-$out';
+  } else if (!fm) {
+    out = ' $out';
+  }
+  return out;
+}
 
 String _strftime(String fmt, DateTime d) {
   final buf = StringBuffer();
@@ -3608,6 +3957,8 @@ const Set<String> kAggregateFunctions = {
   'COVAR_POP',
   'COVAR_SAMP',
   'CORR',
+  'PERCENTILE_CONT',
+  'PERCENTILE_DISC',
   // Vector aggregates — batch-oriented centroid / sum operations.
   // See _aggregateValue in database.dart for implementation.
   'VEC_AVG',

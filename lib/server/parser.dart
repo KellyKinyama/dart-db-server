@@ -4072,6 +4072,15 @@ class Parser {
       _advance();
       return PriorExpr(_parsePrimary());
     }
+    // CONNECT_BY_ROOT <expr> — hierarchical prefix returning the expression's
+    // value at the root of the current row's tree.
+    if (_checkWord('CONNECT_BY_ROOT') &&
+        (_peek(1).type == TokType.ident ||
+            _peek(1).type == TokType.keyword ||
+            (_peek(1).type == TokType.punct && _peek(1).text == '('))) {
+      _advance();
+      return FunctionCallExpr('CONNECT_BY_ROOT', [_parsePrimary()]);
+    }
     // ANSI/Oracle typed datetime literals: DATE '...', TIMESTAMP '...',
     // TIME '...'. The type keyword directly precedes a string literal. We
     // keep the string value (the engine represents dates as text), so it
@@ -4082,6 +4091,60 @@ class Parser {
       _advance(); // type keyword
       final lit = _advance(); // string literal
       return LiteralExpr(lit.text);
+    }
+    // Oracle INTERVAL literal: INTERVAL '<n>' <unit> [(prec)] [TO <unit>].
+    // Modelled as a number of days so it composes with DATE arithmetic
+    // (DATE + INTERVAL '5' DAY). Year/month units use calendar approximations.
+    if ((t.type == TokType.keyword || t.type == TokType.ident) &&
+        t.upper == 'INTERVAL' &&
+        (_peek(1).type == TokType.string ||
+            (_peek(1).type == TokType.op &&
+                (_peek(1).text == '-' || _peek(1).text == '+')))) {
+      _advance(); // INTERVAL
+      var sign = 1;
+      if (_check(TokType.op, '-')) {
+        sign = -1;
+        _advance();
+      } else if (_check(TokType.op, '+')) {
+        _advance();
+      }
+      final valTok = _advance(); // string literal e.g. '5' or '1-6'
+      final raw = valTok.text;
+      // Leading field value (the part before any '-' / ' ' separator).
+      final leadStr = RegExp(r'^\d+').firstMatch(raw)?.group(0) ?? '0';
+      final lead = int.tryParse(leadStr) ?? 0;
+      final unit =
+          (_check(TokType.ident) || _peek().type == TokType.keyword)
+              ? _advance().text.toUpperCase()
+              : 'DAY';
+      // Optional precision qualifier and TO <unit> tail — consumed, ignored.
+      if (_check(TokType.punct, '(')) {
+        while (!_isAtEnd() && !_check(TokType.punct, ')')) {
+          _advance();
+        }
+        _match(TokType.punct, ')');
+      }
+      if (_matchWord('TO')) {
+        if (_check(TokType.ident) || _peek().type == TokType.keyword) {
+          _advance();
+        }
+        if (_check(TokType.punct, '(')) {
+          while (!_isAtEnd() && !_check(TokType.punct, ')')) {
+            _advance();
+          }
+          _match(TokType.punct, ')');
+        }
+      }
+      const daysPerUnit = <String, double>{
+        'YEAR': 365,
+        'MONTH': 30,
+        'DAY': 1,
+        'HOUR': 1 / 24,
+        'MINUTE': 1 / 1440,
+        'SECOND': 1 / 86400,
+      };
+      final days = sign * lead * (daysPerUnit[unit] ?? 1);
+      return LiteralExpr(days == days.roundToDouble() ? days.toInt() : days);
     }
     if (t.type == TokType.param) {
       _advance();
@@ -4356,6 +4419,15 @@ class Parser {
         }
       }
     }
+    // Oracle `IGNORE NULLS` / `RESPECT NULLS` modifier (FIRST_VALUE,
+    // LAST_VALUE, LAG, LEAD, NTH_VALUE).
+    bool ignoreNulls = false;
+    if (_matchWord('IGNORE')) {
+      _expectWord('NULLS');
+      ignoreNulls = true;
+    } else if (_matchWord('RESPECT')) {
+      _expectWord('NULLS');
+    }
     List<WindowOrderItem>? aggOrderBy;
     if (_matchKw('ORDER')) {
       _expectKw('BY');
@@ -4426,6 +4498,7 @@ class Parser {
       aggOrderBy: aggOrderBy,
       keepFirst: keepFirst,
       keepOrderBy: keepOrderBy,
+      ignoreNulls: ignoreNulls,
     );
   }
 
