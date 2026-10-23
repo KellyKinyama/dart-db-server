@@ -469,6 +469,10 @@ class Lexer {
       _pos += 2;
       return Token(TokType.op, ':=', start); // PL/SQL assignment
     }
+    if (c == '=' && _peek(1) == '>') {
+      _pos += 2;
+      return Token(TokType.op, '=>', start); // PL/SQL named-argument arrow
+    }
     if (c == '.' && _peek(1) == '.') {
       _pos += 2;
       return Token(TokType.op, '..', start); // PL/SQL FOR range

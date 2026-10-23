@@ -5103,7 +5103,14 @@ class Database implements SequenceProvider {
   Future<QueryResult> _call(CallStmt s,
       [Map<String, Object?>? userVars]) async {
     final routine = _routines[s.name.toUpperCase()];
-    if (routine == null) throw StateError('No such procedure: ${s.name}');
+    if (routine == null) {
+      // Oracle built-in packages (DBMS_STATS, DBMS_OUTPUT, …) aren't modeled;
+      // accept such calls as a no-op rather than erroring.
+      if (s.name.toUpperCase().startsWith('DBMS_')) {
+        return QueryResult.message('CALL ${s.name}');
+      }
+      throw StateError('No such procedure: ${s.name}');
+    }
     final argValues = <Object?>[];
     if (s.args.isNotEmpty) {
       final sel = SelectStmt(

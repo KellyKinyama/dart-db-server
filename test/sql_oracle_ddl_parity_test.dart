@@ -249,4 +249,93 @@ void main() {
       await db.close();
     }
   });
+
+  // F79: a schema-qualified FK target (REFERENCES owner.table) parses; the
+  // owner is dropped (single-schema engine) and the FK still enforces.
+  test('schema-qualified FK reference parses and enforces', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE p (id NUMBER PRIMARY KEY)');
+      await db.execute('CREATE TABLE c (pid NUMBER)');
+      await db.execute('ALTER TABLE c ADD (CONSTRAINT fk FOREIGN KEY (pid) '
+          'REFERENCES hr.p (id))');
+      await db.execute('INSERT INTO p VALUES (1)');
+      await db.execute('INSERT INTO c VALUES (1)');
+      await expectLater(
+          db.execute('INSERT INTO c VALUES (99)'), throwsA(anything));
+    } finally {
+      await db.close();
+    }
+  });
+
+  // F80: ALTER TABLE MODIFY CONSTRAINT toggles constraint state.
+  test('ALTER TABLE MODIFY CONSTRAINT DISABLE suspends the constraint',
+      () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE p (id NUMBER PRIMARY KEY)');
+      await db.execute('CREATE TABLE c (pid NUMBER, '
+          'CONSTRAINT fk FOREIGN KEY (pid) REFERENCES p (id))');
+      await expectLater(
+          db.execute('INSERT INTO c VALUES (99)'), throwsA(anything));
+      await db.execute('ALTER TABLE c MODIFY CONSTRAINT fk DISABLE NOVALIDATE');
+      await db.execute('INSERT INTO c VALUES (99)'); // loads while disabled
+      await db.execute('ALTER TABLE c MODIFY CONSTRAINT fk ENABLE');
+      await expectLater(
+          db.execute('INSERT INTO c VALUES (98)'), throwsA(anything));
+    } finally {
+      await db.close();
+    }
+  });
+
+  // F81: CREATE BITMAP INDEX is treated as a regular index.
+  test('CREATE BITMAP INDEX works as a regular index', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE t (id NUMBER, g NUMBER)');
+      await db.execute('CREATE BITMAP INDEX ix ON t (g)');
+      await db.execute('INSERT INTO t VALUES (1, 10)');
+      expect((await db.execute('SELECT id FROM t WHERE g = 10')).rows, [
+        [1]
+      ]);
+    } finally {
+      await db.close();
+    }
+  });
+
+  // F82: a trailing storage clause on CREATE INDEX is accepted and ignored.
+  test('CREATE INDEX trailing NOLOGGING/LOCAL is accepted', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE t (id NUMBER, g NUMBER)');
+      await db.execute('CREATE INDEX ix ON t (g) NOLOGGING');
+      await db.execute('CREATE INDEX ix2 ON t (id) LOCAL');
+    } finally {
+      await db.close();
+    }
+  });
+
+  // F83: CREATE DIMENSION (OLAP) is accepted and ignored.
+  test('CREATE DIMENSION is accepted', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE t (id NUMBER, city VARCHAR2(10))');
+      await db.execute('CREATE DIMENSION d LEVEL c IS (t.id)');
+    } finally {
+      await db.close();
+    }
+  });
+
+  // F84: PL/SQL named-argument (=>) syntax + a dbms_* call accepted as a no-op.
+  test('PL/SQL named-argument call is accepted', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute(
+          "BEGIN dbms_stats.gather_schema_stats('SH', cascade => TRUE); END;");
+      await db.execute(
+          "CALL dbms_stats.gather_table_stats('SH', 'SALES', degree => 4)");
+    } finally {
+      await db.close();
+    }
+  });
 }

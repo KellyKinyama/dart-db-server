@@ -494,10 +494,18 @@ class Parser {
     }
     if (_matchWord('SYNONYM')) return _parseCreateSynonymTail();
     if (_matchWord('TYPE')) return _parseCreateTypeIgnore();
+    if (_matchWord('DIMENSION')) {
+      // Oracle OLAP CREATE DIMENSION — accepted and ignored.
+      while (!_isAtEnd() && !_check(TokType.punct, ';')) {
+        _advance();
+      }
+      return DdlNoopStmt('DIMENSION');
+    }
     if (_matchKw('VIRTUAL')) {
       _expectKw('TABLE');
       return _parseCreateVirtualTableTail();
     }
+    _matchWord('BITMAP'); // Oracle bitmap index — treated as a regular index
     final isUnique = _matchKw('UNIQUE');
     if (_matchKw('INDEX')) return _parseCreateIndexTail(unique: isUnique);
     if (_matchKw('VIEW')) return _parseCreateViewTail();
@@ -786,7 +794,12 @@ class Parser {
 
   ForeignKeyRef _parseReferencesClause() {
     _expectKw('REFERENCES');
-    final tbl = _expectIdent().text;
+    var tbl = _expectIdent().text;
+    // Schema-qualified target `owner.table` — the engine is single-schema, so
+    // keep the table name and drop the owner.
+    if (_match(TokType.punct, '.')) {
+      tbl = _expectIdent().text;
+    }
     String? col;
     if (_match(TokType.punct, '(')) {
       col = _expectIdent().text;
@@ -1065,6 +1078,11 @@ class Parser {
       _parseExpr();
       final end = _peek().offset;
       whereSql = _sliceSource(start, end);
+    }
+    // Trailing Oracle storage/physical clauses (NOLOGGING, LOCAL, PARALLEL,
+    // TABLESPACE …, COMPUTE STATISTICS …) — accepted and ignored.
+    while (!_isAtEnd() && !_check(TokType.punct, ';')) {
+      _advance();
     }
     return CreateIndexStmt(
       indexName,
@@ -1960,14 +1978,25 @@ class Parser {
     final args = <Expr>[];
     if (_match(TokType.punct, '(')) {
       if (!_check(TokType.punct, ')')) {
-        args.add(_parseExpr());
+        args.add(_parseCallArg());
         while (_match(TokType.punct, ',')) {
-          args.add(_parseExpr());
+          args.add(_parseCallArg());
         }
       }
       _expect(TokType.punct, ')');
     }
     return CallStmt(name, args);
+  }
+
+  /// A call argument: a positional `expr` or an Oracle named argument
+  /// `name => expr` (the name is dropped; the value is kept positionally).
+  Expr _parseCallArg() {
+    // The arg name may be an ident or a keyword (e.g. `cascade => TRUE`).
+    if (_peek(1).type == TokType.op && _peek(1).text == '=>') {
+      _advance(); // argument name
+      _advance(); // =>
+    }
+    return _parseExpr();
   }
 
   // ---- PL/SQL (Oracle anonymous blocks & routine bodies) ------------------
@@ -2243,6 +2272,28 @@ class Parser {
       _expectKw('TO');
       final newName = _expectIdent().text;
       return AlterTableRenameColumnStmt(table, oldName, newName);
+    }
+    if (_matchWord('MODIFY')) {
+      // MODIFY CONSTRAINT <name> ENABLE/DISABLE … toggles constraint state;
+      // MODIFY (col …) / MODIFY col … changes column attributes (accepted).
+      if (_matchWord('CONSTRAINT')) {
+        final cname = _expectName();
+        bool? enable;
+        while (!_isAtEnd() && !_check(TokType.punct, ';')) {
+          final u = _peek().upper;
+          if (u == 'ENABLE') enable = true;
+          if (u == 'DISABLE') enable = false;
+          _advance();
+        }
+        if (enable != null) {
+          return AlterTableSetConstraintStmt(table, cname, enable);
+        }
+        return DdlNoopStmt('ALTER TABLE MODIFY');
+      }
+      while (!_isAtEnd() && !_check(TokType.punct, ';')) {
+        _advance();
+      }
+      return DdlNoopStmt('ALTER TABLE MODIFY');
     }
     if (_checkWord('DISABLE') || _checkWord('ENABLE')) {
       final enable = _peek().upper == 'ENABLE';
