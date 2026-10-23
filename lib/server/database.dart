@@ -14293,7 +14293,9 @@ class Database implements SequenceProvider {
     }
     if (e is CastExpr) {
       final v = _evalProjectedWithAggregates(e.expr, grp, ctx);
-      return CastExpr(LiteralExpr(v), e.targetType).eval(ctx);
+      return CastExpr(LiteralExpr(v), e.targetType,
+              numericScale: e.numericScale, charLength: e.charLength)
+          .eval(ctx);
     }
     return e.eval(ctx);
   }
@@ -14479,10 +14481,11 @@ class Database implements SequenceProvider {
           // GROUP_CONCAT(expr [, sep]) -- defaults to ','.
           // STRING_AGG(expr, sep) -- separator is required, but we accept
           // a missing one too for symmetry.
-          String sep = ',';
+          // LISTAGG(expr) with no separator concatenates with nothing.
+          String sep = e.name == 'LISTAGG' ? '' : ',';
           if (e.args.length > 1) {
             final s = _bindExpr(e.args[1]).eval(grp.isEmpty ? {} : grp.first);
-            sep = s?.toString() ?? ',';
+            sep = s?.toString() ?? sep;
           }
           final parts = <String>[];
           if (e.args.isNotEmpty) {
@@ -14656,6 +14659,16 @@ class Database implements SequenceProvider {
             }
           }
           return best;
+        }
+      case 'APPROX_COUNT_DISTINCT':
+        {
+          // Exact distinct count (the engine is in-memory; no approximation).
+          final seen = <Object?>{};
+          for (final v in _aggValues(e, grp)) {
+            if (v == null) continue;
+            seen.add(v);
+          }
+          return seen.length;
         }
       case 'MEDIAN':
         {
@@ -15178,6 +15191,26 @@ class Database implements SequenceProvider {
             final defaultVal =
                 fn.args.length >= 3 ? fn.args[2].eval(const {}) : null;
             for (var k = 0; k < ordered.length; k++) {
+              if (fn.ignoreNulls && fn.args.isNotEmpty) {
+                // Step over NULL-valued rows when counting the offset.
+                var remaining = offset;
+                var idx = k;
+                Object? val;
+                while (remaining > 0) {
+                  idx += dir;
+                  if (idx < 0 || idx >= ordered.length) {
+                    val = defaultVal;
+                    break;
+                  }
+                  final cand = fn.args.first.eval(rows[ordered[idx]]);
+                  if (cand != null) {
+                    remaining--;
+                    val = cand;
+                  }
+                }
+                out[ordered[k]] = val;
+                continue;
+              }
               final target = k + dir * offset;
               if (target < 0 || target >= ordered.length) {
                 out[ordered[k]] = defaultVal;
@@ -15387,7 +15420,8 @@ class Database implements SequenceProvider {
       );
     }
     if (e is CastExpr) {
-      return CastExpr(_bindExpr(e.expr, outerScope), e.targetType);
+      return CastExpr(_bindExpr(e.expr, outerScope), e.targetType,
+          numericScale: e.numericScale, charLength: e.charLength);
     }
     if (e is FunctionCallExpr) {
       // Window arguments are evaluated in their own pass, but we still

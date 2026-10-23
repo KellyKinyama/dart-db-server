@@ -119,4 +119,77 @@ void main() {
       await db.close();
     }
   });
+
+  test('TO_CHAR number Roman numeral + date CC/quoted text', () async {
+    final db = await Database.open(null);
+    try {
+      expect(await scalar(db, "SELECT TO_CHAR(2024,'FMRN')"), 'MMXXIV');
+      expect(await scalar(db, "SELECT TO_CHAR(DATE '2024-07-20','CC')"), '21');
+      expect(
+          await scalar(db, "SELECT TO_CHAR(DATE '2024-07-20','YYYY\"x\"MM')"),
+          '2024x07');
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('REGEXP_SUBSTR subexpression argument', () async {
+    final db = await Database.open(null);
+    try {
+      expect(
+          await scalar(db,
+              "SELECT REGEXP_SUBSTR('abc123def','([a-z]+)([0-9]+)',1,1,NULL,2)"),
+          '123');
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('LISTAGG default separator is empty', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE t (s VARCHAR2(10))');
+      await db.execute("INSERT INTO t VALUES ('a'), ('b'), ('c')");
+      expect(
+          await scalar(db, 'SELECT LISTAGG(s) WITHIN GROUP (ORDER BY s) FROM t'),
+          'abc');
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('LEAD IGNORE NULLS skips NULL rows', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE t (id NUMBER, v NUMBER)');
+      await db.execute('INSERT INTO t VALUES (1, 10), (2, NULL), (3, 30)');
+      final r = await db.execute(
+          'SELECT LEAD(v) IGNORE NULLS OVER (ORDER BY id) FROM t '
+          'FETCH FIRST 1 ROW ONLY');
+      expect(r.rows.first.first, 30);
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('CAST enforces NUMBER scale and VARCHAR2 length', () async {
+    final db = await Database.open(null);
+    try {
+      expect(await scalar(db, 'SELECT CAST(123.456 AS NUMBER(5,1))'), 123.5);
+      expect(await scalar(db, "SELECT CAST('abc' AS VARCHAR2(2))"), 'ab');
+    } finally {
+      await db.close();
+    }
+  });
+
+  test('APPROX_COUNT_DISTINCT counts distinct values', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE t (d NUMBER)');
+      await db.execute('INSERT INTO t VALUES (10), (10), (20), (30)');
+      expect(await scalar(db, 'SELECT APPROX_COUNT_DISTINCT(d) FROM t'), 3);
+    } finally {
+      await db.close();
+    }
+  });
 }

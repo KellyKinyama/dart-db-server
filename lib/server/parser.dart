@@ -4829,6 +4829,16 @@ class Parser {
       }
       _expect(TokType.punct, ')');
     }
+    // Oracle `IGNORE NULLS` / `RESPECT NULLS` may also follow the closing paren
+    // (LEAD/LAG: `LEAD(v) IGNORE NULLS OVER (...)`).
+    if (!ignoreNulls) {
+      if (_matchWord('IGNORE')) {
+        _expectWord('NULLS');
+        ignoreNulls = true;
+      } else if (_matchWord('RESPECT')) {
+        _expectWord('NULLS');
+      }
+    }
     WindowSpec? window;
     if (_matchKw('OVER')) {
       // OVER w   |   OVER (...)
@@ -5005,17 +5015,39 @@ class Parser {
     _expectKw('AS');
     final typeTok = _advance();
     final type = parseDataType(typeTok.text);
-    // Optional size/precision — `VARCHAR(10)`, `DECIMAL(5,2)` — accepted but
-    // not retained (the engine casts by affinity, not by declared width).
+    // Oracle CAST enforces the declared size: NUMBER(p,s) rounds to the scale,
+    // VARCHAR2/CHAR(n) truncates to the length.
+    int? numericScale;
+    int? charLength;
     if (_check(TokType.punct, '(')) {
-      _advance();
+      final rawType = typeTok.text.toUpperCase();
+      const charTypes = {
+        'VARCHAR', 'VARCHAR2', 'CHAR', 'NCHAR', 'NVARCHAR', 'NVARCHAR2',
+        'CHARACTER',
+      };
+      _advance(); // (
+      final first = _advance();
+      final firstN = int.tryParse(first.text);
+      if (_matchWord('CHAR') || _matchWord('BYTE')) {}
+      if (_match(TokType.punct, ',')) {
+        var neg = false;
+        if (_check(TokType.op, '-')) {
+          neg = true;
+          _advance();
+        }
+        final sc = int.tryParse(_advance().text);
+        numericScale = sc == null ? null : (neg ? -sc : sc);
+      } else if (charTypes.contains(rawType)) {
+        charLength = firstN;
+      }
       while (!_check(TokType.punct, ')') && !_check(TokType.eof)) {
         _advance();
       }
       _expect(TokType.punct, ')');
     }
     _expect(TokType.punct, ')');
-    return CastExpr(e, type);
+    return CastExpr(e, type,
+        numericScale: numericScale, charLength: charLength);
   }
 
   Expr _parseExistsExpr() {

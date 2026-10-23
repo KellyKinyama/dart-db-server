@@ -947,11 +947,32 @@ class CaseExpr extends Expr {
 class CastExpr extends Expr {
   final Expr expr;
   final DataType targetType;
-  CastExpr(this.expr, this.targetType);
+  // Oracle CAST enforces the declared size: NUMBER(p,s) rounds to [scale];
+  // VARCHAR2/CHAR(n) truncates to [charLength].
+  final int? numericScale;
+  final int? charLength;
+  CastExpr(this.expr, this.targetType, {this.numericScale, this.charLength});
   @override
   Object? eval(Map<String, Object?> row) {
     final v = expr.eval(row);
     if (v == null) return null;
+    final result = _convert(v);
+    if (result is num && numericScale != null) {
+      final factor = _pow10(numericScale!);
+      final r = numericScale! >= 0
+          ? (result * factor).round() / factor
+          : (result / _pow10(-numericScale!)).round() * _pow10(-numericScale!);
+      return r is double && r == r.truncateToDouble() && numericScale! <= 0
+          ? r.toInt()
+          : r;
+    }
+    if (result is String && charLength != null && result.length > charLength!) {
+      return result.substring(0, charLength!);
+    }
+    return result;
+  }
+
+  Object? _convert(Object? v) {
     // CAST has more lenient conversion than the implicit table coercion:
     // - double->int truncates
     // - int/double->TEXT stringifies
@@ -1758,6 +1779,29 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
   'CHR': (a) => _propagateNull(a, () {
         return String.fromCharCode((a[0] as num).toInt());
       }),
+  // Oracle NLSSORT: a collation sort key (we fold to upper-case for a
+  // case-insensitive linguistic-ish ordering).
+  'NLSSORT': (a) => _propagateNull(a, () => a[0].toString().toUpperCase()),
+  // ASCIISTR: non-ASCII characters become \XXXX escapes.
+  'ASCIISTR': (a) => _propagateNull(a, () {
+        final sb = StringBuffer();
+        for (final r in a[0].toString().runes) {
+          if (r < 128) {
+            sb.writeCharCode(r);
+          } else {
+            sb.write('\\${r.toRadixString(16).toUpperCase().padLeft(4, '0')}');
+          }
+        }
+        return sb.toString();
+      }),
+  // UNISTR: decode \XXXX escapes back to Unicode characters.
+  'UNISTR': (a) => _propagateNull(a, () {
+        return a[0].toString().replaceAllMapped(
+            RegExp(r'\\([0-9A-Fa-f]{4})'),
+            (m) => String.fromCharCode(int.parse(m.group(1)!, radix: 16)));
+      }),
+  // GROUP_ID distinguishes duplicate rows in GROUPING SETS; 0 here.
+  'GROUP_ID': (a) => 0,
   // SPACE(n) -- string of n spaces.
   'SPACE': (a) => _propagateNull(a, () {
         final n = (a[0] as num).toInt();
@@ -2145,7 +2189,14 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     final start = (position - 1).clamp(0, src.length);
     final matches = re.allMatches(src, start).toList();
     if (occurrence > matches.length) return null;
-    return matches[occurrence - 1].group(0);
+    final m = matches[occurrence - 1];
+    // 6th arg selects a capture group (subexpression); 0/absent = whole match.
+    final subexpr =
+        a.length > 5 && a[5] != null ? _sqlTextToNum(a[5]).toInt() : 0;
+    if (subexpr > 0) {
+      return subexpr <= m.groupCount ? m.group(subexpr) : null;
+    }
+    return m.group(0);
   },
   'REGEXP_COUNT': (a) {
     if (a.length < 2 || a[0] == null || a[1] == null) return null;
@@ -2863,6 +2914,20 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
         n = num.tryParse(v.trim());
       }
       if (n != null) {
+        final upperFmt = fmt.toUpperCase().replaceAll('FM', '');
+        // Roman numerals (RN): 1..3999.
+        if (upperFmt == 'RN') {
+          final r = _toRoman(n.toInt());
+          if (r != null) {
+            return fmt.toUpperCase().startsWith('FM') ? r : r.padLeft(15);
+          }
+        }
+        // Negative sign in angle brackets (PR): -5 -> <5>.
+        if (RegExp(r'PR$', caseSensitive: false).hasMatch(fmt)) {
+          final body = _formatOracleNumber(n.abs(), fmt.replaceAll(
+              RegExp('PR', caseSensitive: false), '')).trim();
+          return n < 0 ? '<$body>' : ' $body ';
+        }
         // Hexadecimal format model (FMXXX / XXXX): emit uppercase hex.
         final hexFmt = RegExp(r'^(FM)?X+$', caseSensitive: false);
         if (hexFmt.hasMatch(fmt)) {
@@ -3904,7 +3969,7 @@ String _applyNameCase(String value, String token) {
 }
 
 bool _looksLikeDateFormat(String fmt) =>
-    RegExp(r'Y{2,4}|MON|MM|DD|DAY|DY|HH|MI|SS|FF|WW|IW|\bQ\b|\bJ\b',
+    RegExp(r'Y{2,4}|R{2,4}|MON|MM|DD|DAY|DY|HH|MI|SS|FF|WW|IW|CC|\bQ\b|\bJ\b|"',
             caseSensitive: false)
         .hasMatch(fmt);
 
@@ -3918,12 +3983,23 @@ bool _looksLikeNumberFormat(String fmt) =>
 String _formatOracleDate(DateTime d, String fmt) {
   // Longest tokens first so e.g. MONTH wins over MON over MM, DDD over DD.
   const tokens = [
-    'YYYY', 'MONTH', 'HH24', 'HH12', 'DDD', 'MON', 'DAY', 'YY', 'MM', 'DD',
-    'DY', 'HH', 'MI', 'WW', 'IW', 'SS', 'AM', 'PM', 'Q', 'J', 'D',
+    'YYYY', 'RRRR', 'YEAR', 'MONTH', 'HH24', 'HH12', 'DDD', 'MON', 'DAY', 'CC',
+    'YY', 'RR', 'MM', 'DD', 'DY', 'HH', 'MI', 'WW', 'IW', 'SS', 'AM', 'PM',
+    'Q', 'J', 'D',
   ];
   final sb = StringBuffer();
   var i = 0;
   while (i < fmt.length) {
+    // Double-quoted literal text is emitted verbatim (without the quotes).
+    if (fmt[i] == '"') {
+      i++;
+      while (i < fmt.length && fmt[i] != '"') {
+        sb.write(fmt[i]);
+        i++;
+      }
+      if (i < fmt.length) i++; // closing quote
+      continue;
+    }
     // Fractional seconds FF[1-9]: emit that many leading fraction digits.
     if (i + 1 < fmt.length &&
         fmt.substring(i, i + 2).toUpperCase() == 'FF') {
@@ -3954,10 +4030,18 @@ String _formatOracleDate(DateTime d, String fmt) {
     final up = matched.toUpperCase();
     switch (up) {
       case 'YYYY':
+      case 'RRRR':
         sb.write(d.year.toString().padLeft(4, '0'));
         break;
       case 'YY':
+      case 'RR':
         sb.write((d.year % 100).toString().padLeft(2, '0'));
+        break;
+      case 'CC':
+        sb.write(((d.year - 1) ~/ 100 + 1).toString().padLeft(2, '0'));
+        break;
+      case 'YEAR':
+        sb.write(_applyNameCase(_spellYear(d.year), matched));
         break;
       case 'MM':
         sb.write(d.month.toString().padLeft(2, '0'));
@@ -4026,6 +4110,62 @@ String _formatOracleDate(DateTime d, String fmt) {
     i += matched.length;
   }
   return sb.toString();
+}
+
+/// Roman numeral for 1..3999 (Oracle TO_CHAR 'RN'); null outside that range.
+String? _toRoman(int n) {
+  if (n < 1 || n > 3999) return null;
+  const vals = [1000, 900, 500, 400, 100, 90, 50, 40, 10, 9, 5, 4, 1];
+  const syms = [
+    'M', 'CM', 'D', 'CD', 'C', 'XC', 'L', 'XL', 'X', 'IX', 'V', 'IV', 'I',
+  ];
+  final sb = StringBuffer();
+  var x = n;
+  for (var i = 0; i < vals.length; i++) {
+    while (x >= vals[i]) {
+      sb.write(syms[i]);
+      x -= vals[i];
+    }
+  }
+  return sb.toString();
+}
+
+/// Spells a year in words (Oracle TO_CHAR 'YEAR'), upper-case; the caller
+/// re-cases per the token. e.g. 2024 -> "TWO THOUSAND TWENTY-FOUR".
+String _spellYear(int year) {
+  const ones = [
+    'ZERO', 'ONE', 'TWO', 'THREE', 'FOUR', 'FIVE', 'SIX', 'SEVEN', 'EIGHT',
+    'NINE', 'TEN', 'ELEVEN', 'TWELVE', 'THIRTEEN', 'FOURTEEN', 'FIFTEEN',
+    'SIXTEEN', 'SEVENTEEN', 'EIGHTEEN', 'NINETEEN',
+  ];
+  const tens = [
+    '', '', 'TWENTY', 'THIRTY', 'FORTY', 'FIFTY', 'SIXTY', 'SEVENTY', 'EIGHTY',
+    'NINETY',
+  ];
+  String two(int n) {
+    if (n < 20) return ones[n];
+    final t = tens[n ~/ 10];
+    final o = n % 10;
+    return o == 0 ? t : '$t-${ones[o]}';
+  }
+
+  String three(int n) {
+    final h = n ~/ 100;
+    final rest = n % 100;
+    if (h == 0) return two(rest);
+    final head = '${ones[h]} HUNDRED';
+    return rest == 0 ? head : '$head ${two(rest)}';
+  }
+
+  final th = year ~/ 1000;
+  final rest = year % 1000;
+  final sb = StringBuffer();
+  if (th > 0) sb.write('${ones[th]} THOUSAND');
+  if (rest > 0) {
+    if (sb.isNotEmpty) sb.write(' ');
+    sb.write(three(rest));
+  }
+  return sb.isEmpty ? 'ZERO' : sb.toString();
 }
 
 /// Oracle Julian day number (days since 4712 BC); J for 2024-07-20 is 2460512.
@@ -4406,6 +4546,7 @@ const Set<String> kAggregateFunctions = {
   'PERCENTILE_CONT',
   'PERCENTILE_DISC',
   'STATS_MODE',
+  'APPROX_COUNT_DISTINCT',
   // Vector aggregates — batch-oriented centroid / sum operations.
   // See _aggregateValue in database.dart for implementation.
   'VEC_AVG',
