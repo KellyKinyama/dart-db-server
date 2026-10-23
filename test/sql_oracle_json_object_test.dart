@@ -86,4 +86,17 @@ void main() {
       await db.close();
     }
   });
+
+  test('JSON_VALUE decodes a BLOB column holding JSON', () async {
+    final db = await Database.open(null);
+    try {
+      await db.execute('CREATE TABLE jb (id NUMBER, details BLOB)');
+      await db.execute("INSERT INTO jb VALUES "
+          "(1, UTL_RAW.CAST_TO_RAW('{\"colour\":\"white\"}'))");
+      expect(await scalar(db, "SELECT JSON_VALUE(details, '\$.colour') FROM jb"),
+          'white');
+    } finally {
+      await db.close();
+    }
+  });
 }

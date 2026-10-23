@@ -2531,23 +2531,15 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
   // results, matching Oracle). JSON_QUERY returns the object/array fragment.
   'JSON_VALUE': (a) {
     if (a.length < 2 || a[0] == null || a[1] == null) return null;
-    Object? root;
-    try {
-      root = jsonDecode(a[0].toString());
-    } catch (_) {
-      return null;
-    }
+    final root = _decodeJsonSource(a[0]);
+    if (root == null) return null;
     final v = jsonPathLookup(root, a[1].toString());
     return (v is List || v is Map) ? null : v;
   },
   'JSON_QUERY': (a) {
     if (a.length < 2 || a[0] == null || a[1] == null) return null;
-    Object? root;
-    try {
-      root = jsonDecode(a[0].toString());
-    } catch (_) {
-      return null;
-    }
+    final root = _decodeJsonSource(a[0]);
+    if (root == null) return null;
     final v = jsonPathLookup(root, a[1].toString());
     return (v is List || v is Map) ? jsonEncode(v) : null;
   },
@@ -3292,6 +3284,28 @@ Object? jsonPathLookup(Object? root, String path) {
 /// Render the result of a JSON lookup as SQLite would: scalars (number,
 /// string, bool, null) come back unwrapped; arrays/objects stay as JSON
 /// text.
+/// Decodes a JSON source value into its parsed tree. BLOB/RAW bytes (List<int>)
+/// are UTF-8 decoded first (Oracle stores JSON in BLOB columns); returns null
+/// when the payload is not valid JSON.
+Object? _decodeJsonSource(Object? v) {
+  if (v == null) return null;
+  String s;
+  if (v is List<int>) {
+    try {
+      s = utf8.decode(v);
+    } catch (_) {
+      return null;
+    }
+  } else {
+    s = v.toString();
+  }
+  try {
+    return jsonDecode(s);
+  } catch (_) {
+    return null;
+  }
+}
+
 Object? _jsonScalarOrText(Object? v) {
   if (v == null) return null;
   if (v is num || v is String || v is bool) return v;
