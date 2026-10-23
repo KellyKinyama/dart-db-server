@@ -1504,4 +1504,20 @@ void main() {
       await db.close();
     }
   });
+
+  test('F232 XMLTABLE with PASSING shreds repeated nodes', () async {
+    final db = await Database.open(null);
+    try {
+      final r = await db.execute(
+          "SELECT v FROM XMLTABLE('/a/b' "
+          "PASSING XMLTYPE('<a><b>1</b><b>2</b></a>') "
+          "COLUMNS v NUMBER PATH '.')");
+      expect(r.rows, [
+        [1],
+        [2],
+      ]);
+    } finally {
+      await db.close();
+    }
+  });
 }

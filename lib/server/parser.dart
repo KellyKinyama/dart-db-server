@@ -762,6 +762,56 @@ class Parser {
     );
   }
 
+  /// Parses `XMLTABLE('xpath' PASSING xmldoc COLUMNS col type PATH 'p', …)`
+  /// into a derived table whose FROM is an `XMLTABLE` table-function call:
+  /// args are `[xmldoc, rowXPath, jsonEncode(columnSpecs)]`.
+  SelectStmt _parseXmlTableClause() {
+    _expect(TokType.punct, '(');
+    final rowXPath = _check(TokType.string) ? _advance().text : '/';
+    Expr doc = LiteralExpr('');
+    if (_matchWord('PASSING')) {
+      _matchWord('BY');
+      _matchWord('VALUE');
+      doc = _parseExpr();
+    }
+    final names = <String>[];
+    final specs = <Map<String, Object?>>[];
+    if (_matchWord('COLUMNS')) {
+      do {
+        final name = _expectName();
+        if (_matchWord('FOR')) {
+          _matchWord('ORDINALITY');
+          names.add(name);
+          specs.add({'kind': 'ord', 'name': name});
+          continue;
+        }
+        final typeName = _advance().text.toUpperCase();
+        if (_check(TokType.punct, '(')) {
+          while (!_check(TokType.punct, ')') && !_isAtEnd()) {
+            _advance();
+          }
+          _match(TokType.punct, ')');
+        }
+        var path = name;
+        if (_matchWord('PATH') && _check(TokType.string)) {
+          path = _advance().text;
+        }
+        names.add(name);
+        specs.add(
+            {'kind': 'path', 'name': name, 'path': path, 'type': typeName});
+      } while (_match(TokType.punct, ','));
+    }
+    _expect(TokType.punct, ')'); // XMLTABLE
+    return SelectStmt(
+      projection: [for (final c in names) SelectItem.expr(ColumnExpr(c))],
+      fromFunction: FunctionCallExpr(
+        'XMLTABLE',
+        [doc, LiteralExpr(rowXPath), LiteralExpr(jsonEncode(specs))],
+      ),
+      orderBy: const [],
+    );
+  }
+
   /// Parses a JSON_TABLE `COLUMNS ( … )` list into [names] (projection order)
   /// and [specs] (per-column descriptors: FOR ORDINALITY, EXISTS PATH, a typed
   /// PATH column with optional DEFAULT … ON ERROR, or a NESTED PATH subtree).
@@ -3754,6 +3804,11 @@ class Parser {
           _peek(1).text == '(') {
         _advance(); // JSON_TABLE
         fromSub = _parseJsonTableClause();
+      } else if (_checkWord('XMLTABLE') &&
+          _peek(1).type == TokType.punct &&
+          _peek(1).text == '(') {
+        _advance(); // XMLTABLE
+        fromSub = _parseXmlTableClause();
       } else {
         // Look ahead: an identifier immediately followed by `(` is a
         // table-valued function call (e.g. `json_each('[1,2]')`).

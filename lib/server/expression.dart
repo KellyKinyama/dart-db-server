@@ -4821,6 +4821,10 @@ String? _xmlExtractText(String xml, String xpath) {
   return content;
 }
 
+/// Public entry point for [_xmlExtractText], used by XMLTABLE materialization.
+String? xmlExtractText(String xml, String xpath) =>
+    _xmlExtractText(xml, xpath);
+
 /// Evaluates a constant arithmetic expression string (`+ - * /` over numeric
 /// literals, with parentheses) and returns the result, or null when the text
 /// is not a pure arithmetic expression. Used for XMLQUERY content evaluation.

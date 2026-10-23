@@ -12070,6 +12070,9 @@ class Database implements SequenceProvider {
       case 'JSON_TABLE':
         rows = _jsonTableRows(args, qual);
         break;
+      case 'XMLTABLE':
+        rows = _xmlTableRows(args, qual);
+        break;
       case 'GENERATE_SERIES':
         rows = _generateSeriesRows(args);
         break;
@@ -14088,6 +14091,69 @@ class Database implements SequenceProvider {
     }
     if (raw == null && hasDefault) return spec['default'];
     return raw;
+  }
+
+  /// Implementation of Oracle `XMLTABLE(rowXPath PASSING doc COLUMNS …)`.
+  /// [args] is `[xmlDoc, rowXPath, jsonEncode(columnSpecs)]`. Produces one row
+  /// per element matched by [rowXPath]; each column's PATH (relative, `.` for
+  /// the current node) selects its text, coerced by the declared type.
+  List<Map<String, Object?>> _xmlTableRows(List<Object?> args, String qual) {
+    if (args.isEmpty || args[0] == null) return const [];
+    final src = args[0];
+    final xml = src is List<int> ? utf8.decode(src) : src.toString();
+    final rowXPath =
+        args.length >= 2 && args[1] != null ? args[1].toString() : '/';
+    final specs = args.length >= 3 && args[2] != null
+        ? (jsonDecode(args[2].toString()) as List).cast<Map<String, Object?>>()
+        : const <Map<String, Object?>>[];
+    final nodes = _xmlSelectNodes(xml, rowXPath);
+    final out = <Map<String, Object?>>[];
+    var ord = 0;
+    for (final node in nodes) {
+      ord++;
+      final row = <String, Object?>{};
+      for (final spec in specs) {
+        final name = spec['name'] as String;
+        if (spec['kind'] == 'ord') {
+          row[name] = ord;
+          continue;
+        }
+        final path = (spec['path'] as String?) ?? '.';
+        String? text;
+        if (path == '.' || path.isEmpty) {
+          text = node;
+        } else {
+          text = xmlExtractText('<__x__>$node</__x__>', '/__x__/$path') ??
+              xmlExtractText(node, path);
+        }
+        row[name] = _coerceJsonTableValue(text, spec);
+      }
+      for (final e in row.entries.toList()) {
+        row['$qual.${e.key}'] = e.value;
+      }
+      out.add(row);
+    }
+    return out;
+  }
+
+  /// Selects the inner text of every element addressed by [xpath]. All but the
+  /// final segment resolve to the first matching element; the final segment
+  /// collects every matching sibling (one per output row).
+  List<String> _xmlSelectNodes(String xml, String xpath) {
+    final segs = xpath.split('/').where((s) => s.isNotEmpty).toList();
+    var content = xml.trim();
+    if (segs.isEmpty) return [content];
+    for (var i = 0; i < segs.length; i++) {
+      final tag = segs[i].replaceAll(RegExp(r'\[.*\]$'), '');
+      final re = RegExp('<$tag\\b[^>]*>(.*?)</$tag>', dotAll: true);
+      if (i == segs.length - 1) {
+        return [for (final m in re.allMatches(content)) m.group(1)!.trim()];
+      }
+      final m = re.firstMatch(content);
+      if (m == null) return const [];
+      content = m.group(1)!.trim();
+    }
+    return const [];
   }
 
   /// Implementation of `json_each` / `json_tree`. Returns rows with the
