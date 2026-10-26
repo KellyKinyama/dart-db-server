@@ -263,6 +263,9 @@ Tasks:
 - [ ] **Coordinator.** Either integrate an external arbiter (etcd/Consul/ZK) or
   implement a minimal **Raft-lite** for leader election over the small cluster
   (3 or 5 nodes). Start with the external arbiter to avoid building consensus.
+  The embedded, dependency-free path is planned in
+  [`raft-lite-plan.md`](raft-lite-plan.md) (it reuses the op-log as Raft's log,
+  so most of the substrate already exists).
 - [ ] **Quorum-gated promotion.** Promote only with majority agreement +
   successful fence of the old primary; refuse on a minority partition.
 
