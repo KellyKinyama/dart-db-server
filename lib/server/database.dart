@@ -80,6 +80,44 @@ class _VectorIndexBinding {
   _VectorIndexBinding(this.spec);
 }
 
+/// A point-in-time view of a node's high-availability role and replication
+/// position (see [Database.haStatus]).
+class HaStatus {
+  /// `'primary'` (accepts writes) or `'replica'` (read-only).
+  final String role;
+
+  /// The epoch/term this node holds.
+  final int epoch;
+
+  /// The highest op-log LSN this node has applied as a replica.
+  final int appliedLsn;
+
+  /// The head LSN of this node's own op-log (0 when it isn't a logging primary).
+  final int logLastLsn;
+
+  /// True when this node has been fenced (superseded by a newer primary).
+  final bool fenced;
+
+  HaStatus({
+    required this.role,
+    required this.epoch,
+    required this.appliedLsn,
+    required this.logLastLsn,
+    required this.fenced,
+  });
+
+  Map<String, Object?> toJson() => {
+        'role': role,
+        'epoch': epoch,
+        'applied_lsn': appliedLsn,
+        'log_last_lsn': logLastLsn,
+        'fenced': fenced,
+      };
+
+  @override
+  String toString() => 'HaStatus(${toJson()})';
+}
+
 class Database implements SequenceProvider {
   final Map<String, Table> _tables = <String, Table>{};
 
@@ -271,6 +309,19 @@ class Database implements SequenceProvider {
 
   /// The epoch (term) this node holds.
   int get epoch => _epoch;
+
+  /// True when a shared fence is attached and the cluster epoch has advanced
+  /// past the epoch this node holds (i.e. it has been superseded).
+  bool get isFenced => _fence != null && _fence!.read() > _epoch;
+
+  /// A point-in-time view of this node's HA role and replication position.
+  HaStatus haStatus() => HaStatus(
+        role: _replicaReadOnly ? 'replica' : 'primary',
+        epoch: _epoch,
+        appliedLsn: _appliedLsn,
+        logLastLsn: _oplog?.lastLsn ?? 0,
+        fenced: isFenced,
+      );
 
   /// The highest op-log LSN applied as a replica (0 when not following).
   int get appliedLsn => _appliedLsn;

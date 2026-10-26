@@ -247,5 +247,77 @@ void main() {
         await replica.close();
       }
     });
+
+    test('haStatus reports role, epoch, and replication position', () async {
+      final primary = await Database.open(_tmp('hs_p'));
+      await primary.enableOpLog();
+      final replica = await Database.open(_tmp('hs_r'));
+      final r = Replica(replica);
+      try {
+        await primary.execute('CREATE TABLE t(id INTEGER PRIMARY KEY)');
+        await primary.execute('INSERT INTO t VALUES (1)');
+
+        final ps = primary.haStatus();
+        expect(ps.role, 'primary');
+        expect(ps.logLastLsn, 2);
+        expect(ps.fenced, isFalse);
+
+        await r.catchUp(primary.opLog!);
+        final rs = replica.haStatus();
+        expect(rs.role, 'replica');
+        expect(rs.appliedLsn, 2);
+      } finally {
+        await primary.close();
+        await replica.close();
+      }
+    });
+
+    test('FailoverController promotes the most-caught-up replica', () async {
+      final fence = ClusterEpoch(_tmp('fo').replaceAll('.json', '.epoch'));
+      fence.write(1);
+      final primary = await Database.open(_tmp('fo_p'));
+      await primary.enableOpLog();
+      primary.attachFence(fence, epoch: 1);
+
+      final r1 = Replica(await Database.open(_tmp('fo_r1')))..attachFence(fence);
+      final r2 = Replica(await Database.open(_tmp('fo_r2')))..attachFence(fence);
+      var alive = true;
+      final ctrl = FailoverController(
+        replicas: [r1, r2],
+        isPrimaryAlive: () async => alive,
+      );
+      try {
+        await primary.execute('CREATE TABLE t(id INTEGER PRIMARY KEY)');
+        await primary.execute('INSERT INTO t VALUES (1)');
+        await r1.catchUp(primary.opLog!); // r1 fully caught up
+        await primary.execute('INSERT INTO t VALUES (2)');
+
+        // Primary alive → no failover.
+        expect(await ctrl.checkAndFailover(primaryLog: primary.opLog!), isNull);
+
+        // Primary dies.
+        alive = false;
+        final winner =
+            await ctrl.checkAndFailover(primaryLog: primary.opLog!);
+        expect(winner, isNotNull);
+        expect(fence.read(), 2); // epoch bumped
+        expect(winner!.target.epoch, 2);
+
+        // Old primary is fenced; the winner is writable.
+        expect(
+          () => primary.execute('INSERT INTO t VALUES (99)'),
+          throwsA(isA<StateError>()),
+        );
+        await winner.target.execute('INSERT INTO t VALUES (3)');
+        final rr = await winner.target.execute('SELECT COUNT(*) FROM t');
+        expect(rr.rows, [
+          [3],
+        ]);
+      } finally {
+        await primary.close();
+        await r1.target.close();
+        await r2.target.close();
+      }
+    });
   });
 }

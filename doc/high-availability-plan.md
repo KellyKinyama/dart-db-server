@@ -188,6 +188,11 @@ Tasks:
   fencing is still required before this is safe to automate (below).
 - [ ] **Heartbeat & health.** Primary↔replica heartbeats; `GET /health`
   exposing role, `appliedLsn`, lag, and uptime.
+
+  *Partially LANDED:* `Database.haStatus()` returns an `HaStatus`
+  (role / epoch / appliedLsn / logLastLsn / fenced), the data a `/health`
+  endpoint and the coordinator consume. Network heartbeats are still TODO.
+  Test: `test/replication_test.dart` → "haStatus reports role, epoch, …".
 - [ ] **Fencing.** An epoch/term token bumped on every promotion; the old
   primary refuses writes once it sees a higher epoch (STONITH-lite). This gate
   **must** land before any automation.
@@ -209,11 +214,18 @@ split-brain.
 
 ---
 
-## Phase 4 — Automated failover & coordination  ·  Status: TODO
+## Phase 4 — Automated failover & coordination  ·  Status: WIP
 
 **Goal:** automatic promotion on primary loss with quorum safety.
 
 Tasks:
+- [x] **Coordinator (v1, single-node).** `FailoverController(replicas,
+  isPrimaryAlive)`: on a dead-primary probe, drains the primary's log into each
+  replica, ranks by `appliedLsn`, and promotes the most-caught-up one (bumping
+  the shared epoch, which fences the old primary). Test:
+  `test/replication_test.dart` → "FailoverController promotes the most-caught-up
+  replica". *Liveness is an injected probe and there is no quorum yet* — a
+  networked arbiter + majority gate replace this below.
 - [ ] **Coordinator.** Either integrate an external arbiter (etcd/Consul/ZK) or
   implement a minimal **Raft-lite** for leader election over the small cluster
   (3 or 5 nodes). Start with the external arbiter to avoid building consensus.

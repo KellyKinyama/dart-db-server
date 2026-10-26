@@ -95,3 +95,42 @@ class Replica {
     await catchUp(source);
   }
 }
+
+/// Coordinates automatic failover for a set of [replicas] following one
+/// primary. On [checkAndFailover], if the injected liveness probe reports the
+/// primary dead, the most-caught-up replica is brought fully current and
+/// promoted — which bumps the shared epoch and fences the old primary.
+///
+/// v1 relies on an injected liveness probe and a shared-filesystem op-log for
+/// the final catch-up; a networked coordinator with true quorum replaces this
+/// in a full Phase 4. All replicas must share the same fence for promotion to
+/// fence the old primary.
+class FailoverController {
+  final List<Replica> replicas;
+  final Future<bool> Function() isPrimaryAlive;
+
+  FailoverController({required this.replicas, required this.isPrimaryAlive});
+
+  /// If the primary is dead, promote the most-caught-up replica and return it;
+  /// otherwise return null. [primaryLog], when still readable over shared
+  /// storage, is drained into each replica first so the winner is as current
+  /// as possible before promotion.
+  Future<Replica?> checkAndFailover({OpLog? primaryLog}) async {
+    if (await isPrimaryAlive()) return null;
+    if (replicas.isEmpty) return null;
+    if (primaryLog != null) {
+      for (final r in replicas) {
+        try {
+          await r.catchUp(primaryLog);
+        } catch (_) {
+          /* a dead primary's log may be unreadable; promote on what we have */
+        }
+      }
+    }
+    final ranked = [...replicas]
+      ..sort((a, b) => b.appliedLsn.compareTo(a.appliedLsn));
+    final winner = ranked.first;
+    await winner.promote();
+    return winner;
+  }
+}
