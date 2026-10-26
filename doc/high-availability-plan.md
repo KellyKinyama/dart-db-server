@@ -289,8 +289,10 @@ Tasks:
   (primary + two TCP-streaming replicas, router, probe, quorum controller),
   runs a workload, crashes the primary, and asserts probe-driven epoch-fenced
   failover with **no loss of replicated writes**, old-primary fencing, and
-  continued writes on the promoted node. Network-partition / rolling-restart
-  variants are still TODO.
+  continued writes on the promoted node. Also covers **network-partition**
+  (partitioned replica resumes after the partition heals) and **rolling
+  restart** (a replica survives close/reopen with no data loss). Under-load
+  RTO bounds are still TODO.
 
 **Delivers:** unattended HA with a quorum-safe failover path.
 
