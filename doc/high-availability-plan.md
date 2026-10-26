@@ -79,7 +79,7 @@ Tasks:
 
 ---
 
-## Phase 1 — Durable commit/op-log (the keystone)  ·  Status: TODO
+## Phase 1 — Durable commit/op-log (the keystone)  ·  Status: WIP
 
 **Goal:** an append-only, crash-safe **logical change log**. Every committed
 transaction appends one framed record — a monotonic `LSN`, a timestamp, and the
@@ -88,9 +88,13 @@ This single artifact enables both streaming replication (Phase 2) and
 transaction-level point-in-time recovery.
 
 Tasks:
-- [ ] **Log format & writer.** `lib/server/oplog.dart`: length-prefixed,
-  CRC32-checksummed frames; append + fsync; segment rotation
-  (`<db>.oplog/<seg>.log`) with a manifest of `(segment, firstLsn, lastLsn)`.
+- [x] **Log format & writer.** `lib/server/oplog.dart`: length-prefixed,
+  CRC32-checksummed frames (`[u32 len][u32 crc][payload]`, payload = JSON of
+  `{lsn, ts, ops}`); append + fsync (`flush`); segment rotation
+  (`<db>.oplog/NNNNNN.log`); `readFrom(afterLsn)` replay iterator;
+  `truncateBelow(minLsn)` segment GC; and crash-safe **torn-tail recovery** on
+  `open()` (scans every segment, trims a partial final frame, recomputes
+  `lastLsn`). Fully unit-tested (`test/oplog_test.dart`). LANDED.
 - [ ] **Capture point.** Emit records at the commit boundary in
   `database.dart` (the `COMMIT` path and every auto-commit statement), after
   constraints pass but before releasing the write lock, so log order == apply
