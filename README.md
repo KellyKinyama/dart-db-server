@@ -12,10 +12,11 @@ and an interactive REPL.
 > **What ships in the box**
 >
 > - Full SQL surface (DDL, DML, joins, CTEs, window functions, transactions).
-> - **Broad Oracle SQL dialect** — `MERGE`, `PIVOT`/`UNPIVOT`, hierarchical
->   `CONNECT BY`, recursive `WITH` (auto-detected), quantified comparisons,
->   a large Oracle function library, `NUMBER`/`VARCHAR2`/`CHAR` fidelity,
->   PL/SQL blocks & packages, object types, and Oracle JSON.
+> - **Broad Oracle SQL dialect** — `MERGE`, `PIVOT`/`UNPIVOT` (incl. `PIVOT
+>   XML`), `MATCH_RECOGNIZE` row-pattern matching, hierarchical `CONNECT BY`,
+>   recursive `WITH` (auto-detected), quantified comparisons, a large Oracle
+>   function library, `NUMBER`/`VARCHAR2`/`CHAR` fidelity, PL/SQL blocks &
+>   packages, object types, and Oracle JSON & XML (`JSON_TABLE`, `XMLTABLE`).
 > - Three storage backends: in-memory (JSON), out-of-core paged, SQLite
 >   on-disk format.
 > - **Vector database** — six index kinds (Flat / HNSW / IVFFlat / LSH / PQ
@@ -105,8 +106,12 @@ print(r.rows); // [[1, Alice]]
   `EXTRACT`, `TRUNC`/`ROUND` date models, `INTERVAL` literals/arithmetic),
   conversion (`CAST`, `TO_NUMBER`, `HEXTORAW`/`RAWTOHEX`, `UTL_RAW.*`,
   `VSIZE`/`DUMP`, `NVL`/`NVL2`/`COALESCE`/`NULLIF`/`DECODE`/`GREATEST`/
-  `LEAST`), and JSON (`JSON_VALUE`, `JSON_QUERY`, `JSON_EXISTS`,
-  `JSON_OBJECT`, `IS [NOT] JSON`).
+  `LEAST`), JSON (`JSON_VALUE` with `RETURNING`/`DEFAULT ... ON ERROR`,
+  `JSON_QUERY` with `WITH WRAPPER`, `JSON_EXISTS`, `JSON_OBJECT`/`JSON_ARRAY`
+  with `ABSENT ON NULL`, `JSON_MERGEPATCH`, `JSON_SET`/`JSON_INSERT`/
+  `JSON_REPLACE`/`JSON_REMOVE`/`JSON_PATCH`, `IS [NOT] JSON`), and XML
+  (`XMLELEMENT`, `XMLFOREST`, `XMLQUERY`, `XMLSERIALIZE`, `XMLTYPE`,
+  `EXTRACTVALUE`).
 - **Joins**: `INNER`, `LEFT [OUTER]`, `RIGHT [OUTER]`, `CROSS`, plus Oracle
   legacy `(+)` outer-join markers.
 - **Subqueries**: scalar, `IN (SELECT ...)`, `EXISTS (SELECT ...)`, and
@@ -118,11 +123,19 @@ print(r.rows); // [[1, Alice]]
   `CHAR(n)` (length enforcement & blank-padding), `TIMESTAMP [WITH [LOCAL]
   TIME ZONE]`, `INTERVAL ... TO ...`, `BLOB`/`CLOB`, and `VECTOR`.
 - **Oracle dialect extras**: `MERGE ... WHEN [NOT] MATCHED [... DELETE WHERE]`,
-  `INSERT ALL`, `PIVOT`/`UNPIVOT`, hierarchical `START WITH ... CONNECT BY
-  [PRIOR]` with `CONNECT_BY_ROOT` / `SYS_CONNECT_BY_PATH`, sequences
-  (`seq.NEXTVAL`/`CURRVAL`, `GENERATED AS IDENTITY`), `DUAL`, `q'[...]'`
-  quoting, `ROWNUM`, object types & attribute navigation, and PL/SQL blocks,
-  packages, triggers, `CASE` statements and `%TYPE` declarations.
+  `INSERT ALL`, `PIVOT`/`UNPIVOT` (including `PIVOT XML (... FOR col IN
+  (ANY))`), `MATCH_RECOGNIZE (PARTITION BY ... ORDER BY ... MEASURES ...
+  PATTERN (...) DEFINE ...)` row-pattern recognition, hierarchical `START
+  WITH ... CONNECT BY [PRIOR]` with `CONNECT_BY_ROOT` / `SYS_CONNECT_BY_PATH`,
+  sequences (`seq.NEXTVAL`/`CURRVAL`, `GENERATED AS IDENTITY`), `DUAL`,
+  `q'[...]'` quoting, `ROWNUM`, object types & attribute navigation, and
+  PL/SQL blocks, packages, triggers, `CASE` statements and `%TYPE`
+  declarations.
+- **Table-valued row sources**: `JSON_TABLE(src, rowPath COLUMNS (...))` with
+  `FOR ORDINALITY`, `EXISTS PATH`, typed `PATH ... DEFAULT ... ON ERROR`, and
+  `NESTED PATH` subtrees; `XMLTABLE(rowXPath PASSING doc COLUMNS ...)` XML
+  shredding; plus SQLite-style `json_each` / `json_tree` and
+  `generate_series`.
 - **Introspection / utility**: `SHOW TABLES`, `DESCRIBE <table>`,
   `EXPLAIN <stmt>`, `PRAGMA name [= value]` (no-op acknowledgement).
 
