@@ -140,10 +140,13 @@ round-tripped on real Oracle in `test/oracle_real_login_test.dart`.
 - [x] **Implicit result sets** (`DBMS_SQL.RETURN_RESULT`, TTC msg 27): decoded
   to `NativeImplicitResult` (cursor id + columns), FETCH-drained via
   `fetchImplicitResult`.
+- [x] **IN OUT binds** (`NativeBind.inOut(value, {maxSize})`): the IN value
+  ships in ROW_DATA and the modified value decodes back via the IO_VECTOR
+  (direction 48). NUMBER/VARCHAR2 + mixed IN/IN OUT/OUT verified vs 26ai.
 - [x] Gated tests pass vs 26ai (REF CURSOR, NUMBER/VARCHAR2/DATE OUT, IN→OUT,
-  implicit result).
-- [ ] (follow-up) nested `CURSOR(SELECT …)` columns; IN OUT binds; multiple REF
-  CURSOR OUT binds in one call.
+  IN OUT, implicit result).
+- [ ] (follow-up) nested `CURSOR(SELECT …)` columns; multiple REF CURSOR OUT
+  binds in one call; oversized CLOB IN bind to a PL/SQL LOB parameter.
 
 ## Phase T6 — Bulk & RETURNING  ·  Status: LANDED (DML, array DML, RETURNING, works vs 26ai)
 - [x] **DML execute** (`buildDmlExecute` + `executeDml`): INSERT/UPDATE/DELETE

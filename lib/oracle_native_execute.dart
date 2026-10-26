@@ -166,7 +166,7 @@ class NativeUnsupportedTypeException implements Exception {
 }
 
 /// Bind direction for a PL/SQL bind.
-enum NativeBindDir { input, output }
+enum NativeBindDir { input, output, inputOutput }
 
 /// A PL/SQL bind — an IN value or an OUT placeholder of a declared type. Build
 /// with the factory constructors (`NativeBind.value`, `NativeBind.outNumber`,
@@ -188,6 +188,21 @@ class NativeBind {
       dir: NativeBindDir.input,
       oraType: e.oraType,
       maxSize: e.maxSize,
+      csfrm: e.csfrm,
+      contFlags: e.contFlags,
+      value: value,
+    );
+  }
+
+  /// An IN OUT bind: sends [value] and receives the block's updated value.
+  /// [maxSize] is the OUT buffer (default 4000 for strings; the inferred type's
+  /// minimum otherwise).
+  factory NativeBind.inOut(Object? value, {int? maxSize}) {
+    final e = _encodeBind(value);
+    return NativeBind._(
+      dir: NativeBindDir.inputOutput,
+      oraType: e.oraType,
+      maxSize: maxSize ?? (e.oraType == _oraTypeVarchar ? 4000 : e.maxSize),
       csfrm: e.csfrm,
       contFlags: e.contFlags,
       value: value,

@@ -355,6 +355,41 @@ void main() {
       }
     });
 
+    test('IN OUT binds round-trip through real Oracle', () async {
+      final host = env['ORACLE_HOST'] ?? '127.0.0.1';
+      final port = int.tryParse(env['ORACLE_PORT'] ?? '1521') ?? 1521;
+      final user = env['ORACLE_USER'] ?? 'system';
+      final pass = env['ORACLE_PASSWORD'] ?? 'TestPw1234';
+      final service = env['ORACLE_SERVICE'] ?? 'FREEPDB1';
+
+      final client = await OracleThickClient.connect(port, host: host);
+      try {
+        await client.loginReal(
+          username: user,
+          password: pass,
+          serviceName: service,
+        );
+        final r = await client
+            .callPlsql('BEGIN :1 := :1 * 2; END;', [NativeBind.inOut(21)]);
+        expect(r.outBindValues, [42]);
+
+        final r2 = await client.callPlsql(
+            "BEGIN :1 := :1 || '_x'; END;", [NativeBind.inOut('hello')]);
+        expect(r2.outBindValues, ['hello_x']);
+
+        // IN feeding an IN OUT, plus a pure OUT.
+        final r3 = await client.callPlsql(
+            'BEGIN :2 := :2 + :1; :3 := :2 * 10; END;', [
+          NativeBind.value(5),
+          NativeBind.inOut(100),
+          NativeBind.outNumber(),
+        ]);
+        expect(r3.outBindValues, [105, 1050]);
+      } finally {
+        await client.close();
+      }
+    });
+
     test('DML, array DML, and RETURNING against real Oracle', () async {
       final host = env['ORACLE_HOST'] ?? '127.0.0.1';
       final port = int.tryParse(env['ORACLE_PORT'] ?? '1521') ?? 1521;
