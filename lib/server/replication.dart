@@ -112,15 +112,26 @@ class FailoverController {
   final List<Replica> replicas;
   final Future<bool> Function() isPrimaryAlive;
 
-  FailoverController({required this.replicas, required this.isPrimaryAlive});
+  /// Minimum number of replicas that must be reachable to promote. Set to a
+  /// majority of the surviving cluster to refuse promotion on a minority
+  /// partition (split-brain safety). Default 1 = no quorum requirement.
+  final int quorum;
+
+  FailoverController({
+    required this.replicas,
+    required this.isPrimaryAlive,
+    this.quorum = 1,
+  });
 
   /// If the primary is dead, promote the most-caught-up replica and return it;
   /// otherwise return null. [primaryLog], when still readable over shared
   /// storage, is drained into each replica first so the winner is as current
-  /// as possible before promotion.
+  /// as possible before promotion. Returns null without promoting when fewer
+  /// than [quorum] replicas are reachable (minority partition).
   Future<Replica?> checkAndFailover({OpLog? primaryLog}) async {
     if (await isPrimaryAlive()) return null;
     if (replicas.isEmpty) return null;
+    if (replicas.length < quorum) return null; // insufficient quorum: refuse
     if (primaryLog != null) {
       for (final r in replicas) {
         try {

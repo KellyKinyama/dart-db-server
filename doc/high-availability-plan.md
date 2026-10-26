@@ -250,6 +250,13 @@ Tasks:
   (3 or 5 nodes). Start with the external arbiter to avoid building consensus.
 - [ ] **Quorum-gated promotion.** Promote only with majority agreement +
   successful fence of the old primary; refuse on a minority partition.
+
+  *Partially LANDED:* `FailoverController(quorum:)` refuses to promote when
+  fewer than `quorum` replicas are reachable (set to a majority of survivors),
+  avoiding split-brain on a minority partition; promotion still fences the old
+  primary via the shared epoch. Test: `test/replication_test.dart` →
+  "FailoverController refuses to promote without quorum". True networked
+  majority voting arrives with the coordinator.
 - [ ] **Automatic client re-routing.** Router subscribes to coordinator state
   and fails reads/writes over within the heartbeat window.
 

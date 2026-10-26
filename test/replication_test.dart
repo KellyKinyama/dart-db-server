@@ -358,5 +358,33 @@ void main() {
         await replica.close();
       }
     });
+
+    test('FailoverController refuses to promote without quorum', () async {
+      final fence = ClusterEpoch(_tmp('q').replaceAll('.json', '.epoch'));
+      fence.write(1);
+      final primary = await Database.open(_tmp('q_p'));
+      await primary.enableOpLog();
+      primary.attachFence(fence, epoch: 1);
+      final r1 = Replica(await Database.open(_tmp('q_r1')))..attachFence(fence);
+      // Cluster of 3 (primary + 2 replicas); only 1 replica is reachable here,
+      // so a quorum of 2 cannot be met → promotion must be refused.
+      final ctrl = FailoverController(
+        replicas: [r1],
+        isPrimaryAlive: () async => false,
+        quorum: 2,
+      );
+      try {
+        await primary.execute('CREATE TABLE t(id INTEGER PRIMARY KEY)');
+        await r1.catchUp(primary.opLog!);
+
+        final winner = await ctrl.checkAndFailover(primaryLog: primary.opLog!);
+        expect(winner, isNull); // minority partition: no promotion
+        expect(fence.read(), 1); // epoch unchanged
+        expect(r1.target.isReplica, isTrue); // still a replica
+      } finally {
+        await primary.close();
+        await r1.target.close();
+      }
+    });
   });
 }
