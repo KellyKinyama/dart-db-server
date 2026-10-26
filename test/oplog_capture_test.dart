@@ -96,5 +96,38 @@ void main() {
         await db.close();
       }
     });
+
+    test('replay-on-open recovers a committed-but-unpersisted transaction',
+        () async {
+      final path = _tmp('recover');
+      var db = await Database.open(path);
+      await db.enableOpLog();
+      try {
+        await db.execute('CREATE TABLE t(id INTEGER PRIMARY KEY)');
+        await db.execute('INSERT INTO t VALUES (1)');
+      } finally {
+        await db.close(); // snapshot now reflects LSN 2
+      }
+
+      // Simulate a crash in the append→persist window: a later commit was
+      // fsync'd to the op-log but the snapshot was never rewritten.
+      final log = OpLog('$path.oplog');
+      await log.open();
+      final lsn = await log.append(['INSERT INTO t VALUES (3)']);
+      expect(lsn, 3);
+      await log.close();
+
+      db = await Database.open(path);
+      await db.enableOpLog(); // replays LSN 3
+      try {
+        final r = await db.execute('SELECT id FROM t ORDER BY id');
+        expect(r.rows, [
+          [1],
+          [3],
+        ]);
+      } finally {
+        await db.close();
+      }
+    });
   });
 }

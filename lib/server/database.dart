@@ -240,6 +240,15 @@ class Database implements SequenceProvider {
   /// whole transaction is appended to [_oplog] as one record at COMMIT.
   List<String>? _txnOps;
 
+  /// The op-log LSN the last persisted snapshot reflects (JSON backend). On
+  /// reopen, records above this are replayed to recover committed-but-not-yet-
+  /// persisted transactions.
+  int _persistedOpLogLsn = 0;
+
+  /// True while replaying the op-log on open: suppresses re-capture and the
+  /// per-statement persist so replay is idempotent and converges once at the end.
+  bool _replaying = false;
+
   /// The durable op-log, or null when not enabled. Exposed for replication and
   /// tests.
   OpLog? get opLog => _oplog;
@@ -2344,7 +2353,7 @@ class Database implements SequenceProvider {
         }
         // HA op-log capture: buffer in-transaction mutations (flushed as one
         // record at COMMIT); auto-commit mutations are appended below.
-        if (_oplog != null && inTransaction && sourceSql != null) {
+        if (_oplog != null && !_replaying && inTransaction && sourceSql != null) {
           (_txnOps ??= <String>[]).add(sourceSql);
         }
         // Conservatively drop FTS5 caches for the statement's target
@@ -2358,24 +2367,28 @@ class Database implements SequenceProvider {
           if (t != null) _refreshPartialIndexes(t);
         }
       }
-      if (_oplog != null && stmt is BeginStmt) _txnOps = <String>[];
+      if (_oplog != null && !_replaying && stmt is BeginStmt) {
+        _txnOps = <String>[];
+      }
       if (_oplog != null &&
+          !_replaying &&
           (stmt is RollbackStmt || stmt is RollbackToSavepointStmt)) {
         _txnOps = null;
       }
       if (stmt is CommitStmt) {
-        if (_oplog != null && _txnOps != null && _txnOps!.isNotEmpty) {
+        if (_oplog != null && !_replaying && _txnOps != null &&
+            _txnOps!.isNotEmpty) {
           await _oplog!.append(_txnOps!);
         }
         _txnOps = null;
-        await _persist();
+        if (!_replaying) await _persist();
         return result;
       }
       if (!inTransaction && _isMutation(stmt)) {
-        if (_oplog != null && sourceSql != null) {
+        if (_oplog != null && !_replaying && sourceSql != null) {
           await _oplog!.append([sourceSql]);
         }
-        await _persist();
+        if (!_replaying) await _persist();
       }
       return result;
     }
@@ -18284,7 +18297,9 @@ class Database implements SequenceProvider {
           for (final e in _vectorIndexes.entries)
             _vectorIndexToJson(e.key, e.value),
         ],
+      if (_oplog != null) 'oplog_lsn': _oplog!.lastLsn,
     };
+    _persistedOpLogLsn = _oplog?.lastLsn ?? _persistedOpLogLsn;
     await _atomicWriteBytes(
       path!,
       Uint8List.fromList(utf8.encode(jsonEncode(out))),
@@ -18847,6 +18862,7 @@ class Database implements SequenceProvider {
     if (text.trim().isEmpty) return;
     final data = jsonDecode(text);
     if (data is Map && data['__schema__'] == 2) {
+      _persistedOpLogLsn = (data['oplog_lsn'] as num?)?.toInt() ?? 0;
       final tables = (data['tables'] as Map).cast<String, Object?>();
       for (final e in tables.entries) {
         final t = Table.fromJson((e.value as Map).cast<String, Object?>());
@@ -18905,11 +18921,29 @@ class Database implements SequenceProvider {
   /// Enable the durable op-log (HA Phase 1) for this path-backed database.
   /// Opens `<path>.oplog/` and begins appending every committed mutation for
   /// replication / point-in-time recovery. No-op for an in-memory database.
+  ///
+  /// On the JSON backend this also **recovers** any committed-but-not-yet-
+  /// persisted transactions: records above the snapshot's stamped LSN are
+  /// replayed, then a single persist converges the snapshot. (The SQLite
+  /// backend recovers through its own WAL, so replay is skipped there.)
   Future<void> enableOpLog() async {
     if (path == null || _oplog != null) return;
     final log = OpLog('$path.oplog');
     await log.open();
     _oplog = log;
+    if (!_persistAsSqlite && log.lastLsn > _persistedOpLogLsn) {
+      _replaying = true;
+      try {
+        await for (final rec in log.readFrom(_persistedOpLogLsn)) {
+          for (final op in rec.ops) {
+            await execute(op);
+          }
+        }
+      } finally {
+        _replaying = false;
+      }
+      await _persist();
+    }
   }
 
   /// Quiesce the database so an external backup tool (e.g. `dbr`) can copy a

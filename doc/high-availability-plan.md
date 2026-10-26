@@ -113,6 +113,14 @@ Tasks:
   persisted snapshot's LSN, replay the tail to recover committed-but-not-yet-
   snapshotted transactions. Reconciles the "no redo log" gap called out in the
   [reliability plan](reliability-gap-closure-plan.md) (F15 family).
+
+  *LANDED (JSON backend):* the snapshot is stamped with `oplog_lsn`;
+  `enableOpLog()` replays every record above it under a `_replaying` guard
+  (no re-capture, single converging persist), recovering a commit that was
+  fsync'd to the log but lost before the snapshot was rewritten.
+  Test: `test/oplog_capture_test.dart` → "replay-on-open recovers a
+  committed-but-unpersisted transaction". SQLite backend recovers via its own
+  WAL, so replay is skipped there.
 - [ ] **Checkpoint/truncation.** Persist a full snapshot periodically, stamp it
   with its LSN, and GC log segments fully below the min(snapshot LSN, slowest
   replica LSN).
