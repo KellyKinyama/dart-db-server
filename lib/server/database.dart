@@ -14,6 +14,7 @@ import 'concurrency.dart';
 import 'blob.dart';
 import 'expression.dart';
 import 'fts5.dart';
+import 'oplog.dart';
 import 'parser.dart';
 import 'prepared.dart';
 import 'result.dart';
@@ -228,6 +229,20 @@ class Database implements SequenceProvider {
   /// Once a transaction is in flight all further statements run under
   /// the writer arm so the snapshot semantics stay coherent.
   final AsyncRwLock _lock = AsyncRwLock();
+
+  /// Optional durable logical change log (HA Phase 1). When enabled via
+  /// [enableOpLog], every committed mutation is appended as an [OpLogRecord]
+  /// for replication / point-in-time recovery. Null (off) by default so the
+  /// write path is unchanged for callers that don't opt in.
+  OpLog? _oplog;
+
+  /// Buffers the source SQL of mutations inside an explicit transaction so the
+  /// whole transaction is appended to [_oplog] as one record at COMMIT.
+  List<String>? _txnOps;
+
+  /// The durable op-log, or null when not enabled. Exposed for replication and
+  /// tests.
+  OpLog? get opLog => _oplog;
 
   /// Test/diagnostics hook: returns the in-process RW lock so callers
   /// can assert serialization properties.
@@ -2157,6 +2172,10 @@ class Database implements SequenceProvider {
       } catch (_) {}
     }
     _pagedTables.clear();
+    try {
+      await _oplog?.close();
+    } catch (_) {}
+    _oplog = null;
     final fl = _fileLock;
     _fileLock = null;
     if (fl != null) await fl.release();
@@ -2167,7 +2186,7 @@ class Database implements SequenceProvider {
   // ---------------------------------------------------------------------------
   Future<QueryResult> execute(String sql, {Map<String, Object?>? userVars}) async {
     final stmt = Parser.fromString(sql).parseStatement();
-    return executeStmt(stmt, userVars: userVars);
+    return executeStmt(stmt, userVars: userVars, sourceSql: sql);
   }
 
   Future<List<QueryResult>> executeScript(String sql,
@@ -2223,7 +2242,7 @@ class Database implements SequenceProvider {
   }
 
   Future<QueryResult> executeStmt(Statement stmt,
-      {Map<String, Object?>? userVars}) async {
+      {Map<String, Object?>? userVars, String? sourceSql}) async {
     // CALL runs the procedural interpreter, whose embedded statements each
     // take the lock themselves — so it must not run inside an outer lock.
     if (stmt is CallStmt) return _call(stmt, userVars);
@@ -2323,6 +2342,11 @@ class Database implements SequenceProvider {
           _changesCount = result.affected;
           _totalChangesCount += result.affected;
         }
+        // HA op-log capture: buffer in-transaction mutations (flushed as one
+        // record at COMMIT); auto-commit mutations are appended below.
+        if (_oplog != null && inTransaction && sourceSql != null) {
+          (_txnOps ??= <String>[]).add(sourceSql);
+        }
         // Conservatively drop FTS5 caches for the statement's target
         // table; the next ranking call will rebuild on demand.
         final tname = _statementTable(stmt);
@@ -2334,11 +2358,23 @@ class Database implements SequenceProvider {
           if (t != null) _refreshPartialIndexes(t);
         }
       }
+      if (_oplog != null && stmt is BeginStmt) _txnOps = <String>[];
+      if (_oplog != null &&
+          (stmt is RollbackStmt || stmt is RollbackToSavepointStmt)) {
+        _txnOps = null;
+      }
       if (stmt is CommitStmt) {
+        if (_oplog != null && _txnOps != null && _txnOps!.isNotEmpty) {
+          await _oplog!.append(_txnOps!);
+        }
+        _txnOps = null;
         await _persist();
         return result;
       }
       if (!inTransaction && _isMutation(stmt)) {
+        if (_oplog != null && sourceSql != null) {
+          await _oplog!.append([sourceSql]);
+        }
         await _persist();
       }
       return result;
@@ -18865,6 +18901,16 @@ class Database implements SequenceProvider {
   }
 
   Future<void> flush() => _persist();
+
+  /// Enable the durable op-log (HA Phase 1) for this path-backed database.
+  /// Opens `<path>.oplog/` and begins appending every committed mutation for
+  /// replication / point-in-time recovery. No-op for an in-memory database.
+  Future<void> enableOpLog() async {
+    if (path == null || _oplog != null) return;
+    final log = OpLog('$path.oplog');
+    await log.open();
+    _oplog = log;
+  }
 
   /// Quiesce the database so an external backup tool (e.g. `dbr`) can copy a
   /// self-consistent on-disk image. Holds the write lock for the duration so

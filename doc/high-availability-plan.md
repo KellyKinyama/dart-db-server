@@ -100,6 +100,15 @@ Tasks:
   constraints pass but before releasing the write lock, so log order == apply
   order. Capture the *logical* op (normalized SQL or a structured op), not the
   physical page diff.
+
+  *Partially LANDED:* opt-in `Database.enableOpLog()` opens `<path>.oplog/` and
+  the executor appends each committed mutation — auto-commit statements as one
+  record, an explicit `BEGIN…COMMIT` as a single multi-op record (`ROLLBACK`
+  discards the buffer). Capture currently keys off the `execute(sql)` source
+  text; **prepared/bind statements are not yet captured** (tracked below).
+  Tests: `test/oplog_capture_test.dart`.
+- [ ] **Bind-aware capture.** Capture prepared/parameterized statements (expand
+  binds to literals, or log a structured op) so the log is complete.
 - [ ] **Recovery/replay.** On `Database.open`, if the log is ahead of the last
   persisted snapshot's LSN, replay the tail to recover committed-but-not-yet-
   snapshotted transactions. Reconciles the "no redo log" gap called out in the
