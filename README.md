@@ -5,18 +5,25 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![CI](https://github.com/KellyKinyama/dart-db-server/actions/workflows/ci.yml/badge.svg)](https://github.com/KellyKinyama/dart-db-server/actions/workflows/ci.yml)
 
-A small SQLite-style SQL database server written in pure Dart. In-memory
-storage with JSON file persistence, TCP server with a JSON line protocol,
-and an interactive REPL.
+A pure-Dart SQL database engine and server built to be a **drop-in Oracle
+replacement**, with **MySQL** wire compatibility alongside. It speaks a broad
+Oracle SQL dialect and the Oracle and MySQL wire protocols, so unmodified
+Oracle and MySQL clients and ORMs connect unchanged — backed by an in-memory
+store with file persistence, an out-of-core paged backend, the real SQLite
+on-disk format, a TCP server, and an interactive REPL.
 
 > **What ships in the box**
 >
-> - Full SQL surface (DDL, DML, joins, CTEs, window functions, transactions).
-> - **Broad Oracle SQL dialect** — `MERGE`, `PIVOT`/`UNPIVOT` (incl. `PIVOT
+> - **Drop-in Oracle dialect** — `MERGE`, `PIVOT`/`UNPIVOT` (incl. `PIVOT
 >   XML`), `MATCH_RECOGNIZE` row-pattern matching, hierarchical `CONNECT BY`,
 >   recursive `WITH` (auto-detected), quantified comparisons, a large Oracle
 >   function library, `NUMBER`/`VARCHAR2`/`CHAR` fidelity, PL/SQL blocks &
->   packages, object types, and Oracle JSON & XML (`JSON_TABLE`, `XMLTABLE`).
+>   packages, object types, sequences, `DUAL`, `ROWNUM`, and Oracle JSON & XML
+>   (`JSON_TABLE`, `XMLTABLE`).
+> - **Oracle & MySQL wire compatibility** — unmodified Oracle clients
+>   (node-oracledb / python-oracledb / JDBC thin, and the pure-Dart `oracledb`
+>   driver) and MySQL ORMs like `mysql_client` connect unchanged.
+> - Full SQL surface (DDL, DML, joins, CTEs, window functions, transactions).
 > - Three storage backends: in-memory (JSON), out-of-core paged, SQLite
 >   on-disk format.
 > - **Vector database** — six index kinds (Flat / HNSW / IVFFlat / LSH / PQ
@@ -24,8 +31,6 @@ and an interactive REPL.
 >   payload-filter pruning, range search, hybrid vector + BM25 retrieval.
 > - **FTS5-lite** full-text search with BM25.
 > - TCP server + JSON line protocol.
-> - **MySQL wire compatibility** — ORMs like `mysql_client` connect
->   unchanged.
 
 ## Install
 
