@@ -169,7 +169,11 @@ round-tripped on real Oracle in `test/oracle_real_login_test.dart`.
   server answered with a BREAK marker. Closes the large-bind gap flagged in
   T3/T4. (Values > 32767 bytes still need a CLOB bind — see below.)
 - [ ] Full ORA error + warning decode; multi-error batches.
-- [ ] Oversized string binds (> 32767 bytes) via temporary-CLOB binds.
+- [x] **Oversized string binds (> 32767 bytes) via temporary CLOBs**
+  (`buildLobCreateTemp` / `buildLobWrite`): `queryReal` / `executeDml` detect a
+  String past the VARCHAR2 limit, CREATE_TEMP a CLOB, WRITE it (UTF-16BE on this
+  server), and bind the locator (CLOB wire shape + LOB-prefetch cont flag).
+  50000-char round-trip verified vs 26ai.
 - [ ] Statement-cache reuse; cursor close/CLOSE_ALL.
 - [ ] Session settings (NLS date/number formats, time zone) that affect decode.
 - [ ] A behavioral parity pass vs `reference/node-oracledb` / the thin

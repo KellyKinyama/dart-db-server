@@ -177,6 +177,7 @@ class NativeBind {
     required this.oraType,
     required this.maxSize,
     required this.csfrm,
+    this.contFlags = 0,
     this.value,
   });
 
@@ -188,6 +189,7 @@ class NativeBind {
       oraType: e.oraType,
       maxSize: e.maxSize,
       csfrm: e.csfrm,
+      contFlags: e.contFlags,
       value: value,
     );
   }
@@ -222,6 +224,7 @@ class NativeBind {
   final int oraType;
   final int maxSize;
   final int csfrm;
+  final int contFlags;
   final Object? value;
 
   bool get isOut => dir == NativeBindDir.output;
@@ -375,15 +378,24 @@ Uint8List buildQueryExecute(
     _writeBindMetadata(b, encodedBinds, ttcFieldVersion);
     b.writeUint8(_msgTypeRowData);
     for (final bind in encodedBinds) {
-      if (bind.bytes == null) {
-        b.writeUint8(0); // NULL indicator
-      } else {
-        b.writeBytesWithLength(bind.bytes!);
-      }
+      _writeBindValue(b, bind);
     }
   }
 
   return b.toBytes();
+}
+
+/// Writes one bind value into a ROW_DATA stream: a NULL indicator, a CLOB/BLOB
+/// locator (`UB4(len)+length-prefixed`), or a plain length-prefixed value.
+void _writeBindValue(WriteBuffer b, _EncodedBind bind) {
+  if (bind.bytes == null) {
+    b.writeUint8(0); // NULL indicator
+  } else if (bind.isLobLocator) {
+    b.writeUB4(bind.bytes!.length);
+    b.writeBytesWithLength(bind.bytes!);
+  } else {
+    b.writeBytesWithLength(bind.bytes!);
+  }
 }
 
 // --- typed binds -----------------------------------------------------------
@@ -401,21 +413,48 @@ class _EncodedBind {
     required this.maxSize,
     required this.csfrm,
     required this.bytes,
+    this.contFlags = 0,
+    this.isLobLocator = false,
   });
   final int oraType;
   final int maxSize;
   final int csfrm;
   final Uint8List? bytes;
+
+  /// Bind cont-flags word (LOB-prefetch flag for a CLOB/BLOB locator bind).
+  final int contFlags;
+
+  /// Whether [bytes] is a LOB locator — written as `UB4(len) + length-prefixed
+  /// bytes` rather than a plain length-prefixed value.
+  final bool isLobLocator;
+}
+
+/// A pre-created temporary CLOB locator used as a bind value — the vehicle for
+/// binding a String larger than the 32767-byte VARCHAR2 limit. Create one via
+/// `OracleThickClient` oversized-bind handling; it binds as a CLOB locator.
+class NativeClobBindValue {
+  NativeClobBindValue(this.locator);
+  final Uint8List locator;
 }
 
 /// Maps a Dart value to its Oracle bind wire type + encoded bytes. Supports
 /// NUMBER (num), VARCHAR2 (String), RAW (Uint8List), TIMESTAMP (DateTime),
-/// and NULL; other types throw [NativeUnsupportedTypeException].
+/// CLOB locator ([NativeClobBindValue]), and NULL; other types throw
+/// [NativeUnsupportedTypeException].
 _EncodedBind _encodeBind(Object? value) {
   if (value == null) {
     // Untyped NULL binds as a 1-byte VARCHAR slot.
     return _EncodedBind(
         oraType: _oraTypeVarchar, maxSize: 1, csfrm: _csfrmImplicit, bytes: null);
+  }
+  if (value is NativeClobBindValue) {
+    return _EncodedBind(
+        oraType: _oraTypeClob,
+        maxSize: _lobLocatorBindBufferSize,
+        csfrm: _csfrmImplicit,
+        contFlags: _lobPrefetchFlag,
+        bytes: value.locator,
+        isLobLocator: true);
   }
   if (value is num) {
     return _EncodedBind(
@@ -459,7 +498,7 @@ void _writeBindMetadata(
     b.writeUint8(0); // scale
     b.writeUB4(bind.maxSize);
     b.writeUB4(0); // max num elements
-    b.writeUB4(0); // cont flags (no LOB prefetch for scalar binds)
+    b.writeUB4(bind.contFlags); // cont flags (LOB prefetch for locator binds)
     b.writeUB4(0); // OID
     b.writeUB2(0); // version
     b.writeUB2(bind.csfrm != 0 ? _charsetUtf8 : 0); // charset field
@@ -637,7 +676,7 @@ Uint8List buildDmlExecute(
       b.writeUint8(0); // scale
       b.writeUB4(maxSizes[bi] == 0 ? 1 : maxSizes[bi]);
       b.writeUB4(0); // max num elements
-      b.writeUB4(0); // cont flags
+      b.writeUB4(bind.contFlags); // cont flags (LOB prefetch for locator binds)
       b.writeUB4(0); // OID
       b.writeUB2(0); // version
       b.writeUB2(bind.csfrm != 0 ? _charsetUtf8 : 0); // charset field
@@ -659,12 +698,8 @@ Uint8List buildDmlExecute(
           b.writeUint8(0); // OUT slot null indicator (non-returning)
           continue;
         }
-        final e = _encodeBind(i < rowValues.length ? rowValues[i] : bind.value);
-        if (e.bytes == null) {
-          b.writeUint8(0);
-        } else {
-          b.writeBytesWithLength(e.bytes!);
-        }
+        _writeBindValue(
+            b, _encodeBind(i < rowValues.length ? rowValues[i] : bind.value));
       }
     }
   }
@@ -776,7 +811,7 @@ Uint8List buildPlsqlExecute(
       b.writeUint8(0); // scale
       b.writeUB4(bind.maxSize);
       b.writeUB4(0); // max num elements
-      b.writeUB4(0); // cont flags
+      b.writeUB4(bind.contFlags); // cont flags (LOB prefetch for locator binds)
       b.writeUB4(0); // OID
       b.writeUB2(0); // version
       b.writeUB2(bind.csfrm != 0 ? _charsetUtf8 : 0); // charset field
@@ -796,12 +831,7 @@ Uint8List buildPlsqlExecute(
       } else if (bind.isOut) {
         b.writeUint8(0); // NULL indicator for an OUT slot
       } else {
-        final e = _encodeBind(bind.value);
-        if (e.bytes == null) {
-          b.writeUint8(0);
-        } else {
-          b.writeBytesWithLength(e.bytes!);
-        }
+        _writeBindValue(b, _encodeBind(bind.value));
       }
     }
   }
@@ -1630,6 +1660,13 @@ void _processServerSidePiggyback(ReadBuffer buf) {
 const int _funcLobOp = 0x60; // TNS_FUNC_LOB_OP (96)
 const int _lobOpGetLength = 0x0001;
 const int _lobOpRead = 0x0002;
+const int _lobOpWrite = 0x0040;
+const int _lobOpCreateTemp = 0x0110;
+const int _durationSession = 10;
+const int _lobLocatorBufferSize = 40;
+const int _lobLocatorBindBufferSize = 112;
+const int _lobPrefetchFlag = 0x2000000;
+const int _charsetAl16Utf16 = 2000;
 const int _msgTypeLobData = 14;
 
 /// Builds a LOB READ request for [amount] units (characters for CLOB, bytes
@@ -1692,6 +1729,84 @@ Uint8List _buildLobOp(
   return b.toBytes();
 }
 
+/// Builds a LOB CREATE_TEMP request for a temporary CLOB ([csfrm] 1 = CLOB,
+/// 2 = NCLOB). The response's `updatedLocator` is the real temp-LOB locator.
+Uint8List buildLobCreateTemp({
+  int csfrm = 1,
+  int ttcFieldVersion = _fieldVersion23_4,
+  int sequence = 1,
+}) {
+  final locator = Uint8List(_lobLocatorBufferSize);
+  final b = WriteBuffer();
+  b.writeUint8(_msgTypeFunction);
+  b.writeUint8(_funcLobOp);
+  b.writeUint8(sequence & 0xFF);
+  if (ttcFieldVersion >= _fieldVersion23_1Ext1) {
+    b.writeUB8(0); // token number
+  }
+  b.writeUint8(1); // source locator pointer (zeroed buffer)
+  b.writeUB4(locator.length);
+  b.writeUint8(0); // dest locator pointer
+  b.writeUB4(_durationSession); // dest length carries the temp-LOB duration
+  b.writeUB4(0); // short source offset
+  b.writeUB4(0); // short dest offset
+  b.writeUint8(1); // charset pointer (CREATE_TEMP)
+  b.writeUint8(0); // short amount pointer
+  b.writeUint8(1); // boolean-out pointer (CREATE_TEMP)
+  b.writeUB4(_lobOpCreateTemp);
+  b.writeUint8(0); // SCN pointer
+  b.writeUint8(0); // SCN array length
+  b.writeUB8(csfrm); // source offset carries the charset form
+  b.writeUB8(_oraTypeClob); // dest offset carries the Oracle type
+  b.writeUint8(0); // amount pointer
+  for (var i = 0; i < 3; i++) {
+    b.writeUint16BE(0);
+  }
+  b.writeBytes(locator);
+  b.writeUB4(csfrm == _csfrmNChar ? _charsetAl16Utf16 : _charsetUtf8);
+  return b.toBytes();
+}
+
+/// Builds a LOB WRITE request: writes [data] into [locator] at 1-based
+/// [offset]. For a plain CLOB, [data] is UTF-8; for an NCLOB, UTF-16BE.
+Uint8List buildLobWrite(
+  Uint8List locator,
+  int offset,
+  Uint8List data, {
+  int ttcFieldVersion = _fieldVersion23_4,
+  int sequence = 1,
+}) {
+  final b = WriteBuffer();
+  b.writeUint8(_msgTypeFunction);
+  b.writeUint8(_funcLobOp);
+  b.writeUint8(sequence & 0xFF);
+  if (ttcFieldVersion >= _fieldVersion23_1Ext1) {
+    b.writeUB8(0); // token number
+  }
+  b.writeUint8(1); // source locator pointer
+  b.writeUB4(locator.length);
+  b.writeUint8(0); // dest locator pointer
+  b.writeUB4(0); // dest locator length
+  b.writeUB4(0); // short source offset
+  b.writeUB4(0); // short dest offset
+  b.writeUint8(0); // charset pointer
+  b.writeUint8(0); // short amount pointer
+  b.writeUint8(0); // boolean-out pointer
+  b.writeUB4(_lobOpWrite);
+  b.writeUint8(0); // SCN pointer
+  b.writeUint8(0); // SCN array length
+  b.writeUB8(offset);
+  b.writeUB8(0); // dest offset
+  b.writeUint8(0); // amount pointer
+  for (var i = 0; i < 3; i++) {
+    b.writeUint16BE(0);
+  }
+  b.writeBytes(locator);
+  b.writeUint8(_msgTypeLobData);
+  b.writeBytesWithLength(data);
+  return b.toBytes();
+}
+
 /// The decoded result of a LOB READ: the concatenated data bytes (CLOB/NCLOB
 /// still charset-encoded) and whether the response stream was complete.
 class NativeLobReadResponse {
@@ -1699,6 +1814,7 @@ class NativeLobReadResponse {
     required this.data,
     required this.complete,
     this.amount,
+    this.updatedLocator,
     this.errorNum,
     this.errorMessage,
   });
@@ -1708,22 +1824,31 @@ class NativeLobReadResponse {
   /// The SB8 amount echoed in RETURN_PARAMETER (LOB length for GET_LENGTH,
   /// bytes/chars read for READ).
   final int? amount;
+
+  /// The locator the server echoed back — the real temp-LOB locator after
+  /// CREATE_TEMP, or the updated locator after WRITE.
+  final Uint8List? updatedLocator;
   final int? errorNum;
   final String? errorMessage;
   bool get isSuccess => errorNum == null || errorNum == 0;
 }
 
 /// Decodes a (possibly partial) LOB operation response. [sourceLocatorLength]
-/// is the request locator's length (echoed back in RETURN_PARAMETER).
+/// is the request locator's length (echoed back in RETURN_PARAMETER). For
+/// CREATE_TEMP pass [isCreateTemp]; for READ/GET_LENGTH leave [sendAmount] true;
+/// for WRITE pass [sendAmount] false.
 NativeLobReadResponse decodeLobReadResponse(
   Uint8List body, {
   required int sourceLocatorLength,
+  bool isCreateTemp = false,
+  bool sendAmount = true,
   int ttcFieldVersion = _fieldVersion23_4,
 }) {
   final buf = ReadBuffer(body);
   final chunks = <int>[];
   var endOfResponse = false;
   int? amount;
+  Uint8List? updatedLocator;
   int? errorNum;
   String? errorMessage;
   try {
@@ -1734,8 +1859,16 @@ NativeLobReadResponse decodeLobReadResponse(
           chunks.addAll(buf.readBytesWithLength());
           break;
         case _msgTypeParameter:
-          if (sourceLocatorLength > 0) buf.readBytes(sourceLocatorLength);
-          amount = buf.readSB8(); // amount read / LOB length
+          if (sourceLocatorLength > 0) {
+            updatedLocator =
+                Uint8List.fromList(buf.readBytes(sourceLocatorLength));
+          }
+          if (isCreateTemp) {
+            buf.skipUB2(); // charset
+            buf.skipUB1(); // flags
+          } else if (sendAmount) {
+            amount = buf.readSB8(); // amount read / LOB length
+          }
           break;
         case _msgTypeError:
           final err = _readTtcErrorBody(buf, ttcFieldVersion);
@@ -1768,6 +1901,7 @@ NativeLobReadResponse decodeLobReadResponse(
     data: Uint8List.fromList(chunks),
     complete: endOfResponse,
     amount: amount,
+    updatedLocator: updatedLocator,
     errorNum: errorNum,
     errorMessage: errorMessage,
   );

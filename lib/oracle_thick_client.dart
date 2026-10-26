@@ -814,7 +814,8 @@ class OracleThickClient {
   /// Throws [OracleThickException] on an `ORA-xxxxx` error.
   Future<ex.NativeExecuteResponse> queryReal(String sql,
       {List<Object?> binds = const [], int prefetch = 100}) async {
-    _send(ex.buildQueryExecute(sql, binds: binds, numIters: prefetch));
+    final prepared = await _prepareBinds(binds);
+    _send(ex.buildQueryExecute(sql, binds: prepared, numIters: prefetch));
     var resp = await _readRealResponse(isQuery: true);
     final columns = resp.columns;
     final rows = <List<Object?>>[...resp.rows];
@@ -898,14 +899,54 @@ class OracleThickClient {
     return resp.amount ?? 0;
   }
 
-  Future<ex.NativeLobReadResponse> _readLobResponse(int locatorLen) async {
+  Future<ex.NativeLobReadResponse> _readLobResponse(int locatorLen,
+      {bool isCreateTemp = false, bool sendAmount = true}) async {
     final acc = BytesBuilder();
     while (true) {
       acc.add(_ttcBody(await _nextDataFrame()));
       final resp = ex.decodeLobReadResponse(acc.toBytes(),
-          sourceLocatorLength: locatorLen);
+          sourceLocatorLength: locatorLen,
+          isCreateTemp: isCreateTemp,
+          sendAmount: sendAmount);
       if (resp.complete) return resp;
     }
+  }
+
+  /// Creates a temporary CLOB and writes [value] (UTF-8), returning its server
+  /// locator — the vehicle for binding a String past the 32767-byte VARCHAR2
+  /// limit.
+  Future<Uint8List> _createTempClob(String value) async {
+    _send(ex.buildLobCreateTemp());
+    final created = await _readLobResponse(40, isCreateTemp: true);
+    final locator = created.updatedLocator;
+    if (!created.isSuccess || locator == null) {
+      throw OracleThickException(
+          created.errorNum ?? -1, 'temp CLOB create failed');
+    }
+    // This server's CLOBs are UTF-16BE on the wire (reads return UCS-2), so the
+    // WRITE payload is UTF-16BE too.
+    _send(ex.buildLobWrite(locator, 1, _encodeUtf16Be(value)));
+    final written =
+        await _readLobResponse(locator.length, sendAmount: false);
+    if (!written.isSuccess) {
+      throw OracleThickException(
+          written.errorNum ?? -1, 'temp CLOB write failed');
+    }
+    return written.updatedLocator ?? locator;
+  }
+
+  /// Replaces any String bind larger than the 32767-byte VARCHAR2 limit with a
+  /// temporary-CLOB locator so it can be bound as a CLOB.
+  Future<List<Object?>> _prepareBinds(List<Object?> binds) async {
+    List<Object?>? out;
+    for (var i = 0; i < binds.length; i++) {
+      final v = binds[i];
+      if (v is String && utf8.encode(v).length > 32767) {
+        out ??= List.of(binds);
+        out[i] = ex.NativeClobBindValue(await _createTempClob(v));
+      }
+    }
+    return out ?? binds;
   }
 
   static String _decodeUtf16Be(Uint8List bytes) {
@@ -914,6 +955,16 @@ class OracleThickClient {
       units.add((bytes[i] << 8) | bytes[i + 1]);
     }
     return String.fromCharCodes(units);
+  }
+
+  static Uint8List _encodeUtf16Be(String value) {
+    final units = value.codeUnits;
+    final out = Uint8List(units.length * 2);
+    for (var i = 0; i < units.length; i++) {
+      out[i * 2] = (units[i] >> 8) & 0xFF;
+      out[i * 2 + 1] = units[i] & 0xFF;
+    }
+    return out;
   }
 
   /// Reads DATA frames, concatenating their TTC bodies, until the OALL8
@@ -962,11 +1013,15 @@ class OracleThickClient {
   Future<int> executeDml(String sql,
       {List<Object?> binds = const [], List<List<Object?>>? bulkRows}) async {
     // Array DML derives its bind templates from the first iteration's values.
-    final templateRow = (bulkRows != null && bulkRows.isNotEmpty)
-        ? bulkRows.first
-        : binds;
+    final preparedBulk = bulkRows == null
+        ? null
+        : [for (final row in bulkRows) await _prepareBinds(row)];
+    final preparedBinds = await _prepareBinds(binds);
+    final templateRow = (preparedBulk != null && preparedBulk.isNotEmpty)
+        ? preparedBulk.first
+        : preparedBinds;
     final nativeBinds = [for (final v in templateRow) ex.NativeBind.value(v)];
-    _send(ex.buildDmlExecute(sql, nativeBinds, bulkRows: bulkRows));
+    _send(ex.buildDmlExecute(sql, nativeBinds, bulkRows: preparedBulk));
     final resp = await _readRealResponse(isQuery: false, binds: nativeBinds);
     if (!resp.isSuccess) {
       throw OracleThickException(
