@@ -539,5 +539,47 @@ void main() {
         await client.close();
       }
     });
+
+    test('oversized bind in DML RETURNING routes through a temp CLOB',
+        () async {
+      final host = env['ORACLE_HOST'] ?? '127.0.0.1';
+      final port = int.tryParse(env['ORACLE_PORT'] ?? '1521') ?? 1521;
+      final user = env['ORACLE_USER'] ?? 'system';
+      final pass = env['ORACLE_PASSWORD'] ?? 'TestPw1234';
+      final service = env['ORACLE_SERVICE'] ?? 'FREEPDB1';
+
+      final client = await OracleThickClient.connect(port, host: host);
+      try {
+        await client.loginReal(
+          username: user,
+          password: pass,
+          serviceName: service,
+        );
+        await client
+            .executeDml('DROP TABLE t_thick_ret PURGE')
+            .catchError((_) => 0);
+        await client
+            .executeDml('CREATE TABLE t_thick_ret (id NUMBER, body CLOB)');
+        try {
+          final big = 'Q' * 45000;
+          final ret = await client.executeReturning(
+              'INSERT INTO t_thick_ret VALUES (:1, :2) RETURNING id INTO :3', [
+            NativeBind.value(7),
+            NativeBind.value(big),
+            NativeBind.outNumber(),
+          ]);
+          expect(ret.outBindValues, [
+            [7]
+          ]);
+          final back = await client.queryReal(
+              'SELECT body FROM t_thick_ret WHERE id = 7');
+          expect(back.rows.first.first, big);
+        } finally {
+          await client.executeDml('DROP TABLE t_thick_ret PURGE');
+        }
+      } finally {
+        await client.close();
+      }
+    });
   }, skip: enabled ? false : 'set RUN_ORACLE_TESTS=true to run (needs Oracle)');
 }

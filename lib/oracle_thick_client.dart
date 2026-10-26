@@ -973,6 +973,28 @@ class OracleThickClient {
     return out ?? binds;
   }
 
+  /// Like [_prepareBinds] but for a `NativeBind` list: rebuilds any IN bind
+  /// whose value is an oversized String/`Uint8List` as a temp-LOB locator bind.
+  Future<List<ex.NativeBind>> _prepareNativeBinds(
+      List<ex.NativeBind> binds) async {
+    List<ex.NativeBind>? out;
+    for (var i = 0; i < binds.length; i++) {
+      final bind = binds[i];
+      if (bind.isOut) continue;
+      final v = bind.value;
+      if (v is String && utf8.encode(v).length > 32767) {
+        out ??= List.of(binds);
+        out[i] = ex.NativeBind.value(
+            ex.NativeClobBindValue(await _createTempClob(v)));
+      } else if (v is Uint8List && v.length > 32767) {
+        out ??= List.of(binds);
+        out[i] = ex.NativeBind.value(
+            ex.NativeClobBindValue.blob(await _createTempBlob(v)));
+      }
+    }
+    return out ?? binds;
+  }
+
   static String _decodeUtf16Be(Uint8List bytes) {
     final units = <int>[];
     for (var i = 0; i + 1 < bytes.length; i += 2) {
@@ -1062,9 +1084,10 @@ class OracleThickClient {
   /// (one entry per affected row) in `outBindValues`.
   Future<ex.NativeExecuteResponse> executeReturning(
       String sql, List<ex.NativeBind> binds) async {
-    _send(ex.buildDmlExecute(sql, binds, returning: true));
+    final prepared = await _prepareNativeBinds(binds);
+    _send(ex.buildDmlExecute(sql, prepared, returning: true));
     final resp = await _readRealResponse(
-        isQuery: false, binds: binds, dmlReturning: true);
+        isQuery: false, binds: prepared, dmlReturning: true);
     if (!resp.isSuccess) {
       throw OracleThickException(
           resp.errorNum ?? -1,
@@ -1111,8 +1134,9 @@ class OracleThickClient {
   /// use [openRefCursor] to also drain it). Requires a prior [loginReal].
   Future<ex.NativeExecuteResponse> callPlsql(
       String plsql, List<ex.NativeBind> binds) async {
-    _send(ex.buildPlsqlExecute(plsql, binds));
-    final resp = await _readRealResponse(isQuery: false, binds: binds);
+    final prepared = await _prepareNativeBinds(binds);
+    _send(ex.buildPlsqlExecute(plsql, prepared));
+    final resp = await _readRealResponse(isQuery: false, binds: prepared);
     if (!resp.isSuccess) {
       throw OracleThickException(
           resp.errorNum ?? -1,
