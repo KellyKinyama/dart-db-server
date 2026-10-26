@@ -98,14 +98,22 @@ round-tripped on real Oracle in `test/oracle_real_login_test.dart`.
 - [ ] (follow-up) **LONG / LONG RAW**, **UROWID**, **CLOB/BLOB** (T4),
   TSTZ numeric-offset wrapper.
 
-## Phase T3 — Typed binds  ·  Status: TODO
+## Phase T3 — Typed binds  ·  Status: LANDED (positional scalar binds, work vs 26ai)
 **Goal:** send binds with real types, not `toString()`.
-- [ ] **Bind describe + dty tagging** on the OALL8 request (per-bind type, max
-  size, scale; IN/OUT/INOUT; array size).
-- [ ] **Encoders:** NUMBER (`encodeOracleNumber`), DATE/TIMESTAMP (binary),
-  RAW (bytes), BINARY_FLOAT/DOUBLE, CHAR/VARCHAR2 charset-correct.
-- [ ] **Named binds** (`:name`) → wire order mapping; **NULL** typed binds.
-- [ ] Round-trip binds of every T2 type on real Oracle.
+- [x] **Bind metadata block** per bind on the OALL8 request (wire type, maxSize,
+  csfrm, charset field) + the `ttcExecOptionBind` flag + ROW_DATA value message.
+- [x] **Encoders:** NUMBER (`encodeOracleNumber`), VARCHAR2 (UTF-8), RAW (bytes),
+  TIMESTAMP (11-byte binary), and typed **NULL** (zero-length indicator).
+- [x] **Positional binds** (`:1`, `:2` …) via `queryReal(sql, binds: [...])`;
+  server-side WHERE filtering verified.
+- [x] Round-trip test on real Oracle (NUMBER/String/RAW/DateTime/NULL + a
+  WHERE-clause bind).
+- [ ] (follow-up) named binds (`:name`→order), DATE vs TIMESTAMP distinction,
+  NVARCHAR2/interval binds, OUT/IN OUT binds, array (executeMany) binds.
+
+## Phase T4 — LOBs (CLOB / BLOB)  ·  Status: TODO
+- [ ] LOB locator decode; `LOB READ`/`WRITE`/`GETLEN` TTC ops; streamed read of
+  CLOB (char) and BLOB (bytes); temporary-LOB write for binds.
 
 ## Phase T4 — LOBs (CLOB / BLOB)  ·  Status: TODO
 - [ ] LOB locator decode; `LOB READ`/`WRITE`/`GETLEN` TTC ops; streamed read of

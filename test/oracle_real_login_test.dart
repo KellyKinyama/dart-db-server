@@ -2,6 +2,7 @@
 library;
 
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:dart_db_server/oracle_thick_client.dart';
 import 'package:dart_db_server/oracle_native_execute.dart' show OracleYearMonth;
@@ -125,6 +126,52 @@ void main() {
         expect(row[7], 'hi');
         expect(row[8], isA<String>());
         expect((row[8] as String).length, 18);
+      } finally {
+        await client.close();
+      }
+    });
+
+    test('typed binds round-trip through real Oracle', () async {
+      final host = env['ORACLE_HOST'] ?? '127.0.0.1';
+      final port = int.tryParse(env['ORACLE_PORT'] ?? '1521') ?? 1521;
+      final user = env['ORACLE_USER'] ?? 'system';
+      final pass = env['ORACLE_PASSWORD'] ?? 'TestPw1234';
+      final service = env['ORACLE_SERVICE'] ?? 'FREEPDB1';
+
+      final client = await OracleThickClient.connect(port, host: host);
+      try {
+        await client.loginReal(
+          username: user,
+          password: pass,
+          serviceName: service,
+        );
+        final r = await client.queryReal(
+          'SELECT :1 AS n, :2 AS s, :3 AS r, :4 AS t, :5 AS z FROM dual',
+          binds: [
+            42.5,
+            'hello world',
+            Uint8List.fromList([1, 2, 3, 255]),
+            DateTime(2026, 10, 26, 11, 22, 33, 456),
+            null,
+          ],
+        );
+        final row = r.rows.first;
+        expect(row[0], 42.5);
+        expect(row[1], 'hello world');
+        expect(row[2], [1, 2, 3, 255]);
+        expect(row[3], DateTime(2026, 10, 26, 11, 22, 33, 456));
+        expect(row[4], isNull);
+
+        // A bind in a WHERE clause filters server-side.
+        final filtered = await client.queryReal(
+          'SELECT n FROM (SELECT 1 n FROM dual UNION ALL SELECT 2 FROM dual '
+          'UNION ALL SELECT 3 FROM dual) WHERE n > :1',
+          binds: [1],
+        );
+        expect(filtered.rows, [
+          [2],
+          [3]
+        ]);
       } finally {
         await client.close();
       }

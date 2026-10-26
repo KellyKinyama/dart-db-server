@@ -38,7 +38,6 @@ const int _funcFetch = 5;
 const int _execOptionParse = 0x01;
 const int _execOptionExecute = 0x20;
 const int _execOptionFetch = 0x40;
-const int _execOptionNotPlSql = 0x8000;
 const int _execOptionImplicitResultset = 0x8000;
 
 const int _maxLongLength = 0x7fffffff;
@@ -157,12 +156,19 @@ class OracleYearMonth {
 
 /// Builds an OALL8 EXECUTE for a row-returning [sql] with no binds. [numIters]
 /// is the prefetch row window. A fresh parse always uses cursor id 0.
+/// Builds an OALL8 EXECUTE for a row-returning [sql], optionally parameterised
+/// by positional [binds] (one Dart value per `:1`, `:2` … placeholder in wire
+/// order). [numIters] is the prefetch row window. A fresh parse always uses
+/// cursor id 0.
 Uint8List buildQueryExecute(
   String sql, {
+  List<Object?> binds = const [],
   int numIters = 100,
   int ttcFieldVersion = _fieldVersion23_4,
   int sequence = 1,
 }) {
+  final encodedBinds = [for (final v in binds) _encodeBind(v)];
+  final numParams = encodedBinds.length;
   final b = WriteBuffer();
   b.writeUint8(_msgTypeFunction);
   b.writeUint8(_funcExecute);
@@ -172,11 +178,10 @@ Uint8List buildQueryExecute(
   }
 
   final sqlBytes = utf8.encode(sql);
-  // Query, fresh parse, no binds.
-  final options = _execOptionParse |
-      _execOptionExecute |
-      _execOptionFetch |
-      _execOptionNotPlSql;
+  // Query, fresh parse; add the bind flag when binds are present.
+  var options =
+      _execOptionParse | _execOptionExecute | _execOptionFetch;
+  if (numParams > 0) options |= _execOptionBind;
   final dmlOptions = _execOptionImplicitResultset;
 
   b.writeUB4(options);
@@ -194,8 +199,13 @@ Uint8List buildQueryExecute(
   b.writeUB4(numIters); // prefetch num rows
   b.writeUB4(_maxLongLength); // maximum long size
 
-  b.writeUint8(0); // numParams == 0
-  b.writeUB4(0);
+  if (numParams == 0) {
+    b.writeUint8(0);
+    b.writeUB4(0);
+  } else {
+    b.writeUint8(1);
+    b.writeUB4(numParams);
+  }
 
   b.writeUint8(0); // al8pp
   b.writeUint8(0); // al8txn
@@ -249,7 +259,123 @@ Uint8List buildQueryExecute(
   b.writeUB4(0); // al8i4[11]
   b.writeUB4(0); // al8i4[12]
 
+  if (numParams > 0) {
+    _writeBindMetadata(b, encodedBinds, ttcFieldVersion);
+    b.writeUint8(_msgTypeRowData);
+    for (final bind in encodedBinds) {
+      if (bind.bytes == null) {
+        b.writeUint8(0); // NULL indicator
+      } else {
+        b.writeBytesWithLength(bind.bytes!);
+      }
+    }
+  }
+
   return b.toBytes();
+}
+
+// --- typed binds -----------------------------------------------------------
+
+const int _execOptionBind = 0x08;
+const int _bindUseIndicators = 0x0001;
+const int _charsetUtf8 = 873;
+const int _csfrmImplicit = 1;
+
+/// An encoded bind: its wire type + metadata, and the encoded value bytes
+/// (null ⇒ SQL NULL, written as a zero-length indicator).
+class _EncodedBind {
+  _EncodedBind({
+    required this.oraType,
+    required this.maxSize,
+    required this.csfrm,
+    required this.bytes,
+  });
+  final int oraType;
+  final int maxSize;
+  final int csfrm;
+  final Uint8List? bytes;
+}
+
+/// Maps a Dart value to its Oracle bind wire type + encoded bytes. Supports
+/// NUMBER (num), VARCHAR2 (String), RAW (Uint8List), TIMESTAMP (DateTime),
+/// and NULL; other types throw [NativeUnsupportedTypeException].
+_EncodedBind _encodeBind(Object? value) {
+  if (value == null) {
+    // Untyped NULL binds as a 1-byte VARCHAR slot.
+    return _EncodedBind(
+        oraType: _oraTypeVarchar, maxSize: 1, csfrm: _csfrmImplicit, bytes: null);
+  }
+  if (value is num) {
+    return _EncodedBind(
+        oraType: _oraTypeNumber,
+        maxSize: 22,
+        csfrm: 0,
+        bytes: encodeOracleNumber(value));
+  }
+  if (value is String) {
+    final bytes = Uint8List.fromList(utf8.encode(value));
+    return _EncodedBind(
+        oraType: _oraTypeVarchar,
+        maxSize: bytes.isEmpty ? 1 : bytes.length,
+        csfrm: _csfrmImplicit,
+        bytes: bytes);
+  }
+  if (value is Uint8List) {
+    return _EncodedBind(
+        oraType: _oraTypeRaw,
+        maxSize: value.isEmpty ? 1 : value.length,
+        csfrm: 0,
+        bytes: value);
+  }
+  if (value is DateTime) {
+    return _EncodedBind(
+        oraType: _oraTypeTimestamp,
+        maxSize: 11,
+        csfrm: 0,
+        bytes: _encodeTimestamp(value));
+  }
+  throw NativeUnsupportedTypeException(-1);
+}
+
+/// Writes one bind-metadata block per bind (node-oracledb writeColumnMetadata).
+void _writeBindMetadata(
+    WriteBuffer b, List<_EncodedBind> binds, int ttcFieldVersion) {
+  for (final bind in binds) {
+    b.writeUint8(bind.oraType);
+    b.writeUint8(_bindUseIndicators);
+    b.writeUint8(0); // precision
+    b.writeUint8(0); // scale
+    b.writeUB4(bind.maxSize);
+    b.writeUB4(0); // max num elements
+    b.writeUB4(0); // cont flags (no LOB prefetch for scalar binds)
+    b.writeUB4(0); // OID
+    b.writeUB2(0); // version
+    b.writeUB2(bind.csfrm != 0 ? _charsetUtf8 : 0); // charset field
+    b.writeUint8(bind.csfrm);
+    b.writeUB4(0); // LOB prefetch length
+    if (ttcFieldVersion >= _fieldVersion12_2) {
+      b.writeUB4(0); // oaccolid
+    }
+  }
+}
+
+/// Oracle 11-byte TIMESTAMP wire (no time zone): the 7 DATE bytes then a
+/// big-endian UInt32 nanoseconds field.
+Uint8List _encodeTimestamp(DateTime v) {
+  final out = Uint8List(11);
+  out[0] = (v.year ~/ 100) + 100;
+  out[1] = (v.year % 100) + 100;
+  out[2] = v.month;
+  out[3] = v.day;
+  out[4] = v.hour + 1;
+  out[5] = v.minute + 1;
+  out[6] = v.second + 1;
+  final nanos = (v.millisecond * 1000 + v.microsecond) * 1000;
+  out[7] = (nanos >> 24) & 0xFF;
+  out[8] = (nanos >> 16) & 0xFF;
+  out[9] = (nanos >> 8) & 0xFF;
+  out[10] = nanos & 0xFF;
+  return out;
 }
 
 /// Builds a FETCH for [numRows] more rows from an open server [cursorId].

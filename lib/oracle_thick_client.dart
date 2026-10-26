@@ -741,14 +741,15 @@ class OracleThickClient {
     );
   }
 
-  /// Runs a row-returning [sql] (no binds) against a **real Oracle** server over
-  /// the canonical OALL8 execute path, following FETCH round-trips until the
-  /// cursor is drained. Requires a prior [loginReal]. Throws
-  /// [OracleThickException] on an `ORA-xxxxx` error.
+  /// Runs a row-returning [sql] against a **real Oracle** server over the
+  /// canonical OALL8 execute path, optionally parameterised by positional
+  /// [binds] (one value per `:1`, `:2` … placeholder), following FETCH
+  /// round-trips until the cursor is drained. Requires a prior [loginReal].
+  /// Throws [OracleThickException] on an `ORA-xxxxx` error.
   Future<ex.NativeExecuteResponse> queryReal(String sql,
-      {int prefetch = 100}) async {
+      {List<Object?> binds = const [], int prefetch = 100}) async {
     _socket.add(_wrapData(
-        ex.buildQueryExecute(sql, numIters: prefetch),
+        ex.buildQueryExecute(sql, binds: binds, numIters: prefetch),
         dataFlags: _realDataFlags));
     var resp = await _readRealResponse(isQuery: true);
     final columns = resp.columns;
