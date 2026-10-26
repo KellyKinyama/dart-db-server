@@ -4,6 +4,7 @@ library;
 import 'dart:io';
 
 import 'package:dart_db_server/oracle_thick_client.dart';
+import 'package:dart_db_server/oracle_native_execute.dart' show OracleYearMonth;
 import 'package:test/test.dart';
 
 /// Real-Oracle integration test for the thick client's native FAST_AUTH +
@@ -78,6 +79,52 @@ void main() {
         // DATE decode.
         final now = await client.queryReal('SELECT sysdate FROM dual');
         expect(now.rows.first.first, isA<DateTime>());
+      } finally {
+        await client.close();
+      }
+    });
+
+    test('scalar type decoders round-trip from real Oracle', () async {
+      final host = env['ORACLE_HOST'] ?? '127.0.0.1';
+      final port = int.tryParse(env['ORACLE_PORT'] ?? '1521') ?? 1521;
+      final user = env['ORACLE_USER'] ?? 'system';
+      final pass = env['ORACLE_PASSWORD'] ?? 'TestPw1234';
+      final service = env['ORACLE_SERVICE'] ?? 'FREEPDB1';
+
+      final client = await OracleThickClient.connect(port, host: host);
+      try {
+        await client.loginReal(
+          username: user,
+          password: pass,
+          serviceName: service,
+        );
+        final r = await client.queryReal('''
+          SELECT
+            CAST(TIMESTAMP '2026-10-26 11:22:33.456789' AS TIMESTAMP) AS ts,
+            CAST(TIMESTAMP '2026-10-26 11:22:33.456 +02:00'
+                 AS TIMESTAMP WITH TIME ZONE) AS tstz,
+            INTERVAL '5 03:14:15.926' DAY TO SECOND AS ids,
+            INTERVAL '3-7' YEAR TO MONTH AS iym,
+            TO_BINARY_FLOAT('3.5') AS bf,
+            TO_BINARY_DOUBLE('2.71828') AS bd,
+            UTL_RAW.CAST_TO_RAW('abc') AS rawcol,
+            CAST('hi' AS NVARCHAR2(10)) AS nv,
+            ROWID AS rid
+          FROM dual
+        ''');
+        final row = r.rows.first;
+        expect(row[0], DateTime(2026, 10, 26, 11, 22, 33, 456, 789));
+        // TIMESTAMP WITH TIME ZONE normalizes to the UTC instant.
+        expect(row[1], DateTime.utc(2026, 10, 26, 9, 22, 33, 456));
+        expect(row[2], const Duration(
+            days: 5, hours: 3, minutes: 14, seconds: 15, milliseconds: 926));
+        expect(row[3], const OracleYearMonth(3, 7));
+        expect(row[4], closeTo(3.5, 1e-6));
+        expect(row[5], closeTo(2.71828, 1e-9));
+        expect(row[6], [97, 98, 99]);
+        expect(row[7], 'hi');
+        expect(row[8], isA<String>());
+        expect((row[8] as String).length, 18);
       } finally {
         await client.close();
       }

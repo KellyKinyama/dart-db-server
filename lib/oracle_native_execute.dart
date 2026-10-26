@@ -65,6 +65,13 @@ const int _oraTypeLongRaw = 24;
 const int _oraTypeChar = 96;
 const int _oraTypeBinaryFloat = 100;
 const int _oraTypeBinaryDouble = 101;
+const int _oraTypeRowid = 11;
+const int _oraTypeURowid = 208;
+const int _oraTypeTimestamp = 180;
+const int _oraTypeTimestampTz = 181;
+const int _oraTypeTimestampLtz = 231;
+const int _oraTypeIntervalYM = 182;
+const int _oraTypeIntervalDS = 183;
 
 const int _csfrmNChar = 2;
 
@@ -130,6 +137,22 @@ class NativeUnsupportedTypeException implements Exception {
   @override
   String toString() =>
       'NativeUnsupportedTypeException: Oracle type $oraType not supported yet';
+}
+
+/// An Oracle `INTERVAL YEAR TO MONTH` value (Dart has no year-month duration).
+class OracleYearMonth {
+  const OracleYearMonth(this.years, this.months);
+  final int years;
+  final int months;
+  @override
+  bool operator ==(Object other) =>
+      other is OracleYearMonth &&
+      other.years == years &&
+      other.months == months;
+  @override
+  int get hashCode => Object.hash(years, months);
+  @override
+  String toString() => 'INTERVAL $years-$months YEAR TO MONTH';
 }
 
 /// Builds an OALL8 EXECUTE for a row-returning [sql] with no binds. [numIters]
@@ -531,8 +554,34 @@ Object? _decodeColumnValue(ReadBuffer buf, NativeColumn col) {
       final bytes = buf.readBytesWithLength();
       if (bytes.isEmpty) return null;
       return _decodeDate(bytes);
+    case _oraTypeTimestamp:
+    case _oraTypeTimestampLtz:
+      final bytes = buf.readBytesWithLength();
+      if (bytes.isEmpty) return null;
+      return _decodeTimestamp(bytes, asUtc: false);
+    case _oraTypeTimestampTz:
+      final bytes = buf.readBytesWithLength();
+      if (bytes.isEmpty) return null;
+      // Default UTC-instant contract (numeric-offset preservation is a later
+      // refinement): a 13-byte TSTZ payload's fields are already UTC.
+      return _decodeTimestamp(bytes, asUtc: true);
+    case _oraTypeIntervalDS:
+      final bytes = buf.readBytesWithLength();
+      if (bytes.isEmpty) return null;
+      return _decodeIntervalDS(bytes);
+    case _oraTypeIntervalYM:
+      final bytes = buf.readBytesWithLength();
+      if (bytes.isEmpty) return null;
+      return _decodeIntervalYM(bytes);
+    case _oraTypeRowid:
+      // Fetch shape: one-byte length (0 / 0xFF = NULL), then the physical
+      // rowid fields, rendered as Oracle's 18-char base64 text.
+      final numBytes = buf.readUint8();
+      if (numBytes == 0 || numBytes == 0xFF) return null;
+      return _decodeRowid(buf);
     case _oraTypeLong:
     case _oraTypeLongRaw:
+    case _oraTypeURowid:
       throw NativeUnsupportedTypeException(col.oracleType);
     default:
       throw NativeUnsupportedTypeException(col.oracleType);
@@ -557,6 +606,89 @@ DateTime _decodeDate(List<int> b) {
   final minute = b.length > 5 ? b[5] - 1 : 0;
   final second = b.length > 6 ? b[6] - 1 : 0;
   return DateTime(year, month, day, hour, minute, second);
+}
+
+/// Oracle TIMESTAMP wire: the 7 DATE bytes, then (>=11 bytes) a big-endian
+/// UInt32 nanoseconds field, then (>=13 bytes) 2 time-zone bytes. [asUtc]
+/// builds the instant in UTC (TIMESTAMP WITH TIME ZONE ships UTC fields);
+/// otherwise a local wall-clock DateTime (plain / LTZ TIMESTAMP).
+DateTime _decodeTimestamp(List<int> b, {required bool asUtc}) {
+  final year = (b[0] - 100) * 100 + (b[1] - 100);
+  final month = b[2];
+  final day = b[3];
+  final hour = b[4] - 1;
+  final minute = b[5] - 1;
+  final second = b[6] - 1;
+  var micros = 0;
+  if (b.length >= 11) {
+    final nanos =
+        (b[7] << 24) | (b[8] << 16) | (b[9] << 8) | b[10];
+    micros = nanos ~/ 1000;
+  }
+  final ms = micros ~/ 1000;
+  final us = micros % 1000;
+  return asUtc
+      ? DateTime.utc(year, month, day, hour, minute, second, ms, us)
+      : DateTime(year, month, day, hour, minute, second, ms, us);
+}
+
+const int _durationMid = 0x80000000;
+const int _durationOffset = 60;
+
+/// Oracle 11-byte INTERVAL DAY TO SECOND → [Duration]. Bytes: UInt32 days+mid,
+/// hours+60, minutes+60, seconds+60, UInt32 nanoseconds+mid.
+Duration _decodeIntervalDS(List<int> raw) {
+  final data = ByteData.sublistView(Uint8List.fromList(raw));
+  final days = data.getUint32(0) - _durationMid;
+  final hours = data.getUint8(4) - _durationOffset;
+  final minutes = data.getUint8(5) - _durationOffset;
+  final seconds = data.getUint8(6) - _durationOffset;
+  final fseconds = data.getUint32(7) - _durationMid; // nanoseconds
+  return Duration(
+    days: days,
+    hours: hours,
+    minutes: minutes,
+    seconds: seconds,
+    microseconds: fseconds ~/ 1000,
+  );
+}
+
+/// Oracle 5-byte INTERVAL YEAR TO MONTH → [OracleYearMonth]. Bytes: UInt32
+/// years+mid, months+60.
+OracleYearMonth _decodeIntervalYM(List<int> raw) {
+  final data = ByteData.sublistView(Uint8List.fromList(raw));
+  final years = data.getUint32(0) - _durationMid;
+  final months = data.getUint8(4) - _durationOffset;
+  return OracleYearMonth(years, months);
+}
+
+const String _rowidBase64 =
+    'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+
+/// Reads a fetched physical ROWID's fields and renders Oracle's 18-char text
+/// (6 base64 digits of the data-object number, 3 of the file number, 6 of the
+/// block number, 3 of the slot). All-zero rowid → null.
+String? _decodeRowid(ReadBuffer buf) {
+  final rba = buf.readUB4();
+  final partitionId = buf.readUB2();
+  buf.skipUB1();
+  final blockNum = buf.readUB4();
+  final slotNum = buf.readUB2();
+  if (rba == 0 && partitionId == 0 && blockNum == 0 && slotNum == 0) {
+    return null;
+  }
+  final out = StringBuffer();
+  _writeBase64(out, rba, 6);
+  _writeBase64(out, partitionId, 3);
+  _writeBase64(out, blockNum, 6);
+  _writeBase64(out, slotNum, 3);
+  return out.toString();
+}
+
+void _writeBase64(StringBuffer out, int value, int digits) {
+  for (var shift = (digits - 1) * 6; shift >= 0; shift -= 6) {
+    out.writeCharCode(_rowidBase64.codeUnitAt((value >> shift) & 0x3f));
+  }
 }
 
 /// Oracle BINARY_FLOAT (4 bytes) / BINARY_DOUBLE (8 bytes): IEEE-754 with the

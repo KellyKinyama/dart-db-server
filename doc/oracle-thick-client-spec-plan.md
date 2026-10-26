@@ -82,14 +82,21 @@ dart-db-server smoke format.
 - [ ] (follow-up) typed binds (T3) so `queryReal` accepts parameters; array
   fetch tuning; `OracleThickResult`-shaped public wrapper.
 
-## Phase T2 — Scalar type decoders  ·  Status: TODO
-One increment each (describe + cell decode + round-trip on real Oracle):
-- [ ] **DATE** (7-byte) and **TIMESTAMP** (11-byte) + fractional seconds.
-- [ ] **TIMESTAMP WITH TIME ZONE / WITH LOCAL TIME ZONE** (13-byte + tz).
-- [ ] **CHAR / NCHAR / NVARCHAR2** (charsetForm, blank-pad semantics).
-- [ ] **RAW / LONG RAW** (bytes, not UTF-8).
-- [ ] **BINARY_FLOAT / BINARY_DOUBLE** (IEEE-754 with Oracle's sign flip).
-- [ ] **ROWID / UROWID**, **LONG**.
+## Phase T2 — Scalar type decoders  ·  Status: LANDED (temporal/interval/rowid, works vs 26ai)
+Decoders live in `lib/oracle_native_execute.dart` `_decodeColumnValue`;
+round-tripped on real Oracle in `test/oracle_real_login_test.dart`.
+- [x] **DATE** (7-byte) and **TIMESTAMP** (11-byte) + fractional seconds →
+  `DateTime` (microsecond precision).
+- [x] **TIMESTAMP WITH TIME ZONE / WITH LOCAL TIME ZONE** (13-byte) → UTC
+  `DateTime` instant (numeric-offset/region preservation is a later refinement).
+- [x] **CHAR / NCHAR / NVARCHAR2** (csfrm UTF-16BE for national charset).
+- [x] **RAW** → `Uint8List`.
+- [x] **BINARY_FLOAT / BINARY_DOUBLE** (IEEE-754 with Oracle's sign flip).
+- [x] **INTERVAL DAY TO SECOND** → `Duration`; **INTERVAL YEAR TO MONTH** →
+  `OracleYearMonth`.
+- [x] **ROWID** → Oracle's 18-char base64 text.
+- [ ] (follow-up) **LONG / LONG RAW**, **UROWID**, **CLOB/BLOB** (T4),
+  TSTZ numeric-offset wrapper.
 
 ## Phase T3 — Typed binds  ·  Status: TODO
 **Goal:** send binds with real types, not `toString()`.
