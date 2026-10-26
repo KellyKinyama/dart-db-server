@@ -126,20 +126,26 @@ Tasks:
 
 ---
 
-## Phase R4 — Safety hardening  ·  Status: TODO
+## Phase R4 — Safety hardening  ·  Status: WIP
 
 **Goal:** the properties that make Raft correct, explicitly tested.
 
 Tasks:
-- [ ] **Election safety** — at most one leader per term (tested under
-  concurrent elections + partitions).
-- [ ] **Leader completeness** — a committed entry is present in every future
-  leader's log (the up-to-date vote check guarantees this; test it).
-- [ ] **Log matching** — identical `(term, lsn)` prefixes across nodes.
-- [ ] **State-machine safety** — no node applies a different op at a given LSN.
-- [ ] **Fenced reads/writes** — a deposed leader (lower term) rejects client
-  writes immediately (reuse the existing write-path fence check, keyed on
-  `currentTerm`/leadership rather than `ClusterEpoch`).
+- [x] **Randomized invariant simulation.** `test/raft_safety_test.dart` runs
+  many seeded scenarios (200 random events each: elections, heartbeats, client
+  appends, partitions/heals) over a 3-node cluster and asserts after **every
+  step**: **election safety** (≤1 leader/term), **log matching** (equal
+  `(term, index)` ⇒ identical prefix), and **state-machine safety** (a
+  committed index never changes). Converges after `healAll`. LANDED.
+- [ ] **Leader completeness (explicit).** A dedicated test that a committed
+  entry survives leader changes (currently covered transitively by the
+  up-to-date vote check + committed-stability invariant).
+- [ ] **Linearizability checker.** A Jepsen-style history check of concurrent
+  client ops under faults.
+- [ ] **Fenced reads/writes.** A deposed leader rejects client writes
+  immediately (R5 wiring, keyed on leadership of `currentTerm`).
+- [ ] **Pre-vote (optional).** Avoid term inflation from a partitioned node
+  disrupting a healthy leader on rejoin.
 
 ---
 
