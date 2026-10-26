@@ -71,6 +71,8 @@ const int _oraTypeTimestampTz = 181;
 const int _oraTypeTimestampLtz = 231;
 const int _oraTypeIntervalYM = 182;
 const int _oraTypeIntervalDS = 183;
+const int _oraTypeClob = 112;
+const int _oraTypeBlob = 113;
 
 const int _csfrmNChar = 2;
 
@@ -152,6 +154,29 @@ class OracleYearMonth {
   int get hashCode => Object.hash(years, months);
   @override
   String toString() => 'INTERVAL $years-$months YEAR TO MONTH';
+}
+
+/// A CLOB/BLOB locator decoded from a fetched row. The value bytes are NOT
+/// inline — the caller materializes them with a LOB READ ([buildLobRead]) and
+/// replaces the cell. `isNChar` CLOBs (NCLOB) read back as UTF-16BE.
+class NativeLob {
+  NativeLob({
+    required this.locator,
+    required this.oracleType,
+    required this.length,
+    required this.chunkSize,
+    required this.isNChar,
+  });
+
+  final Uint8List locator;
+  final int oracleType;
+
+  /// LOB length: characters for CLOB, bytes for BLOB.
+  final int length;
+  final int chunkSize;
+  final bool isNChar;
+
+  bool get isClob => oracleType == _oraTypeClob;
 }
 
 /// Builds an OALL8 EXECUTE for a row-returning [sql] with no binds. [numIters]
@@ -436,6 +461,7 @@ NativeExecuteResponse decodeExecuteResponse(
     }
   } on OracleBufferUnderflow {
     // Response is split across more packets — caller reads another frame.
+    // Response is split across more packets — caller reads another frame.
     return NativeExecuteResponse(
       columns: s.columns,
       rows: s.rows,
@@ -705,6 +731,22 @@ Object? _decodeColumnValue(ReadBuffer buf, NativeColumn col) {
       final numBytes = buf.readUint8();
       if (numBytes == 0 || numBytes == 0xFF) return null;
       return _decodeRowid(buf);
+    case _oraTypeClob:
+    case _oraTypeBlob:
+      // Non-prefetch LOB wire shape (this connection does not negotiate LOB
+      // prefetch): UB4 locator length (0 = NULL), then the length-prefixed
+      // locator. The length is unknown here — materialized via GET_LENGTH +
+      // READ. The redundant locatorLen matches the length prefix.
+      final locatorLen = buf.readUB4();
+      if (locatorLen == 0) return null;
+      final locator = buf.readBytesWithLength();
+      return NativeLob(
+        locator: Uint8List.fromList(locator),
+        oracleType: col.oracleType,
+        length: -1, // unknown until GET_LENGTH
+        chunkSize: 0,
+        isNChar: col.csfrm == _csfrmNChar,
+      );
     case _oraTypeLong:
     case _oraTypeLongRaw:
     case _oraTypeURowid:
@@ -842,14 +884,25 @@ double _decodeBinaryFloat(List<int> raw) {
   return ByteData.sublistView(bytes).getFloat64(0);
 }
 
-void _processError(ReadBuffer buf, _DecodeState s) {
+/// Decoded header fields of a TTC ERROR message, shared by the EXECUTE and LOB
+/// response decoders.
+class _TtcError {
+  _TtcError(this.num, this.message, this.cursorId, this.rowCount);
+  final int num;
+  final String? message;
+  final int cursorId;
+  final int? rowCount;
+}
+
+/// Walks a TTC ERROR body (after the message-type byte) and returns its fields.
+_TtcError _readTtcErrorBody(ReadBuffer buf, int ttcFieldVersion) {
   buf.readUB4(); // end of call status
   buf.skipUB2(); // end-to-end seq num
   buf.skipUB4(); // current row number
   buf.skipUB2(); // error number (short)
   buf.skipUB2(); // array elem error
   buf.skipUB2(); // array elem error
-  s.cursorId = buf.readUB4();
+  final cursorId = buf.readUB4();
   buf.readSB4(); // error position
   buf.skipUB1(); // sql type
   buf.skipUB1(); // fatal?
@@ -869,7 +922,6 @@ void _processError(ReadBuffer buf, _DecodeState s) {
   buf.skipUB4(); // success iters
   final oerrddLen = buf.readUB4();
   if (oerrddLen > 0) buf.readBytesWithLength();
-  // Batch error arrays (always 0 here — no array DML in this increment).
   final numErrs = buf.readUB2();
   if (numErrs > 0) {
     final firstByte = buf.readUint8();
@@ -899,21 +951,28 @@ void _processError(ReadBuffer buf, _DecodeState s) {
   }
   final num = buf.readUB4(); // extended error number
   int? rowCount;
-  if (s.ttcFieldVersion >= _fieldVersion12_2) {
+  if (ttcFieldVersion >= _fieldVersion12_2) {
     rowCount = buf.readUB8();
-    if (s.ttcFieldVersion >= 21 /* 20.1 */) {
+    if (ttcFieldVersion >= 21 /* 20.1 */) {
       buf.skipUB4(); // sql type
       buf.skipUB4(); // server checksum
     }
   }
   String? message;
   if (num != 0) {
-    message = utf8.decode(buf.readBytesWithLength(), allowMalformed: true).trim();
+    message =
+        utf8.decode(buf.readBytesWithLength(), allowMalformed: true).trim();
   }
+  return _TtcError(num, message, cursorId, rowCount);
+}
 
+void _processError(ReadBuffer buf, _DecodeState s) {
+  final err = _readTtcErrorBody(buf, s.ttcFieldVersion);
+  final num = err.num;
+  s.cursorId = err.cursorId;
   s.errorNum = num;
   if (num != 0) {
-    s.errorMessage = message;
+    s.errorMessage = err.message;
   }
   if (s.isQuery && num == 1403) {
     s.errorNum = 0;
@@ -922,7 +981,7 @@ void _processError(ReadBuffer buf, _DecodeState s) {
     s.moreRowsToFetch = true;
   }
   if (!s.isQuery && num == 0) {
-    s.rowsAffected = rowCount;
+    s.rowsAffected = err.rowCount;
   }
 }
 
@@ -1018,4 +1077,152 @@ void _processServerSidePiggyback(ReadBuffer buf) {
     default:
       throw StateError('Unknown server-side piggyback opcode: $opcode');
   }
+}
+
+// --- LOB read (CLOB / BLOB materialization) --------------------------------
+
+const int _funcLobOp = 0x60; // TNS_FUNC_LOB_OP (96)
+const int _lobOpGetLength = 0x0001;
+const int _lobOpRead = 0x0002;
+const int _msgTypeLobData = 14;
+
+/// Builds a LOB READ request for [amount] units (characters for CLOB, bytes
+/// for BLOB) from [locator] starting at 1-based [offset].
+Uint8List buildLobRead(
+  Uint8List locator,
+  int offset,
+  int amount, {
+  int ttcFieldVersion = _fieldVersion23_4,
+  int sequence = 1,
+}) =>
+    _buildLobOp(locator, _lobOpRead, offset, amount,
+        ttcFieldVersion: ttcFieldVersion, sequence: sequence);
+
+/// Builds a LOB GET_LENGTH request; the length rides back as the SB8 amount in
+/// the RETURN_PARAMETER reply.
+Uint8List buildLobGetLength(
+  Uint8List locator, {
+  int ttcFieldVersion = _fieldVersion23_4,
+  int sequence = 1,
+}) =>
+    _buildLobOp(locator, _lobOpGetLength, 0, 0,
+        ttcFieldVersion: ttcFieldVersion, sequence: sequence);
+
+Uint8List _buildLobOp(
+  Uint8List locator,
+  int operation,
+  int offset,
+  int amount, {
+  required int ttcFieldVersion,
+  required int sequence,
+}) {
+  final b = WriteBuffer();
+  b.writeUint8(_msgTypeFunction);
+  b.writeUint8(_funcLobOp);
+  b.writeUint8(sequence & 0xFF);
+  if (ttcFieldVersion >= _fieldVersion23_1Ext1) {
+    b.writeUB8(0); // token number
+  }
+  b.writeUint8(1); // source locator pointer
+  b.writeUB4(locator.length);
+  b.writeUint8(0); // dest locator pointer
+  b.writeUB4(0); // dest locator length
+  b.writeUB4(0); // short source offset
+  b.writeUB4(0); // short dest offset
+  b.writeUint8(0); // charset pointer (not CREATE_TEMP)
+  b.writeUint8(0); // short amount pointer
+  b.writeUint8(0); // boolean-out pointer
+  b.writeUB4(operation);
+  b.writeUint8(0); // SCN pointer
+  b.writeUint8(0); // SCN array length
+  b.writeUB8(offset);
+  b.writeUB8(0); // dest offset
+  b.writeUint8(1); // amount pointer (sendAmount)
+  for (var i = 0; i < 3; i++) {
+    b.writeUint16BE(0); // three fixed two-byte zero fields
+  }
+  b.writeBytes(locator);
+  b.writeUB8(amount);
+  return b.toBytes();
+}
+
+/// The decoded result of a LOB READ: the concatenated data bytes (CLOB/NCLOB
+/// still charset-encoded) and whether the response stream was complete.
+class NativeLobReadResponse {
+  NativeLobReadResponse({
+    required this.data,
+    required this.complete,
+    this.amount,
+    this.errorNum,
+    this.errorMessage,
+  });
+  final Uint8List data;
+  final bool complete;
+
+  /// The SB8 amount echoed in RETURN_PARAMETER (LOB length for GET_LENGTH,
+  /// bytes/chars read for READ).
+  final int? amount;
+  final int? errorNum;
+  final String? errorMessage;
+  bool get isSuccess => errorNum == null || errorNum == 0;
+}
+
+/// Decodes a (possibly partial) LOB operation response. [sourceLocatorLength]
+/// is the request locator's length (echoed back in RETURN_PARAMETER).
+NativeLobReadResponse decodeLobReadResponse(
+  Uint8List body, {
+  required int sourceLocatorLength,
+  int ttcFieldVersion = _fieldVersion23_4,
+}) {
+  final buf = ReadBuffer(body);
+  final chunks = <int>[];
+  var endOfResponse = false;
+  int? amount;
+  int? errorNum;
+  String? errorMessage;
+  try {
+    while (buf.hasRemaining && !endOfResponse) {
+      final msgType = buf.readUint8();
+      switch (msgType) {
+        case _msgTypeLobData:
+          chunks.addAll(buf.readBytesWithLength());
+          break;
+        case _msgTypeParameter:
+          if (sourceLocatorLength > 0) buf.readBytes(sourceLocatorLength);
+          amount = buf.readSB8(); // amount read / LOB length
+          break;
+        case _msgTypeError:
+          final err = _readTtcErrorBody(buf, ttcFieldVersion);
+          errorNum = err.num;
+          if (err.num != 0) errorMessage = err.message;
+          break;
+        case _msgTypeWarning:
+          _skipWarning(buf);
+          break;
+        case _msgTypeStatus:
+          buf.skipUB4();
+          buf.skipUB2();
+          endOfResponse = true;
+          break;
+        case _msgTypeServerSidePiggyback:
+          _processServerSidePiggyback(buf);
+          break;
+        case _msgTypeEndOfRequest:
+          endOfResponse = true;
+          break;
+        default:
+          throw StateError('Unknown TTC message in LOB response: $msgType');
+      }
+    }
+  } on OracleBufferUnderflow {
+    return NativeLobReadResponse(
+        data: Uint8List.fromList(chunks), complete: false);
+  }
+  return NativeLobReadResponse(
+    data: Uint8List.fromList(chunks),
+    complete: endOfResponse,
+    amount: amount,
+    errorNum: errorNum,
+    errorMessage: errorMessage,
+  );
 }

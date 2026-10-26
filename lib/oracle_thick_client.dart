@@ -771,6 +771,15 @@ class OracleThickClient {
           'ORA-${(resp.errorNum ?? 0).toString().padLeft(5, '0')}: '
           '${resp.errorMessage ?? ''}');
     }
+    // Materialize any CLOB/BLOB locators into String / Uint8List.
+    for (final row in rows) {
+      for (var i = 0; i < row.length; i++) {
+        final cell = row[i];
+        if (cell is ex.NativeLob) {
+          row[i] = await _readLob(cell);
+        }
+      }
+    }
     return ex.NativeExecuteResponse(
       columns: columns,
       rows: rows,
@@ -778,6 +787,75 @@ class OracleThickClient {
       moreRows: false,
       complete: true,
     );
+  }
+
+  /// Reads a CLOB/BLOB locator fully and returns its materialized value: a
+  /// [String] for CLOB/NCLOB, a [Uint8List] for BLOB. The LOB length is fetched
+  /// with GET_LENGTH, then the content with READ ops looped until drained (a
+  /// single READ caps the amount it returns).
+  Future<Object?> _readLob(ex.NativeLob lob) async {
+    final len = await _lobGetLength(lob);
+    if (len == 0) return lob.isClob ? '' : Uint8List(0);
+    final data = BytesBuilder();
+    var offset = 1; // 1-based, in characters (CLOB) or bytes (BLOB)
+    var remaining = len;
+    var guard = 0;
+    while (remaining > 0 && guard++ < 100000) {
+      _socket.add(_wrapData(
+          ex.buildLobRead(lob.locator, offset, remaining),
+          dataFlags: _realDataFlags));
+      final resp = await _readLobResponse(lob.locator.length);
+      if (!resp.isSuccess) {
+        throw OracleThickException(
+            resp.errorNum ?? -1,
+            'ORA-${(resp.errorNum ?? 0).toString().padLeft(5, '0')}: '
+            '${resp.errorMessage ?? ''}');
+      }
+      final got = resp.amount ?? 0;
+      if (got <= 0 || resp.data.isEmpty) break;
+      data.add(resp.data);
+      offset += got;
+      remaining -= got;
+    }
+    final bytes = data.toBytes();
+    if (!lob.isClob) return bytes;
+    // Oracle returns CLOB/NCLOB LOB_DATA as UTF-16BE (UCS-2) regardless of the
+    // client charset.
+    return _decodeUtf16Be(bytes);
+  }
+
+  /// Issues a LOB GET_LENGTH and returns the length (characters for CLOB,
+  /// bytes for BLOB).
+  Future<int> _lobGetLength(ex.NativeLob lob) async {
+    _socket.add(_wrapData(
+        ex.buildLobGetLength(lob.locator),
+        dataFlags: _realDataFlags));
+    final resp = await _readLobResponse(lob.locator.length);
+    if (!resp.isSuccess) {
+      throw OracleThickException(
+          resp.errorNum ?? -1,
+          'ORA-${(resp.errorNum ?? 0).toString().padLeft(5, '0')}: '
+          '${resp.errorMessage ?? ''}');
+    }
+    return resp.amount ?? 0;
+  }
+
+  Future<ex.NativeLobReadResponse> _readLobResponse(int locatorLen) async {
+    final acc = BytesBuilder();
+    while (true) {
+      acc.add(_ttcBody(await _frames.next()));
+      final resp = ex.decodeLobReadResponse(acc.toBytes(),
+          sourceLocatorLength: locatorLen);
+      if (resp.complete) return resp;
+    }
+  }
+
+  static String _decodeUtf16Be(Uint8List bytes) {
+    final units = <int>[];
+    for (var i = 0; i + 1 < bytes.length; i += 2) {
+      units.add((bytes[i] << 8) | bytes[i + 1]);
+    }
+    return String.fromCharCodes(units);
   }
 
   /// Reads DATA frames, concatenating their TTC bodies, until the OALL8

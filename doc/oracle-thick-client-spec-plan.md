@@ -111,13 +111,19 @@ round-tripped on real Oracle in `test/oracle_real_login_test.dart`.
 - [ ] (follow-up) named binds (`:name`→order), DATE vs TIMESTAMP distinction,
   NVARCHAR2/interval binds, OUT/IN OUT binds, array (executeMany) binds.
 
-## Phase T4 — LOBs (CLOB / BLOB)  ·  Status: TODO
-- [ ] LOB locator decode; `LOB READ`/`WRITE`/`GETLEN` TTC ops; streamed read of
-  CLOB (char) and BLOB (bytes); temporary-LOB write for binds.
-
-## Phase T4 — LOBs (CLOB / BLOB)  ·  Status: TODO
-- [ ] LOB locator decode; `LOB READ`/`WRITE`/`GETLEN` TTC ops; streamed read of
-  CLOB (char) and BLOB (bytes); temporary-LOB write for binds.
+## Phase T4 — LOBs (CLOB / BLOB)  ·  Status: LANDED (read, works vs 26ai)
+- [x] **LOB locator decode** (non-prefetch wire shape: UB4 locatorLen +
+  length-prefixed locator) → `NativeLob` cell.
+- [x] **`LOB GET_LENGTH` + `LOB READ` TTC ops** (`buildLobGetLength` /
+  `buildLobRead`, function 96) with `decodeLobReadResponse` (LOB_DATA +
+  RETURN_PARAMETER amount + split-packet reassembly).
+- [x] **Materialization** in `queryReal`: CLOB/NCLOB → `String` (UTF-16BE),
+  BLOB → `Uint8List`; empty LOB → empty value; multi-read loop for LOBs larger
+  than one READ returns.
+- [x] Gated test: 16-char CLOB, `BLOBDATA` BLOB, 9000-char multi-read CLOB,
+  empty (NULL) CLOB. **Passes vs Docker 26ai.**
+- [ ] (follow-up) `LOB WRITE` / temporary-LOB binds, large (>252 byte) scalar
+  binds (chunked ROW_DATA encoding), `BFILE`.
 
 ## Phase T5 — Cursors & multiple results  ·  Status: TODO
 - [ ] **REF CURSOR** OUT binds (describe + fetch the nested cursor).

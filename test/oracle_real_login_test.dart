@@ -176,5 +176,37 @@ void main() {
         await client.close();
       }
     });
+
+    test('CLOB / BLOB materialize from real Oracle', () async {
+      final host = env['ORACLE_HOST'] ?? '127.0.0.1';
+      final port = int.tryParse(env['ORACLE_PORT'] ?? '1521') ?? 1521;
+      final user = env['ORACLE_USER'] ?? 'system';
+      final pass = env['ORACLE_PASSWORD'] ?? 'TestPw1234';
+      final service = env['ORACLE_SERVICE'] ?? 'FREEPDB1';
+
+      final client = await OracleThickClient.connect(port, host: host);
+      try {
+        await client.loginReal(
+          username: user,
+          password: pass,
+          serviceName: service,
+        );
+        final r = await client.queryReal('''
+          SELECT
+            TO_CLOB('hello clob world') AS c,
+            TO_BLOB(UTL_RAW.CAST_TO_RAW('BLOBDATA')) AS b,
+            TO_CLOB(RPAD(TO_CLOB('z'), 9000, 'z')) AS bigc,
+            TO_CLOB('') AS emptyc
+          FROM dual
+        ''');
+        final row = r.rows.first;
+        expect(row[0], 'hello clob world');
+        expect(row[1], [66, 76, 79, 66, 68, 65, 84, 65]); // 'BLOBDATA'
+        expect((row[2] as String).length, 9000); // multi-read CLOB
+        expect(row[3], isNull); // TO_CLOB('') is NULL in Oracle
+      } finally {
+        await client.close();
+      }
+    });
   }, skip: enabled ? false : 'set RUN_ORACLE_TESTS=true to run (needs Oracle)');
 }
