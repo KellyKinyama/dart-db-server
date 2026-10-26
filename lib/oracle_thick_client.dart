@@ -36,6 +36,8 @@ import 'package:dart_db_server/oracle_native_execute.dart' as ex;
 
 const int _tnsHeaderSize = 8;
 const int _tnsPacketConnect = 1;
+const int _tnsPacketAccept = 2;
+const int _tnsPacketRefuse = 4;
 const int _tnsPacketData = 6;
 const int _tnsPacketMarker = 12;
 const int _ttcMsgTypeFunction = 3;
@@ -74,6 +76,17 @@ Uint8List _wrapData(Uint8List ttc, {int dataFlags = 0}) {
 /// The TTC body of a received DATA frame (strips the 8-byte header + 2 flags).
 Uint8List _ttcBody(Uint8List frame) =>
     Uint8List.sublistView(frame, _tnsHeaderSize + 2);
+
+/// Extracts the Oracle error from a TNS REFUSE packet (type 4). The body
+/// carries a connect-string-shaped payload with `(ERR=NNNNN)` / `(CODE=NNNNN)`;
+/// returns `ORA-NNNNN` (or a generic message when no code is present).
+String _refuseError(Uint8List frame) {
+  final text = String.fromCharCodes(
+      frame.where((b) => b >= 32 && b < 127));
+  final m = RegExp(r'(?:ERR|CODE)=(\d{3,5})').firstMatch(text);
+  if (m != null) return 'ORA-${m.group(1)!.padLeft(5, '0')}';
+  return 'connection refused by listener';
+}
 
 /// Builds a native CONNECT packet. By default (dart-db-server) the descriptor
 /// length is announced but the descriptor itself is *not* inline (the offset
@@ -694,17 +707,41 @@ class OracleThickClient {
   /// path a genuine OCI/thin client uses, distinct from the dart-db-server
   /// [login] flow. Returns a [NativeLoginResult] whose `authenticated` reflects
   /// the server's AUTH_SVR_RESPONSE mutual-auth validation.
+  ///
+  /// Pass exactly one of [serviceName] (service-based, EZ-connect style) or
+  /// [sid] (SID-based, e.g. pre-12c databases). A listener REFUSE (wrong
+  /// service/SID) surfaces its `ORA-xxxxx` in the result's `params['error']`
+  /// instead of hanging.
   Future<NativeLoginResult> loginReal({
     required String username,
     required String password,
-    required String serviceName,
+    String? serviceName,
+    String? sid,
     String? alterSession,
   }) async {
-    final descriptor = '(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=$serviceName)'
+    if ((serviceName == null) == (sid == null)) {
+      throw ArgumentError('pass exactly one of serviceName / sid');
+    }
+    final connectData = sid != null ? 'SID=$sid' : 'SERVICE_NAME=$serviceName';
+    final descriptor = '(DESCRIPTION=(CONNECT_DATA=($connectData)'
         '(CID=(PROGRAM=dart-thick)(HOST=localhost)(USER=$username))))';
     _socket.add(
         buildNativeConnect(descriptor: descriptor, inline: true, versionDesired: 319));
-    final accept = hs.parseAccept(await _frames.next());
+    final firstFrame = await _frames.next();
+    final frameType = firstFrame.length > 4 ? firstFrame[4] : 0;
+    if (frameType == _tnsPacketRefuse) {
+      // The listener refused the CONNECT (e.g. ORA-12514 unknown service,
+      // ORA-12505 unknown SID). Surface the embedded error instead of hanging.
+      return NativeLoginResult(
+          authenticated: false,
+          params: {'error': _refuseError(firstFrame)});
+    }
+    if (frameType != _tnsPacketAccept) {
+      return NativeLoginResult(authenticated: false, params: {
+        'error': 'unexpected TNS packet type $frameType (expected ACCEPT)'
+      });
+    }
+    final accept = hs.parseAccept(firstFrame);
     _realDataFlags = accept.supportsEndOfRequest ? hs.tnsDataFlagsEndOfRpc : 0;
 
     _socket.add(_wrapData(

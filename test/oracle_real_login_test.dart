@@ -42,6 +42,37 @@ void main() {
       }
     });
 
+    test('a wrong connect-string surfaces an ORA error, not a hang', () async {
+      final host = env['ORACLE_HOST'] ?? '127.0.0.1';
+      final port = int.tryParse(env['ORACLE_PORT'] ?? '1521') ?? 1521;
+
+      final client = await OracleThickClient.connect(port, host: host);
+      try {
+        // An unknown SID draws a listener REFUSE (ORA-12505); it must fail fast
+        // rather than time out waiting for an ACCEPT.
+        final result = await client
+            .loginReal(username: 'x', password: 'y', sid: 'NOSUCHSID')
+            .timeout(const Duration(seconds: 5));
+        expect(result.authenticated, isFalse);
+        expect(result.params['error'], startsWith('ORA-'));
+      } finally {
+        await client.close();
+      }
+    });
+
+    test('loginReal requires exactly one of serviceName / sid', () async {
+      final host = env['ORACLE_HOST'] ?? '127.0.0.1';
+      final port = int.tryParse(env['ORACLE_PORT'] ?? '1521') ?? 1521;
+      final client = await OracleThickClient.connect(port, host: host);
+      try {
+        expect(
+            () => client.loginReal(username: 'x', password: 'y'),
+            throwsArgumentError);
+      } finally {
+        await client.close();
+      }
+    });
+
     test('canonical OALL8 query returns rows from real Oracle', () async {
       final host = env['ORACLE_HOST'] ?? '127.0.0.1';
       final port = int.tryParse(env['ORACLE_PORT'] ?? '1521') ?? 1521;
