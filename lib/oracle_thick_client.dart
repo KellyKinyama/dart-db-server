@@ -843,7 +843,7 @@ class OracleThickClient {
   Future<ex.NativeLobReadResponse> _readLobResponse(int locatorLen) async {
     final acc = BytesBuilder();
     while (true) {
-      acc.add(_ttcBody(await _frames.next()));
+      acc.add(_ttcBody(await _nextDataFrame()));
       final resp = ex.decodeLobReadResponse(acc.toBytes(),
           sourceLocatorLength: locatorLen);
       if (resp.complete) return resp;
@@ -864,18 +864,81 @@ class OracleThickClient {
     required bool isQuery,
     List<ex.NativeColumn>? expectedColumns,
     List<ex.NativeBind> binds = const [],
+    bool dmlReturning = false,
   }) async {
     final acc = BytesBuilder();
     while (true) {
-      acc.add(_ttcBody(await _frames.next()));
+      acc.add(_ttcBody(await _nextDataFrame()));
       final resp = ex.decodeExecuteResponse(
         acc.toBytes(),
         isQuery: isQuery,
         expectedColumns: expectedColumns,
         binds: binds,
+        dmlReturning: dmlReturning,
       );
       if (resp.complete) return resp;
     }
+  }
+
+  /// Reads the next TNS DATA frame, handling break/reset MARKER packets: a
+  /// server BREAK marker (`dataType == 1`) is answered with a RESET marker and
+  /// skipped (the real DATA response follows). Non-DATA frames are skipped.
+  Future<Uint8List> _nextDataFrame() async {
+    while (true) {
+      final frame = await _frames.next();
+      final type = frame.length > 4 ? frame[4] : 0;
+      if (type == _tnsPacketData) return frame;
+      if (type == _tnsPacketMarker) {
+        // Marker payload at offset 8: [markerType, pad, dataType]; 1 = BREAK.
+        final dataType = frame.length > 10 ? frame[10] : 0;
+        if (dataType == 1) _socket.add(buildResetMarker());
+        continue;
+      }
+      // Any other control packet — skip and keep reading.
+    }
+  }
+
+  /// Runs a DML statement (INSERT/UPDATE/DELETE) against a **real Oracle**
+  /// server with optional positional IN [binds], returning rows affected.
+  /// For array DML pass [bulkRows] (one inner list of IN values per iteration).
+  Future<int> executeDml(String sql,
+      {List<Object?> binds = const [], List<List<Object?>>? bulkRows}) async {
+    // Array DML derives its bind templates from the first iteration's values.
+    final templateRow = (bulkRows != null && bulkRows.isNotEmpty)
+        ? bulkRows.first
+        : binds;
+    final nativeBinds = [for (final v in templateRow) ex.NativeBind.value(v)];
+    _socket.add(_wrapData(
+        ex.buildDmlExecute(sql, nativeBinds, bulkRows: bulkRows),
+        dataFlags: _realDataFlags));
+    final resp = await _readRealResponse(isQuery: false, binds: nativeBinds);
+    if (!resp.isSuccess) {
+      throw OracleThickException(
+          resp.errorNum ?? -1,
+          'ORA-${(resp.errorNum ?? 0).toString().padLeft(5, '0')}: '
+          '${resp.errorMessage ?? ''}');
+    }
+    return resp.rowsAffected ?? 0;
+  }
+
+  /// Runs a DML `… RETURNING <cols> INTO <outs>` statement against a **real
+  /// Oracle** server. [binds] are in appearance order (IN values + OUT
+  /// returning targets). Returns each OUT bind's returned values as a `List`
+  /// (one entry per affected row) in `outBindValues`.
+  Future<ex.NativeExecuteResponse> executeReturning(
+      String sql, List<ex.NativeBind> binds) async {
+    _socket.add(_wrapData(
+        ex.buildDmlExecute(sql, binds, returning: true),
+        dataFlags: _realDataFlags));
+    final resp = await _readRealResponse(
+        isQuery: false, binds: binds, dmlReturning: true);
+    if (!resp.isSuccess) {
+      throw OracleThickException(
+          resp.errorNum ?? -1,
+          'ORA-${(resp.errorNum ?? 0).toString().padLeft(5, '0')}: '
+          '${resp.errorMessage ?? ''}');
+    }
+    return resp;
   }
 
   /// Fetches all rows from an open server [cursorId] with the given [columns].

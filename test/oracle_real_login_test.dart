@@ -298,5 +298,67 @@ void main() {
         await client.close();
       }
     });
+
+    test('DML, array DML, and RETURNING against real Oracle', () async {
+      final host = env['ORACLE_HOST'] ?? '127.0.0.1';
+      final port = int.tryParse(env['ORACLE_PORT'] ?? '1521') ?? 1521;
+      final user = env['ORACLE_USER'] ?? 'system';
+      final pass = env['ORACLE_PASSWORD'] ?? 'TestPw1234';
+      final service = env['ORACLE_SERVICE'] ?? 'FREEPDB1';
+
+      final client = await OracleThickClient.connect(port, host: host);
+      try {
+        await client.loginReal(
+          username: user,
+          password: pass,
+          serviceName: service,
+        );
+        await client
+            .executeDml('DROP TABLE t_thick_it PURGE')
+            .catchError((_) => 0);
+        await client.executeDml(
+            'CREATE TABLE t_thick_it (id NUMBER, name VARCHAR2(40))');
+        try {
+          // Single-row DML with binds.
+          expect(
+              await client.executeDml('INSERT INTO t_thick_it VALUES (:1, :2)',
+                  binds: [1, 'alice']),
+              1);
+          // Array DML (executeMany) with varying string lengths.
+          expect(
+              await client.executeDml('INSERT INTO t_thick_it VALUES (:1, :2)',
+                  bulkRows: [
+                    [2, 'bob'],
+                    [3, 'carol'],
+                    [4, 'david'],
+                  ]),
+              3);
+          final all = await client
+              .queryReal('SELECT id, name FROM t_thick_it ORDER BY id');
+          expect(all.rows, [
+            [1, 'alice'],
+            [2, 'bob'],
+            [3, 'carol'],
+            [4, 'david'],
+          ]);
+          // DML RETURNING INTO an OUT bind (one value per affected row).
+          final ret = await client.executeReturning(
+              'UPDATE t_thick_it SET name = :1 WHERE id <= :2 '
+              'RETURNING id INTO :3',
+              [
+                NativeBind.value('updated'),
+                NativeBind.value(2),
+                NativeBind.outNumber(),
+              ]);
+          expect(ret.outBindValues, [
+            [1, 2]
+          ]);
+        } finally {
+          await client.executeDml('DROP TABLE t_thick_it PURGE');
+        }
+      } finally {
+        await client.close();
+      }
+    });
   }, skip: enabled ? false : 'set RUN_ORACLE_TESTS=true to run (needs Oracle)');
 }

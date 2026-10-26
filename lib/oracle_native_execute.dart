@@ -510,7 +510,167 @@ Uint8List buildFetch(
 }
 
 const int _execOptionPlSqlBind = 0x400;
+const int _execOptionNotPlSql = 0x8000;
 const int _oraTypeCursor = 102;
+
+/// Builds a DML OALL8 EXECUTE (INSERT/UPDATE/DELETE), optionally with
+/// `RETURNING … INTO` OUT binds and/or array (executeMany) iterations.
+///
+/// [binds] are the single-iteration bind templates (IN values + OUT returning
+/// targets). For array DML, [bulkRows] holds one inner list of IN values per
+/// iteration (OUT binds keep their template); otherwise a single iteration uses
+/// the [binds] values. [returning] enables the RETURNING decode (OUT binds are
+/// omitted from ROW_DATA and their values stream back count-prefixed).
+Uint8List buildDmlExecute(
+  String sql,
+  List<NativeBind> binds, {
+  bool returning = false,
+  List<List<Object?>>? bulkRows,
+  int ttcFieldVersion = _fieldVersion23_4,
+  int sequence = 1,
+}) {
+  final b = WriteBuffer();
+  b.writeUint8(_msgTypeFunction);
+  b.writeUint8(_funcExecute);
+  b.writeUint8(sequence & 0xFF);
+  if (ttcFieldVersion >= _fieldVersion23_1Ext1) {
+    b.writeUB8(0); // token number
+  }
+
+  final sqlBytes = utf8.encode(sql);
+  final numParams = binds.length;
+  final numExecs = bulkRows?.length ?? 1;
+  var options = _execOptionParse | _execOptionExecute | _execOptionNotPlSql;
+  if (numParams > 0) options |= _execOptionBind;
+  final dmlOptions = _execOptionImplicitResultset;
+
+  b.writeUB4(options);
+  b.writeUB4(0); // cursor id
+
+  b.writeUint8(1); // ptr to SQL
+  b.writeUB4(sqlBytes.length);
+
+  b.writeUint8(1); // al8i4 vector pointer
+  b.writeUB4(13);
+
+  b.writeUint8(0); // al8o4
+  b.writeUint8(0); // al8o4l
+  b.writeUint8(0); // prefetch buffer size
+  b.writeUB4(1); // prefetch num rows
+  b.writeUB4(_maxLongLength);
+
+  if (numParams == 0) {
+    b.writeUint8(0);
+    b.writeUB4(0);
+  } else {
+    b.writeUint8(1);
+    b.writeUB4(numParams);
+  }
+
+  b.writeUint8(0); // al8pp
+  b.writeUint8(0); // al8txn
+  b.writeUint8(0); // al8txl
+  b.writeUint8(0); // al8kv
+  b.writeUint8(0); // al8kvl
+
+  b.writeUint8(0); // defines absent
+  b.writeUB4(0);
+
+  b.writeUB4(0); // registration id
+
+  b.writeUint8(0); // al8objlist
+  b.writeUint8(0); // al8objlen
+  b.writeUint8(0); // al8blv
+  b.writeUB4(0); // al8blv
+  b.writeUint8(0); // al8dnam
+  b.writeUB4(0); // al8dnaml
+  b.writeUB4(0); // al8regid_msb
+
+  b.writeUint8(0); // array dml row counts absent
+  b.writeUB4(0);
+  b.writeUint8(0);
+
+  if (ttcFieldVersion >= _fieldVersion12_2) {
+    b.writeUint8(0); // al8sqlsig
+    b.writeUB4(0);
+    b.writeUint8(0); // sql id
+    b.writeUB4(0);
+    b.writeUint8(0); // length of sql id
+    b.writeUint8(0); // chunk ids
+    b.writeUB4(0);
+  }
+
+  b.writeBytesWithLength(Uint8List.fromList(sqlBytes));
+  b.writeUB4(1); // al8i4[0] parse
+
+  b.writeUB4(numExecs); // al8i4[1] execution count
+  b.writeUB4(0); // al8i4[2]
+  b.writeUB4(0); // al8i4[3]
+  b.writeUB4(0); // al8i4[4]
+  b.writeUB4(0); // al8i4[5] SCN p1
+  b.writeUB4(0); // al8i4[6] SCN p2
+  b.writeUB4(0); // al8i4[7] (not a query)
+  b.writeUB4(0); // al8i4[8]
+  b.writeUB4(dmlOptions); // al8i4[9]
+  b.writeUB4(0); // al8i4[10]
+  b.writeUB4(0); // al8i4[11]
+  b.writeUB4(0); // al8i4[12]
+
+  if (numParams > 0) {
+    // For array DML the per-bind buffer must fit the largest value across all
+    // iterations, so widen each bind's declared maxSize to the column max.
+    final maxSizes = [for (final bind in binds) bind.maxSize];
+    if (bulkRows != null) {
+      for (final row in bulkRows) {
+        for (var i = 0; i < binds.length && i < row.length; i++) {
+          final e = _encodeBind(row[i]);
+          final n = e.bytes?.length ?? 0;
+          if (n > maxSizes[i]) maxSizes[i] = n;
+        }
+      }
+    }
+    for (var bi = 0; bi < binds.length; bi++) {
+      final bind = binds[bi];
+      b.writeUint8(bind.oraType);
+      b.writeUint8(_bindUseIndicators);
+      b.writeUint8(0); // precision
+      b.writeUint8(0); // scale
+      b.writeUB4(maxSizes[bi] == 0 ? 1 : maxSizes[bi]);
+      b.writeUB4(0); // max num elements
+      b.writeUB4(0); // cont flags
+      b.writeUB4(0); // OID
+      b.writeUB2(0); // version
+      b.writeUB2(bind.csfrm != 0 ? _charsetUtf8 : 0); // charset field
+      b.writeUint8(bind.csfrm);
+      b.writeUB4(0); // LOB prefetch length
+      if (ttcFieldVersion >= _fieldVersion12_2) {
+        b.writeUB4(0); // oaccolid
+      }
+    }
+    // One ROW_DATA message per iteration. A RETURNING target (OUT bind) is
+    // omitted from the row data — the server fills and streams it back.
+    final rows = bulkRows ?? [[for (final bind in binds) bind.value]];
+    for (final rowValues in rows) {
+      b.writeUint8(_msgTypeRowData);
+      for (var i = 0; i < binds.length; i++) {
+        final bind = binds[i];
+        if (returning && bind.isOut) continue; // omit RETURNING targets
+        if (bind.isOut) {
+          b.writeUint8(0); // OUT slot null indicator (non-returning)
+          continue;
+        }
+        final e = _encodeBind(i < rowValues.length ? rowValues[i] : bind.value);
+        if (e.bytes == null) {
+          b.writeUint8(0);
+        } else {
+          b.writeBytesWithLength(e.bytes!);
+        }
+      }
+    }
+  }
+
+  return b.toBytes();
+}
 
 /// Builds a PL/SQL OALL8 EXECUTE for a block with [binds] (IN and/or OUT). The
 /// server runs the block and returns OUT bind values (and any opened REF
@@ -656,12 +816,17 @@ class _DecodeState {
     required this.isQuery,
     required this.ttcFieldVersion,
     this.binds = const [],
+    this.dmlReturning = false,
   });
   final bool isQuery;
   final int ttcFieldVersion;
 
   /// Bind metadata (PL/SQL), used to decode OUT bind values by type.
   final List<NativeBind> binds;
+
+  /// Whether this is a DML `RETURNING … INTO` response (OUT values stream back
+  /// count-prefixed with no IO_VECTOR).
+  final bool dmlReturning;
   List<NativeColumn> columns = [];
   final List<List<Object?>> rows = [];
   int cursorId = 0;
@@ -701,10 +866,20 @@ NativeExecuteResponse decodeExecuteResponse(
   required bool isQuery,
   List<NativeColumn>? expectedColumns,
   List<NativeBind> binds = const [],
+  bool dmlReturning = false,
   int ttcFieldVersion = _fieldVersion23_4,
 }) {
   final s = _DecodeState(
-      isQuery: isQuery, ttcFieldVersion: ttcFieldVersion, binds: binds);
+      isQuery: isQuery,
+      ttcFieldVersion: ttcFieldVersion,
+      binds: binds,
+      dmlReturning: dmlReturning);
+  // DML RETURNING has no IO_VECTOR: seed the OUT indices from the bind list.
+  if (dmlReturning) {
+    for (var i = 0; i < binds.length; i++) {
+      if (binds[i].isOut) s.outBindIndices.add(i);
+    }
+  }
   if (expectedColumns != null) s.columns = List.of(expectedColumns);
   final buf = ReadBuffer(body);
   try {
@@ -897,6 +1072,10 @@ void _processRowHeader(ReadBuffer buf, _DecodeState s) {
 void _processRowData(ReadBuffer buf, _DecodeState s) {
   // A PL/SQL response ships OUT bind values in ROW_DATA after the IO_VECTOR.
   if (!s.isQuery && s.outBindIndices.isNotEmpty) {
+    if (s.dmlReturning) {
+      _decodeReturningBinds(buf, s);
+      return;
+    }
     if (!s.outBindsDecoded) {
       _decodeOutBinds(buf, s);
       s.outBindsDecoded = true;
@@ -967,6 +1146,29 @@ List<NativeColumn> _readEmbeddedCursorDescribe(
   final tailBytes = buf.readUB4();
   if (tailBytes > 0) buf.readBytesWithLength();
   return columns;
+}
+
+/// Decodes a DML `RETURNING … INTO` ROW_DATA: each OUT bind is a `UB4 numRows`
+/// count followed by that many (value + SB4 trailer). Collects each bind's
+/// returned values as a `List` into [_DecodeState.outBindValues].
+void _decodeReturningBinds(ReadBuffer buf, _DecodeState s) {
+  final result = <Object?>[];
+  for (final idx in s.outBindIndices) {
+    final bind = idx < s.binds.length ? s.binds[idx] : null;
+    final oraType = bind?.oraType ?? _oraTypeVarchar;
+    final numRows = buf.readUB4();
+    final values = <Object?>[];
+    final col = NativeColumn(
+        name: '', oracleType: oraType, maxLength: 0, csfrm: bind?.csfrm ?? 0);
+    for (var j = 0; j < numRows; j++) {
+      values.add(_decodeColumnValue(buf, col));
+      buf.readSB4();
+    }
+    result.add(values);
+  }
+  s.outBindValues
+    ..clear()
+    ..addAll(result);
 }
 
 void _processBitVector(ReadBuffer buf, _DecodeState s) {

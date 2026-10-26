@@ -141,9 +141,20 @@ round-tripped on real Oracle in `test/oracle_real_login_test.dart`.
 - [ ] (follow-up) nested `CURSOR(SELECT …)` columns; IN OUT binds; multiple REF
   CURSOR OUT binds in one call.
 
-## Phase T6 — Bulk & RETURNING  ·  Status: TODO
-- [ ] **Array DML** (`executeMany`) with per-row batch errors.
-- [ ] **DML RETURNING … INTO** OUT binds (incl. array returning).
+## Phase T6 — Bulk & RETURNING  ·  Status: LANDED (DML, array DML, RETURNING, works vs 26ai)
+- [x] **DML execute** (`buildDmlExecute` + `executeDml`): INSERT/UPDATE/DELETE
+  (and DDL) with positional IN binds → rows affected.
+- [x] **Array DML** (`executeMany` via `bulkRows`): one ROW_DATA per iteration,
+  `al8i4[1]=numExecs`, per-column maxSize widened to the column max.
+- [x] **DML RETURNING … INTO** (`executeReturning`): OUT binds omitted from
+  ROW_DATA, returned values stream back count-prefixed (one list per OUT bind).
+- [x] **Break/RESET marker handling** (`_nextDataFrame`): a server BREAK marker
+  (packet type 12, dataType 1) is answered with a RESET marker — this is what
+  DDL/DML responses send; previously desynced the stream. Also unblocks DDL.
+- [x] Gated test (single DML, 3-row array DML with varying string lengths,
+  RETURNING) passes vs 26ai.
+- [ ] (follow-up) array-DML per-row batch errors (`batchErrors`), array
+  RETURNING (multiple rows per iteration), DML row-count array.
 
 ## Phase T7 — Robustness & parity  ·  Status: TODO
 - [ ] Full ORA error + warning decode; multi-error batches.
