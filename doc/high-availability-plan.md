@@ -191,6 +191,13 @@ Tasks:
 - [ ] **Semi-sync (optional).** `PRAGMA replication = async|semisync(k)` —
   withhold `COMMIT` ack until `k` replicas confirm, trading latency for a
   stronger RPO.
+
+  *LANDED (API form):* `ReplicationClient` acks each applied record back to the
+  `ReplicationServer`, which tracks per-replica acked LSNs and exposes
+  `awaitAcks(lsn, count, timeout)`. `Database.configureSemiSync(waiter)` makes a
+  commit block on that barrier after appending — degrading to async on timeout
+  so a commit is never lost. Tests: `test/replication_tcp_test.dart` (ack-
+  confirmed commit, timeout degradation). A `PRAGMA` surface is still TODO.
 - [ ] **Protocol surface.** Decide whether replicas are visible to Oracle/MySQL
   wire clients as read-only endpoints (likely yes — reuse existing front-ends).
 

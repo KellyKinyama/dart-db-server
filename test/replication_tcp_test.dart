@@ -235,4 +235,56 @@ void main() {
       }
     });
   });
+
+  group('semi-sync replication', () {
+    test('a semi-sync commit waits for a replica ack', () async {
+      final primary = await Database.open(_tmp('ss_p'));
+      await primary.enableOpLog();
+      final server = ReplicationServer(primary.opLog!);
+      final port = await server.start();
+      primary.configureSemiSync(
+          (lsn) => server.awaitAcks(lsn, 1, const Duration(seconds: 2)));
+
+      final replica = await Database.open(_tmp('ss_r'));
+      final client = ReplicationClient(replica);
+      try {
+        await client.connect('127.0.0.1', port);
+        // This commit only returns once the replica has acked applying it.
+        await primary.execute('CREATE TABLE t(id INTEGER PRIMARY KEY)');
+        expect(replica.appliedLsn, greaterThanOrEqualTo(1));
+        await primary.execute('INSERT INTO t VALUES (1)');
+        expect(replica.appliedLsn, primary.opLog!.lastLsn);
+      } finally {
+        await client.close();
+        await server.stop();
+        await primary.close();
+        await replica.close();
+      }
+    });
+
+    test('a semi-sync commit degrades to async after the ack timeout',
+        () async {
+      final primary = await Database.open(_tmp('ss_to_p'));
+      await primary.enableOpLog();
+      final server = ReplicationServer(primary.opLog!);
+      await server.start();
+      // Require 1 ack but no replica is connected → commit waits then proceeds.
+      primary.configureSemiSync(
+          (lsn) => server.awaitAcks(lsn, 1, const Duration(milliseconds: 200)));
+      try {
+        final sw = Stopwatch()..start();
+        await primary.execute('CREATE TABLE t(id INTEGER PRIMARY KEY)');
+        sw.stop();
+        expect(sw.elapsedMilliseconds, greaterThanOrEqualTo(150));
+        // The commit still succeeded despite no replica ack.
+        final rr = await primary.execute('SELECT COUNT(*) FROM t');
+        expect(rr.rows, [
+          [0],
+        ]);
+      } finally {
+        await server.stop();
+        await primary.close();
+      }
+    });
+  });
 }

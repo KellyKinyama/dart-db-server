@@ -19,6 +19,12 @@ class ReplicationServer {
   ServerSocket? _socket;
   final _clients = <Socket>{};
 
+  /// Highest LSN each connected replica has acknowledged applying.
+  final Map<Socket, int> _acked = {};
+
+  /// Pending semi-sync waiters: each wants [count] replicas acked up to [lsn].
+  final List<_AckWaiter> _ackWaiters = [];
+
   ReplicationServer(this.log);
 
   /// The bound port (0 before [start]).
@@ -33,54 +39,100 @@ class ReplicationServer {
     return s.port;
   }
 
-  Future<void> _handleClient(Socket client) async {
+  /// Number of replicas that have acknowledged applying up to at least [lsn].
+  int ackedReplicas(int lsn) =>
+      _acked.values.where((a) => a >= lsn).length;
+
+  /// Semi-sync barrier: completes once [count] replicas have acked [lsn], or
+  /// after [timeout] (degrading to asynchronous — the commit still stands, it
+  /// just wasn't confirmed by enough replicas in time). A [count] of 0 returns
+  /// immediately (pure async replication).
+  Future<void> awaitAcks(int lsn, int count, Duration timeout) {
+    if (count <= 0 || ackedReplicas(lsn) >= count) return Future.value();
+    final completer = Completer<void>();
+    final waiter = _AckWaiter(lsn, count, completer);
+    _ackWaiters.add(waiter);
+    Timer(timeout, () {
+      if (!completer.isCompleted) {
+        _ackWaiters.remove(waiter);
+        completer.complete();
+      }
+    });
+    return completer.future;
+  }
+
+  void _onAck(Socket client, int lsn) {
+    final prev = _acked[client] ?? 0;
+    if (lsn > prev) _acked[client] = lsn;
+    _ackWaiters.removeWhere((w) {
+      if (ackedReplicas(w.lsn) >= w.count) {
+        if (!w.completer.isCompleted) w.completer.complete();
+        return true;
+      }
+      return false;
+    });
+  }
+
+  void _handleClient(Socket client) {
     _clients.add(client);
     StreamSubscription<OpLogRecord>? tail;
-    try {
-      final firstLine = await client
-          .cast<List<int>>()
-          .transform(utf8.decoder)
-          .transform(const LineSplitter())
-          .first;
-      final req = (jsonDecode(firstLine) as Map).cast<String, Object?>();
-      final fromLsn = (req['from_lsn'] as num?)?.toInt() ?? 0;
+    var lastSent = 0;
+    var handshaken = false;
 
-      var lastSent = fromLsn;
-      void send(OpLogRecord rec) {
-        client.writeln(jsonEncode(rec.toJson()));
-        lastSent = rec.lsn;
-      }
-
-      // Subscribe to the live tail BEFORE draining the backlog so a record
-      // appended mid-drain is buffered, not lost; the lsn guard de-dupes.
-      final pending = <OpLogRecord>[];
-      var draining = true;
-      tail = log.onAppend.listen((rec) {
-        if (draining) {
-          pending.add(rec);
-        } else if (rec.lsn > lastSent) {
-          send(rec);
-        }
-      });
-
-      await for (final rec in log.readFrom(fromLsn)) {
-        send(rec);
-      }
-      for (final rec in pending) {
-        if (rec.lsn > lastSent) send(rec);
-      }
-      draining = false;
-
-      await client.done;
-    } catch (_) {
-      /* client gone / malformed handshake */
-    } finally {
-      await tail?.cancel();
-      _clients.remove(client);
-      try {
-        await client.close();
-      } catch (_) {/* best-effort */}
+    void send(OpLogRecord rec) {
+      client.writeln(jsonEncode(rec.toJson()));
+      lastSent = rec.lsn;
     }
+
+    final lines = client
+        .cast<List<int>>()
+        .transform(utf8.decoder)
+        .transform(const LineSplitter());
+
+    lines.listen(
+      (line) async {
+        if (line.trim().isEmpty) return;
+        try {
+          final m = (jsonDecode(line) as Map).cast<String, Object?>();
+          // Replica → primary acks (semi-sync feedback).
+          if (m.containsKey('ack')) {
+            _onAck(client, (m['ack'] as num).toInt());
+            return;
+          }
+          // Handshake: begin streaming backlog + live tail.
+          if (!handshaken && m.containsKey('from_lsn')) {
+            handshaken = true;
+            final fromLsn = (m['from_lsn'] as num?)?.toInt() ?? 0;
+            lastSent = fromLsn;
+            final pending = <OpLogRecord>[];
+            var draining = true;
+            tail = log.onAppend.listen((rec) {
+              if (draining) {
+                pending.add(rec);
+              } else if (rec.lsn > lastSent) {
+                send(rec);
+              }
+            });
+            await for (final rec in log.readFrom(fromLsn)) {
+              send(rec);
+            }
+            for (final rec in pending) {
+              if (rec.lsn > lastSent) send(rec);
+            }
+            draining = false;
+          }
+        } catch (_) {/* malformed line */}
+      },
+      onError: (_) {},
+      onDone: () async {
+        await tail?.cancel();
+        _acked.remove(client);
+        _clients.remove(client);
+        try {
+          await client.close();
+        } catch (_) {/* best-effort */}
+      },
+    );
   }
 
   /// Stop accepting connections and drop existing replica sockets.
@@ -93,6 +145,11 @@ class ReplicationServer {
       } catch (_) {/* best-effort */}
     }
     _clients.clear();
+    _acked.clear();
+    for (final w in _ackWaiters) {
+      if (!w.completer.isCompleted) w.completer.complete();
+    }
+    _ackWaiters.clear();
   }
 }
 
@@ -191,7 +248,12 @@ class ReplicationClient {
   Future<void> _applyLine(String line) async {
     if (line.trim().isEmpty) return;
     final m = (jsonDecode(line) as Map).cast<String, Object?>();
-    await target.applyReplicated(OpLogRecord.fromJson(m));
+    final rec = OpLogRecord.fromJson(m);
+    await target.applyReplicated(rec);
+    // Ack back to the primary so semi-sync commits can be confirmed.
+    try {
+      _socket?.writeln(jsonEncode({'ack': rec.lsn}));
+    } catch (_) {/* socket closing — ack is best-effort */}
   }
 
   /// Completes when the stream ends (server closed / disconnected).
@@ -202,4 +264,13 @@ class ReplicationClient {
     await _socket?.close();
     if (!_done.isCompleted) _done.complete();
   }
+}
+
+/// One pending semi-sync barrier: completes when [count] replicas have
+/// acknowledged applying up to [lsn].
+class _AckWaiter {
+  final int lsn;
+  final int count;
+  final Completer<void> completer;
+  _AckWaiter(this.lsn, this.count, this.completer);
 }

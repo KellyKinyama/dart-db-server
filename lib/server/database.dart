@@ -389,6 +389,16 @@ class Database implements SequenceProvider {
   /// tests.
   OpLog? get opLog => _oplog;
 
+  /// Optional semi-synchronous replication barrier: called with each committed
+  /// record's LSN after it is appended to the op-log and before the commit
+  /// returns, so the caller can block until enough replicas have acknowledged.
+  Future<void> Function(int lsn)? _semiSyncWaiter;
+
+  /// Install (or clear with null) the semi-sync barrier. Typically wired to a
+  /// `ReplicationServer.awaitAcks` so commits wait for replica acknowledgement.
+  void configureSemiSync(Future<void> Function(int lsn)? waiter) =>
+      _semiSyncWaiter = waiter;
+
   /// Garbage-collect op-log segments that every consumer has moved past.
   /// Keeps records at or above `min(snapshot LSN, slowestReplicaLsn)` so both
   /// crash replay and any lagging replica can still be served. No-op when the
@@ -2544,7 +2554,8 @@ class Database implements SequenceProvider {
       if (stmt is CommitStmt) {
         if (_oplog != null && !_replaying && _txnOps != null &&
             _txnOps!.isNotEmpty) {
-          await _oplog!.append(_txnOps!);
+          final lsn = await _oplog!.append(_txnOps!);
+          if (_semiSyncWaiter != null) await _semiSyncWaiter!(lsn);
         }
         _txnOps = null;
         if (!_replaying) await _persist();
@@ -2552,7 +2563,8 @@ class Database implements SequenceProvider {
       }
       if (!inTransaction && _isMutation(stmt)) {
         if (_oplog != null && !_replaying && sourceSql != null) {
-          await _oplog!.append([sourceSql]);
+          final lsn = await _oplog!.append([sourceSql]);
+          if (_semiSyncWaiter != null) await _semiSyncWaiter!(lsn);
         }
         if (!_replaying) await _persist();
       }
