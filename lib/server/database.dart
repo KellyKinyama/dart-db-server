@@ -14,6 +14,7 @@ import 'concurrency.dart';
 import 'blob.dart';
 import 'expression.dart';
 import 'fts5.dart';
+import 'oplog.dart';
 import 'parser.dart';
 import 'prepared.dart';
 import 'result.dart';
@@ -77,6 +78,44 @@ class _VectorIndexBinding {
   bool payloadIndexDirty = false;
 
   _VectorIndexBinding(this.spec);
+}
+
+/// A point-in-time view of a node's high-availability role and replication
+/// position (see [Database.haStatus]).
+class HaStatus {
+  /// `'primary'` (accepts writes) or `'replica'` (read-only).
+  final String role;
+
+  /// The epoch/term this node holds.
+  final int epoch;
+
+  /// The highest op-log LSN this node has applied as a replica.
+  final int appliedLsn;
+
+  /// The head LSN of this node's own op-log (0 when it isn't a logging primary).
+  final int logLastLsn;
+
+  /// True when this node has been fenced (superseded by a newer primary).
+  final bool fenced;
+
+  HaStatus({
+    required this.role,
+    required this.epoch,
+    required this.appliedLsn,
+    required this.logLastLsn,
+    required this.fenced,
+  });
+
+  Map<String, Object?> toJson() => {
+        'role': role,
+        'epoch': epoch,
+        'applied_lsn': appliedLsn,
+        'log_last_lsn': logLastLsn,
+        'fenced': fenced,
+      };
+
+  @override
+  String toString() => 'HaStatus(${toJson()})';
 }
 
 class Database implements SequenceProvider {
@@ -228,6 +267,140 @@ class Database implements SequenceProvider {
   /// Once a transaction is in flight all further statements run under
   /// the writer arm so the snapshot semantics stay coherent.
   final AsyncRwLock _lock = AsyncRwLock();
+
+  /// Optional durable logical change log (HA Phase 1). When enabled via
+  /// [enableOpLog], every committed mutation is appended as an [OpLogRecord]
+  /// for replication / point-in-time recovery. Null (off) by default so the
+  /// write path is unchanged for callers that don't opt in.
+  OpLog? _oplog;
+
+  /// Buffers the source SQL of mutations inside an explicit transaction so the
+  /// whole transaction is appended to [_oplog] as one record at COMMIT.
+  List<String>? _txnOps;
+
+  /// The op-log LSN the last persisted snapshot reflects (JSON backend). On
+  /// reopen, records above this are replayed to recover committed-but-not-yet-
+  /// persisted transactions.
+  int _persistedOpLogLsn = 0;
+
+  /// True while replaying the op-log on open: suppresses re-capture and the
+  /// per-statement persist so replay is idempotent and converges once at the end.
+  bool _replaying = false;
+
+  /// True when this database is a read-only replica: client mutations are
+  /// rejected; the only writes come through [applyReplicated].
+  bool _replicaReadOnly = false;
+
+  /// The highest op-log LSN this database has applied (as a replica).
+  int _appliedLsn = 0;
+
+  /// Wall-clock timestamp (ms) of the most recently applied replicated record,
+  /// for time-based replication-lag reporting.
+  int _lastAppliedTimestampMs = 0;
+
+  /// Timestamp (ms since epoch) of the last applied replicated record, 0 when
+  /// none has been applied.
+  int get lastAppliedTimestampMs => _lastAppliedTimestampMs;
+
+  /// The epoch (term) this node holds as primary, and the shared fence it
+  /// checks before each write. When the shared epoch exceeds [_epoch] the node
+  /// has been superseded by a newer primary and stops accepting writes.
+  int _epoch = 0;
+  ClusterEpoch? _fence;
+
+  /// Attach a shared fence so this node refuses writes once superseded. [epoch]
+  /// is the generation this node currently holds (default 0).
+  void attachFence(ClusterEpoch fence, {int epoch = 0}) {
+    _fence = fence;
+    _epoch = epoch;
+  }
+
+  /// The epoch (term) this node holds.
+  int get epoch => _epoch;
+
+  /// True when a shared fence is attached and the cluster epoch has advanced
+  /// past the epoch this node holds (i.e. it has been superseded).
+  bool get isFenced => _fence != null && _fence!.read() > _epoch;
+
+  /// A point-in-time view of this node's HA role and replication position.
+  HaStatus haStatus() => HaStatus(
+        role: _replicaReadOnly ? 'replica' : 'primary',
+        epoch: _epoch,
+        appliedLsn: _appliedLsn,
+        logLastLsn: _oplog?.lastLsn ?? 0,
+        fenced: isFenced,
+      );
+
+  /// The highest op-log LSN applied as a replica (0 when not following).
+  int get appliedLsn => _appliedLsn;
+
+  /// Mark this database as a read-only replica (see [_replicaReadOnly]).
+  void markReplica() => _replicaReadOnly = true;
+
+  /// True when this node is a read-only replica (not accepting client writes).
+  bool get isReplica => _replicaReadOnly;
+
+  /// Mark this database as a read-only replica that has already materialized a
+  /// base snapshot up to [appliedLsn] (bootstrap). Subsequent op-log records
+  /// above [appliedLsn] are applied via [applyReplicated].
+  void seedAsReplica(int appliedLsn) {
+    _replicaReadOnly = true;
+    _appliedLsn = appliedLsn;
+  }
+
+  /// Apply a replicated op-log [record] to this replica without re-capturing
+  /// it, then advance [appliedLsn] and persist. Idempotent: records at or below
+  /// the current [appliedLsn] are ignored.
+  Future<void> applyReplicated(OpLogRecord record) async {
+    if (record.lsn <= _appliedLsn) return;
+    _replaying = true;
+    try {
+      for (final op in record.ops) {
+        await execute(op);
+      }
+    } finally {
+      _replaying = false;
+    }
+    _appliedLsn = record.lsn;
+    _lastAppliedTimestampMs = record.timestampMs;
+    await _persist();
+  }
+
+  /// Promote this replica to a writable primary: accept client writes again and
+  /// start (or continue) its own op-log seeded above the LSN already applied,
+  /// so new commits keep LSNs monotonic for any downstream replicas.
+  ///
+  /// v1 assumes a single coordinator drives promotion. Split-brain fencing
+  /// (refusing writes once a higher epoch is observed) arrives with the
+  /// coordinator in Phase 4 — do not automate promotion before it.
+  Future<void> promoteToPrimary() async {
+    if (_fence != null) {
+      _epoch = _fence!.bump(); // adopt a strictly higher generation to fence the old primary
+    }
+    _replicaReadOnly = false;
+    if (path != null && _oplog == null) {
+      final log = OpLog('$path.oplog');
+      await log.open(seedLsn: _appliedLsn);
+      _oplog = log;
+    }
+  }
+
+  /// The durable op-log, or null when not enabled. Exposed for replication and
+  /// tests.
+  OpLog? get opLog => _oplog;
+
+  /// Garbage-collect op-log segments that every consumer has moved past.
+  /// Keeps records at or above `min(snapshot LSN, slowestReplicaLsn)` so both
+  /// crash replay and any lagging replica can still be served. No-op when the
+  /// op-log is disabled.
+  Future<void> gcOpLog(int slowestReplicaLsn) async {
+    final log = _oplog;
+    if (log == null) return;
+    final safe = slowestReplicaLsn < _persistedOpLogLsn
+        ? slowestReplicaLsn
+        : _persistedOpLogLsn;
+    await log.truncateBelow(safe);
+  }
 
   /// Test/diagnostics hook: returns the in-process RW lock so callers
   /// can assert serialization properties.
@@ -2157,6 +2330,10 @@ class Database implements SequenceProvider {
       } catch (_) {}
     }
     _pagedTables.clear();
+    try {
+      await _oplog?.close();
+    } catch (_) {}
+    _oplog = null;
     final fl = _fileLock;
     _fileLock = null;
     if (fl != null) await fl.release();
@@ -2167,7 +2344,7 @@ class Database implements SequenceProvider {
   // ---------------------------------------------------------------------------
   Future<QueryResult> execute(String sql, {Map<String, Object?>? userVars}) async {
     final stmt = Parser.fromString(sql).parseStatement();
-    return executeStmt(stmt, userVars: userVars);
+    return executeStmt(stmt, userVars: userVars, sourceSql: sql);
   }
 
   Future<List<QueryResult>> executeScript(String sql,
@@ -2223,7 +2400,7 @@ class Database implements SequenceProvider {
   }
 
   Future<QueryResult> executeStmt(Statement stmt,
-      {Map<String, Object?>? userVars}) async {
+      {Map<String, Object?>? userVars, String? sourceSql}) async {
     // CALL runs the procedural interpreter, whose embedded statements each
     // take the lock themselves — so it must not run inside an outer lock.
     if (stmt is CallStmt) return _call(stmt, userVars);
@@ -2244,6 +2421,23 @@ class Database implements SequenceProvider {
         throw StateError(
           'Cannot mutate inside a read-only snapshot transaction',
         );
+      }
+      if (_replicaReadOnly && !_replaying && _isMutation(stmt)) {
+        throw StateError('Cannot mutate a read-only replica');
+      }
+      // Fencing: a superseded primary (shared epoch advanced past ours) must
+      // stop accepting writes to avoid split-brain.
+      if (_fence != null &&
+          !_replaying &&
+          (_isMutation(stmt) || stmt is CommitStmt)) {
+        final current = _fence!.read();
+        if (current > _epoch) {
+          _replicaReadOnly = true;
+          throw StateError(
+            'Write rejected: this primary has been fenced '
+            '(cluster epoch $current > held epoch $_epoch)',
+          );
+        }
       }
       final cb = authorizer;
       if (cb != null) {
@@ -2323,6 +2517,11 @@ class Database implements SequenceProvider {
           _changesCount = result.affected;
           _totalChangesCount += result.affected;
         }
+        // HA op-log capture: buffer in-transaction mutations (flushed as one
+        // record at COMMIT); auto-commit mutations are appended below.
+        if (_oplog != null && !_replaying && inTransaction && sourceSql != null) {
+          (_txnOps ??= <String>[]).add(sourceSql);
+        }
         // Conservatively drop FTS5 caches for the statement's target
         // table; the next ranking call will rebuild on demand.
         final tname = _statementTable(stmt);
@@ -2334,12 +2533,28 @@ class Database implements SequenceProvider {
           if (t != null) _refreshPartialIndexes(t);
         }
       }
+      if (_oplog != null && !_replaying && stmt is BeginStmt) {
+        _txnOps = <String>[];
+      }
+      if (_oplog != null &&
+          !_replaying &&
+          (stmt is RollbackStmt || stmt is RollbackToSavepointStmt)) {
+        _txnOps = null;
+      }
       if (stmt is CommitStmt) {
-        await _persist();
+        if (_oplog != null && !_replaying && _txnOps != null &&
+            _txnOps!.isNotEmpty) {
+          await _oplog!.append(_txnOps!);
+        }
+        _txnOps = null;
+        if (!_replaying) await _persist();
         return result;
       }
       if (!inTransaction && _isMutation(stmt)) {
-        await _persist();
+        if (_oplog != null && !_replaying && sourceSql != null) {
+          await _oplog!.append([sourceSql]);
+        }
+        if (!_replaying) await _persist();
       }
       return result;
     }
@@ -18248,7 +18463,10 @@ class Database implements SequenceProvider {
           for (final e in _vectorIndexes.entries)
             _vectorIndexToJson(e.key, e.value),
         ],
+      if (_oplog != null) 'oplog_lsn': _oplog!.lastLsn,
+      if (_appliedLsn > 0) 'applied_lsn': _appliedLsn,
     };
+    _persistedOpLogLsn = _oplog?.lastLsn ?? _persistedOpLogLsn;
     await _atomicWriteBytes(
       path!,
       Uint8List.fromList(utf8.encode(jsonEncode(out))),
@@ -18811,6 +19029,8 @@ class Database implements SequenceProvider {
     if (text.trim().isEmpty) return;
     final data = jsonDecode(text);
     if (data is Map && data['__schema__'] == 2) {
+      _persistedOpLogLsn = (data['oplog_lsn'] as num?)?.toInt() ?? 0;
+      _appliedLsn = (data['applied_lsn'] as num?)?.toInt() ?? 0;
       final tables = (data['tables'] as Map).cast<String, Object?>();
       for (final e in tables.entries) {
         final t = Table.fromJson((e.value as Map).cast<String, Object?>());
@@ -18865,6 +19085,64 @@ class Database implements SequenceProvider {
   }
 
   Future<void> flush() => _persist();
+
+  /// Enable the durable op-log (HA Phase 1) for this path-backed database.
+  /// Opens `<path>.oplog/` and begins appending every committed mutation for
+  /// replication / point-in-time recovery. No-op for an in-memory database.
+  ///
+  /// On the JSON backend this also **recovers** any committed-but-not-yet-
+  /// persisted transactions: records above the snapshot's stamped LSN are
+  /// replayed, then a single persist converges the snapshot. (The SQLite
+  /// backend recovers through its own WAL, so replay is skipped there.)
+  Future<void> enableOpLog() async {
+    if (path == null || _oplog != null) return;
+    final log = OpLog('$path.oplog');
+    await log.open();
+    _oplog = log;
+    if (!_persistAsSqlite && log.lastLsn > _persistedOpLogLsn) {
+      _replaying = true;
+      try {
+        await for (final rec in log.readFrom(_persistedOpLogLsn)) {
+          for (final op in rec.ops) {
+            await execute(op);
+          }
+        }
+      } finally {
+        _replaying = false;
+      }
+      await _persist();
+    }
+  }
+
+  /// Quiesce the database so an external backup tool (e.g. `dbr`) can copy a
+  /// self-consistent on-disk image. Holds the write lock for the duration so
+  /// no mutation interleaves, flushes all pending state, and — on the SQLite
+  /// backend — folds the WAL into the main file. Returns the absolute paths
+  /// that make up the backup set (main file, vector sidecar, paged directory);
+  /// empty for an in-memory database.
+  Future<List<String>> checkpointForBackup() {
+    if (path == null) return Future.value(const <String>[]);
+    return _lock.write(() async {
+      await _persist();
+      if (_persistAsSqlite) {
+        await checkpointSqlite();
+        await _persistVectorIndexSidecar();
+      }
+      return _backupFileSet();
+    });
+  }
+
+  /// Existing on-disk files/directories that constitute a full backup of this
+  /// database. Call only after a [checkpointForBackup] flush.
+  Future<List<String>> _backupFileSet() async {
+    final p = path!;
+    final out = <String>[];
+    for (final c in [p, '$p.vec.json', '$p-wal', '$p-wal2', '$p-wal2.meta']) {
+      if (await File(c).exists()) out.add(c);
+    }
+    if (await Directory('$p.paged').exists()) out.add('$p.paged');
+    return out;
+  }
 
   // ---------------------------------------------------------------------------
   // SQLite file-format import/export
