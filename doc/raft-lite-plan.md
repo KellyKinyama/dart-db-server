@@ -45,21 +45,24 @@ won election. The work is the election + commit-advancement + safety rules.
 
 ---
 
-## Phase R0 — Node identity, cluster config & RPC transport  ·  Status: TODO
+## Phase R0 — Node identity, cluster config & RPC transport  ·  Status: WIP
 
 **Goal:** a peer-to-peer message layer every later phase rides on.
 
 Tasks:
-- [ ] **Cluster config.** `RaftConfig(nodeId, peers: {id → host:port})`, stable
-  and identical on every node (loaded from a config file / args).
-- [ ] **RPC envelope & transport.** `lib/server/raft/transport.dart`: a
-  length-or-line-framed JSON message channel over TCP (reuse the
-  `replication_server.dart` framing). Two request/response RPCs:
-  `RequestVote` and `AppendEntries` (Figure 2). Must tolerate drops, delays,
-  reordering, and reconnection (idempotent by term/index).
-- [ ] **Loopback + simulated transport.** An in-memory transport implementing
-  the same interface with injectable latency / partition / drop, so the whole
-  module is testable deterministically in one isolate.
+- [x] **Cluster config.** `RaftConfig(nodeId, peers)` with `members`,
+  `clusterSize`, and `majority`/`hasMajority` quorum math
+  (`lib/server/raft/config.dart`). LANDED.
+- [x] **RPC envelope.** `lib/server/raft/rpc.dart`: `RaftEntry` and the
+  `RequestVote` / `AppendEntries` args+replies (Figure 2), all JSON
+  round-trippable. LANDED.
+- [x] **Simulated transport.** `lib/server/raft/transport.dart`:
+  `RaftTransport` / `RaftHandlers` interfaces plus `SimulatedNetwork` — an
+  in-memory, one-isolate network with injectable `partition` / `isolate` /
+  `heal` and `latency`, so the module is developed and invariant-tested
+  deterministically. Tests: `test/raft_transport_test.dart`. LANDED.
+- [ ] **TCP transport.** A real `dart:io` implementation of `RaftTransport`
+  (reusing the `replication_server.dart` line framing) for cross-host clusters.
 
 ---
 
