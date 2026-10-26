@@ -159,11 +159,17 @@ Tasks:
 **Goal:** replace the Phase-4 HA glue with the Raft module, behind a flag.
 
 Tasks:
-- [ ] **Leadership → writability.** `Database` accepts client writes only while
-  the Raft module reports it leader of `currentTerm`; otherwise it is a
-  read-only follower (reuse `markReplica` / the write-path gate).
+- [x] **Leadership → writability.** `RaftReplicator(node, db)` marks the
+  database a read-only replica (direct client writes throw) and applies every
+  Raft-**committed** entry to it via `applyReplicated`, in order. Writes enter
+  through `propose(sql)` on the leader. This keeps the engine's commit path
+  untouched — Raft decides *what* commits, the replica-apply path decides *how*
+  it lands. Tests: `test/raft_replicator_test.dart` (propose→commit→apply on
+  every node; partitioned follower catches up on rejoin). LANDED.
 - [ ] **Router.** `ClusterRouter` resolves the primary from the Raft leader and
   redirects on leader change (replace the node-scan heuristic).
+- [ ] **TCP transport + timer driver.** A `dart:io` `RaftTransport` and a
+  real election/heartbeat timer loop (the explicit-tick API wraps cleanly).
 - [ ] **Bootstrap/catch-up.** A far-behind follower seeds via
   `Replica.bootstrap` (snapshot) then resumes AppendEntries — no InstallSnapshot
   RPC needed in v1.
