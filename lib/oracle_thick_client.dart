@@ -644,6 +644,38 @@ class OracleThickClient {
   /// (0x0800 END_OF_RPC on 23ai+). 0 for the dart-db-server flow.
   int _realDataFlags = 0;
 
+  /// Negotiated SDU (max TNS packet size incl. header). Bounds how large a
+  /// single DATA packet may be; larger TTC requests are fragmented across
+  /// packets by [_send]. Set from the ACCEPT in [loginReal].
+  int _sdu = 8192;
+
+  /// Fragments a TTC request across DATA packets no larger than the negotiated
+  /// SDU. Per Oracle's framing, intermediate packets carry data flags 0x0000
+  /// and only the FINAL packet carries [dataFlags] (END_OF_RPC on 23ai+).
+  void _send(Uint8List ttc, {int? dataFlags}) {
+    final flags = dataFlags ?? _realDataFlags;
+    final capacity = _sdu - (_tnsHeaderSize + 2);
+    var offset = 0;
+    while (true) {
+      final remaining = ttc.length - offset;
+      final chunkLen = remaining > capacity ? capacity : remaining;
+      final isLast = offset + chunkLen >= ttc.length;
+      final f = isLast ? flags : 0x0000;
+      final header = ByteData(_tnsHeaderSize);
+      header.setUint32(0, _tnsHeaderSize + 2 + chunkLen);
+      header.setUint8(4, _tnsPacketData);
+      final out = BytesBuilder()
+        ..add(header.buffer.asUint8List())
+        ..add([(f >> 8) & 0xFF, f & 0xFF]);
+      if (chunkLen > 0) {
+        out.add(Uint8List.sublistView(ttc, offset, offset + chunkLen));
+      }
+      _socket.add(out.toBytes());
+      offset += chunkLen;
+      if (isLast) break;
+    }
+  }
+
   /// Connects to a native listener at [host]:[port]. Defaults to the loopback
   /// interface (the local dart-db-server); pass [host] to reach a real Oracle
   /// listener.
@@ -743,11 +775,10 @@ class OracleThickClient {
     }
     final accept = hs.parseAccept(firstFrame);
     _realDataFlags = accept.supportsEndOfRequest ? hs.tnsDataFlagsEndOfRpc : 0;
+    _sdu = accept.sdu;
 
-    _socket.add(_wrapData(
-        hs.buildFastAuthMessage(
-            username: username, endOfRequest: accept.supportsEndOfRequest),
-        dataFlags: _realDataFlags));
+    _send(hs.buildFastAuthMessage(
+        username: username, endOfRequest: accept.supportsEndOfRequest));
     final bundle = _ttcBody(await _frames.next());
     final challenge = hs.findAuthChallenge(bundle);
     if (challenge == null) {
@@ -756,15 +787,13 @@ class OracleThickClient {
 
     final o8 = hs.computeO8Logon(password, challenge.pairs);
     final tz = alterSession ?? "ALTER SESSION SET TIME_ZONE='+00:00'\u0000";
-    _socket.add(_wrapData(
-        hs.buildAuthPhaseTwoMessage(
-          username: username,
-          sessionKeyHex: o8.sessionKeyHex,
-          authPasswordHex: o8.authPasswordHex,
-          speedyKeyHex: o8.speedyKeyHex,
-          alterSession: tz,
-        ),
-        dataFlags: _realDataFlags));
+    _send(hs.buildAuthPhaseTwoMessage(
+      username: username,
+      sessionKeyHex: o8.sessionKeyHex,
+      authPasswordHex: o8.authPasswordHex,
+      speedyKeyHex: o8.speedyKeyHex,
+      alterSession: tz,
+    ));
     final resp2 = _ttcBody(await _frames.next());
     final txt = String.fromCharCodes(resp2.where((b) => b >= 32 && b < 127));
     final ora = RegExp(r'ORA-\d{5}').firstMatch(txt);
@@ -785,18 +814,14 @@ class OracleThickClient {
   /// Throws [OracleThickException] on an `ORA-xxxxx` error.
   Future<ex.NativeExecuteResponse> queryReal(String sql,
       {List<Object?> binds = const [], int prefetch = 100}) async {
-    _socket.add(_wrapData(
-        ex.buildQueryExecute(sql, binds: binds, numIters: prefetch),
-        dataFlags: _realDataFlags));
+    _send(ex.buildQueryExecute(sql, binds: binds, numIters: prefetch));
     var resp = await _readRealResponse(isQuery: true);
     final columns = resp.columns;
     final rows = <List<Object?>>[...resp.rows];
     var cursorId = resp.cursorId;
     var seq = 3;
     while (resp.moreRows) {
-      _socket.add(_wrapData(
-          ex.buildFetch(cursorId, prefetch, sequence: seq++),
-          dataFlags: _realDataFlags));
+      _send(ex.buildFetch(cursorId, prefetch, sequence: seq++));
       resp = await _readRealResponse(isQuery: true, expectedColumns: columns);
       rows.addAll(resp.rows);
       if (resp.cursorId != 0) cursorId = resp.cursorId;
@@ -838,9 +863,7 @@ class OracleThickClient {
     var remaining = len;
     var guard = 0;
     while (remaining > 0 && guard++ < 100000) {
-      _socket.add(_wrapData(
-          ex.buildLobRead(lob.locator, offset, remaining),
-          dataFlags: _realDataFlags));
+      _send(ex.buildLobRead(lob.locator, offset, remaining));
       final resp = await _readLobResponse(lob.locator.length);
       if (!resp.isSuccess) {
         throw OracleThickException(
@@ -864,9 +887,7 @@ class OracleThickClient {
   /// Issues a LOB GET_LENGTH and returns the length (characters for CLOB,
   /// bytes for BLOB).
   Future<int> _lobGetLength(ex.NativeLob lob) async {
-    _socket.add(_wrapData(
-        ex.buildLobGetLength(lob.locator),
-        dataFlags: _realDataFlags));
+    _send(ex.buildLobGetLength(lob.locator));
     final resp = await _readLobResponse(lob.locator.length);
     if (!resp.isSuccess) {
       throw OracleThickException(
@@ -945,9 +966,7 @@ class OracleThickClient {
         ? bulkRows.first
         : binds;
     final nativeBinds = [for (final v in templateRow) ex.NativeBind.value(v)];
-    _socket.add(_wrapData(
-        ex.buildDmlExecute(sql, nativeBinds, bulkRows: bulkRows),
-        dataFlags: _realDataFlags));
+    _send(ex.buildDmlExecute(sql, nativeBinds, bulkRows: bulkRows));
     final resp = await _readRealResponse(isQuery: false, binds: nativeBinds);
     if (!resp.isSuccess) {
       throw OracleThickException(
@@ -964,9 +983,7 @@ class OracleThickClient {
   /// (one entry per affected row) in `outBindValues`.
   Future<ex.NativeExecuteResponse> executeReturning(
       String sql, List<ex.NativeBind> binds) async {
-    _socket.add(_wrapData(
-        ex.buildDmlExecute(sql, binds, returning: true),
-        dataFlags: _realDataFlags));
+    _send(ex.buildDmlExecute(sql, binds, returning: true));
     final resp = await _readRealResponse(
         isQuery: false, binds: binds, dmlReturning: true);
     if (!resp.isSuccess) {
@@ -987,9 +1004,7 @@ class OracleThickClient {
     var more = true;
     var cid = cursorId;
     while (more) {
-      _socket.add(_wrapData(
-          ex.buildFetch(cid, prefetch, sequence: seq++),
-          dataFlags: _realDataFlags));
+      _send(ex.buildFetch(cid, prefetch, sequence: seq++));
       final fetch = await _readRealResponse(
           isQuery: true, expectedColumns: columns);
       rows.addAll(fetch.rows);
@@ -1017,9 +1032,7 @@ class OracleThickClient {
   /// use [openRefCursor] to also drain it). Requires a prior [loginReal].
   Future<ex.NativeExecuteResponse> callPlsql(
       String plsql, List<ex.NativeBind> binds) async {
-    _socket.add(_wrapData(
-        ex.buildPlsqlExecute(plsql, binds),
-        dataFlags: _realDataFlags));
+    _send(ex.buildPlsqlExecute(plsql, binds));
     final resp = await _readRealResponse(isQuery: false, binds: binds);
     if (!resp.isSuccess) {
       throw OracleThickException(

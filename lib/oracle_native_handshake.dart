@@ -46,11 +46,14 @@ const int _tnsAcceptFlagFastAuth = 0x10000000;
 /// Negotiated transport properties parsed from a TNS ACCEPT packet.
 class AcceptInfo {
   AcceptInfo(this.version, this.useLargeSdu, this.supportsFastAuth,
-      this.supportsEndOfRequest);
+      this.supportsEndOfRequest, this.sdu);
   final int version;
   final bool useLargeSdu;
   final bool supportsFastAuth;
   final bool supportsEndOfRequest;
+
+  /// Negotiated Session Data Unit (max TNS packet size, header included).
+  final int sdu;
 }
 
 /// Parse a raw ACCEPT packet (the full TNS frame).
@@ -61,6 +64,12 @@ AcceptInfo parseAccept(Uint8List frame) {
       frame[off + 3];
   final version = be16(_acceptVersionOffset);
   final useLargeSdu = version >= _tnsVersionMinLargeSdu;
+  // SDU: 2-byte field at offset 12, or 4-byte "large SDU" at offset 32 (v315+).
+  var sdu = frame.length >= 14 ? be16(12) : 8192;
+  if (useLargeSdu && frame.length >= 36) {
+    sdu = be32(32);
+  }
+  if (sdu < 512) sdu = 8192; // defensive floor
   var fastAuth = false;
   var endOfRequest = false;
   if (version >= _tnsVersionMinDataFlags &&
@@ -71,7 +80,7 @@ AcceptInfo parseAccept(Uint8List frame) {
     }
     fastAuth = (flag2 & _tnsAcceptFlagFastAuth) != 0;
   }
-  return AcceptInfo(version, useLargeSdu, fastAuth, endOfRequest);
+  return AcceptInfo(version, useLargeSdu, fastAuth, endOfRequest, sdu);
 }
 
 // --- Capabilities (ported from thin driver transport.dart) ----------------

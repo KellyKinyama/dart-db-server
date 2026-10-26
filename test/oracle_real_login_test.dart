@@ -416,5 +416,49 @@ void main() {
         await client.close();
       }
     });
+
+    test('large binds and big array DML fragment across SDU packets', () async {
+      final host = env['ORACLE_HOST'] ?? '127.0.0.1';
+      final port = int.tryParse(env['ORACLE_PORT'] ?? '1521') ?? 1521;
+      final user = env['ORACLE_USER'] ?? 'system';
+      final pass = env['ORACLE_PASSWORD'] ?? 'TestPw1234';
+      final service = env['ORACLE_SERVICE'] ?? 'FREEPDB1';
+
+      final client = await OracleThickClient.connect(port, host: host);
+      try {
+        await client.loginReal(
+          username: user,
+          password: pass,
+          serviceName: service,
+        );
+        // A bind larger than one SDU packet must be fragmented and round-trip
+        // intact (END_OF_RPC only on the final packet).
+        final big = 'x' * 30000;
+        final r = await client
+            .queryReal('SELECT LENGTH(:1) FROM dual', binds: [big]);
+        expect(r.rows.first.first, 30000);
+
+        // A 500-row array DML is a large multi-packet request.
+        await client
+            .executeDml('DROP TABLE t_thick_split PURGE')
+            .catchError((_) => 0);
+        await client.executeDml(
+            'CREATE TABLE t_thick_split (id NUMBER, v VARCHAR2(100))');
+        try {
+          final rows = [for (var i = 0; i < 500; i++) [i, 'row_$i']];
+          expect(
+              await client.executeDml(
+                  'INSERT INTO t_thick_split VALUES (:1, :2)', bulkRows: rows),
+              500);
+          final cnt =
+              await client.queryReal('SELECT COUNT(*) FROM t_thick_split');
+          expect(cnt.rows.first.first, 500);
+        } finally {
+          await client.executeDml('DROP TABLE t_thick_split PURGE');
+        }
+      } finally {
+        await client.close();
+      }
+    });
   }, skip: enabled ? false : 'set RUN_ORACLE_TESTS=true to run (needs Oracle)');
 }

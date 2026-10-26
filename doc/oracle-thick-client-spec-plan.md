@@ -160,8 +160,16 @@ round-tripped on real Oracle in `test/oracle_real_login_test.dart`.
 - [ ] (follow-up) array-DML per-row batch errors (`batchErrors`), array
   RETURNING (multiple rows per iteration), DML row-count array.
 
-## Phase T7 — Robustness & parity  ·  Status: TODO
+## Phase T7 — Robustness & parity  ·  Status: PARTIAL (TNS request fragmentation landed)
+- [x] **TNS request fragmentation** (`_send`): large TTC requests (binds > one
+  SDU, wide `executeMany`) are split across DATA packets sized to the negotiated
+  SDU (parsed from the ACCEPT). Per Oracle's framing, intermediate packets carry
+  data flags `0x0000` and only the FINAL packet carries END_OF_RPC (0x0800 on
+  23ai+) — previously every request went out as one over-sized packet, which the
+  server answered with a BREAK marker. Closes the large-bind gap flagged in
+  T3/T4. (Values > 32767 bytes still need a CLOB bind — see below.)
 - [ ] Full ORA error + warning decode; multi-error batches.
+- [ ] Oversized string binds (> 32767 bytes) via temporary-CLOB binds.
 - [ ] Statement-cache reuse; cursor close/CLOSE_ALL.
 - [ ] Session settings (NLS date/number formats, time zone) that affect decode.
 - [ ] A behavioral parity pass vs `reference/node-oracledb` / the thin
