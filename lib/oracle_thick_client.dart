@@ -72,9 +72,15 @@ Uint8List _wrapData(Uint8List ttc) {
 Uint8List _ttcBody(Uint8List frame) =>
     Uint8List.sublistView(frame, _tnsHeaderSize + 2);
 
-/// Builds a native CONNECT packet. The descriptor length is announced but the
-/// descriptor itself is *not* inline (the offset points just past this packet),
-/// so the server treats it as the overflow flow and marks the session native.
+/// Builds a native CONNECT packet. By default (dart-db-server) the descriptor
+/// length is announced but the descriptor itself is *not* inline (the offset
+/// points just past this packet), so the server treats it as the overflow flow
+/// and marks the session native.
+///
+/// Set [inline] for the standard real-Oracle CONNECT: the descriptor is
+/// appended inside the packet and the v315+ large SDU/TDU fields are populated,
+/// matching what a real listener (Oracle docker / Instant Client) expects. In
+/// that mode the follow-up descriptor packet must be skipped.
 Uint8List buildNativeConnect({
   String descriptor = _defaultDescriptor,
   int versionDesired = 320,
@@ -84,29 +90,53 @@ Uint8List buildNativeConnect({
   int tdu = 0xFFFF,
   int connectFlags0 = 0x41,
   int connectFlags1 = 0x41,
+  bool inline = false,
 }) {
-  final descLen = utf8.encode(descriptor).length;
+  final descBytes = utf8.encode(descriptor);
+  final descLen = descBytes.length;
   const bodyLen = 66;
   final body = ByteData(bodyLen);
-  body.setUint16(0, versionDesired);
-  body.setUint16(2, versionMinimum);
-  body.setUint16(4, serviceOptions);
-  body.setUint16(6, sdu);
-  body.setUint16(8, tdu);
-  body.setUint16(14, 1); // endianness marker
-  body.setUint16(16, descLen); // connect-data length (announced)
-  body.setUint16(18, _tnsHeaderSize + bodyLen); // offset past this packet
-  body.setUint32(20, 0x00200000); // maximum receivable connect data
-  body.setUint8(24, connectFlags0);
-  body.setUint8(25, connectFlags1);
+  if (inline) {
+    // Standard real-Oracle CONNECT body (mirrors the thin driver). Big-endian.
+    body.setUint16(0, versionDesired);
+    body.setUint16(2, versionMinimum);
+    body.setUint16(4, 0x0001); // options: DONT_CARE
+    body.setUint16(6, 8192); // SDU
+    body.setUint16(8, 32767); // TDU
+    body.setUint16(10, 0); // NT characteristics
+    body.setUint16(12, 0); // line turnaround
+    body.setUint16(14, 1); // endianness marker
+    body.setUint16(16, descLen); // connect-data length
+    body.setUint16(18, _tnsHeaderSize + bodyLen); // data offset (74)
+    body.setUint16(20, 230); // max connect data
+    body.setUint16(22, 0); // reserved
+    body.setUint8(24, 0x04); // connect flags 0: NA disabled
+    body.setUint8(25, 0x04); // connect flags 1: NA disabled
+    body.setUint32(50, 8192); // large SDU (v315+)
+    body.setUint32(54, 32767); // large TDU (v315+)
+  } else {
+    body.setUint16(0, versionDesired);
+    body.setUint16(2, versionMinimum);
+    body.setUint16(4, serviceOptions);
+    body.setUint16(6, sdu);
+    body.setUint16(8, tdu);
+    body.setUint16(14, 1); // endianness marker
+    body.setUint16(16, descLen); // connect-data length (announced)
+    body.setUint16(18, _tnsHeaderSize + bodyLen); // offset past this packet
+    body.setUint32(20, 0x00200000); // maximum receivable connect data
+    body.setUint8(24, connectFlags0);
+    body.setUint8(25, connectFlags1);
+  }
 
+  final packetLen = _tnsHeaderSize + bodyLen + (inline ? descLen : 0);
   final header = ByteData(_tnsHeaderSize);
-  header.setUint16(0, _tnsHeaderSize + bodyLen);
+  header.setUint16(0, packetLen);
   header.setUint8(4, _tnsPacketConnect);
-  return (BytesBuilder()
-        ..add(header.buffer.asUint8List())
-        ..add(body.buffer.asUint8List()))
-      .toBytes();
+  final out = BytesBuilder()
+    ..add(header.buffer.asUint8List())
+    ..add(body.buffer.asUint8List());
+  if (inline) out.add(descBytes);
+  return out.toBytes();
 }
 
 /// The follow-up DATA packet carrying the descriptor after a native CONNECT.
@@ -594,9 +624,12 @@ class OracleThickClient {
   final Socket _socket;
   final _FrameReader _frames;
 
-  /// Connects to a native listener on [port] of the loopback interface.
-  static Future<OracleThickClient> connect(int port) async {
-    final socket = await Socket.connect(InternetAddress.loopbackIPv4, port);
+  /// Connects to a native listener at [host]:[port]. Defaults to the loopback
+  /// interface (the local dart-db-server); pass [host] to reach a real Oracle
+  /// listener.
+  static Future<OracleThickClient> connect(int port,
+      {String host = '127.0.0.1'}) async {
+    final socket = await Socket.connect(host, port);
     return OracleThickClient._(socket, _FrameReader(socket));
   }
 
@@ -608,9 +641,15 @@ class OracleThickClient {
     required String username,
     required String password,
     String descriptor = _defaultDescriptor,
+    bool inlineDescriptor = false,
   }) async {
-    _socket.add(buildNativeConnect(descriptor: descriptor));
-    _socket.add(buildDescriptorPacket(descriptor: descriptor));
+    _socket.add(
+        buildNativeConnect(descriptor: descriptor, inline: inlineDescriptor));
+    // The overflow (dart-db-server) flow carries the descriptor in a second
+    // packet; the inline (real Oracle) flow already included it.
+    if (!inlineDescriptor) {
+      _socket.add(buildDescriptorPacket(descriptor: descriptor));
+    }
     await _frames.next(); // ACCEPT
     _socket.add(buildResetMarker());
     await _frames.next(); // RESET reply
