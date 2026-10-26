@@ -106,27 +106,23 @@ replacement for `FailoverController` + `ClusterEpoch` fencing.
 
 ---
 
-## Phase R3 — Log replication & commit advancement  ·  Status: TODO
+## Phase R3 — Log replication & commit advancement  ·  Status: WIP
 
 **Goal:** entries committed once a majority has them, then applied in order.
 
 Tasks:
-- [ ] **AppendEntries (replication).** Leader tracks `nextIndex[peer]` /
-  `matchIndex[peer]`; sends op-log entries from `nextIndex`; on the consistency
-  check failing (prev `(term, lsn)` mismatch), decrement `nextIndex` and retry;
-  the follower truncates conflicts (`truncateAbove`) and appends.
-- [ ] **commitIndex.** Advance to the highest LSN replicated on a **majority**
-  of `matchIndex` **and** belonging to `currentTerm` (the Raft "don't commit
-  prior-term entries by count" rule). This generalizes semi-sync `awaitAcks`
-  from "k acks" to "majority".
+- [x] **AppendEntries (replication).** Leader tracks `nextIndex`/`matchIndex`,
+  ships `entriesAfter(prev)`, backs off `nextIndex` on a consistency-check
+  failure; the follower runs the log-matching check and truncates conflicts
+  (`truncateAfter`) before appending.
+- [x] **commitIndex.** Advances to the highest index on a **majority** of
+  `matchIndex` belonging to the **current term** (§5.4.2); followers adopt
+  `leaderCommit`. Tests: `test/raft_election_test.dart` (commit on majority,
+  no commit without majority).
 - [ ] **Apply loop.** Apply committed-but-unapplied entries via
-  `applyReplicated` up to `commitIndex`; `appliedLsn ≤ commitIndex` always.
-- [ ] **Leader write path.** A client write on the leader appends to its op-log
-  at `currentTerm`, replicates, and the `COMMIT` ack is withheld until the
-  entry is **committed** (majority) — reusing the `configureSemiSync` hook,
-  now backed by the Raft commitIndex instead of a fixed k.
-
-**Delivers:** linearizable, majority-durable writes with automatic failover.
+  `Database.applyReplicated` up to `commitIndex` (R5 wiring).
+- [ ] **Leader write path.** Withhold the `COMMIT` ack until the entry is
+  committed (majority), reusing `configureSemiSync` backed by commitIndex (R5).
 
 ---
 
