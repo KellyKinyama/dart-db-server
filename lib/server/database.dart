@@ -294,6 +294,14 @@ class Database implements SequenceProvider {
   /// The highest op-log LSN this database has applied (as a replica).
   int _appliedLsn = 0;
 
+  /// Wall-clock timestamp (ms) of the most recently applied replicated record,
+  /// for time-based replication-lag reporting.
+  int _lastAppliedTimestampMs = 0;
+
+  /// Timestamp (ms since epoch) of the last applied replicated record, 0 when
+  /// none has been applied.
+  int get lastAppliedTimestampMs => _lastAppliedTimestampMs;
+
   /// The epoch (term) this node holds as primary, and the shared fence it
   /// checks before each write. When the shared epoch exceeds [_epoch] the node
   /// has been superseded by a newer primary and stops accepting writes.
@@ -354,6 +362,7 @@ class Database implements SequenceProvider {
       _replaying = false;
     }
     _appliedLsn = record.lsn;
+    _lastAppliedTimestampMs = record.timestampMs;
     await _persist();
   }
 

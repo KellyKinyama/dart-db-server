@@ -76,6 +76,15 @@ class Replica {
     return lag < 0 ? 0 : lag;
   }
 
+  /// Replication lag in milliseconds: the wall-clock gap between the primary's
+  /// newest record and the newest record this replica has applied (0 when
+  /// caught up or when no record has been applied yet).
+  int lagMsFrom(OpLog source) {
+    if (target.lastAppliedTimestampMs == 0) return 0;
+    final lag = source.lastTimestampMs - target.lastAppliedTimestampMs;
+    return lag < 0 ? 0 : lag;
+  }
+
   /// Promote this replica to a writable primary (failover). Accepts client
   /// writes again and seeds its op-log above [appliedLsn] so new commits keep
   /// LSNs monotonic for downstream replicas. The caller is responsible for

@@ -110,6 +110,7 @@ class OpLog {
   final List<_Segment> _segments = [];
   RandomAccessFile? _active;
   int _lastLsn = 0;
+  int _lastTimestampMs = 0;
   bool _open = false;
 
   final StreamController<OpLogRecord> _appendController =
@@ -119,6 +120,10 @@ class OpLog {
 
   /// The highest LSN durably appended, or 0 when the log is empty.
   int get lastLsn => _lastLsn;
+
+  /// Wall-clock timestamp (ms since epoch) of the most recent record, for
+  /// time-based replication-lag reporting. 0 when the log is empty.
+  int get lastTimestampMs => _lastTimestampMs;
 
   /// Emits each record as it is durably appended — the live tail a streaming
   /// replica subscribes to after draining the backlog.
@@ -169,6 +174,11 @@ class OpLog {
     }
     _active = raf;
     _open = true;
+    // Capture the newest record's timestamp for time-based lag reporting.
+    if (_lastLsn > 0) {
+      final tail = await readFrom(_lastLsn - 1).toList();
+      if (tail.isNotEmpty) _lastTimestampMs = tail.last.timestampMs;
+    }
   }
 
   /// Append one committed transaction and return its assigned LSN. The frame
@@ -201,6 +211,7 @@ class OpLog {
     cur.lastLsn = lsn;
     cur.validBytes += frameLen;
     _lastLsn = lsn;
+    _lastTimestampMs = rec.timestampMs;
     if (_appendController.hasListener) _appendController.add(rec);
     return lsn;
   }

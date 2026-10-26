@@ -4,6 +4,8 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:dart_db_server/dart_db_server.dart';
+import 'package:dart_db_server/server/oplog.dart';
+import 'package:dart_db_server/server/replication.dart';
 import 'package:dart_db_server/server/replication_server.dart';
 import 'package:test/test.dart';
 
@@ -124,6 +126,81 @@ void main() {
       } finally {
         await client.close();
         await server.stop();
+        await primary.close();
+        await replica.close();
+      }
+    });
+  });
+
+  group('liveness probe & wall-clock lag', () {
+    test('PrimaryProbe reports reachable vs down', () async {
+      final primary = await Database.open(_tmp('probe_p'));
+      await primary.enableOpLog();
+      final server = ReplicationServer(primary.opLog!);
+      final port = await server.start();
+      final probe = PrimaryProbe('127.0.0.1', port,
+          timeout: const Duration(milliseconds: 500));
+      try {
+        expect(await probe.alive(), isTrue);
+        await server.stop();
+        expect(await probe.alive(), isFalse);
+      } finally {
+        await primary.close();
+      }
+    });
+
+    test('probe-driven FailoverController promotes when primary is down',
+        () async {
+      final fence = ClusterEpoch(_tmp('pf').replaceAll('.json', '.epoch'));
+      fence.write(1);
+      final primary = await Database.open(_tmp('pf_p'));
+      await primary.enableOpLog();
+      primary.attachFence(fence, epoch: 1);
+      final server = ReplicationServer(primary.opLog!);
+      final port = await server.start();
+
+      final replica = Replica(await Database.open(_tmp('pf_r')))
+        ..attachFence(fence);
+      final probe = PrimaryProbe('127.0.0.1', port,
+          timeout: const Duration(milliseconds: 500));
+      final ctrl = FailoverController(
+        replicas: [replica],
+        isPrimaryAlive: probe.alive,
+      );
+      try {
+        await primary.execute('CREATE TABLE t(id INTEGER PRIMARY KEY)');
+        await replica.catchUp(primary.opLog!);
+
+        // Primary reachable → no failover.
+        expect(await ctrl.checkAndFailover(), isNull);
+
+        // Primary goes down → probe fails → controller promotes.
+        await server.stop();
+        final winner = await ctrl.checkAndFailover(primaryLog: primary.opLog!);
+        expect(winner, isNotNull);
+        expect(fence.read(), 2);
+      } finally {
+        await primary.close();
+        await replica.target.close();
+      }
+    });
+
+    test('lagMsFrom reports a non-negative time lag', () async {
+      final primary = await Database.open(_tmp('lag_p'));
+      await primary.enableOpLog();
+      final replica = await Database.open(_tmp('lag_r'));
+      final r = Replica(replica);
+      try {
+        await primary.execute('CREATE TABLE t(id INTEGER PRIMARY KEY)');
+        await primary.execute('INSERT INTO t VALUES (1)');
+        // Caught up → zero time lag.
+        await r.catchUp(primary.opLog!);
+        expect(r.lagMsFrom(primary.opLog!), 0);
+        // A new primary commit makes the replica lag (in records at least).
+        await primary.execute('INSERT INTO t VALUES (2)');
+        expect(r.lagMsFrom(primary.opLog!), greaterThanOrEqualTo(0));
+        expect(r.lagFrom(primary.opLog!), 1);
+      } finally {
         await primary.close();
         await replica.close();
       }

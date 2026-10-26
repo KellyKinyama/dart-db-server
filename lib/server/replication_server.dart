@@ -96,6 +96,29 @@ class ReplicationServer {
   }
 }
 
+/// A TCP liveness probe for a primary's replication endpoint. [alive] attempts
+/// a connection within [timeout]; success means the primary is reachable. Wire
+/// it into `FailoverController.isPrimaryAlive` for real heartbeat-based failover.
+class PrimaryProbe {
+  final String host;
+  final int port;
+  final Duration timeout;
+
+  PrimaryProbe(this.host, this.port,
+      {this.timeout = const Duration(seconds: 1)});
+
+  /// True when a TCP connection to the primary succeeds within [timeout].
+  Future<bool> alive() async {
+    try {
+      final s = await Socket.connect(host, port, timeout: timeout);
+      await s.close();
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+}
+
 /// Connects a replica [Database] to a [ReplicationServer], streaming op-log
 /// records from the replica's current `appliedLsn` and applying each in order.
 class ReplicationClient {

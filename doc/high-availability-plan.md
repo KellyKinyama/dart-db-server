@@ -183,6 +183,11 @@ Tasks:
   vector sidecars / paged tables aren't copied yet.
 - [ ] **Lag & backpressure.** Expose `replicationLag` (LSN gap + wall-clock);
   bounded buffers; resumable from last LSN after a disconnect.
+
+  *Partially LANDED:* `Replica.lagFrom(source)` (record gap) and
+  `Replica.lagMsFrom(source)` (wall-clock ms, via `OpLog.lastTimestampMs` and
+  the replica's last-applied timestamp). Resumable-from-LSN is done (TCP
+  transport); bounded send buffers are still TODO.
 - [ ] **Semi-sync (optional).** `PRAGMA replication = async|semisync(k)` —
   withhold `COMMIT` ack until `k` replicas confirm, trading latency for a
   stronger RPO.
@@ -209,9 +214,10 @@ Tasks:
   exposing role, `appliedLsn`, lag, and uptime.
 
   *Partially LANDED:* `Database.haStatus()` returns an `HaStatus`
-  (role / epoch / appliedLsn / logLastLsn / fenced), the data a `/health`
-  endpoint and the coordinator consume. Network heartbeats are still TODO.
-  Test: `test/replication_test.dart` → "haStatus reports role, epoch, …".
+  (role / epoch / appliedLsn / logLastLsn / fenced). `PrimaryProbe(host, port)`
+  is a TCP liveness check that backs `FailoverController.isPrimaryAlive` for
+  real heartbeat-driven failover (test: "probe-driven FailoverController
+  promotes when primary is down"). A `/health` HTTP endpoint is still TODO.
 - [ ] **Fencing.** An epoch/term token bumped on every promotion; the old
   primary refuses writes once it sees a higher epoch (STONITH-lite). This gate
   **must** land before any automation.
