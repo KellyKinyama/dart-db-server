@@ -329,6 +329,9 @@ class Database implements SequenceProvider {
   /// Mark this database as a read-only replica (see [_replicaReadOnly]).
   void markReplica() => _replicaReadOnly = true;
 
+  /// True when this node is a read-only replica (not accepting client writes).
+  bool get isReplica => _replicaReadOnly;
+
   /// Mark this database as a read-only replica that has already materialized a
   /// base snapshot up to [appliedLsn] (bootstrap). Subsequent op-log records
   /// above [appliedLsn] are applied via [applyReplicated].

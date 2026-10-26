@@ -319,5 +319,44 @@ void main() {
         await r2.target.close();
       }
     });
+
+    test('ClusterRouter routes reads to replicas, writes to primary, and '
+        'redirects after failover', () async {
+      final fence = ClusterEpoch(_tmp('rt').replaceAll('.json', '.epoch'));
+      fence.write(1);
+      final primary = await Database.open(_tmp('rt_p'));
+      await primary.enableOpLog();
+      primary.attachFence(fence, epoch: 1);
+      final replica = await Database.open(_tmp('rt_r'));
+      final rep = Replica(replica)..attachFence(fence);
+      final router = ClusterRouter([primary, replica]);
+      try {
+        // Writes land on the primary.
+        await router.execute('CREATE TABLE t(id INTEGER PRIMARY KEY)');
+        await router.execute('INSERT INTO t VALUES (1)');
+        await rep.catchUp(primary.opLog!);
+
+        // A SELECT is served by the replica (round-robin over one replica).
+        final rr = await router.execute('SELECT COUNT(*) FROM t');
+        expect(rr.rows, [
+          [1],
+        ]);
+
+        // Failover: promote the replica (fences the old primary).
+        await rep.promote();
+
+        // The router now sends writes to the promoted node automatically.
+        await router.execute('INSERT INTO t VALUES (2)');
+        final rr2 = await router.execute('SELECT COUNT(*) FROM t');
+        expect(rr2.rows, [
+          [2],
+        ]);
+        // The promoted node is the writable primary now.
+        expect(router.primary, same(replica));
+      } finally {
+        await primary.close();
+        await replica.close();
+      }
+    });
   });
 }

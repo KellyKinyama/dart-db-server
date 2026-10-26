@@ -252,6 +252,13 @@ Tasks:
   successful fence of the old primary; refuse on a minority partition.
 - [ ] **Automatic client re-routing.** Router subscribes to coordinator state
   and fails reads/writes over within the heartbeat window.
+
+  *Partially LANDED:* `ClusterRouter(nodes)` routes `SELECT`s to replicas
+  (round-robin) and everything else to the current writable primary, which it
+  re-resolves after a promotion (and retries once on a fenced-write error) so
+  clients transparently follow failover. Test: `test/replication_test.dart` →
+  "ClusterRouter routes reads …, redirects after failover". A networked router
+  subscribing to the coordinator replaces the in-process node list later.
 - [ ] **Chaos/UAT.** Kill-primary-under-load, network-partition, and
   rolling-restart acceptance tests asserting no lost acked writes and bounded
   RTO.

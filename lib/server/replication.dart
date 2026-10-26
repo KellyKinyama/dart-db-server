@@ -5,6 +5,9 @@ import 'dart:io';
 
 import 'database.dart';
 import 'oplog.dart';
+import 'parser.dart';
+import 'result.dart';
+import 'statement.dart';
 
 /// Drives a read-only replica [Database], applying op-log records streamed from
 /// a primary so the replica stays caught up.
@@ -132,5 +135,49 @@ class FailoverController {
     final winner = ranked.first;
     await winner.promote();
     return winner;
+  }
+}
+
+/// Routes SQL across a set of cluster [nodes]: read-only `SELECT`s fan out to
+/// replicas (round-robin) for read scaling, everything else goes to the current
+/// writable primary. After a promotion the primary is re-resolved on the next
+/// call (and on a fenced-write error), so clients transparently follow failover.
+///
+/// In-process / single-coordinator v1; a networked router subscribing to the
+/// coordinator replaces this in a full Phase 4.
+class ClusterRouter {
+  final List<Database> nodes;
+  int _rr = 0;
+
+  ClusterRouter(this.nodes);
+
+  /// The current writable primary: a node that is neither a replica nor fenced.
+  Database get primary => nodes.firstWhere(
+        (n) => !n.isReplica && !n.isFenced,
+        orElse: () => throw StateError('no writable primary available'),
+      );
+
+  /// The nodes currently serving as read-only replicas.
+  List<Database> get replicas =>
+      [for (final n in nodes) if (n.isReplica) n];
+
+  /// Execute [sql]: a `SELECT` is load-balanced across replicas (falling back to
+  /// the primary when there are none); any other statement runs on the primary,
+  /// retried once against a freshly-resolved primary if the first was fenced.
+  Future<QueryResult> execute(String sql) async {
+    final stmt = Parser.fromString(sql).parseStatement();
+    if (stmt is SelectStmt) {
+      final reps = replicas;
+      if (reps.isNotEmpty) {
+        return reps[_rr++ % reps.length].execute(sql);
+      }
+    }
+    try {
+      return await primary.execute(sql);
+    } on StateError {
+      // The primary may have just been fenced and a replica promoted; the
+      // getter re-resolves to the new primary, so retry once.
+      return await primary.execute(sql);
+    }
   }
 }
