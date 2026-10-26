@@ -100,4 +100,61 @@ void main() {
       }
     });
   });
+
+  group('checkpointForBackup', () {
+    test('in-memory database returns an empty file set', () async {
+      final db = await Database.open();
+      try {
+        expect(await db.checkpointForBackup(), isEmpty);
+      } finally {
+        await db.close();
+      }
+    });
+
+    test('path-backed JSON database flushes and reports its file set',
+        () async {
+      final file = _tmp('ckpt_json').replaceAll('.db', '.json');
+      final db = await Database.open(file);
+      try {
+        await db.execute('CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT)');
+        await db.execute("INSERT INTO t VALUES (1,'alice'),(2,'bob')");
+        final files = await db.checkpointForBackup();
+        expect(files, contains(file));
+        expect(File(file).existsSync(), isTrue);
+        expect(File(file).lengthSync(), greaterThan(0));
+      } finally {
+        await db.close();
+      }
+    });
+
+    test('backup set copied while quiesced restores identical rows', () async {
+      final file = _tmp('ckpt_restore').replaceAll('.db', '.json');
+      final db = await Database.open(file);
+      try {
+        await db.execute('CREATE TABLE t(id INTEGER PRIMARY KEY, n TEXT)');
+        await db.execute("INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')");
+        final files = await db.checkpointForBackup();
+        final copyDir =
+            Directory.systemTemp.createTempSync('ddbs_ckpt_copy_');
+        for (final f in files) {
+          final name = f.split(Platform.pathSeparator).last;
+          File(f).copySync('${copyDir.path}${Platform.pathSeparator}$name');
+        }
+        final restored = await Database.open(
+            '${copyDir.path}${Platform.pathSeparator}${file.split(Platform.pathSeparator).last}');
+        try {
+          final r = await restored.execute('SELECT id, n FROM t ORDER BY id');
+          expect(r.rows, [
+            [1, 'a'],
+            [2, 'b'],
+            [3, 'c'],
+          ]);
+        } finally {
+          await restored.close();
+        }
+      } finally {
+        await db.close();
+      }
+    });
+  });
 }

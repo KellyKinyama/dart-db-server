@@ -18866,6 +18866,36 @@ class Database implements SequenceProvider {
 
   Future<void> flush() => _persist();
 
+  /// Quiesce the database so an external backup tool (e.g. `dbr`) can copy a
+  /// self-consistent on-disk image. Holds the write lock for the duration so
+  /// no mutation interleaves, flushes all pending state, and — on the SQLite
+  /// backend — folds the WAL into the main file. Returns the absolute paths
+  /// that make up the backup set (main file, vector sidecar, paged directory);
+  /// empty for an in-memory database.
+  Future<List<String>> checkpointForBackup() {
+    if (path == null) return Future.value(const <String>[]);
+    return _lock.write(() async {
+      await _persist();
+      if (_persistAsSqlite) {
+        await checkpointSqlite();
+        await _persistVectorIndexSidecar();
+      }
+      return _backupFileSet();
+    });
+  }
+
+  /// Existing on-disk files/directories that constitute a full backup of this
+  /// database. Call only after a [checkpointForBackup] flush.
+  Future<List<String>> _backupFileSet() async {
+    final p = path!;
+    final out = <String>[];
+    for (final c in [p, '$p.vec.json', '$p-wal', '$p-wal2', '$p-wal2.meta']) {
+      if (await File(c).exists()) out.add(c);
+    }
+    if (await Directory('$p.paged').exists()) out.add('$p.paged');
+    return out;
+  }
+
   // ---------------------------------------------------------------------------
   // SQLite file-format import/export
   // ---------------------------------------------------------------------------
