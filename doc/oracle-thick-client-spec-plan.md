@@ -1,5 +1,9 @@
 # Oracle thick-client spec plan (pure-Dart native driver)
 
+> **Using the client?** See [oracle-thick-client-usage.md](oracle-thick-client-usage.md)
+> for the public API (connect, service/SID login, queries, binds, PL/SQL, LOBs,
+> DML). This file is the protocol/implementation plan.
+
 A living, prioritized plan to grow `lib/oracle_thick_client.dart`
 (`OracleThickClient`) from a native-TTC **smoke client** (NUMBER + VARCHAR2,
 text binds, dart-db-server-only) into a **pure-Dart Oracle client to spec** —
