@@ -170,6 +170,13 @@ Tasks:
   redirects on leader change (replace the node-scan heuristic).
 - [ ] **TCP transport + timer driver.** A `dart:io` `RaftTransport` and a
   real election/heartbeat timer loop (the explicit-tick API wraps cleanly).
+
+  *Timer driver LANDED:* `RaftDriver` (`raft_driver.dart`) runs a periodic
+  heartbeat and a randomized election timeout that fires only when no leader was
+  heard that cycle — turning the explicit-tick node into an autonomous,
+  self-electing one. Tests: `test/raft_driver_test.dart` (one stable leader
+  emerges; a new leader is elected after the current one stops). The `dart:io`
+  TCP `RaftTransport` (for cross-host clusters) is still TODO.
 - [ ] **Bootstrap/catch-up.** A far-behind follower seeds via
   `Replica.bootstrap` (snapshot) then resumes AppendEntries — no InstallSnapshot
   RPC needed in v1.
