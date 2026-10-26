@@ -154,6 +154,14 @@ Tasks:
   commits. Reuse the existing TCP/line transport with a new message type.
 - [ ] **Bootstrap.** New replica seeds from a `dbr` snapshot (or a primary
   base-image stream), records the snapshot LSN, then catches up via the stream.
+
+  *LANDED (v1):* `Replica.bootstrap(primary, replicaPath)` quiesces the primary
+  (`checkpointForBackup`), copies its JSON snapshot, opens it as a replica
+  seeded at the primary's LSN (`seedAsReplica`), and catches up. Enables a
+  replica that joins *after* data exists, and a downstream replica of a
+  **promoted** node. Tests: `test/replication_test.dart` (bootstrap seed,
+  bootstrapped-follows-promoted). Production bootstrap should seed from `dbr`;
+  vector sidecars / paged tables aren't copied yet.
 - [ ] **Lag & backpressure.** Expose `replicationLag` (LSN gap + wall-clock);
   bounded buffers; resumable from last LSN after a disconnect.
 - [ ] **Semi-sync (optional).** `PRAGMA replication = async|semisync(k)` —

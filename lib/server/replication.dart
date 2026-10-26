@@ -1,6 +1,7 @@
 library;
 
 import 'dart:async';
+import 'dart:io';
 
 import 'database.dart';
 import 'oplog.dart';
@@ -19,6 +20,31 @@ class Replica {
 
   Replica(this.target) {
     target.markReplica();
+  }
+
+  /// Bootstrap a brand-new replica at [replicaPath] from [primary]: quiesce the
+  /// primary for a consistent on-disk image, copy its snapshot, open it as a
+  /// replica seeded at the primary's current LSN, then [catchUp] any records
+  /// committed after the copy. Returns the ready, caught-up [Replica].
+  ///
+  /// v1 copies the JSON snapshot file (the primary must be JSON-backed) and
+  /// assumes no concurrent writer races the copy — production bootstrap should
+  /// seed from a `dbr` snapshot instead. Vector sidecars / paged tables are not
+  /// yet copied.
+  static Future<Replica> bootstrap(
+      Database primary, String replicaPath) async {
+    final src = primary.path;
+    if (src == null) {
+      throw StateError('cannot bootstrap from an in-memory primary');
+    }
+    await primary.checkpointForBackup();
+    final lsn = primary.opLog?.lastLsn ?? 0;
+    await File(src).copy(replicaPath);
+    final target = await Database.open(replicaPath);
+    target.seedAsReplica(lsn);
+    final replica = Replica(target);
+    if (primary.opLog != null) await replica.catchUp(primary.opLog!);
+    return replica;
   }
 
   /// The highest LSN this replica has durably applied.

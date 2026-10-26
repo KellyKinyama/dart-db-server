@@ -139,5 +139,72 @@ void main() {
         await replica.close();
       }
     });
+
+    test('bootstrap seeds a fresh replica from the primary snapshot', () async {
+      final primary = await Database.open(_tmp('boot_p'));
+      await primary.enableOpLog();
+      try {
+        await primary.execute('CREATE TABLE t(id INTEGER PRIMARY KEY, n TEXT)');
+        await primary.execute("INSERT INTO t VALUES (1,'a'),(2,'b')");
+
+        // A replica that starts AFTER data already exists must still converge.
+        final replica = await Replica.bootstrap(primary, _tmp('boot_r'));
+        try {
+          expect(replica.appliedLsn, primary.opLog!.lastLsn);
+          final rr =
+              await replica.target.execute('SELECT id, n FROM t ORDER BY id');
+          expect(rr.rows, [
+            [1, 'a'],
+            [2, 'b'],
+          ]);
+
+          // Further primary writes stream through incrementally.
+          await primary.execute("INSERT INTO t VALUES (3,'c')");
+          await replica.catchUp(primary.opLog!);
+          final rr2 = await replica.target.execute('SELECT COUNT(*) FROM t');
+          expect(rr2.rows, [
+            [3],
+          ]);
+        } finally {
+          await replica.target.close();
+        }
+      } finally {
+        await primary.close();
+      }
+    });
+
+    test('a bootstrapped replica can follow a promoted primary', () async {
+      final primary = await Database.open(_tmp('chain_p'));
+      await primary.enableOpLog();
+      final mid = await Database.open(_tmp('chain_mid'));
+      final midR = Replica(mid);
+      try {
+        await primary.execute('CREATE TABLE t(id INTEGER PRIMARY KEY)');
+        await primary.execute('INSERT INTO t VALUES (1)');
+        await midR.catchUp(primary.opLog!);
+        await primary.close();
+        await midR.promote(); // mid becomes the new primary
+        await mid.execute('INSERT INTO t VALUES (2)');
+
+        // A downstream replica bootstraps from the promoted node, then follows.
+        final down = await Replica.bootstrap(mid, _tmp('chain_down'));
+        try {
+          final rr = await down.target.execute('SELECT COUNT(*) FROM t');
+          expect(rr.rows, [
+            [2],
+          ]);
+          await mid.execute('INSERT INTO t VALUES (3)');
+          await down.catchUp(mid.opLog!);
+          final rr2 = await down.target.execute('SELECT COUNT(*) FROM t');
+          expect(rr2.rows, [
+            [3],
+          ]);
+        } finally {
+          await down.target.close();
+        }
+      } finally {
+        await mid.close();
+      }
+    });
   });
 }

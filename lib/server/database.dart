@@ -262,6 +262,14 @@ class Database implements SequenceProvider {
   /// Mark this database as a read-only replica (see [_replicaReadOnly]).
   void markReplica() => _replicaReadOnly = true;
 
+  /// Mark this database as a read-only replica that has already materialized a
+  /// base snapshot up to [appliedLsn] (bootstrap). Subsequent op-log records
+  /// above [appliedLsn] are applied via [applyReplicated].
+  void seedAsReplica(int appliedLsn) {
+    _replicaReadOnly = true;
+    _appliedLsn = appliedLsn;
+  }
+
   /// Apply a replicated op-log [record] to this replica without re-capturing
   /// it, then advance [appliedLsn] and persist. Idempotent: records at or below
   /// the current [appliedLsn] are ignored.
