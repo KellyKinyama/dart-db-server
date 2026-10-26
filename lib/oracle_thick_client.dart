@@ -32,6 +32,7 @@ import 'package:dart_db_server/server/oracle_crypto.dart';
 import 'package:dart_db_server/server/oracle_number.dart';
 import 'package:dart_db_server/server/oracle_ttc.dart' show ttcMsgDataTypes;
 import 'package:dart_db_server/oracle_native_handshake.dart' as hs;
+import 'package:dart_db_server/oracle_native_execute.dart' as ex;
 
 const int _tnsHeaderSize = 8;
 const int _tnsPacketConnect = 1;
@@ -738,6 +739,62 @@ class OracleThickClient {
       authenticated: o8.verifyServerResponse(params['AUTH_SVR_RESPONSE']),
       params: params,
     );
+  }
+
+  /// Runs a row-returning [sql] (no binds) against a **real Oracle** server over
+  /// the canonical OALL8 execute path, following FETCH round-trips until the
+  /// cursor is drained. Requires a prior [loginReal]. Throws
+  /// [OracleThickException] on an `ORA-xxxxx` error.
+  Future<ex.NativeExecuteResponse> queryReal(String sql,
+      {int prefetch = 100}) async {
+    _socket.add(_wrapData(
+        ex.buildQueryExecute(sql, numIters: prefetch),
+        dataFlags: _realDataFlags));
+    var resp = await _readRealResponse(isQuery: true);
+    final columns = resp.columns;
+    final rows = <List<Object?>>[...resp.rows];
+    var cursorId = resp.cursorId;
+    var seq = 3;
+    while (resp.moreRows) {
+      _socket.add(_wrapData(
+          ex.buildFetch(cursorId, prefetch, sequence: seq++),
+          dataFlags: _realDataFlags));
+      resp = await _readRealResponse(isQuery: true, expectedColumns: columns);
+      rows.addAll(resp.rows);
+      if (resp.cursorId != 0) cursorId = resp.cursorId;
+      if (!resp.isSuccess) break;
+    }
+    if (!resp.isSuccess) {
+      throw OracleThickException(
+          resp.errorNum ?? -1,
+          'ORA-${(resp.errorNum ?? 0).toString().padLeft(5, '0')}: '
+          '${resp.errorMessage ?? ''}');
+    }
+    return ex.NativeExecuteResponse(
+      columns: columns,
+      rows: rows,
+      cursorId: cursorId,
+      moreRows: false,
+      complete: true,
+    );
+  }
+
+  /// Reads DATA frames, concatenating their TTC bodies, until the OALL8
+  /// response decodes to completion (terminal STATUS / ERROR / END_OF_REQUEST).
+  Future<ex.NativeExecuteResponse> _readRealResponse({
+    required bool isQuery,
+    List<ex.NativeColumn>? expectedColumns,
+  }) async {
+    final acc = BytesBuilder();
+    while (true) {
+      acc.add(_ttcBody(await _frames.next()));
+      final resp = ex.decodeExecuteResponse(
+        acc.toBytes(),
+        isQuery: isQuery,
+        expectedColumns: expectedColumns,
+      );
+      if (resp.complete) return resp;
+    }
   }
 
   /// Runs [sql] (optionally parameterised by [binds], one value per `:name`

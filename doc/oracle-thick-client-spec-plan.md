@@ -59,12 +59,28 @@ capability a recent edit removed.
 - [ ] (follow-up) `SELECT 1 FROM dual` on the real connection — needs the
   canonical OALL8 execute path (T1).
 
-## Phase T1 — Full describe metadata  ·  Status: TODO
-**Goal:** parse real column metadata, not just name + is-number.
-- [ ] **`OracleColumn`** value type: name, `dataType` (dty), length, precision,
-  scale, nullable, charsetId/charsetForm. Expose on `OracleThickResult`.
-- [ ] **Generalized describe parser** keyed on dty (replace the 0x02/0x60
-  special-case), validated against real Oracle describe records for each type.
+## Phase T1 — Canonical OALL8 execute + describe metadata  ·  Status: LANDED (queryReal, works vs 26ai)
+**Goal:** parse real column metadata and run real queries, not the
+dart-db-server smoke format.
+- [x] **New module `lib/oracle_native_execute.dart`** — canonical OALL8
+  `buildQueryExecute` (al8i4 options, no binds) + `buildFetch`, ported from the
+  thin driver, on the Oracle-compatible `oracle_codec.dart` UB buffers.
+- [x] **`NativeColumn`** value type: name, `oracleType` (dty), `maxLength`,
+  `precision`, `scale`, `csfrm`. Produced by the generalized DESCRIBE_INFO
+  parser (version-gated 12.2 / 23.1 / 23.1Ext3 / 23.4 fields).
+- [x] **Full response dispatcher**: DESCRIBE_INFO, ROW_HEADER, ROW_DATA,
+  BIT_VECTOR (duplicate-column), ERROR (ORA-01403 end-of-fetch), STATUS,
+  RETURN_PARAMETER, WARNING, SERVER_SIDE_PIGGYBACK, END_OF_REQUEST — with
+  split-packet reassembly (`complete` flag + frame accumulation).
+- [x] **`OracleThickClient.queryReal(sql)`** drives EXECUTE + FETCH rounds until
+  the cursor drains. Decodes NUMBER, VARCHAR2/CHAR/STRING, RAW,
+  BINARY_FLOAT/DOUBLE, DATE today; fail-loud `NativeUnsupportedTypeException`
+  for the rest (T2 fills them in).
+- [x] **Gated test** (`RUN_ORACLE_TESTS`) in `test/oracle_real_login_test.dart`:
+  `SELECT 1`, mixed VARCHAR2+NUMBER, 5-row `all_tables` fetch, `sysdate` DATE.
+  **Passes vs Docker 26ai.**
+- [ ] (follow-up) typed binds (T3) so `queryReal` accepts parameters; array
+  fetch tuning; `OracleThickResult`-shaped public wrapper.
 
 ## Phase T2 — Scalar type decoders  ·  Status: TODO
 One increment each (describe + cell decode + round-trip on real Oracle):
