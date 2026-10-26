@@ -4,6 +4,40 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+/// A shared, file-backed **epoch** (term) used to fence a superseded primary.
+/// Every node in a cluster points at the same [path]; promotion bumps the
+/// epoch, and a primary that later observes a higher epoch than the one it
+/// holds stops accepting writes (split-brain prevention). This is the minimal
+/// single-file coordinator for in-process / shared-filesystem deployments; a
+/// networked coordinator (etcd/Consul/Raft) replaces it in Phase 4.
+class ClusterEpoch {
+  final String path;
+  ClusterEpoch(this.path);
+
+  /// The current epoch, or 0 when unset/unreadable.
+  int read() {
+    try {
+      return int.parse(File(path).readAsStringSync().trim());
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  /// Durably set the epoch (temp-file + atomic rename).
+  void write(int epoch) {
+    final tmp = '$path.tmp';
+    File(tmp).writeAsStringSync('$epoch', flush: true);
+    File(tmp).renameSync(path);
+  }
+
+  /// Atomically advance the epoch by one and return the new value.
+  int bump() {
+    final next = read() + 1;
+    write(next);
+    return next;
+  }
+}
+
 /// One committed transaction in the logical op-log: a monotonic [lsn], a
 /// wall-clock [timestampMs], and the ordered SQL [ops] that were applied.
 class OpLogRecord {

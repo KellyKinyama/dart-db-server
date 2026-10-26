@@ -256,6 +256,22 @@ class Database implements SequenceProvider {
   /// The highest op-log LSN this database has applied (as a replica).
   int _appliedLsn = 0;
 
+  /// The epoch (term) this node holds as primary, and the shared fence it
+  /// checks before each write. When the shared epoch exceeds [_epoch] the node
+  /// has been superseded by a newer primary and stops accepting writes.
+  int _epoch = 0;
+  ClusterEpoch? _fence;
+
+  /// Attach a shared fence so this node refuses writes once superseded. [epoch]
+  /// is the generation this node currently holds (default 0).
+  void attachFence(ClusterEpoch fence, {int epoch = 0}) {
+    _fence = fence;
+    _epoch = epoch;
+  }
+
+  /// The epoch (term) this node holds.
+  int get epoch => _epoch;
+
   /// The highest op-log LSN applied as a replica (0 when not following).
   int get appliedLsn => _appliedLsn;
 
@@ -295,6 +311,9 @@ class Database implements SequenceProvider {
   /// (refusing writes once a higher epoch is observed) arrives with the
   /// coordinator in Phase 4 — do not automate promotion before it.
   Future<void> promoteToPrimary() async {
+    if (_fence != null) {
+      _epoch = _fence!.bump(); // adopt a strictly higher generation to fence the old primary
+    }
     _replicaReadOnly = false;
     if (path != null && _oplog == null) {
       final log = OpLog('$path.oplog');
@@ -2329,6 +2348,20 @@ class Database implements SequenceProvider {
       }
       if (_replicaReadOnly && !_replaying && _isMutation(stmt)) {
         throw StateError('Cannot mutate a read-only replica');
+      }
+      // Fencing: a superseded primary (shared epoch advanced past ours) must
+      // stop accepting writes to avoid split-brain.
+      if (_fence != null &&
+          !_replaying &&
+          (_isMutation(stmt) || stmt is CommitStmt)) {
+        final current = _fence!.read();
+        if (current > _epoch) {
+          _replicaReadOnly = true;
+          throw StateError(
+            'Write rejected: this primary has been fenced '
+            '(cluster epoch $current > held epoch $_epoch)',
+          );
+        }
       }
       final cb = authorizer;
       if (cb != null) {

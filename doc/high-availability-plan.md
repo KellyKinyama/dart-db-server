@@ -191,6 +191,13 @@ Tasks:
 - [ ] **Fencing.** An epoch/term token bumped on every promotion; the old
   primary refuses writes once it sees a higher epoch (STONITH-lite). This gate
   **must** land before any automation.
+
+  *LANDED (v1):* `ClusterEpoch` (shared, atomically-written epoch file) +
+  `Database.attachFence(fence, epoch:)`. `promoteToPrimary` bumps the shared
+  epoch; every write checks it and a node whose held epoch is below the cluster
+  epoch is fenced (writes throw). Test: `test/replication_test.dart` → "fencing:
+  promotion fences the old primary". v1 is a single shared file (in-process /
+  shared-FS); a networked coordinator replaces it in Phase 4.
 - [ ] **Pick-most-caught-up.** On promote, select the replica with the highest
   `appliedLsn`.
 - [ ] **Connection redirect.** A thin front-door (VIP or `dbr`-style router)

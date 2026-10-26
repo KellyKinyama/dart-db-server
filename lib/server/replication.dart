@@ -50,6 +50,11 @@ class Replica {
   /// The highest LSN this replica has durably applied.
   int get appliedLsn => target.appliedLsn;
 
+  /// Attach a shared [fence] (and the [epoch] this node currently holds) so a
+  /// later [promote] bumps the cluster epoch and the old primary is fenced.
+  void attachFence(ClusterEpoch fence, {int epoch = 0}) =>
+      target.attachFence(fence, epoch: epoch);
+
   /// Apply every source record with `lsn > appliedLsn`, in order. Returns the
   /// number of records applied. Idempotent — safe to call repeatedly.
   Future<int> catchUp(OpLog source) async {

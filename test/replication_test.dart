@@ -3,6 +3,7 @@ library;
 import 'dart:io';
 
 import 'package:dart_db_server/dart_db_server.dart';
+import 'package:dart_db_server/server/oplog.dart';
 import 'package:dart_db_server/server/replication.dart';
 import 'package:test/test.dart';
 
@@ -204,6 +205,46 @@ void main() {
         }
       } finally {
         await mid.close();
+      }
+    });
+
+    test('fencing: promotion fences the old primary (no split-brain)',
+        () async {
+      final epochPath = _tmp('epoch').replaceAll('.json', '.epoch');
+      final fence = ClusterEpoch(epochPath);
+      fence.write(1); // primary holds epoch 1
+
+      final primary = await Database.open(_tmp('fence_p'));
+      await primary.enableOpLog();
+      primary.attachFence(fence, epoch: 1);
+      final replica = await Database.open(_tmp('fence_r'));
+      final r = Replica(replica);
+      r.attachFence(fence); // replica holds epoch 0 until promoted
+      try {
+        await primary.execute('CREATE TABLE t(id INTEGER PRIMARY KEY)');
+        await primary.execute('INSERT INTO t VALUES (1)');
+        await r.catchUp(primary.opLog!);
+
+        // Failover: promote the replica. This bumps the shared epoch to 2.
+        await r.promote();
+        expect(fence.read(), 2);
+        expect(replica.epoch, 2);
+
+        // The OLD primary (still alive, epoch 1) is now fenced.
+        expect(
+          () => primary.execute('INSERT INTO t VALUES (99)'),
+          throwsA(isA<StateError>()),
+        );
+
+        // The NEW primary (epoch 2) accepts writes.
+        await replica.execute('INSERT INTO t VALUES (2)');
+        final rr = await replica.execute('SELECT COUNT(*) FROM t');
+        expect(rr.rows, [
+          [2],
+        ]);
+      } finally {
+        await primary.close();
+        await replica.close();
       }
     });
   });
