@@ -1,5 +1,6 @@
 library;
 
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
@@ -111,10 +112,17 @@ class OpLog {
   int _lastLsn = 0;
   bool _open = false;
 
+  final StreamController<OpLogRecord> _appendController =
+      StreamController<OpLogRecord>.broadcast();
+
   OpLog(this.dir, {this.segmentBytes = 8 * 1024 * 1024});
 
   /// The highest LSN durably appended, or 0 when the log is empty.
   int get lastLsn => _lastLsn;
+
+  /// Emits each record as it is durably appended — the live tail a streaming
+  /// replica subscribes to after draining the backlog.
+  Stream<OpLogRecord> get onAppend => _appendController.stream;
 
   static String _segName(int seq) => '${seq.toString().padLeft(6, '0')}.log';
 
@@ -193,6 +201,7 @@ class OpLog {
     cur.lastLsn = lsn;
     cur.validBytes += frameLen;
     _lastLsn = lsn;
+    if (_appendController.hasListener) _appendController.add(rec);
     return lsn;
   }
 
@@ -238,6 +247,7 @@ class OpLog {
     await _active?.close();
     _active = null;
     _open = false;
+    if (!_appendController.isClosed) await _appendController.close();
   }
 
   /// Read a segment's intact frames up to [limitBytes].

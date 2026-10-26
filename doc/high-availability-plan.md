@@ -158,6 +158,14 @@ Tasks:
 - [ ] **Replication protocol.** A stream endpoint on the server: replica sends
   its last applied `LSN`, primary streams subsequent frames and tails live
   commits. Reuse the existing TCP/line transport with a new message type.
+
+  *LANDED:* `lib/server/replication_server.dart` — `ReplicationServer(opLog)`
+  streams, over TCP, every record above a replica's `{"from_lsn": N}` (on-disk
+  backlog then the live `OpLog.onAppend` tail, de-duped by LSN so no record is
+  missed mid-drain); `ReplicationClient(replica)` applies them in strict LSN
+  order via subscription backpressure, resuming from `appliedLsn` on reconnect.
+  Tests: `test/replication_tcp_test.dart` (backlog+live tail, write rejection,
+  reconnect resume).
 - [ ] **Bootstrap.** New replica seeds from a `dbr` snapshot (or a primary
   base-image stream), records the snapshot LSN, then catches up via the stream.
 
