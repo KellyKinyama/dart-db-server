@@ -38,21 +38,26 @@ full type system, typed binds, LOBs, cursors, and array DML — validated agains
 
 ---
 
-## Phase T0 — Real-Oracle connectivity & auth  ·  Status: TODO
+## Phase T0 — Real-Oracle connectivity & auth  ·  Status: LANDED (loginReal, works vs 26ai)
 **Goal:** connect and authenticate against real Oracle 26ai, re-establishing the
 capability a recent edit removed.
-- [ ] **Restore `host`.** `connect(int port, {String host})` (keep loopback
+- [x] **Restore `host`.** `connect(int port, {String host})` (keep loopback
   default) so non-loopback / named hosts work.
-- [ ] **Inline CONNECT descriptor.** Re-add the standard real-Oracle CONNECT
+- [x] **Inline CONNECT descriptor.** Re-added the standard real-Oracle CONNECT
   (inline descriptor + v315+ large SDU/TDU fields, no follow-up descriptor
-  packet), selected by a `realOracle`/`inline` flag on `login`.
-- [ ] **Descriptor with ADDRESS + service.** Build
-  `(DESCRIPTION=(ADDRESS=(PROTOCOL=tcp)(HOST=..)(PORT=..))(CONNECT_DATA=(SERVICE_NAME=FREEPDB1)(CID=..)))`.
-- [ ] **Validate O5LOGON against 26ai.** Confirm the PBKDF2 challenge/response
-  and `AUTH_SVR_RESPONSE` validate; fix any version-320 vs 26ai differences
-  (ACCEPT version, DATA-TYPES list, auth mode flags).
-- [ ] **A gated smoke test** (`RUN_ORACLE_TESTS`) that logs in and runs
-  `SELECT 1 FROM dual`.
+  packet), via `buildNativeConnect(inline: true)`.
+- [x] **Descriptor with service + CID.** `loginReal` builds
+  `(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=..)(CID=..)))`.
+- [x] **Canonical FAST_AUTH + O8LOGON against 26ai.** New
+  `lib/oracle_native_handshake.dart` ports the thin driver's FAST_AUTH bundle
+  (PROTOCOL + DATATYPES + AUTH_PHASE_ONE), locates the type-8 challenge via
+  `findAuthChallenge`, computes the PBKDF2/AES O8LOGON proof, and validates
+  `AUTH_SVR_RESPONSE`. END_OF_RPC (0x0800) data flag applied on 23ai+.
+- [x] **A gated smoke test** (`RUN_ORACLE_TESTS`):
+  `test/oracle_real_login_test.dart` logs in via `loginReal` and asserts
+  `authenticated == true` + `AUTH_DBNAME`. **Passes vs Docker 26ai.**
+- [ ] (follow-up) `SELECT 1 FROM dual` on the real connection — needs the
+  canonical OALL8 execute path (T1).
 
 ## Phase T1 — Full describe metadata  ·  Status: TODO
 **Goal:** parse real column metadata, not just name + is-number.

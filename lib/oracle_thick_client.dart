@@ -31,6 +31,7 @@ import 'package:dart_db_server/server/oracle_codec.dart';
 import 'package:dart_db_server/server/oracle_crypto.dart';
 import 'package:dart_db_server/server/oracle_number.dart';
 import 'package:dart_db_server/server/oracle_ttc.dart' show ttcMsgDataTypes;
+import 'package:dart_db_server/oracle_native_handshake.dart' as hs;
 
 const int _tnsHeaderSize = 8;
 const int _tnsPacketConnect = 1;
@@ -57,13 +58,14 @@ const String _defaultDescriptor =
 // --- TNS framing -----------------------------------------------------------
 
 /// Wraps a TTC body in a DATA packet using the 4-byte large-SDU length header.
-Uint8List _wrapData(Uint8List ttc) {
+/// [dataFlags] carries the 2-byte data flags (0x0800 END_OF_RPC on 23ai+).
+Uint8List _wrapData(Uint8List ttc, {int dataFlags = 0}) {
   final out = BytesBuilder();
   final header = ByteData(_tnsHeaderSize);
   header.setUint32(0, _tnsHeaderSize + 2 + ttc.length);
   header.setUint8(4, _tnsPacketData);
   out.add(header.buffer.asUint8List());
-  out.add(const [0, 0]);
+  out.add([(dataFlags >> 8) & 0xFF, dataFlags & 0xFF]);
   out.add(ttc);
   return out.toBytes();
 }
@@ -624,6 +626,10 @@ class OracleThickClient {
   final Socket _socket;
   final _FrameReader _frames;
 
+  /// Data flags applied to each DATA packet after a real-Oracle [loginReal]
+  /// (0x0800 END_OF_RPC on 23ai+). 0 for the dart-db-server flow.
+  int _realDataFlags = 0;
+
   /// Connects to a native listener at [host]:[port]. Defaults to the loopback
   /// interface (the local dart-db-server); pass [host] to reach a real Oracle
   /// listener.
@@ -678,6 +684,58 @@ class OracleThickClient {
     final params = _parseNativeResponseParams(responseBody);
     return NativeLoginResult(
       authenticated: o5logon.verifyServerResponse(params['AUTH_SVR_RESPONSE']),
+      params: params,
+    );
+  }
+
+  /// Authenticates against a **real Oracle** listener (19c+/21c/23ai/26ai) using
+  /// the inline CONNECT + FAST_AUTH flow and the canonical O8LOGON proof — the
+  /// path a genuine OCI/thin client uses, distinct from the dart-db-server
+  /// [login] flow. Returns a [NativeLoginResult] whose `authenticated` reflects
+  /// the server's AUTH_SVR_RESPONSE mutual-auth validation.
+  Future<NativeLoginResult> loginReal({
+    required String username,
+    required String password,
+    required String serviceName,
+    String? alterSession,
+  }) async {
+    final descriptor = '(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=$serviceName)'
+        '(CID=(PROGRAM=dart-thick)(HOST=localhost)(USER=$username))))';
+    _socket.add(
+        buildNativeConnect(descriptor: descriptor, inline: true, versionDesired: 319));
+    final accept = hs.parseAccept(await _frames.next());
+    _realDataFlags = accept.supportsEndOfRequest ? hs.tnsDataFlagsEndOfRpc : 0;
+
+    _socket.add(_wrapData(
+        hs.buildFastAuthMessage(
+            username: username, endOfRequest: accept.supportsEndOfRequest),
+        dataFlags: _realDataFlags));
+    final bundle = _ttcBody(await _frames.next());
+    final challenge = hs.findAuthChallenge(bundle);
+    if (challenge == null) {
+      return NativeLoginResult(authenticated: false, params: const {});
+    }
+
+    final o8 = hs.computeO8Logon(password, challenge.pairs);
+    final tz = alterSession ?? "ALTER SESSION SET TIME_ZONE='+00:00'\u0000";
+    _socket.add(_wrapData(
+        hs.buildAuthPhaseTwoMessage(
+          username: username,
+          sessionKeyHex: o8.sessionKeyHex,
+          authPasswordHex: o8.authPasswordHex,
+          speedyKeyHex: o8.speedyKeyHex,
+          alterSession: tz,
+        ),
+        dataFlags: _realDataFlags));
+    final resp2 = _ttcBody(await _frames.next());
+    final txt = String.fromCharCodes(resp2.where((b) => b >= 32 && b < 127));
+    final ora = RegExp(r'ORA-\d{5}').firstMatch(txt);
+    if (ora != null) {
+      return NativeLoginResult(authenticated: false, params: {'error': ora.group(0)!});
+    }
+    final params = hs.parseAuthParams(ReadBuffer(resp2)).pairs;
+    return NativeLoginResult(
+      authenticated: o8.verifyServerResponse(params['AUTH_SVR_RESPONSE']),
       params: params,
     );
   }
