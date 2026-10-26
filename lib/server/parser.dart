@@ -2,8 +2,11 @@
 /// [Statement] AST nodes. Supports the SQL subset documented in README.
 library;
 
+import 'dart:convert';
+
 import 'expression.dart';
 import 'lexer.dart';
+import 'routine.dart';
 import 'schema.dart';
 import 'statement.dart';
 
@@ -74,6 +77,43 @@ class Parser {
   bool _checkKw(String kw, [int offset = 0]) =>
       _peek(offset).type == TokType.keyword && _peek(offset).upper == kw;
 
+  /// Matches a bareword by its uppercased text whether it lexed as a keyword or
+  /// an identifier — for non-reserved words (FETCH, NEXT, ONLY) used only in
+  /// specific clauses, so they stay usable as identifiers elsewhere.
+  bool _checkWord(String upper) {
+    final t = _peek();
+    return (t.type == TokType.keyword || t.type == TokType.ident) &&
+        t.upper == upper;
+  }
+
+  bool _matchWord(String upper) {
+    if (_checkWord(upper)) {
+      _advance();
+      return true;
+    }
+    return false;
+  }
+
+  /// True when the current token is a non-reserved word that introduces a
+  /// trailing clause (e.g. `FETCH`, or Oracle `START` / `CONNECT`) and so must
+  /// not be mistaken for a table alias in `FROM t FETCH ...` / `FROM t START
+  /// WITH ...`.
+  bool _isClauseStartWord() =>
+      _checkWord('FETCH') ||
+      _checkWord('START') ||
+      _checkWord('CONNECT') ||
+      _checkWord('MINUS');
+
+  /// Like [_expect] but for a bareword matched by uppercased text (keyword or
+  /// identifier), e.g. the non-reserved words in MERGE (USING, MATCHED, ...).
+  Token _expectWord(String upper) {
+    if (_checkWord(upper)) return _advance();
+    final got = _peek();
+    throw FormatException(
+      'Expected $upper but got "${got.text}" at offset ${got.offset}',
+    );
+  }
+
   Token _expect(TokType t, [String? text]) {
     if (_check(t, text)) return _advance();
     final got = _peek();
@@ -131,6 +171,48 @@ class Parser {
     return null;
   }
 
+  /// Consumes Oracle flashback (`AS OF SCN|TIMESTAMP …`, `VERSIONS BETWEEN …
+  /// AND …`) and `SAMPLE [BLOCK] (n) [SEED (n)]` clauses after a FROM table.
+  /// Accepted and ignored — the engine queries the current, full table.
+  void _consumeFlashbackAndSample() {
+    if (_checkWord('VERSIONS')) {
+      _advance(); // VERSIONS
+      _matchWord('BETWEEN');
+      // SCN|TIMESTAMP <lo> AND <hi> — tokens up to a clause boundary.
+      while (!_isAtEnd() &&
+          !_isClauseStartWord() &&
+          !_check(TokType.punct, ';') &&
+          !_check(TokType.punct, ')') &&
+          !_check(TokType.punct, ',')) {
+        _advance();
+      }
+    }
+    if (_checkWord('AS') && _peek(1).upper == 'OF') {
+      _advance(); // AS
+      _advance(); // OF
+      _matchWord('SCN');
+      _matchWord('TIMESTAMP');
+      _parseExpr(); // the SCN / timestamp value
+    }
+    if (_matchWord('SAMPLE')) {
+      _matchWord('BLOCK');
+      if (_match(TokType.punct, '(')) {
+        while (!_isAtEnd() && !_check(TokType.punct, ')')) {
+          _advance();
+        }
+        _expect(TokType.punct, ')');
+      }
+      if (_matchWord('SEED')) {
+        if (_match(TokType.punct, '(')) {
+          while (!_isAtEnd() && !_check(TokType.punct, ')')) {
+            _advance();
+          }
+          _expect(TokType.punct, ')');
+        }
+      }
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Statements
   // ---------------------------------------------------------------------------
@@ -146,6 +228,9 @@ class Parser {
         case 'VALUES':
           return _parseValuesAsSelect();
         case 'INSERT':
+          if (_peek(1).upper == 'ALL' || _peek(1).upper == 'FIRST') {
+            return _parseInsertAll();
+          }
           return _parseInsert();
         case 'REPLACE':
           return _parseReplace();
@@ -162,9 +247,20 @@ class Parser {
         case 'TRUNCATE':
           return _parseTruncate();
         case 'BEGIN':
-          _advance();
-          _matchKw('TRANSACTION');
-          return BeginStmt();
+          {
+            // `BEGIN` / `BEGIN TRANSACTION` starts a transaction; `BEGIN <stmt>
+            // … END` is a PL/SQL anonymous block.
+            final nxt = _peek(1);
+            final isTxn = nxt.type == TokType.eof ||
+                (nxt.type == TokType.punct && nxt.text == ';') ||
+                (nxt.type == TokType.keyword && nxt.upper == 'TRANSACTION');
+            if (isTxn) {
+              _advance();
+              _matchKw('TRANSACTION');
+              return BeginStmt();
+            }
+            return _parsePlsqlBlock();
+          }
         case 'COMMIT':
           _advance();
           _matchKw('TRANSACTION');
@@ -260,6 +356,17 @@ class Parser {
           return DetachDatabaseStmt(_expectName());
       }
     }
+    if (_checkWord('MERGE')) return _parseMerge();
+    if (_checkWord('CALL')) return _parseCall();
+    if (_checkWord('COMMENT')) return _parseComment();
+    if (_checkWord('DECLARE')) return _parsePlsqlBlock();
+    if (_checkWord('DELIMITER')) {
+      // Client-side framing directive; accept and ignore the rest of the line.
+      while (!_isAtEnd()) {
+        _advance();
+      }
+      return SetSessionStmt('DELIMITER');
+    }
     throw FormatException('Unsupported statement starting with "${t.text}"');
   }
 
@@ -319,6 +426,32 @@ class Parser {
   Statement _parseSetSession() {
     final start = _peek().offset;
     _expectKw('SET');
+    // MySQL user-variable assignment: `SET @x = expr [, @y = expr]`. Only when
+    // every comma item is an `@var` assignment; otherwise fall through to the
+    // generic no-op (SET SESSION/GLOBAL/NAMES/autocommit/...).
+    final first = _peek();
+    if (first.type == TokType.param &&
+        first.text.startsWith('@') &&
+        !first.text.startsWith('@@')) {
+      final assignments = <(String, Expr)>[];
+      var allUserVars = true;
+      do {
+        final t = _peek();
+        if (t.type != TokType.param ||
+            !t.text.startsWith('@') ||
+            t.text.startsWith('@@')) {
+          allUserVars = false;
+          break;
+        }
+        _advance();
+        final varName = t.text.substring(1);
+        if (!_match(TokType.op, ':=')) _expect(TokType.op, '=');
+        assignments.add((varName, _parseExpr()));
+      } while (_match(TokType.punct, ','));
+      if (allUserVars && assignments.isNotEmpty) {
+        return SetUserVarStmt(assignments);
+      }
+    }
     // Consume tokens until end of statement / semicolon to stay in sync.
     while (!_isAtEnd() && !(_check(TokType.punct, ';'))) {
       _advance();
@@ -381,10 +514,21 @@ class Parser {
   // ---- CREATE -------------------------------------------------------------
   Statement _parseCreate() {
     _expectKw('CREATE');
-    // Accept TEMP / TEMPORARY before TABLE/VIEW/TRIGGER/INDEX. We don't
-    // model temp scope; the modifier is parsed and ignored so that the
+    // Oracle `CREATE OR REPLACE PROCEDURE|FUNCTION …`.
+    var orReplace = false;
+    if (_matchKw('OR')) {
+      _expectWord('REPLACE');
+      orReplace = true;
+    }
+    // Accept [GLOBAL|PRIVATE] TEMP / TEMPORARY before TABLE/VIEW/TRIGGER/INDEX.
+    // We don't model temp scope; the modifiers are parsed and ignored so the
     // CREATE statement is recognised.
     {
+      if (_checkWord('GLOBAL') || _checkWord('PRIVATE')) {
+        if (_peek(1).upper == 'TEMPORARY' || _peek(1).upper == 'TEMP') {
+          _advance();
+        }
+      }
       final p = _peek();
       if (p.type == TokType.ident &&
           (p.upper == 'TEMP' || p.upper == 'TEMPORARY')) {
@@ -392,14 +536,42 @@ class Parser {
       }
     }
     if (_matchKw('TABLE')) return _parseCreateTableTail();
+    if (_matchWord('MATERIALIZED')) {
+      _expectKw('VIEW');
+      return _parseCreateMaterializedViewTail();
+    }
+    if (_matchWord('PUBLIC')) {
+      _expectWord('SYNONYM');
+      return _parseCreateSynonymTail();
+    }
+    if (_matchWord('SYNONYM')) return _parseCreateSynonymTail();
+    if (_matchWord('TYPE')) return _parseCreateType();
+    if (_matchWord('DIMENSION')) {
+      // Oracle OLAP CREATE DIMENSION — accepted and ignored.
+      while (!_isAtEnd() && !_check(TokType.punct, ';')) {
+        _advance();
+      }
+      return DdlNoopStmt('DIMENSION');
+    }
     if (_matchKw('VIRTUAL')) {
       _expectKw('TABLE');
       return _parseCreateVirtualTableTail();
     }
+    _matchWord('BITMAP'); // Oracle bitmap index — treated as a regular index
     final isUnique = _matchKw('UNIQUE');
     if (_matchKw('INDEX')) return _parseCreateIndexTail(unique: isUnique);
     if (_matchKw('VIEW')) return _parseCreateViewTail();
     if (_matchKw('TRIGGER')) return _parseCreateTriggerTail();
+    if (_matchWord('SEQUENCE')) return _parseCreateSequenceTail();
+    if (_matchWord('PROCEDURE')) {
+      return _parseCreateRoutine(false, orReplace: orReplace);
+    }
+    if (_matchWord('FUNCTION')) {
+      return _parseCreateRoutine(true, orReplace: orReplace);
+    }
+    if (_matchWord('PACKAGE')) {
+      return _parseCreatePackage(orReplace: orReplace);
+    }
     throw FormatException(
       'Expected TABLE, INDEX, VIEW or TRIGGER after CREATE',
     );
@@ -450,21 +622,521 @@ class Parser {
     return CreateVirtualTableStmt(name, module, args, ifNotExists: ifNotExists);
   }
 
-  CreateTableStmt _parseCreateTableTail() {
+  /// Parses an Oracle `PIVOT (agg(measure) [alias] FOR col IN (v1 [alias], …))`
+  /// and rewrites it into a grouped CASE-aggregate SELECT over [src].
+  SelectStmt _parsePivotClause(SelectStmt src) {
+    _expect(TokType.punct, '(');
+    final measure = _parseExpr();
+    final aggName =
+        measure is FunctionCallExpr ? measure.name.toUpperCase() : 'MAX';
+    // COUNT(*) has no measure column; the per-value CASE yields a constant 1 so
+    // COUNT counts the matching rows (not a nested COUNT(COUNT(*))).
+    final measureArg = measure is FunctionCallExpr && measure.isStarArg
+        ? LiteralExpr(1)
+        : measure is FunctionCallExpr && measure.args.isNotEmpty
+            ? measure.args.first
+            : measure;
+    if (_matchKw('AS')) {
+      _expectName();
+    } else if (_check(TokType.ident) && !_checkWord('FOR')) {
+      _advance();
+    }
+    _expectWord('FOR');
+    final pivotCol = _expectName();
+    _expectKw('IN');
+    _expect(TokType.punct, '(');
+    final values = <(Expr, String)>[];
+    do {
+      final startOff = _peek().offset;
+      final v = _parseExpr();
+      final endOff = _peek().offset;
+      String label;
+      if (_matchKw('AS')) {
+        label = _expectName();
+      } else if (_check(TokType.ident)) {
+        label = _advance().text;
+      } else {
+        label = _sliceSource(startOff, endOff).trim().replaceAll("'", '');
+      }
+      values.add((v, label));
+    } while (_match(TokType.punct, ','));
+    _expect(TokType.punct, ')'); // IN list
+    _expect(TokType.punct, ')'); // PIVOT
+
+    final measureCols = <String>{};
+    _columnNamesInto(measureArg, measureCols);
+    final srcCols = <String>[];
+    for (final it in src.projection) {
+      if (it.alias != null) {
+        srcCols.add(it.alias!);
+      } else if (it.expr is ColumnExpr) {
+        srcCols.add((it.expr as ColumnExpr).name);
+      }
+    }
+    final groupCols = srcCols
+        .where((c) =>
+            c.toLowerCase() != pivotCol.toLowerCase() &&
+            !measureCols.contains(c.toLowerCase()))
+        .toList();
+    final proj = <SelectItem>[
+      for (final g in groupCols) SelectItem.expr(ColumnExpr(g)),
+    ];
+    for (final (v, label) in values) {
+      final cond = BinaryExpr('=', ColumnExpr(pivotCol), v);
+      proj.add(SelectItem.expr(
+        FunctionCallExpr(aggName, [CaseExpr([cond], [measureArg], null)]),
+        alias: label,
+      ));
+    }
+    return SelectStmt(
+      projection: proj,
+      fromSubquery: src,
+      groupBy: [for (final g in groupCols) ColumnExpr(g)],
+      orderBy: const [],
+    );
+  }
+
+  /// Parses an Oracle `PIVOT XML (agg(measure) FOR col IN (ANY | subquery |
+  /// value-list))`. Unlike relational PIVOT, the pivot values aren't known at
+  /// parse time, so the result has one row per distinct grouping-column
+  /// combination plus a single aggregated XML column. We model that as a
+  /// GROUP BY over the implicit grouping columns.
+  SelectStmt _parsePivotXmlClause(SelectStmt src) {
+    _expect(TokType.punct, '(');
+    final measure = _parseExpr();
+    final measureCols = <String>{};
+    if (measure is FunctionCallExpr && measure.args.isNotEmpty) {
+      _columnNamesInto(measure.args.first, measureCols);
+    }
+    if (_matchKw('AS')) {
+      _expectName();
+    } else if (_check(TokType.ident) && !_checkWord('FOR')) {
+      _advance();
+    }
+    _expectWord('FOR');
+    final pivotCol = _expectName();
+    _expectKw('IN');
+    _expect(TokType.punct, '(');
+    // IN (ANY) | IN (subquery) | IN (v1, v2, …) — the contents don't affect the
+    // output cardinality (one row per group), so skip to the matching ')'.
+    var depth = 1;
+    while (depth > 0 && !_isAtEnd()) {
+      if (_check(TokType.punct, '(')) {
+        depth++;
+      } else if (_check(TokType.punct, ')')) {
+        depth--;
+        if (depth == 0) break;
+      }
+      _advance();
+    }
+    _expect(TokType.punct, ')'); // IN list
+    _expect(TokType.punct, ')'); // PIVOT XML
+
+    final srcCols = <String>[];
+    for (final it in src.projection) {
+      if (it.alias != null) {
+        srcCols.add(it.alias!);
+      } else if (it.expr is ColumnExpr) {
+        srcCols.add((it.expr as ColumnExpr).name);
+      }
+    }
+    final groupCols = srcCols
+        .where((c) =>
+            c.toLowerCase() != pivotCol.toLowerCase() &&
+            !measureCols.contains(c.toLowerCase()))
+        .toList();
+    final proj = <SelectItem>[
+      for (final g in groupCols) SelectItem.expr(ColumnExpr(g)),
+      SelectItem.expr(
+        FunctionCallExpr('MAX', [LiteralExpr('<PivotSet></PivotSet>')]),
+        alias: '${pivotCol}_XML',
+      ),
+    ];
+    return SelectStmt(
+      projection: proj,
+      fromSubquery: src,
+      groupBy: [for (final g in groupCols) ColumnExpr(g)],
+      orderBy: const [],
+    );
+  }
+
+  /// Parses an Oracle `MATCH_RECOGNIZE ( [PARTITION BY …] [ORDER BY …]
+  /// [MEASURES …] [ONE ROW|ALL ROWS PER MATCH] [AFTER MATCH SKIP …]
+  /// PATTERN ( … ) DEFINE var AS cond, … )` clause into a structured
+  /// [MatchRecognizeClause]. Pattern support is a flat sequence of quantified
+  /// variables (`+ * ?`); unsupported constructs are skipped where possible.
+  MatchRecognizeClause _parseMatchRecognize() {
+    _expect(TokType.punct, '(');
+    final partitionBy = <Expr>[];
+    if (_matchWord('PARTITION')) {
+      _expectKw('BY');
+      partitionBy.add(_parseExpr());
+      while (_match(TokType.punct, ',')) {
+        partitionBy.add(_parseExpr());
+      }
+    }
+    final orderBy = <OrderByItem>[];
+    if (_matchKw('ORDER')) {
+      _expectKw('BY');
+      orderBy.add(_parseOrderByItem());
+      while (_match(TokType.punct, ',')) {
+        orderBy.add(_parseOrderByItem());
+      }
+    }
+    final measures = <SelectItem>[];
+    if (_matchWord('MEASURES')) {
+      do {
+        final e = _parseExpr();
+        String? alias;
+        if (_matchKw('AS')) {
+          alias = _expectName();
+        } else if (_check(TokType.ident) &&
+            !_checkWord('ONE') &&
+            !_checkWord('ALL') &&
+            !_checkWord('AFTER') &&
+            !_checkWord('PATTERN')) {
+          alias = _advance().text;
+        }
+        measures.add(SelectItem.expr(e, alias: alias));
+      } while (_match(TokType.punct, ','));
+    }
+    var allRows = false;
+    if (_matchWord('ALL')) {
+      _expectWord('ROWS');
+      _expectWord('PER');
+      _expectWord('MATCH');
+      allRows = true;
+    } else if (_matchWord('ONE')) {
+      _expectWord('ROW');
+      _expectWord('PER');
+      _expectWord('MATCH');
+    }
+    if (_matchWord('AFTER')) {
+      _expectWord('MATCH');
+      _expectWord('SKIP');
+      // SKIP PAST LAST ROW | SKIP TO NEXT ROW | SKIP TO [FIRST|LAST] var
+      while (!_checkWord('PATTERN') && !_isAtEnd()) {
+        _advance();
+      }
+    }
+    final pattern = <MatchPatternElem>[];
+    _expectWord('PATTERN');
+    _expect(TokType.punct, '(');
+    var depth = 1;
+    while (depth > 0 && !_isAtEnd()) {
+      if (_check(TokType.punct, '(')) {
+        depth++;
+        _advance();
+        continue;
+      }
+      if (_check(TokType.punct, ')')) {
+        depth--;
+        _advance();
+        continue;
+      }
+      // Skip anchors/alternation we don't model: ^ $ |
+      if (_check(TokType.op, '|') ||
+          _check(TokType.op, '^') ||
+          _check(TokType.op, r'$')) {
+        _advance();
+        continue;
+      }
+      if (!_check(TokType.ident)) {
+        _advance();
+        continue;
+      }
+      final v = _advance().text;
+      var minRep = 1;
+      var maxRep = 1;
+      if (_match(TokType.op, '+')) {
+        minRep = 1;
+        maxRep = -1;
+      } else if (_match(TokType.op, '*')) {
+        minRep = 0;
+        maxRep = -1;
+      } else if (_match(TokType.op, '?') || _match(TokType.param, '?')) {
+        minRep = 0;
+        maxRep = 1;
+      } else if (_check(TokType.punct, '{') || _check(TokType.op, '{')) {
+        // {n} or {n,m} — consume and best-effort parse.
+        _advance(); // {
+        final lo = _check(TokType.number) ? int.parse(_advance().text) : 0;
+        var hi = lo;
+        if (_match(TokType.punct, ',')) {
+          hi = _check(TokType.number) ? int.parse(_advance().text) : -1;
+        }
+        _match(TokType.punct, '}');
+        _match(TokType.op, '}');
+        minRep = lo;
+        maxRep = hi;
+      }
+      pattern.add(MatchPatternElem(v, minRep, maxRep));
+    }
+    // SUBSET clause (ignored) up to DEFINE / ')'.
+    if (_matchWord('SUBSET')) {
+      while (!_checkWord('DEFINE') &&
+          !_check(TokType.punct, ')') &&
+          !_isAtEnd()) {
+        _advance();
+      }
+    }
+    final defines = <String, Expr>{};
+    if (_matchWord('DEFINE')) {
+      do {
+        final v = _expectName();
+        _expectKw('AS');
+        defines[v.toUpperCase()] = _parseExpr();
+      } while (_match(TokType.punct, ','));
+    }
+    _expect(TokType.punct, ')'); // MATCH_RECOGNIZE
+    return MatchRecognizeClause(
+      partitionBy: partitionBy,
+      orderBy: orderBy,
+      measures: measures,
+      allRowsPerMatch: allRows,
+      pattern: pattern,
+      defines: defines,
+    );
+  }
+
+  /// Parses an Oracle `UNPIVOT [INCLUDE|EXCLUDE NULLS] (valueCol FOR labelCol
+  /// IN (c1 [AS label], …))` over table [tableName] and rewrites it into a
+  /// UNION ALL subquery with one arm per unpivoted column.
+  SelectStmt _parseUnpivotClause(String tableName) {
+    var includeNulls = false;
+    if (_matchWord('INCLUDE')) {
+      _matchWord('NULLS');
+      includeNulls = true;
+    } else if (_matchWord('EXCLUDE')) {
+      _matchWord('NULLS');
+    }
+    _expect(TokType.punct, '(');
+    final valueCol = _expectName();
+    _expectWord('FOR');
+    final labelCol = _expectName();
+    _expectKw('IN');
+    _expect(TokType.punct, '(');
+    final cols = <(String, String)>[];
+    do {
+      final colName = _expectName();
+      var label = colName;
+      if (_matchKw('AS')) {
+        label = _check(TokType.string)
+            ? _advance().text
+            : _expectName();
+      }
+      cols.add((colName, label));
+    } while (_match(TokType.punct, ','));
+    _expect(TokType.punct, ')'); // IN list
+    _expect(TokType.punct, ')'); // UNPIVOT
+    final arms = cols
+        .map((c) =>
+            "SELECT $tableName.*, '${c.$2}' AS $labelCol, ${c.$1} AS $valueCol "
+            "FROM $tableName"
+            '${includeNulls ? '' : ' WHERE ${c.$1} IS NOT NULL'}')
+        .join(' UNION ALL ');
+    return Parser.fromString(arms).parseStatement() as SelectStmt;
+  }
+
+  /// Parses `JSON_TABLE(src, 'path' COLUMNS (col …))` (the opening JSON_TABLE
+  /// word is already consumed) into a derived table whose FROM is a JSON_TABLE
+  /// table-function call the executor materialises: args are
+  /// `[src, rowPath, jsonEncode(columnSpecs)]`.
+  SelectStmt _parseJsonTableClause() {
+    _expect(TokType.punct, '(');
+    final src = _parseExpr(); // JSON source expression
+    var rowPath = r'$';
+    if (_match(TokType.punct, ',')) {
+      if (_check(TokType.string)) rowPath = _advance().text; // row path
+    }
+    final names = <String>[];
+    final specs = <Map<String, Object?>>[];
+    if (_matchWord('COLUMNS')) {
+      _parseJsonTableColumns(names, specs);
+    }
+    _expect(TokType.punct, ')'); // JSON_TABLE
+    return SelectStmt(
+      projection: [for (final c in names) SelectItem.expr(ColumnExpr(c))],
+      fromFunction: FunctionCallExpr(
+        'JSON_TABLE',
+        [src, LiteralExpr(rowPath), LiteralExpr(jsonEncode(specs))],
+      ),
+      orderBy: const [],
+    );
+  }
+
+  /// Parses `XMLTABLE('xpath' PASSING xmldoc COLUMNS col type PATH 'p', …)`
+  /// into a derived table whose FROM is an `XMLTABLE` table-function call:
+  /// args are `[xmldoc, rowXPath, jsonEncode(columnSpecs)]`.
+  SelectStmt _parseXmlTableClause() {
+    _expect(TokType.punct, '(');
+    final rowXPath = _check(TokType.string) ? _advance().text : '/';
+    Expr doc = LiteralExpr('');
+    if (_matchWord('PASSING')) {
+      _matchWord('BY');
+      _matchWord('VALUE');
+      doc = _parseExpr();
+    }
+    final names = <String>[];
+    final specs = <Map<String, Object?>>[];
+    if (_matchWord('COLUMNS')) {
+      do {
+        final name = _expectName();
+        if (_matchWord('FOR')) {
+          _matchWord('ORDINALITY');
+          names.add(name);
+          specs.add({'kind': 'ord', 'name': name});
+          continue;
+        }
+        final typeName = _advance().text.toUpperCase();
+        if (_check(TokType.punct, '(')) {
+          while (!_check(TokType.punct, ')') && !_isAtEnd()) {
+            _advance();
+          }
+          _match(TokType.punct, ')');
+        }
+        var path = name;
+        if (_matchWord('PATH') && _check(TokType.string)) {
+          path = _advance().text;
+        }
+        names.add(name);
+        specs.add(
+            {'kind': 'path', 'name': name, 'path': path, 'type': typeName});
+      } while (_match(TokType.punct, ','));
+    }
+    _expect(TokType.punct, ')'); // XMLTABLE
+    return SelectStmt(
+      projection: [for (final c in names) SelectItem.expr(ColumnExpr(c))],
+      fromFunction: FunctionCallExpr(
+        'XMLTABLE',
+        [doc, LiteralExpr(rowXPath), LiteralExpr(jsonEncode(specs))],
+      ),
+      orderBy: const [],
+    );
+  }
+
+  /// Parses a JSON_TABLE `COLUMNS ( … )` list into [names] (projection order)
+  /// and [specs] (per-column descriptors: FOR ORDINALITY, EXISTS PATH, a typed
+  /// PATH column with optional DEFAULT … ON ERROR, or a NESTED PATH subtree).
+  void _parseJsonTableColumns(
+      List<String> names, List<Map<String, Object?>> specs) {
+    _expect(TokType.punct, '(');
+    do {
+      if (_matchWord('NESTED')) {
+        _matchWord('PATH');
+        final p = _check(TokType.string) ? _advance().text : r'$';
+        _expectWord('COLUMNS');
+        final innerNames = <String>[];
+        final innerSpecs = <Map<String, Object?>>[];
+        _parseJsonTableColumns(innerNames, innerSpecs);
+        names.addAll(innerNames);
+        specs.add({'kind': 'nested', 'path': p, 'cols': innerSpecs});
+        continue;
+      }
+      final name = _expectName();
+      if (_matchWord('FOR')) {
+        _matchWord('ORDINALITY');
+        names.add(name);
+        specs.add({'kind': 'ord', 'name': name});
+        continue;
+      }
+      final typeName = _advance().text.toUpperCase();
+      if (_check(TokType.punct, '(')) {
+        while (!_check(TokType.punct, ')') && !_isAtEnd()) {
+          _advance();
+        }
+        _match(TokType.punct, ')');
+      }
+      if (_matchWord('EXISTS')) {
+        _matchWord('PATH');
+        final p = _check(TokType.string) ? _advance().text : '\$.$name';
+        names.add(name);
+        specs.add({'kind': 'exists', 'name': name, 'path': p});
+        continue;
+      }
+      var path = '\$.$name';
+      if (_matchWord('PATH')) {
+        if (_check(TokType.string)) path = _advance().text;
+      }
+      Object? defaultVal;
+      var hasDefault = false;
+      // Trailing `[DEFAULT expr] ON {ERROR|EMPTY}` clauses.
+      while (true) {
+        if (_matchWord('DEFAULT')) {
+          final d = _parsePrimary();
+          if (!hasDefault && d is LiteralExpr) {
+            defaultVal = d.value;
+            hasDefault = true;
+          }
+          continue;
+        }
+        if (_matchWord('NULL') ||
+            _matchWord('ERROR') ||
+            _matchWord('EMPTY') ||
+            _matchWord('ON')) {
+          continue;
+        }
+        break;
+      }
+      names.add(name);
+      specs.add({
+        'kind': 'path',
+        'name': name,
+        'path': path,
+        'type': typeName,
+        if (hasDefault) 'default': defaultVal,
+      });
+    } while (_match(TokType.punct, ','));
+    _expect(TokType.punct, ')');
+  }
+
+  void _columnNamesInto(Expr e, Set<String> out) {
+    if (e is ColumnExpr) {
+      out.add(e.name.toLowerCase());
+    } else if (e is FunctionCallExpr) {
+      for (final a in e.args) {
+        _columnNamesInto(a, out);
+      }
+    } else if (e is BinaryExpr) {
+      _columnNamesInto(e.left, out);
+      _columnNamesInto(e.right, out);
+    } else if (e is UnaryExpr) {
+      _columnNamesInto(e.operand, out);
+    }
+  }
+
+  Statement _parseCreateTableTail() {
     bool ifNotExists = false;
     if (_matchKw('IF')) {
       _expectKw('NOT');
       _expectKw('EXISTS');
       ifNotExists = true;
     }
-    final name = _expectIdent().text;
+    final name = _parseQualifiedTableName();
+    // Object table: `CREATE TABLE <name> OF <object_type>` (columns from type).
+    if (_matchWord('OF')) {
+      final typeName = _parseQualifiedTableName();
+      while (!_isAtEnd() && !_check(TokType.punct, ';')) {
+        _advance(); // trailing object-table storage clauses
+      }
+      return CreateObjectTableStmt(name, typeName, ifNotExists: ifNotExists);
+    }
+    // CREATE TABLE <name> [AS] SELECT … (CTAS): schema + data from a query.
+    if (_checkKw('AS') || _checkKw('SELECT')) {
+      _matchKw('AS');
+      final sel = _parseSelect();
+      return CreateTableStmt(name, const [],
+          ifNotExists: ifNotExists, asSelect: sel);
+    }
     _expect(TokType.punct, '(');
     final cols = <ColumnDef>[];
     final rawTypes = <String>[]; // parallel to cols; for STRICT validation
     final constraints = <TableConstraint>[];
     do {
       if (_isTableLevelConstraintStart()) {
-        constraints.add(_parseTableConstraint());
+        final c = _parseTableConstraint();
+        _skipConstraintState();
+        constraints.add(c);
       } else {
         _lastColumnRawType = '';
         cols.add(_parseColumnDef());
@@ -493,6 +1165,27 @@ class Parser {
           );
         }
         usingPaged = true;
+      } else if (_matchWord('ORGANIZATION')) {
+        // Oracle index-organized / heap table storage clause: accept + ignore.
+        if (!_matchWord('INDEX')) _matchWord('HEAP');
+      } else if (_matchWord('ON')) {
+        // Oracle GLOBAL TEMPORARY `ON COMMIT {PRESERVE|DELETE} ROWS` — accept.
+        _matchWord('COMMIT');
+        if (!_matchWord('PRESERVE')) _matchWord('DELETE');
+        _matchWord('ROWS');
+      } else if (_matchWord('PARTITION') || _matchWord('PARTITIONS')) {
+        // Oracle partitioning clause (PARTITION BY …): accept and ignore the
+        // remainder of the statement.
+        while (!_isAtEnd() && !_check(TokType.punct, ';')) {
+          _advance();
+        }
+        break;
+      } else if (_matchWord('NESTED')) {
+        // NESTED TABLE <col> STORE AS <name> storage clause: accept + ignore.
+        while (!_isAtEnd() && !_check(TokType.punct, ';')) {
+          _advance();
+        }
+        break;
       } else if (_isMysqlTableOptionStart()) {
         _skipMysqlTableOption();
         // MySQL allows space- or comma-separated options; eat an optional
@@ -593,6 +1286,9 @@ class Parser {
   }
 
   bool _isTableLevelConstraintStart() {
+    // A leading `CONSTRAINT <name>` always introduces a named table-level
+    // constraint when it appears at the start of a CREATE TABLE item.
+    if (_checkWord('CONSTRAINT')) return true;
     final t = _peek();
     if (t.type != TokType.keyword) return false;
     if (t.upper == 'PRIMARY' || t.upper == 'UNIQUE' || t.upper == 'CHECK') {
@@ -605,6 +1301,11 @@ class Parser {
   }
 
   TableConstraint _parseTableConstraint() {
+    // Optional `CONSTRAINT <name>` prefix (the name is accepted but not
+    // retained) before PRIMARY KEY / UNIQUE / CHECK / FOREIGN KEY.
+    if (_matchWord('CONSTRAINT')) {
+      _advance();
+    }
     if (_matchKw('PRIMARY')) {
       _expectKw('KEY');
       _expect(TokType.punct, '(');
@@ -647,7 +1348,12 @@ class Parser {
 
   ForeignKeyRef _parseReferencesClause() {
     _expectKw('REFERENCES');
-    final tbl = _expectIdent().text;
+    var tbl = _expectIdent().text;
+    // Schema-qualified target `owner.table` — the engine is single-schema, so
+    // keep the table name and drop the owner.
+    if (_match(TokType.punct, '.')) {
+      tbl = _expectIdent().text;
+    }
     String? col;
     if (_match(TokType.punct, '(')) {
       col = _expectIdent().text;
@@ -695,14 +1401,87 @@ class Parser {
     final typeTok = _advance();
     _lastColumnRawType = typeTok.text;
     final type = parseDataType(typeTok.text);
+    // Oracle REF column: `col REF <object_type>` — model the opaque reference as
+    // its declared type and consume the referenced type name.
+    if (typeTok.text.toUpperCase() == 'REF' &&
+        (_check(TokType.ident) || _peek().type == TokType.keyword)) {
+      _advance();
+    }
     // Optional size/precision qualifier: VARCHAR(10), DECIMAL(10,2), etc.
-    // Consumed and ignored — it does not affect affinity.
+    // Captured for VARCHAR2(n) length and NUMBER(p[,s]) precision/scale
+    // enforcement; it does not affect affinity.
+    int? charLength;
+    int? numericPrecision;
+    int? numericScale;
     if (_match(TokType.punct, '(')) {
-      _advance(); // first number
+      final rawType = typeTok.text.toUpperCase();
+      const charTypes = {
+        'VARCHAR', 'VARCHAR2', 'CHAR', 'NCHAR', 'NVARCHAR', 'NVARCHAR2',
+        'CHARACTER',
+      };
+      final firstTok = _advance(); // first number
+      final firstN = int.tryParse(firstTok.text);
+      // Optional CHAR / BYTE length semantics keyword (VARCHAR2(10 CHAR)).
+      if (_check(TokType.ident) || _peek().type == TokType.keyword) {
+        if (_checkWord('CHAR') || _checkWord('BYTE')) _advance();
+      }
       if (_match(TokType.punct, ',')) {
-        _advance(); // second number
+        // Negative scale is allowed: NUMBER(5,-2).
+        var scaleNeg = false;
+        if (_check(TokType.op, '-')) {
+          scaleNeg = true;
+          _advance();
+        }
+        final secondTok = _advance(); // scale
+        numericPrecision = firstN;
+        final sc = int.tryParse(secondTok.text);
+        numericScale = sc == null ? null : (scaleNeg ? -sc : sc);
+      } else if (charTypes.contains(rawType)) {
+        charLength = firstN;
+      } else {
+        numericPrecision = firstN;
       }
       _expect(TokType.punct, ')');
+    }
+    // Oracle INTERVAL YEAR [(p)] TO MONTH / INTERVAL DAY [(p)] TO SECOND [(p)]
+    // column types. Consumed (the engine stores intervals as text/number).
+    if (typeTok.text.toUpperCase() == 'INTERVAL') {
+      void consumeParen() {
+        if (_check(TokType.punct, '(')) {
+          var depth = 0;
+          do {
+            final tk = _advance();
+            if (tk.type == TokType.punct && tk.text == '(') depth++;
+            if (tk.type == TokType.punct && tk.text == ')') depth--;
+          } while (depth > 0 && !_isAtEnd());
+        }
+      }
+
+      if (_matchWord('YEAR') ||
+          _matchWord('MONTH') ||
+          _matchWord('DAY') ||
+          _matchWord('HOUR') ||
+          _matchWord('MINUTE') ||
+          _matchWord('SECOND')) {
+        consumeParen();
+        if (_matchWord('TO')) {
+          if (_check(TokType.ident) || _peek().type == TokType.keyword) {
+            _advance(); // trailing unit
+          }
+          consumeParen();
+        }
+      }
+    }
+    // Oracle TIMESTAMP / TIME [WITH [LOCAL] TIME ZONE]. The zone qualifier is
+    // consumed (the engine stores timestamps as text); the column keeps its
+    // TIMESTAMP affinity.
+    if (_checkWord('WITH') &&
+        (typeTok.text.toUpperCase() == 'TIMESTAMP' ||
+            typeTok.text.toUpperCase() == 'TIME')) {
+      _advance(); // WITH
+      _matchWord('LOCAL');
+      _expectWord('TIME');
+      _expectWord('ZONE');
     }
     bool primaryKey = false;
     bool notNull = false;
@@ -715,7 +1494,20 @@ class Parser {
     String? generatedSql;
     bool generatedStored = false;
     Map<String, String>? vectorSpec;
+    String? collate;
+    String? pendingConstraintName;
+    String? checkName;
     while (true) {
+      // Inline named constraint prefix: `CONSTRAINT <name> <constraint>`. The
+      // name is remembered so a following CHECK can be dropped by name later.
+      if (_matchWord('CONSTRAINT')) {
+        pendingConstraintName = _expectName();
+        continue;
+      }
+      if (_matchKw('COLLATE')) {
+        collate = _expectIdent().text;
+        continue;
+      }
       if (_matchKw('PRIMARY')) {
         _expectKw('KEY');
         primaryKey = true;
@@ -740,6 +1532,12 @@ class Parser {
         continue;
       }
       if (_matchKw('DEFAULT')) {
+        // Oracle `DEFAULT ON NULL <expr>`: also applies the default when NULL
+        // is explicitly supplied. Consume the modifier; the expression that
+        // follows is parsed by the branches below.
+        if (_matchWord('ON')) {
+          if (!_matchWord('NULL')) _expectKw('NULL');
+        }
         // 1) DEFAULT (<expr>) — parenthesized expression.
         if (_check(TokType.punct, '(')) {
           _advance(); // consume '('
@@ -763,20 +1561,27 @@ class Parser {
           defaultExprSql = _advance().text;
           continue;
         }
-        // 3) Bare literal (possibly signed numeric).
+        // 3) Bare literal (possibly signed numeric), else a scalar expression
+        //    default (e.g. `seq.NEXTVAL`, a function call) captured as SQL and
+        //    evaluated per INSERT.
+        final exprStart = _peek().offset;
         Expr lit;
         if (_check(TokType.op, '-') || _check(TokType.op, '+')) {
           final sign = _advance().text;
           final next = _parsePrimary();
-          if (next is! LiteralExpr || next.value is! num) {
-            throw FormatException('DEFAULT must be a literal');
+          if (next is LiteralExpr && next.value is num) {
+            lit =
+                LiteralExpr(sign == '-' ? -(next.value as num) : next.value);
+          } else {
+            defaultExprSql = _sliceSource(exprStart, _peek().offset);
+            continue;
           }
-          lit = LiteralExpr(sign == '-' ? -(next.value as num) : next.value);
         } else {
           lit = _parsePrimary();
         }
         if (lit is! LiteralExpr) {
-          throw FormatException('DEFAULT must be a literal');
+          defaultExprSql = _sliceSource(exprStart, _peek().offset);
+          continue;
         }
         defaultValue = lit.value;
         continue;
@@ -788,15 +1593,57 @@ class Parser {
         final end = _peek().offset;
         _expect(TokType.punct, ')');
         checkSql = _sliceSource(start, end);
+        checkName = pendingConstraintName;
         continue;
       }
       if (_checkKw('REFERENCES')) {
         references = _parseReferencesClause();
         continue;
       }
+      // Constraint-state attributes (DEFERRABLE / INITIALLY DEFERRED|IMMEDIATE,
+      // ENABLE/DISABLE, RELY/NORELY, VALIDATE/NOVALIDATE) — accepted + ignored.
+      if (_matchWord('DEFERRABLE')) {
+        if (_matchWord('INITIALLY')) {
+          if (!_matchWord('DEFERRED')) _matchWord('IMMEDIATE');
+        }
+        continue;
+      }
+      if (_checkWord('NOT') && _peek(1).upper == 'DEFERRABLE') {
+        _advance();
+        _advance();
+        continue;
+      }
+      // Oracle column visibility: VISIBLE / INVISIBLE — accepted (the column is
+      // still addressable by name).
+      if (_matchWord('VISIBLE') || _matchWord('INVISIBLE')) {
+        continue;
+      }
       if (_matchKw('GENERATED')) {
-        _expectKw('ALWAYS');
+        // Oracle identity: GENERATED [ALWAYS | BY DEFAULT [ON NULL]] AS IDENTITY
+        //   [ ( sequence options ) ].  Mapped onto the AUTOINCREMENT engine.
+        if (_matchWord('BY')) {
+          _expectKw('DEFAULT');
+          if (_matchWord('ON')) {
+            if (!_matchWord('NULL')) _expectKw('NULL');
+          }
+        } else {
+          _expectKw('ALWAYS');
+        }
         _expectKw('AS');
+        if (_matchWord('IDENTITY')) {
+          autoInc = true;
+          notNull = true;
+          // Optional "( START WITH n INCREMENT BY n … )" sequence options.
+          if (_check(TokType.punct, '(')) {
+            var depth = 0;
+            do {
+              final tk = _advance();
+              if (tk.type == TokType.punct && tk.text == '(') depth++;
+              if (tk.type == TokType.punct && tk.text == ')') depth--;
+            } while (depth > 0 && !_isAtEnd());
+          }
+          continue;
+        }
         _expect(TokType.punct, '(');
         final start = _peek().offset;
         _parseExpr();
@@ -846,6 +1693,7 @@ class Parser {
     return ColumnDef(
       name,
       type,
+      declaredType: typeTok.text,
       primaryKey: primaryKey,
       notNull: notNull,
       unique: unique,
@@ -853,10 +1701,15 @@ class Parser {
       defaultValue: defaultValue,
       defaultExprSql: defaultExprSql,
       checkExprSql: checkSql,
+      checkName: checkName,
       references: references,
       generatedExprSql: generatedSql,
       generatedStored: generatedStored,
       vectorSpec: vectorSpec,
+      collate: collate,
+      charLength: charLength,
+      numericPrecision: numericPrecision,
+      numericScale: numericScale,
     );
   }
 
@@ -914,6 +1767,11 @@ class Parser {
       final end = _peek().offset;
       whereSql = _sliceSource(start, end);
     }
+    // Trailing Oracle storage/physical clauses (NOLOGGING, LOCAL, PARALLEL,
+    // TABLESPACE …, COMPUTE STATISTICS …) — accepted and ignored.
+    while (!_isAtEnd() && !_check(TokType.punct, ';')) {
+      _advance();
+    }
     return CreateIndexStmt(
       indexName,
       table,
@@ -934,6 +1792,15 @@ class Parser {
       ifNotExists = true;
     }
     final name = _expectIdent().text;
+    // Optional explicit column list: `CREATE VIEW v (a, b) AS …`.
+    List<String>? viewCols;
+    if (_match(TokType.punct, '(')) {
+      viewCols = <String>[_expectName()];
+      while (_match(TokType.punct, ',')) {
+        viewCols.add(_expectName());
+      }
+      _expect(TokType.punct, ')');
+    }
     _expectKw('AS');
     final selStart = _peek().offset;
     final sel = _parseSelect();
@@ -944,7 +1811,99 @@ class Parser {
       sel,
       ifNotExists: ifNotExists,
       selectSql: selSql,
+      columns: viewCols,
     );
+  }
+
+  /// `CREATE MATERIALIZED VIEW <name> [build/refresh clauses] AS <select>` —
+  /// modeled as a plain view; the Oracle storage/refresh clauses before AS are
+  /// accepted and ignored.
+  CreateViewStmt _parseCreateMaterializedViewTail() {
+    bool ifNotExists = false;
+    if (_matchKw('IF')) {
+      _expectKw('NOT');
+      _expectKw('EXISTS');
+      ifNotExists = true;
+    }
+    final name = _expectIdent().text;
+    while (!_isAtEnd() && !_checkKw('AS') && !_check(TokType.punct, ';')) {
+      _advance();
+    }
+    _expectKw('AS');
+    final selStart = _peek().offset;
+    final sel = _parseSelect();
+    final selEnd = _peek().offset;
+    final selSql = _sliceSource(selStart, selEnd).trim();
+    return CreateViewStmt(name, sel,
+        ifNotExists: ifNotExists, selectSql: selSql);
+  }
+
+  /// `CREATE [PUBLIC] SYNONYM <name> FOR <target>`.
+  CreateSynonymStmt _parseCreateSynonymTail() {
+    final name = _parseQualifiedTableName();
+    _expectWord('FOR');
+    final target = _parseQualifiedTableName();
+    return CreateSynonymStmt(name, target);
+  }
+
+  /// `CREATE TYPE <name> AS OBJECT (attrs)` records the attribute columns so an
+  /// object table can resolve them; VARRAY / TABLE OF and method members are
+  /// accepted and ignored.
+  Statement _parseCreateType() {
+    final name = _check(TokType.ident) ? _parseQualifiedTableName() : '';
+    final isObject =
+        (_matchWord('AS') || _matchWord('IS')) && _matchWord('OBJECT');
+    if (isObject && _match(TokType.punct, '(')) {
+      final cols = <ColumnDef>[];
+      if (!_check(TokType.punct, ')')) {
+        cols.add(_parseColumnDef());
+        while (_match(TokType.punct, ',')) {
+          // Stop at a method/member clause (not a plain attribute).
+          if (_checkWord('MEMBER') ||
+              _checkWord('MAP') ||
+              _checkWord('STATIC') ||
+              _checkWord('CONSTRUCTOR') ||
+              _checkWord('FINAL') ||
+              _checkWord('ORDER')) {
+            break;
+          }
+          cols.add(_parseColumnDef());
+        }
+      }
+      while (!_isAtEnd() && !_check(TokType.punct, ';')) {
+        _advance();
+      }
+      return CreateTypeStmt(name, cols);
+    }
+    while (!_isAtEnd() && !_check(TokType.punct, ';')) {
+      _advance();
+    }
+    return DdlNoopStmt('TYPE');
+  }
+
+  /// Consumes Oracle constraint-state clauses (`ENABLE`, `DISABLE`, `VALIDATE`,
+  /// `NOVALIDATE`, `RELY`, `DEFERRABLE`, `INITIALLY …`) that trail a constraint.
+  void _skipConstraintState() {
+    while (true) {
+      if (_matchWord('ENABLE') ||
+          _matchWord('DISABLE') ||
+          _matchWord('VALIDATE') ||
+          _matchWord('NOVALIDATE') ||
+          _matchWord('RELY') ||
+          _matchWord('NORELY') ||
+          _matchWord('DEFERRABLE')) {
+        continue;
+      }
+      if (_matchWord('NOT')) {
+        _matchWord('DEFERRABLE') || _matchWord('NULL');
+        continue;
+      }
+      if (_matchWord('INITIALLY')) {
+        _matchWord('IMMEDIATE') || _matchWord('DEFERRED');
+        continue;
+      }
+      break;
+    }
   }
 
   CreateTriggerStmt _parseCreateTriggerTail() {
@@ -991,6 +1950,22 @@ class Parser {
     if (_matchKw('WHEN')) {
       when = _parseExpr();
     }
+    // A PL/SQL trigger body (DECLARE … / `:new.x := …` procedural assignments)
+    // is not a SQL-statement body; recover the `:new.col := expr` assignments
+    // (applied to the NEW row of a BEFORE row trigger) and accept the rest.
+    if (_looksLikePlsqlTriggerBody()) {
+      final assigns = _parsePlsqlTriggerBody();
+      return CreateTriggerStmt(
+        name,
+        timing,
+        event,
+        table,
+        when,
+        const <Statement>[],
+        ifNotExists: ifNotExists,
+        newAssignments: assigns,
+      );
+    }
     _expectKw('BEGIN');
     final body = <Statement>[];
     while (!_checkKw('END')) {
@@ -1009,6 +1984,102 @@ class Parser {
     );
   }
 
+  /// Whether the trigger body is a PL/SQL block (a `DECLARE` section, or a
+  /// `BEGIN` whose first statement is a `:new`/`:old` or `ident :=` assignment)
+  /// rather than the SQL-statement body the engine executes directly.
+  bool _looksLikePlsqlTriggerBody() {
+    if (_checkWord('DECLARE')) return true;
+    if (_checkKw('BEGIN')) {
+      final n = _peek(1);
+      if (n.type == TokType.param) return true;
+      if ((n.type == TokType.ident || n.type == TokType.keyword) &&
+          _peek(2).type == TokType.op &&
+          _peek(2).text == ':=') {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /// Consumes a PL/SQL trigger body (`DECLARE … BEGIN … END;`, tracking nesting)
+  /// and returns its `:new.col := expr` assignments; other procedural
+  /// statements are accepted and ignored.
+  List<TriggerNewAssign> _parsePlsqlTriggerBody() {
+    final out = <TriggerNewAssign>[];
+    var depth = 0;
+    var sawBegin = false;
+    while (!_isAtEnd()) {
+      final p = _peek();
+      // `:new . col := <rhs> ;`
+      if (p.type == TokType.param &&
+          p.text.toUpperCase() == ':NEW' &&
+          _peek(1).type == TokType.punct &&
+          _peek(1).text == '.' &&
+          _peek(3).type == TokType.op &&
+          _peek(3).text == ':=') {
+        _advance(); // :new
+        _advance(); // .
+        final col = _advance().text; // column
+        _advance(); // :=
+        final start = _peek().offset;
+        var pd = 0;
+        while (!_isAtEnd()) {
+          final t = _peek();
+          if (t.type == TokType.punct && t.text == '(') {
+            pd++;
+          } else if (t.type == TokType.punct && t.text == ')') {
+            if (pd == 0) break;
+            pd--;
+          } else if (t.type == TokType.punct && t.text == ';' && pd == 0) {
+            break;
+          }
+          _advance();
+        }
+        final rhs = _sliceSource(start, _peek().offset).trim();
+        final expr = _parseTriggerRhs(rhs);
+        if (expr != null) out.add(TriggerNewAssign(col, expr));
+        _match(TokType.punct, ';');
+        continue;
+      }
+      if (_matchWord('BEGIN')) {
+        depth++;
+        sawBegin = true;
+        continue;
+      }
+      if (_checkWord('END')) {
+        _advance();
+        if (_matchWord('IF') || _matchWord('LOOP') || _matchWord('CASE')) {
+          continue; // inner construct closed by keyword, not the block
+        }
+        depth--;
+        if (sawBegin && depth <= 0) {
+          if (_check(TokType.ident)) _advance(); // optional trigger name
+          _match(TokType.punct, ';');
+          break;
+        }
+        continue;
+      }
+      _advance();
+    }
+    return out;
+  }
+
+  /// Parses a PL/SQL assignment RHS into an [Expr], mapping `:new.x`/`:old.x`
+  /// column references onto the engine's `NEW.x`/`OLD.x` trigger scope. Returns
+  /// null when the RHS cannot be parsed (the assignment is then ignored).
+  Expr? _parseTriggerRhs(String rhs) {
+    final mapped = rhs
+        .replaceAll(RegExp(r':new\s*\.\s*', caseSensitive: false), 'NEW.')
+        .replaceAll(RegExp(r':old\s*\.\s*', caseSensitive: false), 'OLD.');
+    try {
+      final stmt = Parser.fromString('SELECT $mapped').parseStatement();
+      if (stmt is SelectStmt && stmt.projection.isNotEmpty) {
+        return stmt.projection.first.expr;
+      }
+    } catch (_) {}
+    return null;
+  }
+
   // ---- DROP ---------------------------------------------------------------
   Statement _parseDrop() {
     _expectKw('DROP');
@@ -1018,7 +2089,7 @@ class Parser {
         _expectKw('EXISTS');
         ifExists = true;
       }
-      return DropTableStmt(_expectIdent().text, ifExists: ifExists);
+      return DropTableStmt(_parseQualifiedTableName(), ifExists: ifExists);
     }
     if (_matchKw('INDEX')) {
       bool ifExists = false;
@@ -1044,12 +2115,939 @@ class Parser {
       }
       return DropTriggerStmt(_expectIdent().text, ifExists: ifExists);
     }
+    if (_matchWord('SEQUENCE')) {
+      bool ifExists = false;
+      if (_matchKw('IF')) {
+        _expectKw('EXISTS');
+        ifExists = true;
+      }
+      return DropSequenceStmt(_expectIdent().text, ifExists: ifExists);
+    }
+    if (_matchWord('PROCEDURE') || _matchWord('FUNCTION')) {
+      final isFunction = _tokens[_pos - 1].upper == 'FUNCTION';
+      bool ifExists = false;
+      if (_matchKw('IF')) {
+        _expectKw('EXISTS');
+        ifExists = true;
+      }
+      return DropProcedureStmt(_expectIdent().text,
+          isFunction: isFunction, ifExists: ifExists);
+    }
+    if (_matchWord('PACKAGE')) {
+      _matchWord('BODY'); // DROP PACKAGE BODY drops the same member set
+      bool ifExists = false;
+      if (_matchKw('IF')) {
+        _expectKw('EXISTS');
+        ifExists = true;
+      }
+      return DropPackageStmt(_expectIdent().text, ifExists: ifExists);
+    }
     throw FormatException('Expected TABLE, INDEX, VIEW or TRIGGER after DROP');
+  }
+
+  // ---- CREATE SEQUENCE ----------------------------------------------------
+  CreateSequenceStmt _parseCreateSequenceTail() {
+    bool ifNotExists = false;
+    if (_matchKw('IF')) {
+      _expectKw('NOT');
+      _expectKw('EXISTS');
+      ifNotExists = true;
+    }
+    final name = _expectIdent().text;
+    int startWith = 1;
+    int incrementBy = 1;
+    int? minValue;
+    int? maxValue;
+    bool cycle = false;
+    // Options may appear in any order and repeat; last one wins (Oracle-ish).
+    while (true) {
+      if (_matchWord('START')) {
+        _matchKw('WITH');
+        startWith = _parseSignedInt();
+      } else if (_matchWord('INCREMENT')) {
+        _matchKw('BY');
+        incrementBy = _parseSignedInt();
+      } else if (_matchWord('MINVALUE')) {
+        minValue = _parseSignedInt();
+      } else if (_matchWord('NOMINVALUE')) {
+        minValue = null;
+      } else if (_matchWord('MAXVALUE')) {
+        maxValue = _parseSignedInt();
+      } else if (_matchWord('NOMAXVALUE')) {
+        maxValue = null;
+      } else if (_matchWord('CYCLE')) {
+        cycle = true;
+      } else if (_matchWord('NOCYCLE')) {
+        cycle = false;
+      } else if (_matchWord('CACHE')) {
+        _parseSignedInt(); // accepted and ignored
+      } else if (_matchWord('NOCACHE') ||
+          _matchWord('ORDER') ||
+          _matchWord('NOORDER')) {
+        // accepted and ignored
+      } else {
+        break;
+      }
+    }
+    return CreateSequenceStmt(
+      name,
+      startWith: startWith,
+      incrementBy: incrementBy,
+      minValue: minValue,
+      maxValue: maxValue,
+      cycle: cycle,
+      ifNotExists: ifNotExists,
+    );
+  }
+
+  int _parseSignedInt() {
+    var negative = false;
+    if (_check(TokType.op, '-')) {
+      _advance();
+      negative = true;
+    } else if (_check(TokType.op, '+')) {
+      _advance();
+    }
+    final n = int.parse(_expect(TokType.number).text);
+    return negative ? -n : n;
+  }
+
+  // ---- CREATE PROCEDURE / FUNCTION (MySQL + Oracle stored routines) -------
+  CreateProcedureStmt _parseCreateRoutine(bool isFunction,
+      {bool orReplace = false}) {
+    final name = _expectIdent().text;
+    final params = _parseRoutineParams();
+    String? returnType;
+    if (isFunction) {
+      // MySQL `RETURNS t`; Oracle `RETURN t`.
+      if (!_matchWord('RETURNS')) _matchWord('RETURN');
+      returnType = _consumeRoutineType();
+    }
+    // Oracle function options before IS/AS: DETERMINISTIC, PARALLEL_ENABLE,
+    // PIPELINED, RESULT_CACHE, AUTHID …. Accepted and ignored.
+    while (_matchWord('DETERMINISTIC') ||
+        _matchWord('PARALLEL_ENABLE') ||
+        _matchWord('PIPELINED') ||
+        _matchWord('RESULT_CACHE')) {}
+    if (_matchWord('AUTHID')) {
+      _advance(); // CURRENT_USER / DEFINER
+    }
+    final RoutineBlock block;
+    if (_matchWord('IS') || _matchWord('AS')) {
+      // Oracle PL/SQL: declarations between IS/AS and BEGIN, then the body.
+      final decls = _parsePlsqlDeclarations();
+      block = _parsePlsqlBody(decls);
+    } else {
+      // MySQL: optional characteristics, then a BEGIN … END block.
+      _consumeRoutineCharacteristics();
+      block = _parseRoutineBody();
+    }
+    return CreateProcedureStmt(
+      StoredRoutine(name, params, block,
+          isFunction: isFunction, returnType: returnType),
+      orReplace: orReplace,
+    );
+  }
+
+  /// Parse an optional `(param [, param]*)` list shared by `CREATE
+  /// PROCEDURE/FUNCTION` and package members. Each param is
+  /// `[IN|OUT|INOUT] name type` (MySQL) or `name [IN|OUT|INOUT] type` (Oracle).
+  List<RoutineParam> _parseRoutineParams() {
+    final params = <RoutineParam>[];
+    if (_match(TokType.punct, '(')) {
+      if (!_check(TokType.punct, ')')) {
+        do {
+          var mode = RoutineParamMode.inParam;
+          final String pname;
+          // MySQL writes the mode before the name (`IN x INT`); Oracle writes
+          // it after (`x IN NUMBER`). Detect a leading mode keyword only when a
+          // parameter name follows it.
+          if ((_checkWord('IN') || _checkWord('OUT') || _checkWord('INOUT')) &&
+              _peek(1).type == TokType.ident) {
+            if (_matchWord('INOUT')) {
+              mode = RoutineParamMode.inOutParam;
+            } else if (_matchWord('OUT')) {
+              mode = RoutineParamMode.outParam;
+            } else {
+              _matchWord('IN');
+            }
+            pname = _expectIdent().text;
+          } else {
+            pname = _expectIdent().text;
+            if (_matchWord('INOUT')) {
+              mode = RoutineParamMode.inOutParam;
+            } else if (_matchWord('OUT')) {
+              mode = RoutineParamMode.outParam;
+            } else {
+              _matchWord('IN');
+            }
+          }
+          final type = _consumeRoutineType();
+          // Optional parameter default: `DEFAULT <expr>` or `:= <expr>`.
+          String? defaultSql;
+          if (_matchWord('DEFAULT') || _match(TokType.op, ':=')) {
+            final start = _peek().offset;
+            _parseExpr();
+            defaultSql = _sliceSource(start, _peek().offset).trim();
+          }
+          params.add(RoutineParam(pname, mode, type, defaultSql: defaultSql));
+        } while (_match(TokType.punct, ','));
+      }
+      _expect(TokType.punct, ')');
+    }
+    return params;
+  }
+
+  // ---- CREATE PACKAGE / PACKAGE BODY (Oracle) -----------------------------
+  Statement _parseCreatePackage({bool orReplace = false}) {
+    final isBody = _matchWord('BODY');
+    final pkgName = _expectIdent().text;
+    // Tolerate AUTHID / other clauses before the opening IS/AS.
+    while (!_isAtEnd() && !_checkWord('IS') && !_checkWord('AS')) {
+      _advance();
+    }
+    if (!_matchWord('IS')) _expectWord('AS');
+    if (!isBody) {
+      // Package spec: declarations only (no executable bodies). Skip to the
+      // matching END; members live in the body.
+      _skipPackageSpec();
+      return CreatePackageStmt(pkgName, const [],
+          isBody: false, orReplace: orReplace);
+    }
+    final packageVars = <RoutineDecl>[];
+    final routines = _parsePackageBodyMembers(pkgName, packageVars);
+    return CreatePackageStmt(pkgName, routines,
+        isBody: true, orReplace: orReplace, packageVars: packageVars);
+  }
+
+  /// Skip a package spec body (procedure/function/variable declarations) up to
+  /// and including its terminating `END [name];`.
+  void _skipPackageSpec() {
+    var depth = 0;
+    while (!_isAtEnd()) {
+      if (_check(TokType.punct, '(')) {
+        depth++;
+      } else if (_check(TokType.punct, ')')) {
+        if (depth > 0) depth--;
+      } else if (depth == 0 && _checkWord('END')) {
+        break;
+      }
+      _advance();
+    }
+    _expectWord('END');
+    if (_check(TokType.ident)) _advance(); // optional package name
+    _match(TokType.punct, ';');
+  }
+
+  /// Parse the member routines of a package body, returning them with
+  /// qualified `pkg.member` names. Package-level variable/constant declarations
+  /// are collected into [packageVars] (for persistent package state); types,
+  /// cursors and an optional init block are tolerated (parsed and discarded).
+  List<StoredRoutine> _parsePackageBodyMembers(
+      String pkgName, List<RoutineDecl> packageVars) {
+    final members = <StoredRoutine>[];
+    while (!_checkWord('END') && !_isAtEnd()) {
+      if (_matchWord('PROCEDURE')) {
+        members.add(_parsePackageRoutine(pkgName, false));
+      } else if (_matchWord('FUNCTION')) {
+        members.add(_parsePackageRoutine(pkgName, true));
+      } else if (_checkWord('BEGIN')) {
+        // Package initialization block — not executed; parse and discard.
+        _parsePlsqlBody(const []);
+      } else if (_checkWord('TYPE') ||
+          _checkWord('SUBTYPE') ||
+          _checkWord('CURSOR') ||
+          _checkWord('PRAGMA')) {
+        // Non-variable declaration — not modelled; skip to ';'.
+        _skipToSemicolon();
+      } else {
+        // Package-level variable/constant: `name [CONSTANT] type [:= expr];`.
+        final name = _expectIdent().text;
+        _matchWord('CONSTANT');
+        _consumeRoutineType();
+        _matchKw('NOT') && _matchKw('NULL');
+        String? init;
+        if (_check(TokType.op, ':=')) {
+          _advance();
+          init = _captureRoutineExpr(const {});
+        } else if (_matchKw('DEFAULT')) {
+          init = _captureRoutineExpr(const {});
+        }
+        _match(TokType.punct, ';');
+        packageVars.add(RoutineDecl(name, initSql: init));
+      }
+    }
+    _expectWord('END');
+    if (_check(TokType.ident)) _advance(); // optional package name
+    _match(TokType.punct, ';');
+    return members;
+  }
+
+  StoredRoutine _parsePackageRoutine(String pkgName, bool isFunction) {
+    final memberName = _expectIdent().text;
+    final params = _parseRoutineParams();
+    String? returnType;
+    if (isFunction) {
+      if (!_matchWord('RETURNS')) _matchWord('RETURN');
+      returnType = _consumeRoutineType();
+    }
+    if (!_matchWord('IS')) _expectWord('AS');
+    final decls = _parsePlsqlDeclarations();
+    final block = _parsePlsqlBody(decls);
+    return StoredRoutine('$pkgName.$memberName', params, block,
+        isFunction: isFunction, returnType: returnType);
+  }
+
+  void _skipToSemicolon() {
+    var depth = 0;
+    while (!_isAtEnd()) {
+      if (_check(TokType.punct, '(')) {
+        depth++;
+      } else if (_check(TokType.punct, ')')) {
+        if (depth > 0) depth--;
+      } else if (depth == 0 && _check(TokType.punct, ';')) {
+        _advance();
+        return;
+      }
+      _advance();
+    }
+  }
+
+  /// Consume a SQL type (`INT`, `VARCHAR(50)`, `DECIMAL(10,2)` …) and return its
+  /// text. Only used for metadata; the engine does not enforce routine types.
+  String _consumeRoutineType() {
+    final start = _peek().offset;
+    _advance(); // base type word
+    // Anchored declarations: table.column%TYPE / var%ROWTYPE. Consume any
+    // dotted name parts followed by the %TYPE / %ROWTYPE suffix.
+    while (_check(TokType.punct, '.')) {
+      _advance(); // .
+      if (!_isAtEnd()) _advance(); // name part
+    }
+    if (_peek().text == '%') {
+      _advance(); // %
+      if (!_isAtEnd()) _advance(); // TYPE / ROWTYPE
+    }
+    if (_check(TokType.punct, '(')) {
+      var depth = 0;
+      do {
+        final t = _advance();
+        if (t.type == TokType.punct && t.text == '(') depth++;
+        if (t.type == TokType.punct && t.text == ')') depth--;
+      } while (depth > 0 && !_isAtEnd());
+    }
+    while (_matchWord('UNSIGNED') ||
+        _matchWord('ZEROFILL') ||
+        _matchWord('PRECISION')) {}
+    return _sliceSource(start, _peek().offset).trim();
+  }
+
+  /// Skip MySQL routine characteristics (DETERMINISTIC, SQL SECURITY, …) that
+  /// may appear between the signature and the body.
+  void _consumeRoutineCharacteristics() {
+    while (true) {
+      if (_matchKw('NOT')) {
+        _matchWord('DETERMINISTIC');
+        continue;
+      }
+      if (_matchWord('DETERMINISTIC')) continue;
+      if (_matchWord('CONTAINS') || _matchWord('LANGUAGE')) {
+        _matchWord('SQL');
+        continue;
+      }
+      if (_matchWord('NO')) {
+        _matchWord('SQL');
+        continue;
+      }
+      if (_matchWord('READS') || _matchWord('MODIFIES')) {
+        _matchWord('SQL');
+        _matchWord('DATA');
+        continue;
+      }
+      if (_matchWord('SQL')) {
+        _matchWord('SECURITY');
+        _matchWord('DEFINER') || _matchWord('INVOKER');
+        continue;
+      }
+      if (_matchWord('COMMENT')) {
+        _expect(TokType.string);
+        continue;
+      }
+      break;
+    }
+  }
+
+  RoutineBlock _parseRoutineBody() {
+    if (_matchWord('BEGIN')) {
+      final decls = <RoutineDecl>[];
+      final body = <RoutineStmt>[];
+      while (!_checkWord('END') && !_isAtEnd()) {
+        final s = _parseRoutineStmt(decls);
+        if (s != null) body.add(s);
+      }
+      _expectWord('END');
+      if (_check(TokType.ident)) _advance(); // optional end label
+      _match(TokType.punct, ';');
+      return RoutineBlock(body, declarations: decls);
+    }
+    final decls = <RoutineDecl>[];
+    final s = _parseRoutineStmt(decls);
+    return RoutineBlock(s == null ? const [] : [s], declarations: decls);
+  }
+
+  RoutineStmt? _parseRoutineStmt(List<RoutineDecl> decls) {
+    // Optional statement label: `name: LOOP|WHILE|REPEAT`.
+    if (_check(TokType.ident) &&
+        _peek(1).type == TokType.punct &&
+        _peek(1).text == ':') {
+      _advance();
+      _advance();
+    }
+    if (_checkWord('BEGIN')) return _parseRoutineBody();
+    if (_matchWord('DECLARE')) {
+      _parseRoutineDeclare(decls);
+      return null;
+    }
+    if (_matchWord('SET')) return _parseRoutineSet();
+    if (_checkWord('IF')) return _parseRoutineIf();
+    if (_checkWord('WHILE')) return _parseRoutineWhile();
+    if (_checkWord('LOOP')) return _parseRoutineLoop();
+    if (_checkWord('REPEAT')) return _parseRoutineRepeat();
+    if (_matchWord('LEAVE')) {
+      if (_check(TokType.ident)) _advance(); // label
+      _match(TokType.punct, ';');
+      return RoutineExit();
+    }
+    if (_matchWord('ITERATE')) {
+      if (_check(TokType.ident)) _advance();
+      _match(TokType.punct, ';');
+      return null; // ITERATE not yet supported — treated as a no-op
+    }
+    if (_matchWord('RETURN')) {
+      if (_match(TokType.punct, ';')) return RoutineReturn();
+      final e = _captureRoutineExpr(const {});
+      _match(TokType.punct, ';');
+      return RoutineReturn(exprSql: e);
+    }
+    return _parseRoutineEmbedded();
+  }
+
+  void _parseRoutineDeclare(List<RoutineDecl> decls) {
+    final names = <String>[_expectIdent().text];
+    while (_match(TokType.punct, ',')) {
+      names.add(_expectIdent().text);
+    }
+    _consumeRoutineType();
+    String? init;
+    if (_matchKw('DEFAULT')) {
+      init = _captureRoutineExpr(const {});
+    }
+    _match(TokType.punct, ';');
+    for (final n in names) {
+      decls.add(RoutineDecl(n, initSql: init));
+    }
+  }
+
+  RoutineStmt _parseRoutineSet() {
+    final assigns = <RoutineStmt>[];
+    do {
+      final target = _expectIdent().text;
+      _expect(TokType.op, '=');
+      assigns.add(RoutineAssign(target, _captureRoutineExpr(const {})));
+    } while (_match(TokType.punct, ','));
+    _match(TokType.punct, ';');
+    return assigns.length == 1 ? assigns.first : RoutineBlock(assigns);
+  }
+
+  RoutineStmt _parseRoutineIf() {
+    _expectWord('IF');
+    final branches = <RoutineBranch>[
+      RoutineBranch(_captureRoutineExpr({'THEN'}), _thenBody())
+    ];
+    while (_matchWord('ELSEIF')) {
+      branches.add(RoutineBranch(_captureRoutineExpr({'THEN'}), _thenBody()));
+    }
+    var elseBody = const <RoutineStmt>[];
+    if (_matchWord('ELSE')) {
+      elseBody = _parseRoutineStmtsUntil({'END'});
+    }
+    _expectWord('END');
+    _expectWord('IF');
+    _match(TokType.punct, ';');
+    return RoutineIf(branches, elseBody: elseBody);
+  }
+
+  List<RoutineStmt> _thenBody() {
+    _expectWord('THEN');
+    return _parseRoutineStmtsUntil({'ELSEIF', 'ELSE', 'END'});
+  }
+
+  RoutineStmt _parseRoutineWhile() {
+    _expectWord('WHILE');
+    final cond = _captureRoutineExpr({'DO'});
+    _expectWord('DO');
+    final body = _parseRoutineStmtsUntil({'END'});
+    _expectWord('END');
+    _expectWord('WHILE');
+    if (_check(TokType.ident)) _advance();
+    _match(TokType.punct, ';');
+    return RoutineWhile(cond, body);
+  }
+
+  RoutineStmt _parseRoutineLoop() {
+    _expectWord('LOOP');
+    final body = _parseRoutineStmtsUntil({'END'});
+    _expectWord('END');
+    _expectWord('LOOP');
+    if (_check(TokType.ident)) _advance();
+    _match(TokType.punct, ';');
+    return RoutineLoop(body);
+  }
+
+  RoutineStmt _parseRoutineRepeat() {
+    _expectWord('REPEAT');
+    final body = _parseRoutineStmtsUntil({'UNTIL'});
+    _expectWord('UNTIL');
+    final cond = _captureRoutineExpr({'END'});
+    _expectWord('END');
+    _expectWord('REPEAT');
+    if (_check(TokType.ident)) _advance();
+    _match(TokType.punct, ';');
+    // REPEAT runs the body then exits once UNTIL is true.
+    return RoutineLoop([...body, RoutineExit(whenSql: cond)]);
+  }
+
+  List<RoutineStmt> _parseRoutineStmtsUntil(Set<String> stops) {
+    final out = <RoutineStmt>[];
+    final decls = <RoutineDecl>[];
+    while (!_isAtEnd() && !stops.contains(_peek().upper)) {
+      final s = _parseRoutineStmt(decls);
+      if (s != null) out.add(s);
+    }
+    return out;
+  }
+
+  /// Parse an embedded SQL statement inside a routine, up to the next top-level
+  /// `;`. A `SELECT … INTO vars …` becomes a [RoutineSelectInto]; a bare SELECT
+  /// becomes a result-producing [RoutineSelect]; anything else is [RoutineSql].
+  RoutineStmt _parseRoutineEmbedded() {
+    final startOff = _peek().offset;
+    final isSelect = _checkWord('SELECT');
+    var depth = 0;
+    int? intoTokIdx;
+    int? fromTokIdx;
+    int? bulkTokIdx;
+    while (!_isAtEnd() && !(depth == 0 && _check(TokType.punct, ';'))) {
+      final t = _peek();
+      if (t.type == TokType.punct && t.text == '(') {
+        depth++;
+      } else if (t.type == TokType.punct && t.text == ')') {
+        depth--;
+      } else if (depth == 0 && isSelect) {
+        if (bulkTokIdx == null && t.upper == 'BULK') bulkTokIdx = _pos;
+        if (intoTokIdx == null && t.upper == 'INTO') intoTokIdx = _pos;
+        if (fromTokIdx == null && t.upper == 'FROM') fromTokIdx = _pos;
+      }
+      _advance();
+    }
+    final endOff = _peek().offset;
+    _match(TokType.punct, ';');
+
+    if (isSelect && intoTokIdx != null) {
+      final intoTok = _tokens[intoTokIdx];
+      final fromTok = fromTokIdx != null ? _tokens[fromTokIdx] : null;
+      // `SELECT … BULK COLLECT INTO coll …`: the query text stops before the
+      // BULK COLLECT marker (the selected column(s) land in the collection).
+      final qEndTok = bulkTokIdx != null ? _tokens[bulkTokIdx] : intoTok;
+      final q1 = _sliceRoutine(startOff, qEndTok.offset);
+      final q2 =
+          fromTok != null ? ' ${_sliceRoutine(fromTok.offset, endOff)}' : '';
+      final intoVars = <String>[];
+      final varEnd = fromTokIdx ?? _tokenIndexAtOffset(endOff);
+      for (var i = intoTokIdx + 1; i < varEnd; i++) {
+        final t = _tokens[i];
+        if (t.type == TokType.ident) intoVars.add(t.text);
+      }
+      return RoutineSelectInto('$q1$q2', intoVars);
+    }
+    final sql = _sliceRoutine(startOff, endOff);
+    return isSelect ? RoutineSelect(sql) : RoutineSql(sql);
+  }
+
+  int _tokenIndexAtOffset(int offset) {
+    for (var i = 0; i < _tokens.length; i++) {
+      if (_tokens[i].offset >= offset) return i;
+    }
+    return _tokens.length;
+  }
+
+  /// Capture a routine expression (with locals rewritten to `:name`) from the
+  /// current position up to a top-level `;`, `,`, or any word in [stopUpper].
+  String _captureRoutineExpr(Set<String> stopUpper) {
+    final startOff = _peek().offset;
+    var depth = 0;
+    while (!_isAtEnd()) {
+      final t = _peek();
+      if (t.type == TokType.punct && t.text == '(') {
+        depth++;
+      } else if (t.type == TokType.punct && t.text == ')') {
+        if (depth == 0) break;
+        depth--;
+      } else if (depth == 0) {
+        if (t.type == TokType.punct && (t.text == ';' || t.text == ',')) break;
+        if (t.type == TokType.op && t.text == '..') break; // PL/SQL FOR range
+        if ((t.type == TokType.keyword || t.type == TokType.ident) &&
+            stopUpper.contains(t.upper)) {
+          break;
+        }
+      }
+      _advance();
+    }
+    return _sliceRoutine(startOff, _peek().offset);
+  }
+
+  /// Reconstruct a routine SQL fragment from its tokens, verbatim. Local
+  /// variables are left as bare identifiers; the interpreter resolves them at
+  /// run time via [ColumnExpr.routineScopes], so value-position references
+  /// become variables while column-position identifiers stay columns.
+  String _sliceRoutine(int startOffset, int endOffset) =>
+      _sliceSource(startOffset, endOffset);
+
+  // ---- CALL ---------------------------------------------------------------
+  CallStmt _parseCall() {
+    _expectWord('CALL');
+    var name = _expectIdent().text;
+    // Qualified `CALL pkg.proc(args)`.
+    if (_match(TokType.punct, '.')) {
+      name = '$name.${_expectName()}';
+    }
+    final args = <Expr>[];
+    if (_match(TokType.punct, '(')) {
+      if (!_check(TokType.punct, ')')) {
+        args.add(_parseCallArg());
+        while (_match(TokType.punct, ',')) {
+          args.add(_parseCallArg());
+        }
+      }
+      _expect(TokType.punct, ')');
+    }
+    return CallStmt(name, args);
+  }
+
+  /// A call argument: a positional `expr` or an Oracle named argument
+  /// `name => expr` (the name is dropped; the value is kept positionally).
+  Expr _parseCallArg() {
+    // The arg name may be an ident or a keyword (e.g. `cascade => TRUE`).
+    if (_peek(1).type == TokType.op && _peek(1).text == '=>') {
+      _advance(); // argument name
+      _advance(); // =>
+    }
+    return _parseExpr();
+  }
+
+  // ---- PL/SQL (Oracle anonymous blocks & routine bodies) ------------------
+  PlsqlBlockStmt _parsePlsqlBlock() {
+    final decls = <RoutineDecl>[];
+    if (_matchWord('DECLARE')) decls.addAll(_parsePlsqlDeclarations());
+    final block = _parsePlsqlBody(decls);
+    return PlsqlBlockStmt(block);
+  }
+
+  /// Parse PL/SQL declarations (`name [CONSTANT] type [:= expr | DEFAULT expr];`)
+  /// up to the `BEGIN` that opens the executable section.
+  List<RoutineDecl> _parsePlsqlDeclarations() {
+    final decls = <RoutineDecl>[];
+    while (!_checkWord('BEGIN') && !_isAtEnd()) {
+      // PL/SQL type declarations (TYPE … IS TABLE OF / RECORD / REF CURSOR /
+      // VARRAY, and SUBTYPE / CURSOR / PRAGMA) are parsed and discarded.
+      if (_matchWord('TYPE') ||
+          _matchWord('SUBTYPE') ||
+          _matchWord('CURSOR') ||
+          _matchWord('PRAGMA')) {
+        _skipToSemicolon();
+        continue;
+      }
+      final name = _expectIdent().text;
+      _matchWord('CONSTANT');
+      _consumeRoutineType();
+      _matchKw('NOT') && _matchKw('NULL'); // tolerated, not enforced
+      String? init;
+      if (_check(TokType.op, ':=')) {
+        _advance();
+        init = _captureRoutineExpr(const {});
+      } else if (_matchKw('DEFAULT')) {
+        init = _captureRoutineExpr(const {});
+      }
+      _match(TokType.punct, ';');
+      decls.add(RoutineDecl(name, initSql: init));
+    }
+    return decls;
+  }
+
+  RoutineBlock _parsePlsqlBody(List<RoutineDecl> decls) {
+    _expectWord('BEGIN');
+    final body = <RoutineStmt>[];
+    while (!_checkWord('END') && !_checkWord('EXCEPTION') && !_isAtEnd()) {
+      final s = _parsePlsqlStmt();
+      if (s != null) body.add(s);
+    }
+    final handlers = <RoutineExceptionHandler>[];
+    if (_matchWord('EXCEPTION')) {
+      while (_matchWord('WHEN')) {
+        final names = <String>[_expectName().toUpperCase()];
+        while (_matchWord('OR')) {
+          names.add(_expectName().toUpperCase());
+        }
+        _expectWord('THEN');
+        final hbody = _parsePlsqlStmtsUntil({'WHEN', 'END'});
+        handlers.add(RoutineExceptionHandler(names, hbody));
+      }
+    }
+    _expectWord('END');
+    if (_check(TokType.ident)) _advance(); // optional end name
+    _match(TokType.punct, ';');
+    return RoutineBlock(body, declarations: decls, handlers: handlers);
+  }
+
+  RoutineStmt? _parsePlsqlStmt() {
+    if (_checkWord('DECLARE') || _checkWord('BEGIN')) {
+      final nested = <RoutineDecl>[];
+      if (_matchWord('DECLARE')) nested.addAll(_parsePlsqlDeclarations());
+      return _parsePlsqlBody(nested);
+    }
+    if (_matchWord('NULL')) {
+      _match(TokType.punct, ';');
+      return null;
+    }
+    if (_matchWord('IF')) return _parsePlsqlIf();
+    if (_matchWord('CASE')) return _parsePlsqlCase();
+    if (_matchWord('WHILE')) return _parsePlsqlWhile();
+    if (_matchWord('FOR')) return _parsePlsqlFor();
+    if (_matchWord('LOOP')) {
+      final body = _parsePlsqlStmtsUntil({'END'});
+      _expectWord('END');
+      _expectWord('LOOP');
+      if (_check(TokType.ident)) _advance();
+      _match(TokType.punct, ';');
+      return RoutineLoop(body);
+    }
+    if (_matchWord('EXIT')) {
+      if (_check(TokType.ident) && !_checkWord('WHEN')) _advance(); // label
+      String? when;
+      if (_matchWord('WHEN')) when = _captureRoutineExpr(const {});
+      _match(TokType.punct, ';');
+      return RoutineExit(whenSql: when);
+    }
+    if (_matchWord('RETURN')) {
+      if (_match(TokType.punct, ';')) return RoutineReturn();
+      final e = _captureRoutineExpr(const {});
+      _match(TokType.punct, ';');
+      return RoutineReturn(exprSql: e);
+    }
+    if (_matchWord('OPEN')) return _parsePlsqlOpen();
+    // RAISE exc; or bare RAISE; (re-raise). The SQLite `RAISE(action,...)`
+    // function form has a '(' and is left to expression parsing.
+    if (_checkWord('RAISE') &&
+        !(_peek(1).type == TokType.punct && _peek(1).text == '(')) {
+      _advance();
+      String? name;
+      if (_check(TokType.ident)) name = _advance().text;
+      _match(TokType.punct, ';');
+      return RoutineRaise(name);
+    }
+    // Assignment: `name := expr;`.
+    if (_check(TokType.ident) &&
+        _peek(1).type == TokType.op &&
+        _peek(1).text == ':=') {
+      final target = _advance().text;
+      _advance(); // :=
+      final e = _captureRoutineExpr(const {});
+      _match(TokType.punct, ';');
+      return RoutineAssign(target, e);
+    }
+    // DBMS_OUTPUT.PUT_LINE(expr);
+    if (_check(TokType.ident) &&
+        _peek().upper == 'DBMS_OUTPUT' &&
+        _peek(1).type == TokType.punct &&
+        _peek(1).text == '.') {
+      _advance(); // DBMS_OUTPUT
+      _advance(); // .
+      _advance(); // PUT_LINE (or PUT)
+      _expect(TokType.punct, '(');
+      final arg = _captureRoutineExpr(const {});
+      _expect(TokType.punct, ')');
+      _match(TokType.punct, ';');
+      return RoutinePrint(arg);
+    }
+    if (_checkWord('SELECT') ||
+        _checkWord('INSERT') ||
+        _checkWord('UPDATE') ||
+        _checkWord('DELETE') ||
+        _checkWord('MERGE')) {
+      return _parseRoutineEmbedded();
+    }
+    // Otherwise a procedure call: `proc(args);` or `proc;`.
+    return _parsePlsqlCall();
+  }
+
+  /// `OPEN cur FOR <select>;` — bind a ref cursor to the query's result set.
+  RoutineStmt _parsePlsqlOpen() {
+    final name = _expectIdent().text;
+    _expectWord('FOR');
+    final startOff = _peek().offset;
+    var depth = 0;
+    while (!_isAtEnd() && !(depth == 0 && _check(TokType.punct, ';'))) {
+      final t = _peek();
+      if (t.type == TokType.punct && t.text == '(') {
+        depth++;
+      } else if (t.type == TokType.punct && t.text == ')') {
+        depth--;
+      }
+      _advance();
+    }
+    final sql = _sliceRoutine(startOff, _peek().offset);
+    _match(TokType.punct, ';');
+    return RoutineOpen(name, sql);
+  }
+
+  RoutineStmt _parsePlsqlIf() {
+    final branches = <RoutineBranch>[
+      RoutineBranch(_captureRoutineExpr({'THEN'}), _plsqlThen())
+    ];
+    while (_matchWord('ELSIF')) {
+      branches.add(RoutineBranch(_captureRoutineExpr({'THEN'}), _plsqlThen()));
+    }
+    var elseBody = const <RoutineStmt>[];
+    if (_matchWord('ELSE')) {
+      elseBody = _parsePlsqlStmtsUntil({'END'});
+    }
+    _expectWord('END');
+    _expectWord('IF');
+    _match(TokType.punct, ';');
+    return RoutineIf(branches, elseBody: elseBody);
+  }
+
+  List<RoutineStmt> _plsqlThen() {
+    _expectWord('THEN');
+    return _parsePlsqlStmtsUntil({'ELSIF', 'ELSE', 'END'});
+  }
+
+  /// PL/SQL `CASE [selector] WHEN … THEN … [ELSE …] END CASE;` statement.
+  /// Simple CASE (with a selector) is lowered to searched branches of the
+  /// form `(selector) = (value)`. Reuses [RoutineIf] semantics.
+  RoutineStmt _parsePlsqlCase() {
+    String? selector;
+    if (!_checkWord('WHEN')) {
+      selector = _captureRoutineExpr({'WHEN'});
+    }
+    final branches = <RoutineBranch>[];
+    while (_matchWord('WHEN')) {
+      String cond;
+      if (selector != null) {
+        final val = _captureRoutineExpr({'THEN'});
+        cond = '($selector) = ($val)';
+      } else {
+        cond = _captureRoutineExpr({'THEN'});
+      }
+      _expectWord('THEN');
+      branches
+          .add(RoutineBranch(cond, _parsePlsqlStmtsUntil({'WHEN', 'ELSE', 'END'})));
+    }
+    var elseBody = const <RoutineStmt>[];
+    if (_matchWord('ELSE')) {
+      elseBody = _parsePlsqlStmtsUntil({'END'});
+    }
+    _expectWord('END');
+    _expectWord('CASE');
+    _match(TokType.punct, ';');
+    return RoutineIf(branches, elseBody: elseBody);
+  }
+
+  RoutineStmt _parsePlsqlWhile() {
+    final cond = _captureRoutineExpr({'LOOP'});
+    _expectWord('LOOP');
+    final body = _parsePlsqlStmtsUntil({'END'});
+    _expectWord('END');
+    _expectWord('LOOP');
+    if (_check(TokType.ident)) _advance();
+    _match(TokType.punct, ';');
+    return RoutineWhile(cond, body);
+  }
+
+  RoutineStmt _parsePlsqlFor() {
+    final varName = _expectIdent().text;
+    _expectWord('IN');
+    // Cursor FOR loop over a subquery: `FOR rec IN (SELECT …) LOOP`.
+    if (_check(TokType.punct, '(')) {
+      _advance(); // (
+      final startOff = _peek().offset;
+      var depth = 1;
+      while (!_isAtEnd() && depth > 0) {
+        final t = _peek();
+        if (t.type == TokType.punct && t.text == '(') {
+          depth++;
+        } else if (t.type == TokType.punct && t.text == ')') {
+          depth--;
+          if (depth == 0) break;
+        }
+        _advance();
+      }
+      final sql = _sliceRoutine(startOff, _peek().offset);
+      _expect(TokType.punct, ')');
+      _expectWord('LOOP');
+      final body = _parsePlsqlStmtsUntil({'END'});
+      _expectWord('END');
+      _expectWord('LOOP');
+      if (_check(TokType.ident)) _advance();
+      _match(TokType.punct, ';');
+      return RoutineForCursor(varName, sql, body);
+    }
+    final reverse = _matchWord('REVERSE');
+    final lower = _captureRoutineExpr(const {}); // stops at the `..` op
+    _expect(TokType.op, '..');
+    final upper = _captureRoutineExpr({'LOOP'});
+    _expectWord('LOOP');
+    final body = _parsePlsqlStmtsUntil({'END'});
+    _expectWord('END');
+    _expectWord('LOOP');
+    if (_check(TokType.ident)) _advance();
+    _match(TokType.punct, ';');
+    return RoutineForNumeric(varName, lower, upper, body, reverse: reverse);
+  }
+
+  RoutineStmt _parsePlsqlCall() {
+    final startOff = _peek().offset;
+    var depth = 0;
+    while (!_isAtEnd() && !(depth == 0 && _check(TokType.punct, ';'))) {
+      final t = _peek();
+      if (t.type == TokType.punct && t.text == '(') depth++;
+      if (t.type == TokType.punct && t.text == ')') depth--;
+      _advance();
+    }
+    final sql = _sliceRoutine(startOff, _peek().offset);
+    _match(TokType.punct, ';');
+    return RoutineSql('CALL $sql');
+  }
+
+  List<RoutineStmt> _parsePlsqlStmtsUntil(Set<String> stops) {
+    final out = <RoutineStmt>[];
+    while (!_isAtEnd() && !stops.contains(_peek().upper)) {
+      final s = _parsePlsqlStmt();
+      if (s != null) out.add(s);
+    }
+    return out;
   }
 
   // ---- ALTER --------------------------------------------------------------
   Statement _parseAlter() {
     _expectKw('ALTER');
+    if (_matchWord('SESSION')) {
+      // ALTER SESSION SET … — accepted and ignored.
+      while (!_isAtEnd() && !_check(TokType.punct, ';')) {
+        _advance();
+      }
+      return DdlNoopStmt('ALTER SESSION');
+    }
     _expectKw('TABLE');
     final table = _expectIdent().text;
     if (_matchKw('RENAME')) {
@@ -1062,14 +3060,101 @@ class Parser {
       final newName = _expectIdent().text;
       return AlterTableRenameColumnStmt(table, oldName, newName);
     }
+    if (_matchWord('MODIFY')) {
+      // MODIFY CONSTRAINT <name> ENABLE/DISABLE … toggles constraint state;
+      // MODIFY (col …) / MODIFY col … changes column attributes.
+      if (_matchWord('CONSTRAINT')) {
+        final cname = _expectName();
+        bool? enable;
+        while (!_isAtEnd() && !_check(TokType.punct, ';')) {
+          final u = _peek().upper;
+          if (u == 'ENABLE') enable = true;
+          if (u == 'DISABLE') enable = false;
+          _advance();
+        }
+        if (enable != null) {
+          return AlterTableSetConstraintStmt(table, cname, enable);
+        }
+        return DdlNoopStmt('ALTER TABLE MODIFY');
+      }
+      final mparen = _match(TokType.punct, '(');
+      final mcols = <ColumnDef>[_parseColumnDef()];
+      while (_match(TokType.punct, ',')) {
+        mcols.add(_parseColumnDef());
+      }
+      if (mparen) _expect(TokType.punct, ')');
+      return AlterTableModifyColumnStmt(table, mcols);
+    }
+    if (_checkWord('DISABLE') || _checkWord('ENABLE')) {
+      final enable = _peek().upper == 'ENABLE';
+      _advance();
+      _matchWord('VALIDATE');
+      _matchWord('NOVALIDATE');
+      if (_matchWord('CONSTRAINT')) {
+        final cname = _expectName();
+        while (!_isAtEnd() && !_check(TokType.punct, ';')) {
+          _advance();
+        }
+        return AlterTableSetConstraintStmt(table, cname, enable);
+      }
+      // DISABLE/ENABLE ROW MOVEMENT / etc. — accept and ignore.
+      while (!_isAtEnd() && !_check(TokType.punct, ';')) {
+        _advance();
+      }
+      return DdlNoopStmt('ALTER TABLE');
+    }
     if (_matchKw('DROP')) {
+      if (_matchWord('CONSTRAINT')) {
+        return AlterTableDropConstraintStmt(table, _expectName());
+      }
+      // DROP PRIMARY KEY — remove the table's primary-key constraint.
+      if (_matchKw('PRIMARY')) {
+        _expectKw('KEY');
+        return AlterTableDropConstraintStmt(table, '__PRIMARY__');
+      }
       _matchKw('COLUMN');
       return AlterTableDropColumnStmt(table, _expectIdent().text);
     }
     _expectKw('ADD');
+    // Oracle/standard `ADD [(] <constraint>[, …] [)]` — distinguished from an
+    // `ADD [COLUMN] <coldef>` by a leading constraint keyword.
+    final paren = _match(TokType.punct, '(');
+    bool atConstraint() =>
+        _checkWord('CONSTRAINT') ||
+        _checkKw('PRIMARY') ||
+        _checkKw('UNIQUE') ||
+        _checkKw('CHECK') ||
+        _checkKw('FOREIGN');
+    if (atConstraint()) {
+      final cons = <TableConstraint>[_parseTableConstraint()];
+      _skipConstraintState();
+      while (_match(TokType.punct, ',') && atConstraint()) {
+        cons.add(_parseTableConstraint());
+        _skipConstraintState();
+      }
+      if (paren) _expect(TokType.punct, ')');
+      return AlterTableAddConstraintStmt(table, cons);
+    }
     _matchKw('COLUMN');
-    final col = _parseColumnDef();
-    return AlterTableAddColumnStmt(table, col);
+    final cols = <ColumnDef>[_parseColumnDef()];
+    // `ADD (a …, b …)` adds every column in the parenthesised list.
+    while (paren && _match(TokType.punct, ',')) {
+      cols.add(_parseColumnDef());
+    }
+    if (paren) _expect(TokType.punct, ')');
+    return AlterTableAddColumnStmt(table, cols);
+  }
+
+  /// `COMMENT ON TABLE/COLUMN <name> IS '<text>'` — accepted as a no-op.
+  CommentStmt _parseComment() {
+    _expectWord('COMMENT');
+    _expectWord('ON');
+    // TABLE <name> | COLUMN <table.col> | any object-type keyword then a name.
+    _advance(); // object type (TABLE / COLUMN / INDEX / …)
+    _parseQualifiedTableName(); // object name (possibly dotted)
+    _expectWord('IS');
+    _advance(); // the comment string literal (or NULL)
+    return CommentStmt();
   }
 
   TruncateTableStmt _parseTruncate() {
@@ -1149,9 +3234,60 @@ class Parser {
     return _parseInsertTail(InsertMode.orReplace);
   }
 
+  // ---- INSERT ALL / INSERT FIRST (Oracle multi-table insert) --------------
+  InsertAllStmt _parseInsertAll() {
+    _expectKw('INSERT');
+    final first = _matchWord('FIRST');
+    if (!first) _expectWord('ALL');
+    final clauses = <InsertAllClause>[];
+    if (_checkKw('WHEN')) {
+      while (_matchKw('WHEN')) {
+        final cond = _parseExpr();
+        _expectKw('THEN');
+        clauses.add(InsertAllClause(cond, false, _parseInsertAllIntos()));
+      }
+      if (_matchKw('ELSE')) {
+        clauses.add(InsertAllClause(null, true, _parseInsertAllIntos()));
+      }
+    } else {
+      clauses.add(InsertAllClause(null, false, _parseInsertAllIntos()));
+    }
+    final select = _parseSelect();
+    return InsertAllStmt(first, clauses, select);
+  }
+
+  List<InsertAllInto> _parseInsertAllIntos() {
+    final intos = <InsertAllInto>[];
+    while (_matchKw('INTO')) {
+      final table = _parseQualifiedTableName();
+      List<String>? cols;
+      if (_match(TokType.punct, '(')) {
+        cols = <String>[_expectName()];
+        while (_match(TokType.punct, ',')) {
+          cols.add(_expectName());
+        }
+        _expect(TokType.punct, ')');
+      }
+      List<Expr>? values;
+      if (_matchKw('VALUES')) {
+        _expect(TokType.punct, '(');
+        values = <Expr>[_parseExpr()];
+        while (_match(TokType.punct, ',')) {
+          values.add(_parseExpr());
+        }
+        _expect(TokType.punct, ')');
+      }
+      intos.add(InsertAllInto(table, cols, values));
+    }
+    if (intos.isEmpty) {
+      throw const FormatException('Expected INTO in INSERT ALL/FIRST');
+    }
+    return intos;
+  }
+
   InsertStmt _parseInsertTail(InsertMode mode) {
     _expectKw('INTO');
-    final table = _expectIdent().text;
+    final table = _parseQualifiedTableName();
     List<String>? cols;
     if (_match(TokType.punct, '(')) {
       cols = [_expectIdent().text];
@@ -1283,13 +3419,139 @@ class Parser {
   }
 
   // ---- UPDATE -------------------------------------------------------------
+  // ---- MERGE --------------------------------------------------------------
+  MergeStmt _parseMerge() {
+    _expectWord('MERGE');
+    _expectKw('INTO');
+    final target = _expectIdent().text;
+    String? targetAlias;
+    if (_matchKw('AS')) {
+      targetAlias = _expectName();
+    } else if (_check(TokType.ident) && !_checkKw('USING')) {
+      targetAlias = _advance().text;
+    }
+    _expectWord('USING');
+    String? sourceTable;
+    SelectStmt? sourceSub;
+    if (_match(TokType.punct, '(')) {
+      sourceSub = _parseSelect();
+      _expect(TokType.punct, ')');
+    } else {
+      sourceTable = _parseQualifiedTableName();
+    }
+    String? sourceAlias;
+    if (_matchKw('AS')) {
+      sourceAlias = _expectName();
+    } else if (_check(TokType.ident) && !_checkKw('ON')) {
+      sourceAlias = _advance().text;
+    }
+    _expectKw('ON');
+    // ON condition is typically parenthesised; accept both.
+    final Expr on;
+    if (_match(TokType.punct, '(')) {
+      on = _parseExpr();
+      _expect(TokType.punct, ')');
+    } else {
+      on = _parseExpr();
+    }
+
+    Map<String, Expr>? matchedAssignments;
+    Expr? matchedWhere;
+    Expr? matchedDeleteWhere;
+    List<String>? insertColumns;
+    List<Expr>? insertValues;
+    Expr? notMatchedWhere;
+
+    while (_matchKw('WHEN')) {
+      final notMatched = _matchKw('NOT');
+      _expectWord('MATCHED');
+      _expectKw('THEN');
+      if (notMatched) {
+        _expectWord('INSERT');
+        if (_match(TokType.punct, '(')) {
+          insertColumns = <String>[_expectName()];
+          while (_match(TokType.punct, ',')) {
+            insertColumns.add(_expectName());
+          }
+          _expect(TokType.punct, ')');
+        }
+        _expectKw('VALUES');
+        _expect(TokType.punct, '(');
+        insertValues = <Expr>[_parseExpr()];
+        while (_match(TokType.punct, ',')) {
+          insertValues.add(_parseExpr());
+        }
+        _expect(TokType.punct, ')');
+        if (_matchKw('WHERE')) notMatchedWhere = _parseExpr();
+      } else {
+        _expectKw('UPDATE');
+        _expectKw('SET');
+        matchedAssignments = <String, Expr>{};
+        do {
+          var col = _expectIdent().text;
+          // Accept an alias-qualified target column (`SET t.v = …`); the alias
+          // refers to the target table, so drop it.
+          if (_match(TokType.punct, '.')) {
+            col = _expectIdent().text;
+          }
+          _expect(TokType.op, '=');
+          matchedAssignments[col] = _parseExpr();
+        } while (_match(TokType.punct, ','));
+        if (_matchKw('WHERE')) matchedWhere = _parseExpr();
+        // Oracle `... UPDATE SET … [WHERE …] DELETE WHERE <cond>`: the DELETE
+        // sub-clause removes matched rows that satisfy its predicate.
+        if (_matchKw('DELETE')) {
+          _expectKw('WHERE');
+          matchedDeleteWhere = _parseExpr();
+        }
+      }
+    }
+    if (matchedAssignments == null && insertValues == null) {
+      throw const FormatException(
+        'MERGE requires at least one WHEN MATCHED or WHEN NOT MATCHED clause',
+      );
+    }
+    return MergeStmt(
+      targetTable: target,
+      targetAlias: targetAlias,
+      sourceTable: sourceTable,
+      sourceSubquery: sourceSub,
+      sourceAlias: sourceAlias,
+      onCondition: on,
+      matchedAssignments: matchedAssignments,
+      matchedWhere: matchedWhere,
+      matchedDeleteWhere: matchedDeleteWhere,
+      insertColumns: insertColumns,
+      insertValues: insertValues,
+      notMatchedWhere: notMatchedWhere,
+    );
+  }
+
   UpdateStmt _parseUpdate() {
     _expectKw('UPDATE');
-    final table = _expectIdent().text;
+    final table = _parseQualifiedTableName();
     final hint = _consumeIndexedHint();
     _expectKw('SET');
     final assignments = <String, Expr>{};
     do {
+      // Oracle multi-column form: `SET (a, b) = (SELECT …)` assigns each column
+      // from the matching element of a single-row subquery.
+      if (_check(TokType.punct, '(')) {
+        _advance(); // (
+        final cols = <String>[_expectIdent().text];
+        while (_match(TokType.punct, ',')) {
+          cols.add(_expectIdent().text);
+        }
+        _expect(TokType.punct, ')');
+        _expect(TokType.op, '=');
+        _expect(TokType.punct, '(');
+        final sub = SubquerySelectExpr(_parseSelect());
+        _expect(TokType.punct, ')');
+        for (var i = 0; i < cols.length; i++) {
+          assignments[cols[i]] = RowElementExpr(sub, i);
+        }
+        continue;
+      }
       final col = _expectIdent().text;
       _expect(TokType.op, '=');
       assignments[col] = _parseExpr();
@@ -1335,7 +3597,7 @@ class Parser {
   DeleteStmt _parseDelete() {
     _expectKw('DELETE');
     _expectKw('FROM');
-    final table = _expectIdent().text;
+    final table = _parseQualifiedTableName();
     final hint = _consumeIndexedHint();
     Expr? where;
     if (_matchKw('WHERE')) where = _parseExpr();
@@ -1368,8 +3630,35 @@ class Parser {
     final ctes = <String, SelectStmt>{};
     final cteColumns = <String, List<String>>{};
     final cteMaterialized = <String, bool>{};
-    do {
-      final name = _expectIdent().text;
+    // Oracle inline PL/SQL: `WITH FUNCTION f(...) RETURN t IS ... END; … SELECT`.
+    final withFns = <StoredRoutine>[];
+    while (_checkWord('FUNCTION') || _checkWord('PROCEDURE')) {
+      final isFn = _matchWord('FUNCTION');
+      if (!isFn) _matchWord('PROCEDURE');
+      final fname = _expectIdent().text;
+      final params = _parseRoutineParams();
+      String? returnType;
+      if (isFn) {
+        if (!_matchWord('RETURNS')) _matchWord('RETURN');
+        returnType = _consumeRoutineType();
+      }
+      RoutineBlock block;
+      if (_matchWord('IS') || _matchWord('AS')) {
+        final decls = _parsePlsqlDeclarations();
+        block = _parsePlsqlBody(decls);
+      } else {
+        _consumeRoutineCharacteristics();
+        block = _parseRoutineBody();
+      }
+      withFns.add(StoredRoutine(fname, params, block,
+          isFunction: isFn, returnType: returnType));
+      _match(TokType.punct, ';');
+      _match(TokType.punct, ',');
+    }
+    // Named CTEs (optional when only inline functions precede the query).
+    if (_check(TokType.ident)) {
+      do {
+        final name = _expectIdent().text;
       // Optional column list. When present, used to rename the CTE's
       // projected columns (necessary for WITH RECURSIVE so the recursive
       // arm can reference them by name).
@@ -1393,7 +3682,33 @@ class Parser {
       final body = _parseSelect();
       _expect(TokType.punct, ')');
       ctes[name] = body;
-    } while (_match(TokType.punct, ','));
+      // Oracle recursive-WITH SEARCH / CYCLE clauses — parsed and ignored (the
+      // ordering/cycle-mark columns are not materialised).
+      if (_matchWord('SEARCH')) {
+        if (!_matchWord('DEPTH')) _matchWord('BREADTH');
+        _matchWord('FIRST');
+        _matchWord('BY');
+        _parseOrderByItem();
+        while (_match(TokType.punct, ',')) {
+          _parseOrderByItem();
+        }
+        _matchWord('SET');
+        _expectName();
+      }
+      if (_matchWord('CYCLE')) {
+        _expectName();
+        while (_match(TokType.punct, ',')) {
+          _expectName();
+        }
+        _matchWord('SET');
+        _expectName();
+        _matchWord('TO');
+        _parsePrimary();
+        _matchWord('DEFAULT');
+        _parsePrimary();
+      }
+      } while (_match(TokType.punct, ','));
+    }
 
     final t = _peek();
     if (t.type != TokType.keyword) {
@@ -1421,6 +3736,7 @@ class Parser {
           cteColumns: cteColumns,
           ctesRecursive: recursive,
           cteMaterialized: cteMaterialized,
+          withFunctions: withFns,
         );
       case 'INSERT':
         final s = _parseInsert();
@@ -1475,6 +3791,14 @@ class Parser {
     while (_match(TokType.punct, ',')) {
       items.add(_parseSelectItem());
     }
+    // PL/SQL `RETURNING ... INTO var[, var]`: consume the bind-variable
+    // targets (the values are surfaced via the statement's RETURNING result).
+    if (_matchWord('INTO')) {
+      _parseExpr();
+      while (_match(TokType.punct, ',')) {
+        _parseExpr();
+      }
+    }
     return items;
   }
 
@@ -1483,6 +3807,14 @@ class Parser {
     if (_checkKw('VALUES')) {
       return _parseValuesAsSelect();
     }
+    // A subquery / derived table may itself start with a WITH clause
+    // (`FROM (WITH x AS (...) SELECT ... FROM x)`). Delegate to the WITH parser
+    // and keep the resulting SELECT (with its CTE bindings attached).
+    if (_checkKw('WITH')) {
+      final w = _parseWith();
+      if (w is SelectStmt) return w;
+      throw FormatException('Expected SELECT after WITH in subquery');
+    }
     final base = _parseSimpleSelect();
     String? setOp;
     SelectStmt? right;
@@ -1490,10 +3822,14 @@ class Parser {
       setOp = _matchKw('ALL') ? 'UNION ALL' : 'UNION';
       right = _parseSelect();
     } else if (_matchKw('INTERSECT')) {
-      setOp = 'INTERSECT';
+      setOp = _matchKw('ALL') ? 'INTERSECT ALL' : 'INTERSECT';
       right = _parseSelect();
     } else if (_matchKw('EXCEPT')) {
-      setOp = 'EXCEPT';
+      setOp = _matchKw('ALL') ? 'EXCEPT ALL' : 'EXCEPT';
+      right = _parseSelect();
+    } else if (_matchWord('MINUS')) {
+      // Oracle MINUS is a synonym for EXCEPT (distinct set difference).
+      setOp = _matchKw('ALL') ? 'EXCEPT ALL' : 'EXCEPT';
       right = _parseSelect();
     }
     if (setOp == null) return base;
@@ -1556,14 +3892,18 @@ class Parser {
     int? limit;
     int? offset;
     if (_matchKw('LIMIT')) {
-      limit = int.parse(_expect(TokType.number).text);
+      final lim = _parseSignedInt();
       if (_match(TokType.punct, ',')) {
-        offset = limit;
-        limit = int.parse(_expect(TokType.number).text);
+        offset = lim < 0 ? 0 : lim;
+        final cnt = _parseSignedInt();
+        limit = cnt < 0 ? null : cnt;
+      } else {
+        limit = lim < 0 ? null : lim;
       }
     }
     if (_matchKw('OFFSET')) {
-      offset = int.parse(_expect(TokType.number).text);
+      final off = _parseSignedInt();
+      offset = off < 0 ? 0 : off;
     }
     SelectStmt makeArm(List<Expr> vals, {bool nameCols = false}) {
       final proj = <SelectItem>[];
@@ -1605,6 +3945,37 @@ class Parser {
     );
   }
 
+  /// Shreds a `TABLE(collection)` operand into a derived table with one
+  /// `COLUMN_VALUE` row per collection element (the constructor's arguments).
+  SelectStmt _parseTableCollection() {
+    final inner = _parseExpr();
+    final elems = inner is FunctionCallExpr ? inner.args : <Expr>[inner];
+    List<SelectItem> arm(Expr e) =>
+        [SelectItem.expr(e, alias: 'COLUMN_VALUE')];
+    if (elems.isEmpty) {
+      return SelectStmt(
+        projection: [SelectItem.expr(LiteralExpr(null), alias: 'COLUMN_VALUE')],
+        where: LiteralExpr(0),
+        orderBy: const [],
+      );
+    }
+    SelectStmt? tail;
+    for (var i = elems.length - 1; i >= 1; i--) {
+      tail = SelectStmt(
+        projection: arm(elems[i]),
+        orderBy: const [],
+        setOp: tail == null ? null : 'UNION ALL',
+        setOpRight: tail,
+      );
+    }
+    return SelectStmt(
+      projection: arm(elems.first),
+      orderBy: const [],
+      setOp: elems.length == 1 ? null : 'UNION ALL',
+      setOpRight: tail,
+    );
+  }
+
   SelectStmt _parseSimpleSelect() {
     _expectKw('SELECT');
     final distinct = _matchKw('DISTINCT');
@@ -1617,11 +3988,31 @@ class Parser {
     String? fromAlias;
     FunctionCallExpr? fromFunc;
     IndexHint? fromIndexHint;
+    MatchRecognizeClause? fromMatchRecognize;
     final joins = <JoinClause>[];
     if (_matchKw('FROM')) {
       if (_match(TokType.punct, '(')) {
         fromSub = _parseSelect();
         _expect(TokType.punct, ')');
+      } else if (_checkWord('TABLE') &&
+          _peek(1).type == TokType.punct &&
+          _peek(1).text == '(') {
+        // Oracle `TABLE(collection)` unnesting: shred a collection constructor
+        // (e.g. SYS.ODCINUMBERLIST(10,20,30)) into one COLUMN_VALUE row each.
+        _advance(); // TABLE
+        _expect(TokType.punct, '(');
+        fromSub = _parseTableCollection();
+        _expect(TokType.punct, ')');
+      } else if (_checkWord('JSON_TABLE') &&
+          _peek(1).type == TokType.punct &&
+          _peek(1).text == '(') {
+        _advance(); // JSON_TABLE
+        fromSub = _parseJsonTableClause();
+      } else if (_checkWord('XMLTABLE') &&
+          _peek(1).type == TokType.punct &&
+          _peek(1).text == '(') {
+        _advance(); // XMLTABLE
+        fromSub = _parseXmlTableClause();
       } else {
         // Look ahead: an identifier immediately followed by `(` is a
         // table-valued function call (e.g. `json_each('[1,2]')`).
@@ -1635,15 +4026,95 @@ class Parser {
           fromTable = _parseQualifiedTableName();
         }
       }
-      if (_check(TokType.ident)) {
-        fromAlias = _advance().text;
-      } else if (_matchKw('AS')) {
+      // Oracle flashback (`AS OF SCN|TIMESTAMP …`, `VERSIONS BETWEEN … AND …`)
+      // and `SAMPLE [BLOCK] (n) [SEED (n)]` — accepted and ignored (we query
+      // the current rows / the full table).
+      _consumeFlashbackAndSample();
+      if (_matchKw('AS')) {
         fromAlias = _expectName();
+      } else if (_check(TokType.ident) &&
+          !_isClauseStartWord() &&
+          !_checkWord('PIVOT') &&
+          !_checkWord('UNPIVOT') &&
+          !_checkWord('MATCH_RECOGNIZE') &&
+          !_checkWord('MODEL')) {
+        fromAlias = _advance().text;
       }
       fromIndexHint = _consumeIndexedHint();
+      // Oracle PIVOT: rewrite `FROM src PIVOT (agg FOR col IN (vals))` into a
+      // grouped CASE-aggregate subquery the outer SELECT reads from.
+      if (_checkWord('PIVOT') && (fromSub != null || fromTable != null)) {
+        _advance(); // PIVOT
+        final srcSel = fromSub ??
+            SelectStmt(
+              projection: [SelectItem.star()],
+              fromTable: fromTable,
+              orderBy: const [],
+            );
+        fromSub =
+            _matchWord('XML') ? _parsePivotXmlClause(srcSel) : _parsePivotClause(srcSel);
+        fromTable = null;
+        fromFunc = null;
+      }
+      // Oracle UNPIVOT: rewrite `FROM tbl UNPIVOT (val FOR col IN (c1, c2))`
+      // into a UNION ALL subquery (one arm per unpivoted column).
+      if (_checkWord('UNPIVOT') && fromTable != null) {
+        _advance(); // UNPIVOT
+        fromSub = _parseUnpivotClause(fromTable);
+        fromTable = null;
+        fromFunc = null;
+      }
+      // Oracle MATCH_RECOGNIZE row-pattern recognition clause.
+      if (_checkWord('MATCH_RECOGNIZE') &&
+          (fromTable != null || fromSub != null)) {
+        _advance(); // MATCH_RECOGNIZE
+        fromMatchRecognize = _parseMatchRecognize();
+        if (_matchKw('AS')) {
+          fromAlias = _expectName();
+        } else if (_check(TokType.ident) &&
+            !_isClauseStartWord() &&
+            !_checkWord('PIVOT') &&
+            !_checkWord('UNPIVOT')) {
+          fromAlias = _advance().text;
+        }
+      }
       while (true) {
+        // Comma join: `FROM a, b` is a CROSS JOIN; any join predicate lives
+        // in the WHERE clause (and Oracle (+) markers there turn it outer).
+        if (_match(TokType.punct, ',')) {
+          String? ctbl;
+          SelectStmt? csub;
+          var clateral = false;
+          // Oracle/ANSI `, LATERAL (subquery)` — a correlated derived table.
+          if (_matchWord('LATERAL')) {
+            clateral = true;
+            _expect(TokType.punct, '(');
+            csub = _parseSelect();
+            _expect(TokType.punct, ')');
+          } else if (_match(TokType.punct, '(')) {
+            csub = _parseSelect();
+            _expect(TokType.punct, ')');
+          } else if (_checkWord('JSON_TABLE') &&
+              _peek(1).type == TokType.punct &&
+              _peek(1).text == '(') {
+            _advance(); // JSON_TABLE
+            csub = _parseJsonTableClause();
+          } else {
+            ctbl = _parseQualifiedTableName();
+          }
+          String? calias;
+          if (_matchKw('AS')) {
+            calias = _expectName();
+          } else if (_check(TokType.ident) && !_isClauseStartWord()) {
+            calias = _advance().text;
+          }
+          joins.add(JoinClause('CROSS', ctbl, calias, null,
+              subquery: csub, lateral: clateral));
+          continue;
+        }
         String? joinType;
         bool natural = false;
+        var lateral = false;
         if (_matchKw('NATURAL')) {
           natural = true;
         }
@@ -1663,8 +4134,20 @@ class Parser {
           _expectKw('JOIN');
           joinType = 'FULL';
         } else if (_matchKw('CROSS')) {
-          _expectKw('JOIN');
-          joinType = 'CROSS';
+          // `CROSS APPLY (…)` is a correlated inner join; `CROSS JOIN` is plain.
+          if (_matchWord('APPLY')) {
+            joinType = 'CROSS';
+            lateral = true;
+          } else {
+            _expectKw('JOIN');
+            joinType = 'CROSS';
+          }
+        } else if (_checkWord('OUTER') && _peek(1).upper == 'APPLY') {
+          // `OUTER APPLY (…)` is a correlated left join.
+          _advance(); // OUTER
+          _advance(); // APPLY
+          joinType = 'LEFT';
+          lateral = true;
         } else if (_matchKw('JOIN')) {
           joinType = 'INNER';
         }
@@ -1691,7 +4174,7 @@ class Parser {
         final joinHint = _consumeIndexedHint();
         Expr? on;
         List<String>? usingCols;
-        if (!natural && joinType != 'CROSS') {
+        if (!natural && joinType != 'CROSS' && !lateral) {
           if (_matchKw('USING')) {
             _expect(TokType.punct, '(');
             usingCols = [_expectName()];
@@ -1714,81 +4197,150 @@ class Parser {
             using: usingCols,
             natural: natural,
             indexedBy: joinHint,
+            lateral: lateral,
           ),
         );
       }
     }
     Expr? where;
     if (_matchKw('WHERE')) where = _parseExpr();
+    // Oracle legacy (+) outer joins: rewrite comma/CROSS joins into LEFT/RIGHT
+    // joins, moving the marked equality predicate(s) from WHERE into the ON.
+    if (where != null && joins.isNotEmpty) {
+      where = _rewriteOracleOuterJoins(fromTable, fromAlias, joins, where);
+    }
+    // Oracle MODEL clause (spreadsheet-style RULES): advanced and rare — it is
+    // consumed and discarded so the underlying query still runs.
+    if (_matchWord('MODEL')) {
+      var depth = 0;
+      while (!_isAtEnd()) {
+        final t = _peek();
+        if (t.type == TokType.punct && t.text == '(') {
+          depth++;
+          _advance();
+          continue;
+        }
+        if (t.type == TokType.punct && t.text == ')') {
+          if (depth == 0) break;
+          depth--;
+          _advance();
+          continue;
+        }
+        if (depth == 0 &&
+            ((t.type == TokType.punct && t.text == ';') ||
+                t.upper == 'ORDER' ||
+                t.upper == 'UNION' ||
+                t.upper == 'INTERSECT' ||
+                t.upper == 'EXCEPT' ||
+                t.upper == 'MINUS')) {
+          break;
+        }
+        _advance();
+      }
+    }
+    // Oracle hierarchical query: [START WITH ...] CONNECT BY [NOCYCLE] ...
+    // (START WITH and CONNECT BY may appear in either order).
+    final connectBy = _parseConnectBy();
     final groupBy = <Expr>[];
     List<List<Expr>>? groupingSets;
     Expr? having;
     if (_matchKw('GROUP')) {
       _expectKw('BY');
-      // SQL extension: ROLLUP / CUBE / GROUPING SETS desugar into a
-      // list of grouping-key sets that the executor iterates.
-      if (_matchKw('ROLLUP')) {
-        _expect(TokType.punct, '(');
-        final keys = <Expr>[_parseExpr()];
-        while (_match(TokType.punct, ',')) {
-          keys.add(_parseExpr());
-        }
-        _expect(TokType.punct, ')');
-        groupingSets = <List<Expr>>[
-          for (var i = keys.length; i >= 0; i--) keys.sublist(0, i),
-        ];
-        groupBy.addAll(keys);
-      } else if (_matchKw('CUBE')) {
-        _expect(TokType.punct, '(');
-        final keys = <Expr>[_parseExpr()];
-        while (_match(TokType.punct, ',')) {
-          keys.add(_parseExpr());
-        }
-        _expect(TokType.punct, ')');
-        groupingSets = <List<Expr>>[];
-        for (var mask = (1 << keys.length) - 1; mask >= 0; mask--) {
-          final set = <Expr>[
-            for (var i = 0; i < keys.length; i++)
-              if ((mask >> i) & 1 == 1) keys[i],
-          ];
-          groupingSets.add(set);
-        }
-        groupBy.addAll(keys);
-      } else if (_matchKw('GROUPING')) {
-        _expectKw('SETS');
-        _expect(TokType.punct, '(');
-        groupingSets = <List<Expr>>[];
-        do {
-          if (_match(TokType.punct, '(')) {
-            final set = <Expr>[];
-            if (!_check(TokType.punct, ')')) {
-              set.add(_parseExpr());
-              while (_match(TokType.punct, ',')) {
-                set.add(_parseExpr());
-              }
-            }
-            _expect(TokType.punct, ')');
-            groupingSets.add(set);
-            // groupBy holds the union of every set's keys; we don't
-            // dedup here because a structural Expr equality is brittle
-            // and the executor only treats this list as a "known keys"
-            // membership probe via its own structural string key.
-            groupBy.addAll(set);
-          } else {
-            final k = _parseExpr();
-            groupingSets.add([k]);
-            groupBy.add(k);
+      // A GROUP BY is a comma-separated list of factors; each factor is either
+      // a plain key or a ROLLUP / CUBE / GROUPING SETS / () set-generator. The
+      // effective grouping sets are the cross-product (concatenation) of every
+      // factor's alternative key-sets, so `GROUP BY a, ROLLUP(b)` yields
+      // {a,b} and {a}.
+      final factors = <List<List<Expr>>>[];
+      var sawSetFn = false;
+      do {
+        if (_check(TokType.punct, '(') && _peek(1).text == ')') {
+          // Explicit empty grouping `()` — a single grand-total group.
+          _advance(); // (
+          _advance(); // )
+          factors.add(<List<Expr>>[<Expr>[]]);
+          sawSetFn = true;
+        } else if (_matchKw('ROLLUP')) {
+          _expect(TokType.punct, '(');
+          final keys = <Expr>[_parseExpr()];
+          while (_match(TokType.punct, ',')) {
+            keys.add(_parseExpr());
           }
-        } while (_match(TokType.punct, ','));
-        _expect(TokType.punct, ')');
-      } else {
-        groupBy.add(_parseExpr());
-        while (_match(TokType.punct, ',')) {
-          groupBy.add(_parseExpr());
+          _expect(TokType.punct, ')');
+          factors.add(<List<Expr>>[
+            for (var i = keys.length; i >= 0; i--) keys.sublist(0, i),
+          ]);
+          groupBy.addAll(keys);
+          sawSetFn = true;
+        } else if (_matchKw('CUBE')) {
+          _expect(TokType.punct, '(');
+          final keys = <Expr>[_parseExpr()];
+          while (_match(TokType.punct, ',')) {
+            keys.add(_parseExpr());
+          }
+          _expect(TokType.punct, ')');
+          final sets = <List<Expr>>[];
+          for (var mask = (1 << keys.length) - 1; mask >= 0; mask--) {
+            sets.add(<Expr>[
+              for (var i = 0; i < keys.length; i++)
+                if ((mask >> i) & 1 == 1) keys[i],
+            ]);
+          }
+          factors.add(sets);
+          groupBy.addAll(keys);
+          sawSetFn = true;
+        } else if (_matchKw('GROUPING')) {
+          _expectKw('SETS');
+          _expect(TokType.punct, '(');
+          final sets = <List<Expr>>[];
+          do {
+            if (_match(TokType.punct, '(')) {
+              final set = <Expr>[];
+              if (!_check(TokType.punct, ')')) {
+                set.add(_parseExpr());
+                while (_match(TokType.punct, ',')) {
+                  set.add(_parseExpr());
+                }
+              }
+              _expect(TokType.punct, ')');
+              sets.add(set);
+              groupBy.addAll(set);
+            } else {
+              final k = _parseExpr();
+              sets.add([k]);
+              groupBy.add(k);
+            }
+          } while (_match(TokType.punct, ','));
+          _expect(TokType.punct, ')');
+          factors.add(sets);
+          sawSetFn = true;
+        } else {
+          final k = _parseExpr();
+          factors.add(<List<Expr>>[
+            [k]
+          ]);
+          groupBy.add(k);
         }
+      } while (_match(TokType.punct, ','));
+      // Only materialise groupingSets when a set-generator was present; a plain
+      // key list stays a normal GROUP BY (groupBy already holds the keys).
+      if (sawSetFn) {
+        var combined = <List<Expr>>[<Expr>[]];
+        for (final factor in factors) {
+          final next = <List<Expr>>[];
+          for (final acc in combined) {
+            for (final set in factor) {
+              next.add(<Expr>[...acc, ...set]);
+            }
+          }
+          combined = next;
+        }
+        groupingSets = combined;
       }
-      if (_matchKw('HAVING')) having = _parseExpr();
     }
+    // HAVING is accepted with or without GROUP BY (SQLite/MySQL apply it to the
+    // implicit single group when there is no GROUP BY).
+    if (_matchKw('HAVING')) having = _parseExpr();
     final namedWindows = <String, WindowSpec>{};
     if (_matchKw('WINDOW')) {
       do {
@@ -1808,17 +4360,57 @@ class Parser {
     }
     int? limit;
     int? offset;
+    var limitPercent = false;
     if (_matchKw('LIMIT')) {
-      limit = int.parse(_expect(TokType.number).text);
+      final lim = _parseSignedInt();
       // MySQL form: `LIMIT offset, count` swaps the meaning of the
       // first integer.
       if (_match(TokType.punct, ',')) {
-        offset = limit;
-        limit = int.parse(_expect(TokType.number).text);
+        offset = lim < 0 ? 0 : lim;
+        final cnt = _parseSignedInt();
+        limit = cnt < 0 ? null : cnt; // SQLite: a negative LIMIT is unlimited
+      } else {
+        limit = lim < 0 ? null : lim; // SQLite: a negative LIMIT is unlimited
       }
     }
     if (_matchKw('OFFSET')) {
-      offset = int.parse(_expect(TokType.number).text);
+      final off = _parseSignedInt();
+      offset = off < 0 ? 0 : off; // SQLite clamps a negative OFFSET to 0
+      // Oracle / SQL-standard: OFFSET n { ROW | ROWS }.
+      if (_matchKw('ROW') || _matchKw('ROWS')) {}
+    }
+    // Oracle / SQL-standard row-limiting clause:
+    //   FETCH { FIRST | NEXT } [ n ] { ROW | ROWS } { ONLY | WITH TIES }
+    // n defaults to 1; WITH TIES is accepted but behaves like ONLY here.
+    if (_matchWord('FETCH')) {
+      if (!_matchKw('FIRST') && !_matchWord('NEXT')) {
+        final got = _peek();
+        throw FormatException(
+          'Expected FIRST or NEXT after FETCH but got "${got.text}" at '
+          'offset ${got.offset}',
+        );
+      }
+      var count = 1;
+      if (_check(TokType.number)) count = int.parse(_advance().text);
+      final percent = _matchWord('PERCENT');
+      if (_matchKw('ROW') || _matchWord('ROWS')) {}
+      if (!_matchWord('ONLY')) {
+        if (_matchKw('WITH')) _expectKw('TIES');
+      }
+      limit = count;
+      limitPercent = percent;
+    }
+    // Oracle ROWNUM pseudo-column used as a row limiter in the WHERE clause,
+    // e.g. `WHERE ROWNUM <= 10`. Rewrite such top-level conjuncts into an
+    // equivalent LIMIT so they flow through the normal row-limit machinery
+    // (which, combined with ORDER BY / a subquery, matches the common
+    // top-N / pagination idioms).
+    int? rownumLimit;
+    if (where != null) {
+      final rr = _rewriteRownumWhere(where, limit);
+      where = rr.$1;
+      limit = rr.$2;
+      rownumLimit = rr.$3;
     }
     return SelectStmt(
       projection: projection,
@@ -1833,11 +4425,268 @@ class Parser {
       limit: limit,
       offset: offset,
       distinct: distinct,
+      limitPercent: limitPercent,
       fromFunction: fromFunc,
       namedWindows: namedWindows,
       indexedBy: fromIndexHint,
       groupingSets: groupingSets,
+      connectBy: connectBy,
+      rownumLimit: rownumLimit,
+      matchRecognize: fromMatchRecognize,
     );
+  }
+
+  /// Parse an Oracle hierarchical clause: `START WITH expr` /
+  /// `CONNECT BY [NOCYCLE] expr`, accepting the two parts in either order.
+  /// Returns null when no CONNECT BY is present.
+  ConnectByClause? _parseConnectBy() {
+    Expr? startWith;
+    Expr? connectByExpr;
+    var nocycle = false;
+    var sawOrderSiblings = false;
+    final orderSiblings = <OrderByItem>[];
+    while (true) {
+      if (_checkWord('START') && _peek(1).upper == 'WITH') {
+        _advance(); // START
+        _advance(); // WITH
+        startWith = _parseExpr();
+      } else if (_checkWord('CONNECT') && _peek(1).upper == 'BY') {
+        _advance(); // CONNECT
+        _advance(); // BY
+        nocycle = _matchWord('NOCYCLE');
+        connectByExpr = _parseExpr();
+      } else if (!sawOrderSiblings &&
+          _checkWord('ORDER') &&
+          _peek(1).upper == 'SIBLINGS') {
+        _advance(); // ORDER
+        _advance(); // SIBLINGS
+        _expectKw('BY');
+        orderSiblings.add(_parseOrderByItem());
+        while (_match(TokType.punct, ',')) {
+          orderSiblings.add(_parseOrderByItem());
+        }
+        sawOrderSiblings = true;
+      } else {
+        break;
+      }
+    }
+    if (connectByExpr == null) return null;
+    return ConnectByClause(
+      startWith,
+      connectByExpr,
+      nocycle: nocycle,
+      orderSiblings: orderSiblings,
+    );
+  }
+
+  /// Extracts top-level `ROWNUM <op> n` conjuncts from a WHERE expression and
+  /// folds them into an equivalent row limit. Returns the residual WHERE (with
+  /// the ROWNUM conjuncts removed, or null if none remain) and the effective
+  /// limit (the tightest of [existingLimit] and any ROWNUM-implied limit).
+  (Expr?, int?, int?) _rewriteRownumWhere(Expr where, int? existingLimit) {
+    var limit = existingLimit;
+    int? rownumLimit;
+    void tighten(int implied) {
+      final v = implied < 0 ? 0 : implied;
+      limit = (limit == null) ? v : (v < limit! ? v : limit);
+      rownumLimit = (rownumLimit == null) ? v : (v < rownumLimit! ? v : rownumLimit);
+    }
+
+    // Returns the replacement for a single (sub)expression, or `_keep` if it
+    // is not a ROWNUM predicate and should be preserved unchanged.
+    Expr? visit(Expr e) {
+      if (e is BinaryExpr && e.op == 'AND') {
+        final l = visit(e.left);
+        final r = visit(e.right);
+        if (l == null) return r;
+        if (r == null) return l;
+        return BinaryExpr('AND', l, r);
+      }
+      if (e is BinaryExpr) {
+        // Normalise `n <op> ROWNUM` to `ROWNUM <flip> n`.
+        String op = e.op;
+        Expr lhs = e.left, rhs = e.right;
+        if (_isRownum(rhs) && _intLiteral(lhs) != null) {
+          final tmp = lhs;
+          lhs = rhs;
+          rhs = tmp;
+          op = _flipComparison(op);
+        }
+        if (_isRownum(lhs)) {
+          final n = _intLiteral(rhs);
+          if (n != null) {
+            switch (op) {
+              case '<=':
+                tighten(n);
+                return null;
+              case '<':
+                tighten(n - 1);
+                return null;
+              case '=':
+                tighten(n == 1 ? 1 : 0);
+                return null;
+              case '>':
+              case '>=':
+                // ROWNUM > n (n >= 1) is unsatisfiable; ROWNUM >= 1 / > 0 is
+                // always true and simply drops out.
+                final alwaysTrue =
+                    (op == '>=' && n <= 1) || (op == '>' && n < 1);
+                if (!alwaysTrue) tighten(0);
+                return null;
+            }
+          }
+        }
+      }
+      return e;
+    }
+
+    final residual = visit(where);
+    return (residual, limit, rownumLimit);
+  }
+
+  bool _isRownum(Expr e) {
+    // ROWNUM is lowered to `ROW_NUMBER() OVER ()` by _parsePrimary; recognise
+    // that exact node (empty window, no args/filter) as the pseudo-column.
+    if (e is! FunctionCallExpr) return false;
+    final w = e.window;
+    return e.name == 'ROW_NUMBER' &&
+        e.args.isEmpty &&
+        !e.isStarArg &&
+        !e.distinct &&
+        e.filterExpr == null &&
+        (e.aggOrderBy == null || e.aggOrderBy!.isEmpty) &&
+        w != null &&
+        w.partitionBy.isEmpty &&
+        w.orderBy.isEmpty &&
+        w.frame == null &&
+        w.baseName == null;
+  }
+
+  int? _intLiteral(Expr e) {
+    if (e is LiteralExpr) {
+      final v = e.value;
+      if (v is int) return v;
+      if (v is num && v == v.toInt()) return v.toInt();
+    }
+    return null;
+  }
+
+  String _flipComparison(String op) {
+    switch (op) {
+      case '<':
+        return '>';
+      case '<=':
+        return '>=';
+      case '>':
+        return '<';
+      case '>=':
+        return '<=';
+      default:
+        return op; // '=' is symmetric
+    }
+  }
+
+  /// Flatten a top-level AND chain into its conjuncts.
+  List<Expr> _andConjuncts(Expr e) {
+    if (e is BinaryExpr && e.op == 'AND') {
+      return [..._andConjuncts(e.left), ..._andConjuncts(e.right)];
+    }
+    return [e];
+  }
+
+  Expr? _combineAnd(List<Expr> parts) {
+    if (parts.isEmpty) return null;
+    var e = parts.first;
+    for (var i = 1; i < parts.length; i++) {
+      e = BinaryExpr('AND', e, parts[i]);
+    }
+    return e;
+  }
+
+  /// Rewrite Oracle legacy `(+)` outer joins. Comma/CROSS joins whose join
+  /// predicate carries a `(+)` marker in WHERE become LEFT/RIGHT joins with
+  /// that predicate relocated to their ON clause. Returns the residual WHERE.
+  Expr? _rewriteOracleOuterJoins(
+    String? baseTable,
+    String? baseAlias,
+    List<JoinClause> joins,
+    Expr where,
+  ) {
+    // Chain position of a table name/alias: base is 0, joins[i] is i+1.
+    int? posOf(String? name) {
+      if (name == null) return null;
+      final n = name.toUpperCase();
+      if (baseTable != null && baseTable.toUpperCase() == n) return 0;
+      if (baseAlias != null && baseAlias.toUpperCase() == n) return 0;
+      for (var i = 0; i < joins.length; i++) {
+        if (joins[i].table != null && joins[i].table!.toUpperCase() == n) {
+          return i + 1;
+        }
+        if (joins[i].alias != null && joins[i].alias!.toUpperCase() == n) {
+          return i + 1;
+        }
+      }
+      return null;
+    }
+
+    // (table, isMarked) for a column-ish operand, else null.
+    (String?, bool)? operandTable(Expr e) {
+      if (e is OuterJoinExpr) return (e.column.table, true);
+      if (e is ColumnExpr) return (e.table, false);
+      return null;
+    }
+
+    final conjuncts = _andConjuncts(where);
+    final residual = <Expr>[];
+    // joinIndex (into `joins`) -> ON predicates and the implied join type.
+    final onByJoin = <int, List<Expr>>{};
+    final typeByJoin = <int, String>{};
+
+    for (final c in conjuncts) {
+      if (c is! BinaryExpr || c.op == 'AND' || c.op == 'OR') {
+        residual.add(c);
+        continue;
+      }
+      final l = operandTable(c.left);
+      final r = operandTable(c.right);
+      if (l == null || r == null || (!l.$2 && !r.$2)) {
+        residual.add(c); // no (+) marker involved
+        continue;
+      }
+      final lp = posOf(l.$1);
+      final rp = posOf(r.$1);
+      if (lp == null || rp == null || lp == rp) {
+        residual.add(c);
+        continue;
+      }
+      final later = lp > rp ? lp : rp;
+      final joinIdx = later - 1; // index into `joins`
+      if (joins[joinIdx].type != 'CROSS') {
+        residual.add(c);
+        continue;
+      }
+      // The marked side is the null-supplying table. If it is the later table
+      // in the chain, the right side of this join is optional -> LEFT; if it is
+      // the earlier table, the accumulated left is optional -> RIGHT.
+      final markedPos = l.$2 ? lp : rp;
+      typeByJoin[joinIdx] = markedPos == later ? 'LEFT' : 'RIGHT';
+      (onByJoin[joinIdx] ??= <Expr>[]).add(c);
+    }
+
+    if (onByJoin.isEmpty) return where; // nothing rewritten
+
+    onByJoin.forEach((idx, preds) {
+      final j = joins[idx];
+      joins[idx] = JoinClause(
+        typeByJoin[idx]!,
+        j.table,
+        j.alias,
+        _combineAnd(preds),
+        subquery: j.subquery,
+        indexedBy: j.indexedBy,
+      );
+    });
+    return _combineAnd(residual);
   }
 
   SelectItem _parseSelectItem() {
@@ -1940,6 +4789,19 @@ class Parser {
       if (_matchKw('FALSE')) {
         return UnaryExpr(negated ? 'IS NOT FALSE' : 'IS FALSE', left);
       }
+      // IS [NOT] JSON — Oracle validity predicate. Optional FORMAT/semantics
+      // keywords after JSON are consumed and ignored.
+      if (_matchWord('JSON')) {
+        while (_matchWord('FORMAT') ||
+            _matchWord('STRICT') ||
+            _matchWord('LAX') ||
+            _matchWord('WITH') ||
+            _matchWord('WITHOUT') ||
+            _matchWord('UNIQUE') ||
+            _matchWord('KEYS') ||
+            _matchWord('JSON')) {}
+        return UnaryExpr(negated ? 'IS NOT JSON' : 'IS JSON', left);
+      }
       // Bare IS / IS NOT <expr> — NULL-safe (in)equality (SQLite extension).
       final right = _parseConcat();
       return BinaryExpr(negated ? 'IS NOT' : 'IS', left, right);
@@ -1991,12 +4853,94 @@ class Parser {
       if (negated) r = UnaryExpr('NOT', r);
       return r;
     }
+    // Oracle period predicate `(s1, e1) OVERLAPS (s2, e2)`.
+    if (_matchWord('OVERLAPS')) {
+      final right = _parseConcat();
+      return FunctionCallExpr('__OVERLAPS', [left, right]);
+    }
     if (negated) {
       throw FormatException('Unexpected NOT before "${_peek().text}"');
     }
     while (_check(TokType.op) &&
         const {'=', '!=', '<>', '<', '<=', '>', '>='}.contains(_peek().text)) {
       final op = _advance().text;
+      // Quantified comparison `op {ALL|ANY|SOME} (subquery)`.
+      if (const {'=', '!=', '<>', '<', '<=', '>', '>='}.contains(op) &&
+          (_checkWord('ALL') || _checkWord('ANY') || _checkWord('SOME')) &&
+          _peek(1).type == TokType.punct &&
+          _peek(1).text == '(') {
+        final quant = _advance().text.toUpperCase();
+        _expect(TokType.punct, '(');
+        // The operand may be a subquery or a parenthesised value list
+        // (`= ANY ('a', 'b')`), which behaves like IN / a quantified OR/AND.
+        if (!_checkKw('SELECT') && !_checkKw('WITH')) {
+          final items = <Expr>[_parseExpr()];
+          while (_match(TokType.punct, ',')) {
+            items.add(_parseExpr());
+          }
+          _expect(TokType.punct, ')');
+          final all = quant == 'ALL';
+          final eq = op == '=';
+          final ne = op == '!=' || op == '<>';
+          if (eq && !all) {
+            left = InExpr(left, items, negated: false);
+            continue;
+          }
+          if (ne && all) {
+            left = InExpr(left, items, negated: true);
+            continue;
+          }
+          // Other operators: ANY -> OR chain, ALL -> AND chain.
+          Expr chain = BinaryExpr(op, left, items.first);
+          for (var i = 1; i < items.length; i++) {
+            chain = BinaryExpr(
+                all ? 'AND' : 'OR', chain, BinaryExpr(op, left, items[i]));
+          }
+          left = chain;
+          continue;
+        }
+        final sub = _parseSelect();
+        _expect(TokType.punct, ')');
+        final all = quant == 'ALL';
+        final eq = op == '=';
+        final ne = op == '!=' || op == '<>';
+        // Equality quantifiers map onto IN / NOT IN or MIN=MAX bounds.
+        if (eq && !all) {
+          left = SubqueryInExpr(left, sub, negated: false);
+          continue;
+        }
+        if (ne && all) {
+          left = SubqueryInExpr(left, sub, negated: true);
+          continue;
+        }
+        SelectStmt aggSel(String aggName) {
+          final first = sub.projection.first;
+          final label = first.alias ??
+              (first.expr is ColumnExpr
+                  ? (first.expr as ColumnExpr).name
+                  : 'c');
+          return SelectStmt(
+            projection: [
+              SelectItem.expr(FunctionCallExpr(aggName, [ColumnExpr(label)]))
+            ],
+            fromSubquery: sub,
+          );
+        }
+
+        if (eq && all) {
+          // x = ALL (S) iff x = MIN(S) and x = MAX(S).
+          left = BinaryExpr(
+            'AND',
+            BinaryExpr('=', left, SubquerySelectExpr(aggSel('MIN'))),
+            BinaryExpr('=', left, SubquerySelectExpr(aggSel('MAX'))),
+          );
+          continue;
+        }
+        final gt = op == '>' || op == '>=';
+        final aggName = all ? (gt ? 'MAX' : 'MIN') : (gt ? 'MIN' : 'MAX');
+        left = BinaryExpr(op, left, SubquerySelectExpr(aggSel(aggName)));
+        continue;
+      }
       left = BinaryExpr(op, left, _parseConcat());
     }
     return left;
@@ -2055,6 +4999,16 @@ class Parser {
   Expr _parseUnary() {
     if (_check(TokType.op, '-')) {
       _advance();
+      // Fold a unary minus directly onto a numeric literal so int64-min
+      // (`-9223372036854775808`) parses — its positive magnitude overflows a
+      // signed 64-bit int, but the negated value is in range.
+      if (_check(TokType.number)) {
+        final txt = '-${_advance().text}';
+        if (txt.contains('.') || txt.contains('e') || txt.contains('E')) {
+          return LiteralExpr(double.parse(txt));
+        }
+        return LiteralExpr(int.tryParse(txt) ?? double.parse(txt));
+      }
       return UnaryExpr('-', _parseUnary());
     }
     if (_check(TokType.op, '+')) {
@@ -2065,13 +5019,183 @@ class Parser {
       _advance();
       return UnaryExpr('~', _parseUnary());
     }
-    return _parsePrimary();
+    var e = _parsePrimary();
+    // Postfix object method calls — `XMLELEMENT(...).getStringVal()`,
+    // `.getClobVal()`, etc. The value is already the underlying text, so the
+    // method call is transparent (consumed and ignored).
+    while (_check(TokType.punct, '.') &&
+        _peek(1).type == TokType.ident &&
+        _peek(2).type == TokType.punct &&
+        _peek(2).text == '(') {
+      _advance(); // .
+      _advance(); // method name
+      _expect(TokType.punct, '(');
+      while (!_check(TokType.punct, ')') && !_isAtEnd()) {
+        _advance();
+      }
+      _expect(TokType.punct, ')');
+    }
+    // Postfix `COLLATE <name>` binds tightly to its operand.
+    while (_matchKw('COLLATE')) {
+      e = CollateExpr(e, _expectName().toUpperCase());
+    }
+    // Postfix `AT TIME ZONE <tz>` shifts a timestamp to the given zone.
+    while (_checkWord('AT') && _peek(1).upper == 'TIME') {
+      _advance(); // AT
+      _expectWord('TIME');
+      _expectWord('ZONE');
+      e = FunctionCallExpr('__AT_TIME_ZONE', [e, _parsePrimary()]);
+    }
+    // Postfix interval-cast qualifier: `<expr> DAY[(p)] TO SECOND[(p)]` /
+    // `YEAR[(p)] TO MONTH`. A no-op — the engine already models the value as a
+    // day/second (or month) magnitude. Only consumed when a `TO <field>` tail
+    // follows so a bare trailing identifier (a column alias) is left alone.
+    const intervalFields = {
+      'DAY', 'YEAR', 'HOUR', 'MINUTE', 'SECOND', 'MONTH',
+    };
+    while (intervalFields.contains(_peek().upper) && _peek(1).upper == 'TO') {
+      _advance(); // leading field
+      _advance(); // TO
+      if (_check(TokType.ident) || _peek().type == TokType.keyword) {
+        _advance(); // trailing field
+      }
+      if (_check(TokType.punct, '(')) {
+        while (!_check(TokType.punct, ')') && !_isAtEnd()) {
+          _advance();
+        }
+        _match(TokType.punct, ')');
+      }
+    }
+    return e;
   }
 
   Expr _parsePrimary() {
     final t = _peek();
+    // CONNECT BY `PRIOR expr` — a high-precedence prefix referring to the
+    // parent row. Only treated as the operator when followed by a column /
+    // parenthesised expression (so a stray identifier named PRIOR still works).
+    if (_checkWord('PRIOR') &&
+        (_peek(1).type == TokType.ident ||
+            _peek(1).type == TokType.keyword ||
+            (_peek(1).type == TokType.punct && _peek(1).text == '('))) {
+      _advance();
+      return PriorExpr(_parsePrimary());
+    }
+    // CONNECT_BY_ROOT <expr> — hierarchical prefix returning the expression's
+    // value at the root of the current row's tree.
+    if (_checkWord('CONNECT_BY_ROOT') &&
+        (_peek(1).type == TokType.ident ||
+            _peek(1).type == TokType.keyword ||
+            (_peek(1).type == TokType.punct && _peek(1).text == '('))) {
+      _advance();
+      return FunctionCallExpr('CONNECT_BY_ROOT', [_parsePrimary()]);
+    }
+    // ANSI/Oracle typed datetime literals: DATE '...', TIMESTAMP '...',
+    // TIME '...'. The type keyword directly precedes a string literal. We
+    // keep the string value (the engine represents dates as text), so it
+    // flows through EXTRACT and the date scalar functions unchanged.
+    if ((t.type == TokType.keyword || t.type == TokType.ident) &&
+        (t.upper == 'DATE' || t.upper == 'TIMESTAMP' || t.upper == 'TIME') &&
+        _peek(1).type == TokType.string) {
+      _advance(); // type keyword
+      final lit = _advance(); // string literal
+      return LiteralExpr(lit.text);
+    }
+    // Oracle INTERVAL literal: INTERVAL '<n>' <unit> [(prec)] [TO <unit>].
+    // Modelled as a number of days so it composes with DATE arithmetic
+    // (DATE + INTERVAL '5' DAY). Year/month units use calendar approximations.
+    if ((t.type == TokType.keyword || t.type == TokType.ident) &&
+        t.upper == 'INTERVAL' &&
+        (_peek(1).type == TokType.string ||
+            (_peek(1).type == TokType.op &&
+                (_peek(1).text == '-' || _peek(1).text == '+')))) {
+      _advance(); // INTERVAL
+      var sign = 1;
+      if (_check(TokType.op, '-')) {
+        sign = -1;
+        _advance();
+      } else if (_check(TokType.op, '+')) {
+        _advance();
+      }
+      final valTok = _advance(); // string literal e.g. '5' or '1-6'
+      final raw = valTok.text;
+      // Leading field value (the part before any '-' / ' ' separator).
+      final leadStr = RegExp(r'^\d+').firstMatch(raw)?.group(0) ?? '0';
+      final lead = int.tryParse(leadStr) ?? 0;
+      final unit =
+          (_check(TokType.ident) || _peek().type == TokType.keyword)
+              ? _advance().text.toUpperCase()
+              : 'DAY';
+      // Optional precision qualifier and TO <unit> tail — consumed, ignored.
+      if (_check(TokType.punct, '(')) {
+        while (!_isAtEnd() && !_check(TokType.punct, ')')) {
+          _advance();
+        }
+        _match(TokType.punct, ')');
+      }
+      if (_matchWord('TO')) {
+        if (_check(TokType.ident) || _peek().type == TokType.keyword) {
+          _advance();
+        }
+        if (_check(TokType.punct, '(')) {
+          while (!_isAtEnd() && !_check(TokType.punct, ')')) {
+            _advance();
+          }
+          _match(TokType.punct, ')');
+        }
+      }
+      const daysPerUnit = <String, double>{
+        'YEAR': 365,
+        'MONTH': 30,
+        'DAY': 1,
+        'HOUR': 1 / 24,
+        'MINUTE': 1 / 1440,
+        'SECOND': 1 / 86400,
+      };
+      // Compute the interval magnitude in days. A compound literal carries its
+      // own fields: 'D HH:MI:SS[.ff]' (day-to-second) or 'Y-M' (year-to-month).
+      double magnitude;
+      final body = raw.trim();
+      if (body.contains(':')) {
+        var dayPart = 0;
+        var timePart = body;
+        if (body.contains(' ')) {
+          final sp = body.split(RegExp(r'\s+'));
+          dayPart = int.tryParse(sp[0]) ?? 0;
+          timePart = sp[1];
+        }
+        final tp = timePart.split(':');
+        final h = tp.isNotEmpty ? (int.tryParse(tp[0]) ?? 0) : 0;
+        final mi = tp.length > 1 ? (int.tryParse(tp[1]) ?? 0) : 0;
+        final s = tp.length > 2 ? (double.tryParse(tp[2]) ?? 0) : 0;
+        magnitude = dayPart + h / 24 + mi / 1440 + s / 86400;
+      } else if (body.contains('-')) {
+        // 'Y-M' year-to-month: a calendar-month interval (keep the day).
+        final ym = body.split('-');
+        final y = int.tryParse(ym[0]) ?? 0;
+        final mo = ym.length > 1 ? (int.tryParse(ym[1]) ?? 0) : 0;
+        return LiteralExpr(YmInterval(sign * (y * 12 + mo)));
+      } else if (unit == 'YEAR' || unit == 'MONTH') {
+        // Single-field YEAR / MONTH: also a calendar-month interval.
+        final months = unit == 'YEAR' ? lead * 12 : lead;
+        return LiteralExpr(YmInterval(sign * months));
+      } else {
+        magnitude = lead * (daysPerUnit[unit] ?? 1);
+      }
+      final days = sign * magnitude;
+      return LiteralExpr(days == days.roundToDouble() ? days.toInt() : days);
+    }
     if (t.type == TokType.param) {
       _advance();
+      // Trigger pseudo-records `:NEW.col` / `:OLD.col` — resolve to the trigger
+      // scope's NEW/OLD columns rather than a bind parameter.
+      final upper = t.text.toUpperCase();
+      if ((upper == ':NEW' || upper == ':OLD') &&
+          _check(TokType.punct, '.')) {
+        _advance(); // .
+        final col = _expectName();
+        return ColumnExpr(col, table: upper.substring(1)); // NEW / OLD
+      }
       // Anonymous '?' — auto-number sequentially.
       if (t.text == '?') {
         paramCount++;
@@ -2093,8 +5217,12 @@ class Parser {
     }
     if (t.type == TokType.number) {
       _advance();
-      if (t.text.contains('.')) return LiteralExpr(double.parse(t.text));
-      return LiteralExpr(int.parse(t.text));
+      final txt = t.text;
+      if (txt.contains('.') || txt.contains('e') || txt.contains('E')) {
+        return LiteralExpr(double.parse(txt));
+      }
+      // An integer literal beyond int64 range promotes to double (SQLite).
+      return LiteralExpr(int.tryParse(txt) ?? double.parse(txt));
     }
     if (t.type == TokType.string) {
       _advance();
@@ -2153,6 +5281,15 @@ class Parser {
         return SubquerySelectExpr(sel);
       }
       final e = _parseExpr();
+      // Row value / tuple: `(a, b, …)`.
+      if (_check(TokType.punct, ',')) {
+        final items = <Expr>[e];
+        while (_match(TokType.punct, ',')) {
+          items.add(_parseExpr());
+        }
+        _expect(TokType.punct, ')');
+        return RowValueExpr(items);
+      }
       _expect(TokType.punct, ')');
       return e;
     }
@@ -2171,14 +5308,76 @@ class Parser {
       if (_check(TokType.punct, '.')) {
         _advance();
         final col = _expectName();
-        return ColumnExpr(col, table: t.text);
+        // Oracle sequence pseudo-columns seq.NEXTVAL / seq.CURRVAL.
+        final cu = col.toUpperCase();
+        if (cu == 'NEXTVAL' || cu == 'CURRVAL') {
+          return SequenceExpr(t.text, isCurrval: cu == 'CURRVAL');
+        }
+        // Qualified call `pkg.func(args)` — an Oracle package function. Guard
+        // against the Oracle `(+)` outer-join marker, which also starts with
+        // `(` but is handled by _maybeOuterJoin.
+        if (_check(TokType.punct, '(') &&
+            !(_peek(1).type == TokType.op &&
+                _peek(1).text == '+' &&
+                _peek(2).type == TokType.punct &&
+                _peek(2).text == ')')) {
+          return _parseFunctionCall('${t.text}.$col');
+        }
+        // Object-attribute navigation `alias.col.attr[.attr…][.string()]`: the
+        // column holds a JSON object; extract the nested attribute path. A
+        // trailing type accessor (`.string()`, `.number()`, …) is consumed.
+        if (_check(TokType.punct, '.')) {
+          final path = StringBuffer(r'$');
+          while (_check(TokType.punct, '.') &&
+              (_peek(1).type == TokType.ident ||
+                  _peek(1).type == TokType.keyword)) {
+            // A `.method()` accessor terminates the path.
+            if (_peek(2).type == TokType.punct && _peek(2).text == '(') {
+              _advance(); // .
+              _advance(); // accessor name
+              _expect(TokType.punct, '(');
+              while (!_check(TokType.punct, ')') && !_isAtEnd()) {
+                _advance();
+              }
+              _expect(TokType.punct, ')');
+              break;
+            }
+            _advance(); // .
+            path.write('.');
+            path.write(_advance().text);
+          }
+          return FunctionCallExpr('JSON_VALUE', [
+            ColumnExpr(col, table: t.text),
+            LiteralExpr(path.toString()),
+          ]);
+        }
+        return _maybeOuterJoin(ColumnExpr(col, table: t.text));
       }
       // Special bare-word datetime literals (no parentheses).
-      const bareFns = {'CURRENT_TIMESTAMP', 'CURRENT_DATE', 'CURRENT_TIME'};
+      const bareFns = {
+        'CURRENT_TIMESTAMP',
+        'CURRENT_DATE',
+        'CURRENT_TIME',
+        'SYSDATE',
+        'SYSTIMESTAMP',
+        'LOCALTIMESTAMP',
+        'ROWID',
+        'SESSIONTIMEZONE',
+        'DBTIMEZONE',
+        'SYS_GUID',
+      };
       if (bareFns.contains(t.upper)) {
         return FunctionCallExpr(t.upper, const []);
       }
-      return ColumnExpr(t.text);
+      // Oracle ROWNUM pseudo-column. Lower it to ROW_NUMBER() OVER () so it
+      // works anywhere an expression is allowed (projection, ORDER BY, ...),
+      // numbering rows in result order. A top-level `ROWNUM <op> n` in WHERE
+      // is separately folded into a LIMIT by _rewriteRownumWhere (which
+      // recognises this same lowered node).
+      if (t.upper == 'ROWNUM') {
+        return FunctionCallExpr('ROW_NUMBER', const [], window: WindowSpec());
+      }
+      return _maybeOuterJoin(ColumnExpr(t.text));
     }
     // Fall back: a keyword used in expression position becomes a column
     // reference. Allows e.g. `SELECT before FROM t` even though BEFORE is a
@@ -2196,14 +5395,119 @@ class Parser {
         final col = _expectName();
         return ColumnExpr(col, table: t.text);
       }
+      // Oracle ROWID pseudo-column: map to the engine's lowercase `rowid`
+      // pseudo-column so `WHERE ROWID IS NOT NULL` resolves like `rowid`.
+      if (t.upper == 'ROWID') {
+        return ColumnExpr('rowid');
+      }
       return ColumnExpr(t.text);
     }
     throw FormatException('Unexpected token "${t.text}" at offset ${t.offset}');
   }
 
+  /// If the current tokens are the Oracle legacy outer-join marker `( + )`,
+  /// consume them and wrap [col]; otherwise return [col] unchanged.
+  Expr _maybeOuterJoin(ColumnExpr col) {
+    if (_check(TokType.punct, '(') &&
+        _peek(1).type == TokType.op &&
+        _peek(1).text == '+' &&
+        _peek(2).type == TokType.punct &&
+        _peek(2).text == ')') {
+      _advance();
+      _advance();
+      _advance();
+      return OuterJoinExpr(col);
+    }
+    return col;
+  }
+
   Expr _parseFunctionCall(String name) {
     final upper = name.toUpperCase();
     _expect(TokType.punct, '(');
+    // SQL-standard EXTRACT(field FROM source): the field is a bareword
+    // (YEAR, MONTH, DAY, HOUR, MINUTE, SECOND) followed by FROM. Rewrite into
+    // EXTRACT(<field-name-literal>, source) for the scalar implementation.
+    if (upper == 'EXTRACT' &&
+        (_peek().type == TokType.ident || _peek().type == TokType.keyword) &&
+        _peek(1).type == TokType.keyword &&
+        _peek(1).upper == 'FROM') {
+      final field = _advance().text.toUpperCase();
+      _expectKw('FROM');
+      final source = _parseExpr();
+      _expect(TokType.punct, ')');
+      return FunctionCallExpr('EXTRACT', [LiteralExpr(field), source]);
+    }
+    // ANSI TRIM([LEADING|TRAILING|BOTH] [chars] FROM string), detected by a
+    // top-level FROM inside the parens.
+    if (upper == 'TRIM') {
+      var depth = 0;
+      var ansi = false;
+      for (var i = 0;; i++) {
+        final tk = _peek(i);
+        if (tk.type == TokType.eof) break;
+        if (tk.type == TokType.punct && tk.text == '(') {
+          depth++;
+        } else if (tk.type == TokType.punct && tk.text == ')') {
+          if (depth == 0) break;
+          depth--;
+        } else if (depth == 0 &&
+            tk.type == TokType.keyword &&
+            tk.upper == 'FROM') {
+          ansi = true;
+          break;
+        }
+      }
+      if (ansi) {
+        var side = 'BOTH';
+        if (_matchWord('LEADING')) {
+          side = 'LEADING';
+        } else if (_matchWord('TRAILING')) {
+          side = 'TRAILING';
+        } else {
+          _matchWord('BOTH');
+        }
+        final chars = _checkKw('FROM') ? null : _parseExpr();
+        _expectKw('FROM');
+        final str = _parseExpr();
+        _expect(TokType.punct, ')');
+        final fn = side == 'LEADING'
+            ? 'LTRIM'
+            : side == 'TRAILING'
+                ? 'RTRIM'
+                : 'TRIM';
+        return FunctionCallExpr(fn, chars == null ? [str] : [str, chars]);
+      }
+    }
+    // Oracle XMLCAST(value AS type): convert an XML/content value to a SQL
+    // type. Modelled as a plain CAST (the XQuery content is already a scalar).
+    if (upper == 'XMLCAST') {
+      final e = _parseExpr();
+      _expectKw('AS');
+      final typeTok = _advance();
+      final type = parseDataType(typeTok.text);
+      if (_check(TokType.punct, '(')) {
+        var depth = 0;
+        do {
+          final tk = _advance();
+          if (tk.type == TokType.punct && tk.text == '(') depth++;
+          if (tk.type == TokType.punct && tk.text == ')') depth--;
+        } while (depth > 0 && !_isAtEnd());
+      }
+      _expect(TokType.punct, ')');
+      return CastExpr(e, type);
+    }
+    // Oracle XMLSERIALIZE([DOCUMENT|CONTENT] expr [AS type] …): serialise an
+    // XML value to text. We keep the inner expression and ignore the options.
+    if (upper == 'XMLSERIALIZE') {
+      _matchWord('DOCUMENT');
+      _matchWord('CONTENT');
+      final e = _parseExpr();
+      while (!_check(TokType.punct, ')') && !_isAtEnd()) {
+        _advance();
+      }
+      _expect(TokType.punct, ')');
+      return FunctionCallExpr('XMLSERIALIZE', [e]);
+    }
     bool isStar = false;
     bool distinct = false;
     final args = <Expr>[];
@@ -2223,6 +5527,65 @@ class Parser {
         while (_match(TokType.punct, ',')) {
           args.add(_parseExpr());
         }
+      } else if (upper == 'XMLELEMENT') {
+        // XMLELEMENT([NAME] ename, content…): the element name is an
+        // identifier/string treated as a literal.
+        _matchWord('NAME');
+        args.add(LiteralExpr(
+            _check(TokType.string) ? _advance().text : _expectName()));
+        while (_match(TokType.punct, ',')) {
+          args.add(_parseExpr());
+        }
+      } else if (upper == 'XMLFOREST') {
+        // XMLFOREST(value [AS "name"], …): collect (name, value) pairs, the
+        // name defaulting to the value expression's column identifier.
+        do {
+          final v = _parseExpr();
+          String name;
+          if (_matchKw('AS')) {
+            name = _check(TokType.string) ? _advance().text : _expectName();
+          } else if (v is ColumnExpr) {
+            name = v.name;
+          } else {
+            name = 'C';
+          }
+          args.add(LiteralExpr(name));
+          args.add(v);
+        } while (_match(TokType.punct, ','));
+      } else if (upper == 'JSON_OBJECT' || upper == 'JSON_OBJECTAGG') {
+        // Oracle key/value syntax: JSON_OBJECT([KEY] k VALUE v, …) and the
+        // colon form JSON_OBJECT(k : v) map onto the (key, value, …) arg list.
+        do {
+          _matchWord('KEY');
+          args.add(_parseExpr());
+          if (_matchWord('VALUE') || _match(TokType.punct, ':')) {
+            args.add(_parseExpr());
+          }
+        } while (_match(TokType.punct, ','));
+        // Trailing output clauses (FORMAT JSON, [NULL|ABSENT] ON NULL, …).
+        var absentOnNull = false;
+        while (true) {
+          if (_matchWord('ABSENT')) {
+            absentOnNull = true;
+            continue;
+          }
+          if (_matchWord('FORMAT') ||
+              _matchWord('JSON') ||
+              _matchWord('NULL') ||
+              _matchWord('ON') ||
+              _matchWord('RETURNING') ||
+              _matchWord('STRICT') ||
+              _matchWord('WITH') ||
+              _matchWord('WITHOUT') ||
+              _matchWord('UNIQUE') ||
+              _matchWord('KEYS')) {
+            continue;
+          }
+          break;
+        }
+        if (absentOnNull && upper == 'JSON_OBJECT') {
+          args.add(LiteralExpr('\u0001ABSENT'));
+        }
       } else {
         if (_matchKw('DISTINCT')) distinct = true;
         args.add(_parseExpr());
@@ -2230,6 +5593,88 @@ class Parser {
           args.add(_parseExpr());
         }
       }
+    }
+    // Oracle LISTAGG overflow clause: `ON OVERFLOW {TRUNCATE ['txt'] | ERROR}
+    // [WITH|WITHOUT COUNT]`. Consumed (overflow truncation is not modelled).
+    if (_matchWord('ON')) {
+      _expectWord('OVERFLOW');
+      if (!_matchWord('TRUNCATE')) _matchWord('ERROR');
+      if (_check(TokType.string)) _advance();
+      if (_matchWord('WITH') || _matchWord('WITHOUT')) _matchWord('COUNT');
+    }
+    // Oracle JSON_VALUE/JSON_QUERY `RETURNING <type>` and ON ERROR/EMPTY
+    // clauses. For JSON_VALUE the type + DEFAULT … ON ERROR drive coercion;
+    // for JSON_QUERY, WITH WRAPPER wraps a scalar result in an array.
+    String? jsonRetType;
+    Object? jsonDefault;
+    var jsonHasDefault = false;
+    var jsonWrapper = false;
+    if (_matchWord('RETURNING')) {
+      final rt = _advance(); // return type word
+      jsonRetType = rt.text.toUpperCase();
+      if (_check(TokType.punct, '(')) {
+        var depth = 0;
+        do {
+          final tk = _advance();
+          if (tk.type == TokType.punct && tk.text == '(') depth++;
+          if (tk.type == TokType.punct && tk.text == ')') depth--;
+        } while (depth > 0 && !_isAtEnd());
+      }
+    }
+    // JSON_QUERY wrapper clause.
+    if (_matchWord('WITH')) {
+      _matchWord('UNCONDITIONAL');
+      _matchWord('CONDITIONAL');
+      if (_matchWord('WRAPPER') || _matchWord('ARRAY')) {
+        jsonWrapper = true;
+        _matchWord('WRAPPER');
+      }
+    } else if (_matchWord('WITHOUT')) {
+      _matchWord('WRAPPER');
+      _matchWord('ARRAY');
+    }
+    while (_checkWord('ERROR') ||
+        _checkWord('NULL') ||
+        _checkWord('DEFAULT') ||
+        _checkWord('EMPTY') ||
+        _checkWord('TRUE') ||
+        _checkWord('FALSE') ||
+        (_checkWord('ON') &&
+            (_peek(1).upper == 'ERROR' || _peek(1).upper == 'EMPTY'))) {
+      if (_matchWord('DEFAULT')) {
+        var neg = false;
+        if (_check(TokType.op, '-')) {
+          neg = true;
+          _advance();
+        } else if (_check(TokType.op, '+')) {
+          _advance();
+        }
+        final d = _parsePrimary();
+        if (!jsonHasDefault && d is LiteralExpr) {
+          final val = d.value;
+          jsonDefault = neg && val is num ? -val : val;
+          jsonHasDefault = true;
+        }
+      } else {
+        _advance();
+      }
+    }
+    if (upper == 'JSON_VALUE' && (jsonRetType != null || jsonHasDefault)) {
+      args.add(LiteralExpr('\u0001JV:${jsonEncode({
+            'ret': jsonRetType,
+            if (jsonHasDefault) 'def': jsonDefault,
+          })}'));
+    } else if (upper == 'JSON_QUERY' && jsonWrapper) {
+      args.add(LiteralExpr('\u0001JQW'));
+    }
+    // Oracle `IGNORE NULLS` / `RESPECT NULLS` modifier (FIRST_VALUE,
+    // LAST_VALUE, LAG, LEAD, NTH_VALUE).
+    bool ignoreNulls = false;
+    if (_matchWord('IGNORE')) {
+      _expectWord('NULLS');
+      ignoreNulls = true;
+    } else if (_matchWord('RESPECT')) {
+      _expectWord('NULLS');
     }
     List<WindowOrderItem>? aggOrderBy;
     if (_matchKw('ORDER')) {
@@ -2240,6 +5685,18 @@ class Parser {
       }
     }
     _expect(TokType.punct, ')');
+    // Oracle ordered-set aggregate: `agg(args) WITHIN GROUP (ORDER BY …)`.
+    if (_matchWord('WITHIN')) {
+      _expectWord('GROUP');
+      _expect(TokType.punct, '(');
+      _expectKw('ORDER');
+      _expectKw('BY');
+      aggOrderBy = <WindowOrderItem>[_parseWindowOrderItem()];
+      while (_match(TokType.punct, ',')) {
+        aggOrderBy.add(_parseWindowOrderItem());
+      }
+      _expect(TokType.punct, ')');
+    }
     // IIF(cond, a, b) desugars to CASE WHEN cond THEN a ELSE b END so
     // that branches short-circuit, matching SQLite semantics.
     if (upper == 'IIF' && args.length == 3) {
@@ -2251,6 +5708,50 @@ class Parser {
       _expectKw('WHERE');
       filterExpr = _parseExpr();
       _expect(TokType.punct, ')');
+    }
+    // Oracle `KEEP (DENSE_RANK FIRST|LAST ORDER BY …)` ordered-set modifier.
+    bool? keepFirst;
+    List<WindowOrderItem>? keepOrderBy;
+    if (_matchWord('KEEP')) {
+      _expect(TokType.punct, '(');
+      _matchWord('DENSE_RANK');
+      final sawFirst = _matchWord('FIRST') || _matchKw('FIRST');
+      final sawLast = !sawFirst && (_matchWord('LAST') || _matchKw('LAST'));
+      keepFirst = !sawLast;
+      _expectKw('ORDER');
+      _expectKw('BY');
+      keepOrderBy = <WindowOrderItem>[_parseWindowOrderItem()];
+      while (_match(TokType.punct, ',')) {
+        keepOrderBy.add(_parseWindowOrderItem());
+      }
+      _expect(TokType.punct, ')');
+    }
+    // Oracle `IGNORE NULLS` / `RESPECT NULLS` may also follow the closing paren
+    // (LEAD/LAG: `LEAD(v) IGNORE NULLS OVER (...)`).
+    if (!ignoreNulls) {
+      if (_matchWord('IGNORE')) {
+        _expectWord('NULLS');
+        ignoreNulls = true;
+      } else if (_matchWord('RESPECT')) {
+        _expectWord('NULLS');
+      }
+    }
+    // Oracle `NTH_VALUE(expr, n) FROM FIRST|LAST`. Only consume FROM when it
+    // introduces this modifier (FIRST/LAST next), never the query's FROM clause.
+    bool fromLast = false;
+    if (_checkKw('FROM') &&
+        (_peek(1).upper == 'FIRST' || _peek(1).upper == 'LAST')) {
+      _advance(); // FROM
+      fromLast = _advance().upper == 'LAST';
+    }
+    // IGNORE/RESPECT NULLS can also trail the FROM FIRST|LAST clause.
+    if (!ignoreNulls) {
+      if (_matchWord('IGNORE')) {
+        _expectWord('NULLS');
+        ignoreNulls = true;
+      } else if (_matchWord('RESPECT')) {
+        _expectWord('NULLS');
+      }
     }
     WindowSpec? window;
     if (_matchKw('OVER')) {
@@ -2270,6 +5771,10 @@ class Parser {
       window: window,
       filterExpr: filterExpr,
       aggOrderBy: aggOrderBy,
+      keepFirst: keepFirst,
+      keepOrderBy: keepOrderBy,
+      ignoreNulls: ignoreNulls,
+      fromLast: fromLast,
     );
   }
 
@@ -2425,8 +5930,39 @@ class Parser {
     _expectKw('AS');
     final typeTok = _advance();
     final type = parseDataType(typeTok.text);
+    // Oracle CAST enforces the declared size: NUMBER(p,s) rounds to the scale,
+    // VARCHAR2/CHAR(n) truncates to the length.
+    int? numericScale;
+    int? charLength;
+    if (_check(TokType.punct, '(')) {
+      final rawType = typeTok.text.toUpperCase();
+      const charTypes = {
+        'VARCHAR', 'VARCHAR2', 'CHAR', 'NCHAR', 'NVARCHAR', 'NVARCHAR2',
+        'CHARACTER',
+      };
+      _advance(); // (
+      final first = _advance();
+      final firstN = int.tryParse(first.text);
+      if (_matchWord('CHAR') || _matchWord('BYTE')) {}
+      if (_match(TokType.punct, ',')) {
+        var neg = false;
+        if (_check(TokType.op, '-')) {
+          neg = true;
+          _advance();
+        }
+        final sc = int.tryParse(_advance().text);
+        numericScale = sc == null ? null : (neg ? -sc : sc);
+      } else if (charTypes.contains(rawType)) {
+        charLength = firstN;
+      }
+      while (!_check(TokType.punct, ')') && !_check(TokType.eof)) {
+        _advance();
+      }
+      _expect(TokType.punct, ')');
+    }
     _expect(TokType.punct, ')');
-    return CastExpr(e, type);
+    return CastExpr(e, type,
+        numericScale: numericScale, charLength: charLength);
   }
 
   Expr _parseExistsExpr() {

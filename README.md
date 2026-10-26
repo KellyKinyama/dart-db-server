@@ -12,6 +12,11 @@ and an interactive REPL.
 > **What ships in the box**
 >
 > - Full SQL surface (DDL, DML, joins, CTEs, window functions, transactions).
+> - **Broad Oracle SQL dialect** — `MERGE`, `PIVOT`/`UNPIVOT` (incl. `PIVOT
+>   XML`), `MATCH_RECOGNIZE` row-pattern matching, hierarchical `CONNECT BY`,
+>   recursive `WITH` (auto-detected), quantified comparisons, a large Oracle
+>   function library, `NUMBER`/`VARCHAR2`/`CHAR` fidelity, PL/SQL blocks &
+>   packages, object types, and Oracle JSON & XML (`JSON_TABLE`, `XMLTABLE`).
 > - Three storage backends: in-memory (JSON), out-of-core paged, SQLite
 >   on-disk format.
 > - **Vector database** — six index kinds (Flat / HNSW / IVFFlat / LSH / PQ
@@ -67,28 +72,70 @@ print(r.rows); // [[1, Alice]]
   - `CREATE VIEW [IF NOT EXISTS] v AS SELECT ...`, `DROP VIEW [IF EXISTS]`.
 - **DML**:
   - `INSERT [OR REPLACE | OR IGNORE] INTO ... VALUES (...) [, (...)]`,
-    `REPLACE INTO ...` (alias of `INSERT OR REPLACE`).
-  - `UPDATE`, `DELETE`.
+    `REPLACE INTO ...` (alias of `INSERT OR REPLACE`), `INSERT ALL`.
+  - `UPDATE`, `DELETE`, `MERGE INTO ... USING ... ON ... WHEN [NOT] MATCHED`.
   - `SELECT [DISTINCT] cols [FROM t [JOIN ... ON ...]] [WHERE ...]
     [GROUP BY ... [HAVING ...]] [ORDER BY ... [NULLS FIRST|LAST]]
-    [LIMIT n] [OFFSET n] [UNION [ALL] | INTERSECT | EXCEPT ...]`.
-  - `FROM` is optional (e.g. `SELECT 'foo' || 'bar'`).
+    [LIMIT n] [OFFSET n]
+    [UNION [ALL] | INTERSECT | EXCEPT | MINUS ...]`.
+  - `FROM` is optional (e.g. `SELECT 'foo' || 'bar'`, `SELECT ... FROM dual`).
 - **Expressions**: `AND`/`OR`/`NOT`, comparisons (`=`, `!=`, `<>`, `<`, `<=`,
   `>`, `>=`), arithmetic (`+ - * /`), string `||`, `IS [NOT] NULL`,
   `[NOT] IN (list | SELECT ...)`, `[NOT] BETWEEN`, `LIKE` (`%`, `_`),
   `EXISTS (SELECT ...)`, scalar subqueries `(SELECT ...)`,
   `CASE WHEN ... THEN ... [ELSE ...] END` (simple and searched),
   `CAST(expr AS type)`, parentheses.
-- **Aggregates**: `COUNT(*)`, `COUNT([DISTINCT] x)`, `SUM`, `AVG`, `MIN`, `MAX`
-  with `GROUP BY` and `HAVING`.
-- **Scalar functions**: `UPPER`, `LOWER`, `LENGTH`, `TRIM`/`LTRIM`/`RTRIM`,
-  `SUBSTR`/`SUBSTRING`, `REPLACE`, `CONCAT`, `COALESCE`, `IFNULL`, `NULLIF`,
-  `ABS`, `ROUND`, `MOD`.
-- **Joins**: `INNER`, `LEFT [OUTER]`, `RIGHT [OUTER]`, `CROSS`.
-- **Subqueries**: scalar, `IN (SELECT ...)`, `EXISTS (SELECT ...)` —
+- **Aggregates**: `COUNT(*)`, `COUNT([DISTINCT] x)`, `SUM`, `AVG`, `MIN`, `MAX`,
+  `MEDIAN`, `STDDEV`/`VARIANCE` family, `LISTAGG (... [ON OVERFLOW ...]) WITHIN
+  GROUP (ORDER BY ...)`, `PERCENTILE_CONT`/`PERCENTILE_DISC`, `STATS_MODE`,
+  the `KEEP (DENSE_RANK FIRST|LAST ORDER BY ...)` ordered-set modifier, and
+  nested aggregates (`MAX(MIN(x)) ... GROUP BY`) — all with `GROUP BY`,
+  `HAVING`, `ROLLUP`/`CUBE`/`GROUPING SETS`, and `GROUPING`/`GROUPING_ID`.
+  `SUM`/`TOTAL` use exact-decimal accumulation.
+- **Window functions**: `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `NTILE`, `LAG`,
+  `LEAD`, `FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE` (with `IGNORE NULLS`),
+  `RATIO_TO_REPORT`, and the aggregates over `OVER (PARTITION BY ... ORDER BY
+  ... <frame>)`.
+- **Scalar functions**: strings (`UPPER`, `LOWER`, `LENGTH`/`LENGTHB`,
+  `TRIM`/`LTRIM`/`RTRIM`, `SUBSTR`/`SUBSTRB`, `INSTR`/`INSTRB`, `REPLACE`,
+  `TRANSLATE`, `CONCAT`, `LPAD`/`RPAD`, `REGEXP_REPLACE`/`REGEXP_SUBSTR`/
+  `REGEXP_COUNT`/`REGEXP_INSTR`/`REGEXP_LIKE`), numeric (`ABS`, `ROUND`,
+  `TRUNC`, `MOD`, `REMAINDER`, `POWER`, `SIGN`, `WIDTH_BUCKET`, `BITAND`,
+  `BIN_TO_NUM`), dates (`SYSDATE`, `TO_DATE`, `TO_TIMESTAMP`, `TO_CHAR` with
+  date & number format models, `ADD_MONTHS`, `MONTHS_BETWEEN`, `NEXT_DAY`,
+  `EXTRACT`, `TRUNC`/`ROUND` date models, `INTERVAL` literals/arithmetic),
+  conversion (`CAST`, `TO_NUMBER`, `HEXTORAW`/`RAWTOHEX`, `UTL_RAW.*`,
+  `VSIZE`/`DUMP`, `NVL`/`NVL2`/`COALESCE`/`NULLIF`/`DECODE`/`GREATEST`/
+  `LEAST`), JSON (`JSON_VALUE` with `RETURNING`/`DEFAULT ... ON ERROR`,
+  `JSON_QUERY` with `WITH WRAPPER`, `JSON_EXISTS`, `JSON_OBJECT`/`JSON_ARRAY`
+  with `ABSENT ON NULL`, `JSON_MERGEPATCH`, `JSON_SET`/`JSON_INSERT`/
+  `JSON_REPLACE`/`JSON_REMOVE`/`JSON_PATCH`, `IS [NOT] JSON`), and XML
+  (`XMLELEMENT`, `XMLFOREST`, `XMLQUERY`, `XMLSERIALIZE`, `XMLTYPE`,
+  `EXTRACTVALUE`).
+- **Joins**: `INNER`, `LEFT [OUTER]`, `RIGHT [OUTER]`, `CROSS`, plus Oracle
+  legacy `(+)` outer-join markers.
+- **Subqueries**: scalar, `IN (SELECT ...)`, `EXISTS (SELECT ...)`, and
+  quantified comparisons (`>= ALL | ANY | SOME (SELECT ...)`) —
   correlated references to the outer query are supported.
 - **Transactions**: `BEGIN`, `COMMIT`, `ROLLBACK` (snapshot isolation).
-- **Types**: `INTEGER`, `REAL`, `TEXT`, `BOOLEAN`, plus `NULL`.
+- **Types**: `INTEGER`, `REAL`, `TEXT`, `BOOLEAN`, `NULL`, plus Oracle
+  `NUMBER(p[,s])` (scale rounding + precision enforcement), `VARCHAR2(n)`/
+  `CHAR(n)` (length enforcement & blank-padding), `TIMESTAMP [WITH [LOCAL]
+  TIME ZONE]`, `INTERVAL ... TO ...`, `BLOB`/`CLOB`, and `VECTOR`.
+- **Oracle dialect extras**: `MERGE ... WHEN [NOT] MATCHED [... DELETE WHERE]`,
+  `INSERT ALL`, `PIVOT`/`UNPIVOT` (including `PIVOT XML (... FOR col IN
+  (ANY))`), `MATCH_RECOGNIZE (PARTITION BY ... ORDER BY ... MEASURES ...
+  PATTERN (...) DEFINE ...)` row-pattern recognition, hierarchical `START
+  WITH ... CONNECT BY [PRIOR]` with `CONNECT_BY_ROOT` / `SYS_CONNECT_BY_PATH`,
+  sequences (`seq.NEXTVAL`/`CURRVAL`, `GENERATED AS IDENTITY`), `DUAL`,
+  `q'[...]'` quoting, `ROWNUM`, object types & attribute navigation, and
+  PL/SQL blocks, packages, triggers, `CASE` statements and `%TYPE`
+  declarations.
+- **Table-valued row sources**: `JSON_TABLE(src, rowPath COLUMNS (...))` with
+  `FOR ORDINALITY`, `EXISTS PATH`, typed `PATH ... DEFAULT ... ON ERROR`, and
+  `NESTED PATH` subtrees; `XMLTABLE(rowXPath PASSING doc COLUMNS ...)` XML
+  shredding; plus SQLite-style `json_each` / `json_tree` and
+  `generate_series`.
 - **Introspection / utility**: `SHOW TABLES`, `DESCRIBE <table>`,
   `EXPLAIN <stmt>`, `PRAGMA name [= value]` (no-op acknowledgement).
 
@@ -216,6 +263,24 @@ object per line in response.
 // response
 {"id": 1, "ok": true, "columns": ["id","name"], "rows": [[1,"Alice"]], "affected": 1}
 ```
+
+## Plan: Oracle wire protocol compatibility
+
+An **Oracle-compatible server front-end** is in progress — so unmodified
+Oracle clients (node-oracledb thin, python-oracledb thin, JDBC thin, and
+the pure-Dart `oracledb` driver) can connect to `dart_db_server` the same
+way `mysql_wire.dart` serves MySQL clients. The TNS transport, TTC
+negotiation, O5LOGON authentication, and no-bind SQL execute/fetch paths
+are implemented (`lib/server/oracle_*.dart`); a client can connect from
+TCP through a real `SELECT`. Enable it with:
+
+```powershell
+dart run bin/dart_db_server.dart --oracle-port 1521 --oracle-user scott/tiger
+```
+
+The full methodology (inverting the sibling `../dart-oracledb` thin
+client), architecture, phased roadmap, progress, and known risks live in
+[`doc/oracle-wire-protocol-plan.md`](doc/oracle-wire-protocol-plan.md).
 
 ## Layout
 

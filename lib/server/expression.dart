@@ -5,6 +5,8 @@ import 'dart:convert';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
+import 'package:crypto/crypto.dart' as crypto;
+
 import 'fts5.dart';
 import 'schema.dart';
 import 'vector.dart';
@@ -48,8 +50,25 @@ class BindParamExpr extends Expr {
 
   static final List<BindScope> scopeStack = <BindScope>[];
 
+  /// Ambient per-connection MySQL session user-variable store, pushed by
+  /// `Database` while dispatching. A `@name` reference reads from here when it
+  /// is not shadowed by an explicit binding; an unset variable reads as NULL.
+  static final List<Map<String, Object?>> userVarStack =
+      <Map<String, Object?>>[];
+
+  /// True for a MySQL session user-variable spelling (`@name`, not `@@sysvar`).
+  bool get _isUserVar =>
+      name != null && spelling.startsWith('@') && !spelling.startsWith('@@');
+
   @override
   Object? eval(Map<String, Object?> row) {
+    if (_isUserVar) {
+      // An explicit binding (rare for `@`) shadows the session variable.
+      if (scopeStack.isNotEmpty && scopeStack.last.hasNamed(name!)) {
+        return scopeStack.last.lookupNamed(name!, spelling);
+      }
+      return userVarStack.isEmpty ? null : userVarStack.last[name!];
+    }
     if (scopeStack.isEmpty) {
       throw StateError(
         'Bind parameter $spelling used but no bindings are active. '
@@ -69,6 +88,8 @@ class BindScope {
 
   BindScope({this.positional = const [], this.named = const {}});
 
+  bool hasNamed(String name) => named.containsKey(name);
+
   Object? lookupPositional(int index, String spelling) {
     if (index < 1 || index > positional.length) {
       throw StateError(
@@ -87,10 +108,51 @@ class BindScope {
   }
 }
 
+/// Supplies sequence values to [SequenceExpr] during evaluation. Implemented
+/// by `Database`, which pushes itself onto [SequenceExpr.providerStack] while
+/// dispatching a statement (mirrors the bind-scope mechanism above).
+abstract class SequenceProvider {
+  int sequenceNextval(String name);
+  int sequenceCurrval(String name);
+}
+
+/// `seq.NEXTVAL` / `seq.CURRVAL`. NEXTVAL advances the sequence each time it is
+/// evaluated (i.e. once per row for a multi-row INSERT ... SELECT), matching
+/// Oracle; CURRVAL returns the value last issued to the current session.
+class SequenceExpr extends Expr {
+  final String sequence;
+  final bool isCurrval;
+  SequenceExpr(this.sequence, {this.isCurrval = false});
+
+  static final List<SequenceProvider> providerStack = <SequenceProvider>[];
+
+  @override
+  Object? eval(Map<String, Object?> row) {
+    if (providerStack.isEmpty) {
+      throw StateError(
+        'Sequence ${isCurrval ? 'CURRVAL' : 'NEXTVAL'} on "$sequence" used '
+        'outside an active database',
+      );
+    }
+    final p = providerStack.last;
+    return isCurrval
+        ? p.sequenceCurrval(sequence)
+        : p.sequenceNextval(sequence);
+  }
+}
+
 class ColumnExpr extends Expr {
   final String? table; // optional qualifier (table.column)
   final String name;
   ColumnExpr(this.name, {this.table});
+
+  /// Ambient fallback scopes for bare identifiers that aren't columns of the
+  /// current row — the local variables of a running stored routine. Pushed by
+  /// the routine interpreter around each embedded statement so an unqualified
+  /// reference in value position (e.g. `VALUES (id)`) resolves to the variable,
+  /// while the same name used as a column identifier is unaffected.
+  static final List<Map<String, Object?>> routineScopes = [];
+
   @override
   Object? eval(Map<String, Object?> row) {
     if (table != null) {
@@ -107,9 +169,94 @@ class ColumnExpr extends Expr {
     final lower = name.toLowerCase();
     if (row.containsKey(upper)) return row[upper];
     if (row.containsKey(lower)) return row[lower];
+    if (table == null && routineScopes.isNotEmpty) {
+      final scope = routineScopes.last;
+      if (scope.containsKey(name)) return scope[name];
+      if (scope.containsKey(lower)) return scope[lower];
+    }
+    // Qualified `rec.col` from a cursor FOR-loop record in the routine scope.
+    if (table != null && routineScopes.isNotEmpty) {
+      final scope = routineScopes.last;
+      final q = '$table.$name';
+      if (scope.containsKey(q)) return scope[q];
+      final ql = q.toLowerCase();
+      if (scope.containsKey(ql)) return scope[ql];
+    }
+    // A qualified `pkg.func` with no arguments: Oracle allows calling a
+    // parameterless package function without parentheses. Fall back to the
+    // stored-function resolver before failing.
+    if (table != null) {
+      final resolver = FunctionCallExpr.storedFunctionResolver;
+      if (resolver != null) {
+        try {
+          return resolver('$table.$name', const []);
+        } on StateError {
+          // Not a known function — fall through to the column error.
+        }
+      }
+    }
+    // An unqualified name that is not a column may be a parameterless stored
+    // function called without parentheses (Oracle: `SELECT f0 FROM dual`).
+    if (table == null) {
+      final resolver = FunctionCallExpr.storedFunctionResolver;
+      if (resolver != null) {
+        try {
+          return resolver(name, const []);
+        } on StateError {
+          // Not a known function — fall through to the column error.
+        }
+      }
+    }
     throw StateError(
       'Unknown column: ${table == null ? name : '$table.$name'}',
     );
+  }
+}
+
+/// Oracle legacy outer-join marker: `col(+)`. Transparent during evaluation
+/// (returns the inner value); the SELECT parser's outer-join rewrite reads the
+/// marker to turn a comma/CROSS join into a LEFT/RIGHT join, then unwraps it.
+class OuterJoinExpr extends Expr {
+  final ColumnExpr column;
+  OuterJoinExpr(this.column);
+  @override
+  Object? eval(Map<String, Object?> row) => column.eval(row);
+}
+
+/// `PRIOR expr` inside a CONNECT BY condition: refers to the **parent** row.
+/// The hierarchical executor publishes each candidate parent's columns under a
+/// `PRIOR.` prefix while testing the CONNECT BY predicate.
+class PriorExpr extends Expr {
+  final Expr inner;
+  PriorExpr(this.inner);
+  @override
+  Object? eval(Map<String, Object?> row) {
+    final e = inner;
+    if (e is ColumnExpr) {
+      final key = 'PRIOR.${e.name}';
+      if (row.containsKey(key)) return row[key];
+      final up = 'PRIOR.${e.name.toUpperCase()}';
+      if (row.containsKey(up)) return row[up];
+      final lo = 'PRIOR.${e.name.toLowerCase()}';
+      if (row.containsKey(lo)) return row[lo];
+      return null;
+    }
+    return inner.eval(row);
+  }
+}
+
+/// Picks the [index]-th element of a row-valued expression (e.g. a multi-column
+/// single-row subquery), used by `UPDATE … SET (a, b) = (SELECT …)`.
+class RowElementExpr extends Expr {
+  final Expr row;
+  final int index;
+  RowElementExpr(this.row, this.index);
+  @override
+  Object? eval(Map<String, Object?> r) {
+    final v = row.eval(r);
+    if (v is List) return index < v.length ? v[index] : null;
+    // A single-column subquery yields a scalar; index 0 returns it.
+    return index == 0 ? v : null;
   }
 }
 
@@ -126,10 +273,10 @@ class UnaryExpr extends Expr {
         return !(v as bool);
       case '-':
         if (v == null) return null;
-        return -(v as num);
+        return -_sqlTextToNum(v);
       case '~':
         if (v == null) return null;
-        return ~((v as num).toInt());
+        return ~_sqlTextToNum(v).toInt();
       case 'IS NULL':
         return v == null;
       case 'IS NOT NULL':
@@ -142,8 +289,34 @@ class UnaryExpr extends Expr {
         return _truthy(v) == false;
       case 'IS NOT FALSE':
         return _truthy(v) != false;
+      case 'IS JSON':
+        return _isValidJson(v);
+      case 'IS NOT JSON':
+        return !_isValidJson(v);
     }
     throw StateError('Unknown unary op: $op');
+  }
+
+  /// True when [v] is syntactically valid JSON. RAW/BLOB bytes are decoded as
+  /// UTF-8 first (Oracle stores JSON in RAW/BLOB columns).
+  static bool _isValidJson(Object? v) {
+    if (v == null) return false;
+    String s;
+    if (v is List<int>) {
+      try {
+        s = utf8.decode(v);
+      } catch (_) {
+        return false;
+      }
+    } else {
+      s = v.toString();
+    }
+    try {
+      jsonDecode(s);
+      return true;
+    } catch (_) {
+      return false;
+    }
   }
 
   /// SQL truthiness: NULL stays NULL; numeric zero is false; bool passes
@@ -158,6 +331,20 @@ class UnaryExpr extends Expr {
   }
 }
 
+/// A YEAR-TO-MONTH interval value (a signed whole number of months). Kept as a
+/// distinct type — rather than a day count — so DATE arithmetic adds *calendar*
+/// months (preserving the day-of-month) instead of ~30-day approximations.
+class YmInterval {
+  final int months;
+  const YmInterval(this.months);
+  @override
+  String toString() {
+    final y = months.abs() ~/ 12;
+    final m = months.abs() % 12;
+    return '${months < 0 ? '-' : ''}$y-$m';
+  }
+}
+
 class BinaryExpr extends Expr {
   final String op;
   final Expr left;
@@ -166,16 +353,24 @@ class BinaryExpr extends Expr {
 
   @override
   Object? eval(Map<String, Object?> row) {
-    // Short-circuit logical ops
+    // Short-circuit logical ops with full SQL three-valued (Kleene) logic:
+    // AND -> false if either operand is false (even if the other is NULL);
+    // OR  -> true  if either operand is true  (even if the other is NULL).
+    // NULL results only when no operand is decisive.
     if (op == 'AND' || op == 'OR') {
       final l = left.eval(row);
       if (op == 'AND' && l == false) return false;
       if (op == 'OR' && l == true) return true;
       final r = right.eval(row);
-      if (l == null || r == null) return null;
-      return op == 'AND'
-          ? (l as bool) && (r as bool)
-          : (l as bool) || (r as bool);
+      if (op == 'AND') {
+        if (l == false || r == false) return false;
+        if (l == null || r == null) return null;
+        return (l as bool) && (r as bool);
+      } else {
+        if (l == true || r == true) return true;
+        if (l == null || r == null) return null;
+        return (l as bool) || (r as bool);
+      }
     }
     // NULL-safe equality (mirrors SQLite's IS / IS NOT and the standard
     // IS DISTINCT FROM / IS NOT DISTINCT FROM). These must run before the
@@ -199,48 +394,109 @@ class BinaryExpr extends Expr {
     }
     final l = left.eval(row);
     final r = right.eval(row);
+    // Row-value (tuple) comparison: `(a, b) = (1, 2)` etc.
+    if (l is List && r is List) {
+      return _rowValueCompare(op, l, r);
+    }
+    // Oracle concatenation treats a NULL operand as the empty string (and an
+    // all-empty result collapses back to NULL, since '' IS NULL in Oracle).
+    if (op == '||') {
+      final out = (l == null ? '' : _stringify(l)) +
+          (r == null ? '' : _stringify(r));
+      return out.isEmpty ? null : out;
+    }
+    // YEAR-MONTH interval scaled by a number: INTERVAL '1' YEAR * 2 -> +02-00.
+    if ((l is YmInterval || r is YmInterval) && (op == '*' || op == '/')) {
+      final iv = (l is YmInterval ? l : r) as YmInterval;
+      final factor = _toNum(l is YmInterval ? r : l);
+      if (factor == null) return null;
+      final months =
+          op == '*' ? (iv.months * factor).round() : (iv.months / factor).round();
+      return YmInterval(months);
+    }
     if (l == null || r == null) {
       // SQL three-valued logic: comparisons with NULL yield NULL (treated as false).
       return null;
     }
+    // NOCASE collation on either operand makes string (in)equality and ordering
+    // case-insensitive; RTRIM ignores trailing spaces.
+    final nocase = _isNoCase(left) || _isNoCase(right);
+    final rtrim = _isRtrim(left) || _isRtrim(right);
+    final lc = rtrim ? applyCollation(l, 'RTRIM') ?? l : l;
+    final rc = rtrim ? applyCollation(r, 'RTRIM') ?? r : r;
     switch (op) {
       case '->':
         return _jsonOp(l, r, asText: false);
       case '->>':
         return _jsonOp(l, r, asText: true);
       case '=':
-        return _eq(l, r);
+        return nocase ? _eqCI(lc, rc) : _eq(lc, rc);
       case '!=':
       case '<>':
-        return !_eq(l, r);
+        return !(nocase ? _eqCI(lc, rc) : _eq(lc, rc));
       case '<':
-        return _cmp(l, r) < 0;
+        return (nocase ? _cmpCI(lc, rc) : _cmp(lc, rc)) < 0;
       case '<=':
-        return _cmp(l, r) <= 0;
+        return (nocase ? _cmpCI(lc, rc) : _cmp(lc, rc)) <= 0;
       case '>':
-        return _cmp(l, r) > 0;
+        return (nocase ? _cmpCI(lc, rc) : _cmp(lc, rc)) > 0;
       case '>=':
-        return _cmp(l, r) >= 0;
+        return (nocase ? _cmpCI(lc, rc) : _cmp(lc, rc)) >= 0;
       case '+':
-        return (l as num) + (r as num);
+        {
+          // Oracle date arithmetic: DATE + n (days) shifts the date; numbers
+          // on both sides fall through to numeric addition.
+          final ld = _asSqlDate(l);
+          if (ld != null && r is YmInterval) {
+            return _shiftMonths(ld, r.months, l);
+          }
+          if (ld != null && r is num) return _shiftDate(ld, r.toDouble(), l);
+          final rd = _asSqlDate(r);
+          if (rd != null && l is YmInterval) {
+            return _shiftMonths(rd, l.months, r);
+          }
+          if (rd != null && l is num) return _shiftDate(rd, l.toDouble(), r);
+          return _arith(_toNum(l)!, _toNum(r)!, '+');
+        }
       case '-':
-        return (l as num) - (r as num);
+        {
+          // Oracle date arithmetic: DATE - DATE = day count; DATE - n shifts.
+          final ld = _asSqlDate(l);
+          final rd = _asSqlDate(r);
+          if (ld != null && r is YmInterval) {
+            return _shiftMonths(ld, -r.months, l);
+          }
+          if (ld != null && rd != null) {
+            final diff = ld.difference(rd).inSeconds / 86400.0;
+            return diff == diff.roundToDouble() ? diff.toInt() : diff;
+          }
+          if (ld != null && r is num) return _shiftDate(ld, -r.toDouble(), l);
+          return _arith(_toNum(l)!, _toNum(r)!, '-');
+        }
       case '*':
-        return (l as num) * (r as num);
+        return _arith(_toNum(l)!, _toNum(r)!, '*');
       case '/':
-        return (l as num) / (r as num);
+        {
+          final d = _toNum(r)!;
+          if (d == 0) return null; // SQLite: division by zero yields NULL.
+          return _toNum(l)! / d;
+        }
       case '%':
-        // SQLite uses C-style truncated modulo (sign follows the dividend),
-        // not Dart's Euclidean `%` which is always non-negative.
-        return (l as num).remainder(r as num);
+        {
+          final d = _toNum(r)!;
+          if (d == 0) return null;
+          // SQLite uses C-style truncated modulo (sign follows the dividend),
+          // not Dart's Euclidean `%` which is always non-negative.
+          return _toNum(l)!.remainder(d);
+        }
       case '&':
-        return (l as num).toInt() & (r as num).toInt();
+        return _toNum(l)!.toInt() & _toNum(r)!.toInt();
       case '|':
-        return (l as num).toInt() | (r as num).toInt();
+        return _toNum(l)!.toInt() | _toNum(r)!.toInt();
       case '<<':
-        return (l as num).toInt() << (r as num).toInt();
+        return _toNum(l)!.toInt() << _toNum(r)!.toInt();
       case '>>':
-        return (l as num).toInt() >> (r as num).toInt();
+        return _toNum(l)!.toInt() >> _toNum(r)!.toInt();
       case '||':
         return _stringify(l) + _stringify(r);
       case 'LIKE':
@@ -273,6 +529,98 @@ class BinaryExpr extends Expr {
 
   static bool _eq(Object a, Object b) => sqlEq(a, b);
   static int _cmp(Object a, Object b) => sqlCompare(a, b);
+
+  static bool _isNoCase(Expr e) => e is CollateExpr && e.collation == 'NOCASE';
+  static bool _isRtrim(Expr e) => e is CollateExpr && e.collation == 'RTRIM';
+  static bool _eqCI(Object a, Object b) =>
+      (a is String && b is String) ? a.toLowerCase() == b.toLowerCase() : _eq(a, b);
+  static int _cmpCI(Object a, Object b) => (a is String && b is String)
+      ? a.toLowerCase().compareTo(b.toLowerCase())
+      : _cmp(a, b);
+
+  /// SQL row-value comparison for `(a, …) <op> (b, …)`. Equality is the AND of
+  /// element equalities (any decisive mismatch -> false, else a NULL -> NULL);
+  /// ordering compares element-wise, the first difference deciding, with a NULL
+  /// before any difference yielding NULL.
+  static Object? _rowValueCompare(String op, List<Object?> a, List<Object?> b) {
+    final n = a.length < b.length ? a.length : b.length;
+    if (op == '=' || op == '!=' || op == '<>') {
+      var sawNull = false;
+      for (var i = 0; i < n; i++) {
+        final x = a[i];
+        final y = b[i];
+        if (x == null || y == null) {
+          sawNull = true;
+          continue;
+        }
+        if (!_eq(x, y)) return op == '=' ? false : true;
+      }
+      if (a.length != b.length) return op == '=' ? false : true;
+      if (sawNull) return null;
+      return op == '=';
+    }
+    for (var i = 0; i < n; i++) {
+      final x = a[i];
+      final y = b[i];
+      if (x == null || y == null) return null;
+      final c = _cmp(x, y);
+      if (c != 0) {
+        switch (op) {
+          case '<':
+          case '<=':
+            return c < 0;
+          case '>':
+          case '>=':
+            return c > 0;
+        }
+      }
+    }
+    // All compared positions equal.
+    return op == '<=' || op == '>=';
+  }
+
+  /// Coerce an arithmetic operand to a number (SQLite affinity rules):
+  /// numbers pass through, booleans map to 1/0, numeric strings parse, and
+  /// anything non-numeric becomes 0. NULL propagates (callers guard it).
+  static num? _toNum(Object? v) {
+    if (v == null) return null;
+    if (v is num) return v;
+    if (v is bool) return v ? 1 : 0;
+    if (v is String) return num.tryParse(v.trim()) ?? 0;
+    return 0;
+  }
+
+  /// Apply an int-or-double arithmetic op ([o] is `+`, `-`, or `*`). When both
+  /// operands are integers, detect 64-bit overflow via BigInt and promote to
+  /// double, matching SQLite (which keeps the magnitude instead of wrapping).
+  static final BigInt _maxInt64 = BigInt.parse('9223372036854775807');
+  static final BigInt _minInt64 = BigInt.parse('-9223372036854775808');
+  static num _arith(num a, num b, String o) {
+    if (a is int && b is int) {
+      final ba = BigInt.from(a);
+      final bb = BigInt.from(b);
+      final big = o == '+'
+          ? ba + bb
+          : o == '-'
+              ? ba - bb
+              : ba * bb;
+      if (big < _minInt64 || big > _maxInt64) {
+        final da = a.toDouble();
+        final db = b.toDouble();
+        return o == '+'
+            ? da + db
+            : o == '-'
+                ? da - db
+                : da * db;
+      }
+      return big.toInt();
+    }
+    return o == '+'
+        ? a + b
+        : o == '-'
+            ? a - b
+            : a * b;
+  }
 
   static bool _like(String value, String pattern) {
     // Translate SQL LIKE pattern to regex: % -> .*, _ -> .
@@ -336,6 +684,46 @@ class BetweenExpr extends Expr {
   }
 }
 
+/// A parenthesized row value / tuple: `(a, b, …)`. Evaluates to a `List` so
+/// `BinaryExpr` can do element-wise row comparison.
+class RowValueExpr extends Expr {
+  final List<Expr> items;
+  RowValueExpr(this.items);
+  @override
+  Object? eval(Map<String, Object?> row) => [for (final e in items) e.eval(row)];
+}
+
+/// `expr COLLATE <name>`. The value is unchanged; the collation influences how
+/// an enclosing comparison/sort treats it (only NOCASE is special-cased here).
+class CollateExpr extends Expr {
+  final Expr inner;
+  final String collation; // uppercased, e.g. NOCASE / BINARY / RTRIM
+  CollateExpr(this.inner, this.collation);
+  @override
+  Object? eval(Map<String, Object?> row) => inner.eval(row);
+}
+
+/// The explicit collation name carried by [e] (`expr COLLATE <name>`), or null.
+String? collationOf(Expr e) => e is CollateExpr ? e.collation : null;
+
+/// Normalizes [value] for collation-aware dedup / grouping: NOCASE folds case,
+/// RTRIM strips trailing spaces. Non-strings and other collations pass through.
+Object? applyCollation(Object? value, String? collation) {
+  if (value is! String || collation == null) return value;
+  switch (collation) {
+    case 'NOCASE':
+      return value.toLowerCase();
+    case 'RTRIM':
+      var end = value.length;
+      while (end > 0 && value.codeUnitAt(end - 1) == 0x20) {
+        end--;
+      }
+      return value.substring(0, end);
+    default:
+      return value;
+  }
+}
+
 class InExpr extends Expr {
   final Expr value;
   final List<Expr> values;
@@ -345,10 +733,33 @@ class InExpr extends Expr {
   Object? eval(Map<String, Object?> row) {
     final v = value.eval(row);
     if (v == null) return null;
+    var sawNull = false;
     for (final e in values) {
       final ev = e.eval(row);
-      if (ev != null && BinaryExpr._eq(v, ev)) return !negated;
+      if (ev == null) {
+        sawNull = true;
+        continue;
+      }
+      // Row/tuple IN-list: `(a, b) IN ((..), (..))` compares element-wise.
+      if (v is List && ev is List) {
+        if (v.length == ev.length) {
+          var all = true;
+          for (var i = 0; i < v.length; i++) {
+            final a = v[i], b = ev[i];
+            if (a == null || b == null || !BinaryExpr._eq(a, b)) {
+              all = false;
+              break;
+            }
+          }
+          if (all) return !negated;
+        }
+        continue;
+      }
+      if (BinaryExpr._eq(v, ev)) return !negated;
     }
+    // No match: a NULL in the list makes the result UNKNOWN (SQL 3VL), so
+    // `NOT IN (…, NULL)` is also NULL — not TRUE.
+    if (sawNull) return null;
     return negated;
   }
 }
@@ -405,18 +816,92 @@ class LikeExpr extends Expr {
 }
 
 /// Convenience: evaluate expression as boolean (NULL -> false).
-bool evalPredicate(Expr e, Map<String, Object?> row) {
-  final v = e.eval(row);
-  return v is bool && v;
+bool evalPredicate(Expr e, Map<String, Object?> row) => sqlTruthy(e.eval(row));
+
+/// Exact-decimal half-up rounding of [value] to [scale] fractional digits.
+/// Recovers the intended decimal through a guard-digit string first so binary
+/// floating-point noise (1.005 stored as 1.00499999…) rounds like Oracle.
+num _roundHalfUpDecimal(num value, int scale) {
+  if (value is int) return value;
+  final neg = value < 0;
+  final abs = value.abs();
+  final str = abs.toStringAsFixed(scale + 3); // guard digits kill binary noise
+  final dot = str.indexOf('.');
+  final intPart = str.substring(0, dot);
+  final fracPart = str.substring(dot + 1);
+  final keep = scale == 0 ? '' : fracPart.substring(0, scale);
+  final roundDigit = int.parse(fracPart[scale]);
+  var n = BigInt.parse('$intPart$keep');
+  if (roundDigit >= 5) n += BigInt.one;
+  final result = n.toDouble() / _pow10(scale);
+  return neg ? -result : result;
 }
 
 /// Coerce a value to the column's type for storage/comparison purposes.
-Object? coerceForColumn(Object? value, ColumnDef col, {bool strict = false}) {
+Object? coerceForColumn(Object? value, ColumnDef col,
+    {bool strict = false, bool tableHasRowid = true}) {
   if (value == null) {
     if (col.notNull) {
       throw FormatException('Column ${col.name} is NOT NULL');
     }
     return null;
+  }
+  // Oracle VARCHAR2(n)/CHAR(n) length enforcement (ORA-12899).
+  if (col.charLength != null && value is String) {
+    if (value.length > col.charLength!) {
+      throw FormatException(
+        'ORA-12899: value too large for column ${col.name} '
+        '(actual: ${value.length}, maximum: ${col.charLength})',
+      );
+    }
+  }
+  // Oracle NUMBER(p[,s]) scale rounding (F110) + precision enforcement
+  // (ORA-01438, F114). Applies to numeric values and numeric strings.
+  if (col.numericPrecision != null || col.numericScale != null) {
+    num? n;
+    if (value is num) {
+      n = value;
+    } else if (value is String) {
+      n = num.tryParse(value.trim());
+    }
+    if (n != null) {
+      final scale = col.numericScale ?? 0;
+      // Exact-decimal half-up rounding to the declared scale (Oracle NUMBER is
+      // decimal, not binary — 1.005 -> 1.01, not the double's 1.00). A negative
+      // scale rounds to the left of the decimal point (NUMBER(5,-2): 12345 ->
+      // 12300).
+      num rounded;
+      if (scale >= 0) {
+        rounded = _roundHalfUpDecimal(n, scale);
+      } else {
+        final factor = _pow10(-scale);
+        rounded = (n / factor).roundToDouble() * factor;
+      }
+      // Normalize integral doubles back to int.
+      if (rounded is double && rounded == rounded.truncateToDouble()) {
+        rounded = rounded.toInt();
+      }
+      if (col.numericPrecision != null) {
+        final maxDigits = col.numericPrecision! - scale;
+        final limit = _pow10(maxDigits);
+        if (rounded.abs() >= limit) {
+          throw FormatException(
+            'ORA-01438: value larger than specified precision allowed for '
+            'column ${col.name}',
+          );
+        }
+      }
+      value = rounded;
+    }
+  }
+  // Oracle CHAR(n) / NCHAR(n) are fixed-length: blank-pad a shorter string to
+  // the declared length (LENGTH('ab') in a CHAR(5) column is 5).
+  if (col.charLength != null && value is String) {
+    final dt = col.declaredType?.toUpperCase();
+    if ((dt == 'CHAR' || dt == 'NCHAR' || dt == 'CHARACTER') &&
+        value.length < col.charLength!) {
+      value = value.padRight(col.charLength!);
+    }
   }
   if (strict) {
     final ok = switch (col.type) {
@@ -458,11 +943,24 @@ Object? coerceForColumn(Object? value, ColumnDef col, {bool strict = false}) {
   if (col.type == DataType.integer ||
       col.type == DataType.real ||
       col.type == DataType.numeric) {
+    // An INTEGER PRIMARY KEY is a rowid alias: SQLite requires an integer and
+    // raises "datatype mismatch" for a non-integer value, unlike a regular
+    // INTEGER column's loose affinity (which stores it unchanged). A WITHOUT
+    // ROWID table's INTEGER PRIMARY KEY is not a rowid alias, so it keeps the
+    // loose affinity.
+    final rowidAlias =
+        tableHasRowid && col.primaryKey && col.type == DataType.integer;
+    final Object? converted;
     try {
-      return coerce(value, col.type);
+      converted = coerce(value, col.type);
     } on FormatException {
+      if (rowidAlias) throw const FormatException('datatype mismatch');
       return value;
     }
+    if (rowidAlias && converted is! int) {
+      throw const FormatException('datatype mismatch');
+    }
+    return converted;
   }
   return coerce(value, col.type);
 }
@@ -477,7 +975,9 @@ bool sqlEq(Object a, Object b) {
 }
 
 int sqlCompare(Object a, Object b) {
-  if (a is num && b is num) return a.compareTo(b);
+  // IEEE equality first so -0.0 compares equal to 0.0 (Dart's num.compareTo is a
+  // total order that ranks -0.0 below 0.0, which would make `0 > -0.0` true).
+  if (a is num && b is num) return a == b ? 0 : a.compareTo(b);
   if (a is Comparable && b is Comparable && a.runtimeType == b.runtimeType) {
     return a.compareTo(b);
   }
@@ -491,7 +991,15 @@ int sqlCompareNullable(Object? a, Object? b, {bool nullsFirst = true}) {
   return sqlCompare(a, b);
 }
 
-bool sqlTruthy(Object? v) => v is bool && v;
+/// SQL boolean truthiness: bool passes through; any non-zero number is true;
+/// a string takes its numeric value (non-numeric -> 0 -> false); NULL/other
+/// are false. Matches SQLite/MySQL `WHERE`/`CASE WHEN`/`iif` semantics.
+bool sqlTruthy(Object? v) {
+  if (v is bool) return v;
+  if (v is num) return v != 0;
+  if (v is String) return (num.tryParse(v.trim()) ?? 0) != 0;
+  return false;
+}
 
 // =============================================================================
 // Additional expression nodes.
@@ -522,11 +1030,32 @@ class CaseExpr extends Expr {
 class CastExpr extends Expr {
   final Expr expr;
   final DataType targetType;
-  CastExpr(this.expr, this.targetType);
+  // Oracle CAST enforces the declared size: NUMBER(p,s) rounds to [scale];
+  // VARCHAR2/CHAR(n) truncates to [charLength].
+  final int? numericScale;
+  final int? charLength;
+  CastExpr(this.expr, this.targetType, {this.numericScale, this.charLength});
   @override
   Object? eval(Map<String, Object?> row) {
     final v = expr.eval(row);
     if (v == null) return null;
+    final result = _convert(v);
+    if (result is num && numericScale != null) {
+      if (numericScale! >= 0) {
+        // Oracle NUMBER is exact decimal: CAST(1.005 AS NUMBER(5,2)) = 1.01.
+        return _roundHalfUpDecimal(result.toDouble(), numericScale!);
+      }
+      final p = _pow10(-numericScale!);
+      final r = (result / p).round() * p;
+      return r is double && r == r.truncateToDouble() ? r.toInt() : r;
+    }
+    if (result is String && charLength != null && result.length > charLength!) {
+      return result.substring(0, charLength!);
+    }
+    return result;
+  }
+
+  Object? _convert(Object? v) {
     // CAST has more lenient conversion than the implicit table coercion:
     // - double->int truncates
     // - int/double->TEXT stringifies
@@ -535,20 +1064,31 @@ class CastExpr extends Expr {
         if (v is int) return v;
         if (v is double) return v.truncate();
         if (v is String) {
-          final i = int.tryParse(v);
+          final i = int.tryParse(v.trim());
           if (i != null) return i;
-          final d = double.tryParse(v);
-          if (d != null) return d.truncate();
-          return 0;
+          // SQLite parses the leading numeric prefix ('42abc' -> 42).
+          return _sqlTextToNum(v).truncate();
         }
         if (v is bool) return v ? 1 : 0;
         return coerce(v, targetType);
       case DataType.real:
         if (v is num) return v.toDouble();
-        if (v is String) return double.tryParse(v) ?? 0.0;
+        if (v is String) return _sqlTextToNum(v).toDouble();
         return coerce(v, targetType);
       case DataType.text:
+        // CAST(<blob> AS TEXT) decodes the bytes (SQLite), not list.toString().
+        if (v is List<int>) {
+          try {
+            return utf8.decode(v);
+          } catch (_) {
+            return String.fromCharCodes(v);
+          }
+        }
         return v.toString();
+      case DataType.blob:
+        // SQLite yields the blob of the value's text representation.
+        if (v is List<int>) return v;
+        return utf8.encode(v.toString());
       default:
         return coerce(v, targetType);
     }
@@ -585,13 +1125,51 @@ class FunctionCallExpr extends Expr {
     this.window,
     this.filterExpr,
     this.aggOrderBy,
+    this.keepFirst,
+    this.keepOrderBy,
+    this.ignoreNulls = false,
+    this.fromLast = false,
   });
+
+  /// Oracle `KEEP (DENSE_RANK FIRST|LAST ORDER BY …)` ordered-set modifier:
+  /// true = FIRST, false = LAST, null = no KEEP. [keepOrderBy] ranks the group.
+  final bool? keepFirst;
+  final List<WindowOrderItem>? keepOrderBy;
+
+  /// `IGNORE NULLS` modifier (FIRST_VALUE/LAST_VALUE/LAG/LEAD): skip NULLs when
+  /// picking the value. Default false = RESPECT NULLS.
+  final bool ignoreNulls;
+
+  /// Oracle `NTH_VALUE(expr, n) FROM LAST` modifier: count the nth row from the
+  /// end of the window frame instead of the start. Default false = FROM FIRST.
+  final bool fromLast;
 
   bool get isAggregate => kAggregateFunctions.contains(name);
   bool get isWindow => window != null;
 
+  /// Per-row precomputed window values, set by the SELECT executor before it
+  /// evaluates a projection row. Lets a window call nested inside a larger
+  /// scalar expression (e.g. `'row ' || ROW_NUMBER() OVER ()`, which is how
+  /// Oracle ROWNUM lowers) resolve to its row value instead of being treated
+  /// as an unknown scalar function.
+  static Map<FunctionCallExpr, Object?>? windowRowValues;
+
+  /// Resolver for user-defined (stored) functions, set by the active Database
+  /// while dispatching. Invoked synchronously when [name] is not a built-in
+  /// scalar; it runs the stored function and returns its value, or throws if no
+  /// such function exists.
+  static Object? Function(String name, List<Object?> args)?
+      storedFunctionResolver;
+
   @override
   Object? eval(Map<String, Object?> row) {
+    if (isWindow) {
+      final wv = windowRowValues;
+      if (wv != null && wv.containsKey(this)) return wv[this];
+      throw StateError(
+        'Window function $name() OVER (...) is only valid in a query projection',
+      );
+    }
     if (isAggregate) {
       throw StateError(
         'Aggregate function $name() cannot be evaluated as a scalar',
@@ -599,6 +1177,34 @@ class FunctionCallExpr extends Expr {
     }
     final fn = kScalarFunctions[name];
     if (fn == null) {
+      // SYS_CONNECT_BY_PATH(col, sep): build the root→node path from the
+      // ancestor chain the CONNECT BY executor stores under `__CBP`.
+      if (name == 'SYS_CONNECT_BY_PATH') {
+        final sep = args.length > 1 ? (args[1].eval(row)?.toString() ?? '') : '';
+        final chain = row['__CBP'];
+        final nodes = chain is List ? chain : <Object?>[row];
+        final buf = StringBuffer();
+        for (final n in nodes) {
+          final v = args[0].eval(n is Map<String, Object?> ? n : row);
+          buf..write(sep)..write(v ?? '');
+        }
+        return buf.toString();
+      }
+      // CONNECT_BY_ROOT expr: evaluate [expr] against the hierarchy root (the
+      // first ancestor in the `__CBP` chain the CONNECT BY executor stores).
+      if (name == 'CONNECT_BY_ROOT') {
+        final chain = row['__CBP'];
+        final rootRow = (chain is List && chain.isNotEmpty)
+            ? chain.first
+            : row;
+        return args.isEmpty
+            ? null
+            : args[0].eval(rootRow is Map<String, Object?> ? rootRow : row);
+      }
+      final resolver = storedFunctionResolver;
+      if (resolver != null) {
+        return resolver(name, args.map((a) => a.eval(row)).toList());
+      }
       throw StateError('Unknown function: $name');
     }
     final values = args.map((a) => a.eval(row)).toList();
@@ -629,9 +1235,17 @@ class InSubqueryExpr extends Expr {
     final v = value.eval(row);
     if (v == null) return null;
     final list = run(row);
+    var sawNull = false;
     for (final ev in list) {
-      if (ev != null && sqlEq(v, ev)) return !negated;
+      if (ev == null) {
+        sawNull = true;
+        continue;
+      }
+      if (sqlEq(v, ev)) return !negated;
     }
+    // No match: a NULL in the result set makes it UNKNOWN (SQL 3VL), so
+    // `NOT IN (… NULL …)` is NULL — never TRUE.
+    if (sawNull) return null;
     return negated;
   }
 }
@@ -720,6 +1334,37 @@ Object? _propagateNull(List<Object?> args, Object? Function() body) {
     if (a == null) return null;
   }
   return body();
+}
+
+/// SQLite text→number coercion: a number passes through, a bool maps to 1/0,
+/// and a string yields its leading numeric prefix (e.g. `'42abc'`→42,
+/// `'3.14xyz'`→3.14, `'abc'`→0). Used by math scalars and CAST.
+final RegExp _leadingNumRe =
+    RegExp(r'^[ \t\n\r]*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)');
+num _sqlTextToNum(Object? v) {
+  if (v is num) return v;
+  if (v is bool) return v ? 1 : 0;
+  if (v is! String) return 0;
+  final m = _leadingNumRe.firstMatch(v);
+  if (m == null) return 0;
+  return num.tryParse(m.group(1)!) ?? 0;
+}
+String _trimChars(String s, String chars, {required bool left, required bool right}) {
+  if (chars.isEmpty) return s;
+  final set = chars.split('').toSet();
+  var start = 0;
+  var end = s.length;
+  if (left) {
+    while (start < end && set.contains(s[start])) {
+      start++;
+    }
+  }
+  if (right) {
+    while (end > start && set.contains(s[end - 1])) {
+      end--;
+    }
+  }
+  return s.substring(start, end);
 }
 
 /// Returns the numeric value of an ASCII hex digit (`0`-`9`, `A`-`F`,
@@ -858,9 +1503,10 @@ String _sqlitePrintf(String fmt, List<Object?> args) {
         if (conv == 'f') {
           body = n.toStringAsFixed(p);
         } else if (conv == 'e') {
-          body = n.toStringAsExponential(p);
+          // C/SQLite use a >=2-digit exponent (`e+03`, not Dart's `e+3`).
+          body = _fixExponentWidth(n.toStringAsExponential(p));
         } else {
-          body = n.toStringAsPrecision(p == 0 ? 1 : p);
+          body = _formatG(n, p == 0 ? 1 : p, alt);
         }
         if (n >= 0) {
           if (plus) {
@@ -927,6 +1573,51 @@ String _sqlitePrintf(String fmt, List<Object?> args) {
 bool _isDigitChar(String c) =>
     c.codeUnitAt(0) >= 0x30 && c.codeUnitAt(0) <= 0x39;
 
+/// Pad a `toStringAsExponential` result's exponent to the C/SQLite minimum of
+/// two digits: `1.5e+3` -> `1.5e+03`.
+String _fixExponentWidth(String s) {
+  final m = RegExp(r'^(.*[eE])([+-])(\d+)$').firstMatch(s);
+  if (m == null) return s;
+  return '${m.group(1)}${m.group(2)}${m.group(3)!.padLeft(2, '0')}';
+}
+
+/// C `printf('%g')`: choose `%e` or `%f` by magnitude and strip trailing
+/// zeros (unless the `#`/alt flag is set).
+String _formatG(double n, int p, bool alt) {
+  if (n == 0) return '0';
+  final probe = n.toStringAsExponential(p - 1);
+  final x = int.parse(RegExp(r'[eE]([+-]?\d+)$').firstMatch(probe)!.group(1)!);
+  String body;
+  if (x < -4 || x >= p) {
+    body = n.toStringAsExponential(p - 1);
+    if (!alt) body = _stripExpTrailingZeros(body);
+    body = _fixExponentWidth(body);
+  } else {
+    final prec = p - 1 - x;
+    body = n.toStringAsFixed(prec < 0 ? 0 : prec);
+    if (!alt) body = _stripFixedTrailingZeros(body);
+  }
+  return body;
+}
+
+String _stripFixedTrailingZeros(String s) {
+  if (!s.contains('.')) return s;
+  var r = s.replaceFirst(RegExp(r'0+$'), '');
+  if (r.endsWith('.')) r = r.substring(0, r.length - 1);
+  return r;
+}
+
+String _stripExpTrailingZeros(String s) {
+  final m = RegExp(r'^([^eE]*)([eE].*)$').firstMatch(s);
+  if (m == null) return s;
+  var mant = m.group(1)!;
+  if (mant.contains('.')) {
+    mant = mant.replaceFirst(RegExp(r'0+$'), '');
+    if (mant.endsWith('.')) mant = mant.substring(0, mant.length - 1);
+  }
+  return '$mant${m.group(2)}';
+}
+
 int _toIntArg(Object? v) {
   if (v == null) return 0;
   if (v is num) return v.toInt();
@@ -949,6 +1640,71 @@ class RaiseException implements Exception {
   RaiseException(this.action, this.message);
   @override
   String toString() => 'RAISE($action${message.isEmpty ? '' : ", '$message'"})';
+}
+
+/// Resolves a USERENV / SYS_CONTEXT('USERENV', …) parameter to a value. The
+/// engine is single-user, so these are sensible constants.
+String _userenvValue(String param) {
+  switch (param.toUpperCase()) {
+    case 'SESSION_USER':
+    case 'CURRENT_USER':
+    case 'CURRENT_SCHEMA':
+    case 'SCHEMAID':
+      return 'USER';
+    case 'DB_NAME':
+      return 'FREEPDB1';
+    case 'LANG':
+      return 'US';
+    case 'LANGUAGE':
+      return 'AMERICAN_AMERICA.AL32UTF8';
+    case 'SID':
+    case 'SESSIONID':
+      return '1';
+    case 'ISDBA':
+      return 'FALSE';
+    default:
+      return 'UNKNOWN';
+  }
+}
+
+/// Builds a [RegExp] honouring Oracle's REGEXP `match_param` flags:
+/// `i` case-insensitive, `c` case-sensitive (overrides `i`), `m` multiline
+/// anchors, `n` dot matches newlines. Unknown flags are ignored. POSIX
+/// character classes (`[[:digit:]]`, `[[:alpha:]]`, …) are translated to their
+/// Dart `RegExp` equivalents.
+RegExp _oracleRegex(String pattern, String? matchParam) {
+  final mp = matchParam ?? '';
+  final caseSensitive = mp.contains('c') ? true : !mp.contains('i');
+  return RegExp(
+    _translatePosixClasses(pattern),
+    caseSensitive: caseSensitive,
+    multiLine: mp.contains('m'),
+    dotAll: mp.contains('n'),
+  );
+}
+
+/// Replaces POSIX character classes of the form `[:name:]` (used inside a
+/// bracket expression) with the equivalent Dart character ranges.
+String _translatePosixClasses(String pattern) {
+  const map = {
+    'alpha': 'a-zA-Z',
+    'digit': '0-9',
+    'alnum': 'a-zA-Z0-9',
+    'upper': 'A-Z',
+    'lower': 'a-z',
+    'space': r'\s',
+    'blank': ' \\t',
+    'xdigit': '0-9A-Fa-f',
+    'punct': r'!-/:-@\[-`{-~',
+    'cntrl': r'\x00-\x1f\x7f',
+    'print': r'\x20-\x7e',
+    'graph': r'\x21-\x7e',
+    'word': r'\w',
+  };
+  return pattern.replaceAllMapped(RegExp(r'\[:(\^?)(\w+):\]'), (m) {
+    final cls = map[m.group(2)!.toLowerCase()];
+    return cls ?? m.group(0)!;
+  });
 }
 
 final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
@@ -975,46 +1731,179 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
         if (v is List<int>) return v.length * 8;
         return utf8.encode(v.toString()).length * 8;
       }),
+  // Oracle byte-semantics string functions (UTF-8 byte offsets/lengths).
+  'LENGTHB': (a) =>
+      _propagateNull(a, () => utf8.encode(a[0].toString()).length),
+  'SUBSTRB': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final bytes = utf8.encode(a[0].toString());
+    if (a.length < 2) return a[0].toString();
+    final start = _sqlTextToNum(a[1]).toInt();
+    var idx = start > 0
+        ? start - 1
+        : (start == 0 ? 0 : bytes.length + start);
+    if (idx < 0) idx = 0;
+    if (idx >= bytes.length) return '';
+    var end = bytes.length;
+    if (a.length >= 3 && a[2] != null) {
+      final len = _sqlTextToNum(a[2]).toInt();
+      end = (idx + (len < 0 ? 0 : len)).clamp(0, bytes.length);
+    }
+    return utf8.decode(bytes.sublist(idx, end), allowMalformed: true);
+  },
+  'INSTRB': (a) {
+    if (a.length < 2 || a[0] == null || a[1] == null) return null;
+    final hay = utf8.encode(a[0].toString());
+    final needle = utf8.encode(a[1].toString());
+    if (needle.isEmpty) return 1;
+    for (var i = 0; i + needle.length <= hay.length; i++) {
+      var match = true;
+      for (var j = 0; j < needle.length; j++) {
+        if (hay[i + j] != needle[j]) {
+          match = false;
+          break;
+        }
+      }
+      if (match) return i + 1;
+    }
+    return 0;
+  },
+  // BITAND(a, b): bitwise AND of two integers.
+  'BITAND': (a) {
+    if (a.length < 2 || a[0] == null || a[1] == null) return null;
+    return _sqlTextToNum(a[0]).toInt() & _sqlTextToNum(a[1]).toInt();
+  },
+  // BIN_TO_NUM(bit, …): interpret the arguments as a binary vector (MSB first).
+  'BIN_TO_NUM': (a) {
+    if (a.isEmpty || a.any((x) => x == null)) return null;
+    var result = 0;
+    for (final x in a) {
+      result = (result << 1) | (_sqlTextToNum(x).toInt() != 0 ? 1 : 0);
+    }
+    return result;
+  },
+  // ORA_HASH(expr [, max_bucket [, seed]]): deterministic bucket hash.
+  'ORA_HASH': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final maxBucket = a.length > 1 && a[1] != null
+        ? _sqlTextToNum(a[1]).toInt()
+        : 4294967295;
+    final seed = a.length > 2 && a[2] != null ? _sqlTextToNum(a[2]).toInt() : 0;
+    var h = 0x811c9dc5; // FNV-1a 32-bit.
+    for (final c in utf8.encode('${a[0]}|$seed')) {
+      h ^= c;
+      h = (h * 0x01000193) & 0xFFFFFFFF;
+    }
+    return maxBucket <= 0 ? 0 : h % (maxBucket + 1);
+  },
+  // STANDARD_HASH(expr [, 'algo']): cryptographic hash as uppercase hex.
+  // Supported algorithms: SHA1 (default), MD5, SHA256, SHA384, SHA512.
+  'STANDARD_HASH': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final algo =
+        (a.length > 1 && a[1] != null ? a[1].toString() : 'SHA1').toUpperCase();
+    final bytes = utf8.encode(a[0].toString());
+    final crypto.Hash h;
+    switch (algo) {
+      case 'MD5':
+        h = crypto.md5;
+        break;
+      case 'SHA256':
+        h = crypto.sha256;
+        break;
+      case 'SHA384':
+        h = crypto.sha384;
+        break;
+      case 'SHA512':
+        h = crypto.sha512;
+        break;
+      default:
+        h = crypto.sha1;
+    }
+    return h.convert(bytes).toString().toUpperCase();
+  },
+  // ROWIDTOCHAR: the rowid value is already text in this engine.
+  'ROWIDTOCHAR': (a) => a.isEmpty || a[0] == null ? null : a[0].toString(),
+  'CHARTOROWID': (a) => a.isEmpty || a[0] == null ? null : a[0].toString(),
+  // SYS_CONTEXT(namespace, parameter): session-context values. We return
+  // sensible constants for the common USERENV parameters.
+  'SYS_CONTEXT': (a) {
+    if (a.length < 2 || a[1] == null) return null;
+    return _userenvValue(a[1].toString());
+  },
+  // USERENV(parameter): legacy session-context accessor.
+  'USERENV': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    return _userenvValue(a[0].toString());
+  },
   // LEAST(a, b, ...) -- smallest non-NULL value; returns NULL if all NULL.
   'LEAST': (a) {
+    if (a.any((v) => v == null)) return null; // any NULL -> NULL (Oracle/SQLite)
     Object? best;
     for (final v in a) {
-      if (v == null) continue;
-      if (best == null || sqlCompare(v, best) < 0) best = v;
+      if (best == null || sqlCompare(v!, best) < 0) best = v;
     }
     return best;
   },
-  // GREATEST(a, b, ...) -- largest non-NULL value.
+  // GREATEST(a, b, ...) -- NULL when any argument is NULL, else the largest.
   'GREATEST': (a) {
+    if (a.any((v) => v == null)) return null;
     Object? best;
     for (final v in a) {
-      if (v == null) continue;
-      if (best == null || sqlCompare(v, best) > 0) best = v;
+      if (best == null || sqlCompare(v!, best) > 0) best = v;
     }
     return best;
   },
-  'TRIM': (a) => _propagateNull(a, () => a[0].toString().trim()),
+  'TRIM': (a) => _propagateNull(
+        a,
+        () => a.length >= 2
+            ? _trimChars(a[0].toString(), a[1].toString(), left: true, right: true)
+            : a[0].toString().trim(),
+      ),
   'LTRIM': (a) => _propagateNull(
         a,
-        () => a[0].toString().replaceFirst(RegExp(r'^\s+'), ''),
+        () => a.length >= 2
+            ? _trimChars(a[0].toString(), a[1].toString(), left: true, right: false)
+            : a[0].toString().replaceFirst(RegExp(r'^\s+'), ''),
       ),
   'RTRIM': (a) => _propagateNull(
         a,
-        () => a[0].toString().replaceFirst(RegExp(r'\s+$'), ''),
+        () => a.length >= 2
+            ? _trimChars(a[0].toString(), a[1].toString(), left: false, right: true)
+            : a[0].toString().replaceFirst(RegExp(r'\s+$'), ''),
       ),
   'SUBSTR': (a) {
     if (a.isEmpty || a[0] == null) return null;
     final s = a[0].toString();
     if (a.length < 2) return s;
-    final start = (a[1] as num).toInt();
-    // SQL is 1-based; negative offsets count from the end.
-    var idx = start > 0 ? start - 1 : (s.length + start).clamp(0, s.length);
-    if (idx < 0) idx = 0;
+    final start = _sqlTextToNum(a[1]).toInt();
+    // SQL is 1-based. A start of 0 means "before position 1" and a negative
+    // start counts from the end; either way the window begins at the string
+    // start, but the part that falls before position 1 still consumes length.
+    int idx;
+    var consumed = 0;
+    if (start > 0) {
+      idx = start - 1;
+    } else if (start == 0) {
+      idx = 0;
+      consumed = 1;
+    } else {
+      idx = s.length + start;
+      if (idx < 0) {
+        consumed = -idx;
+        idx = 0;
+      }
+    }
     if (idx >= s.length) return '';
     if (a.length >= 3 && a[2] != null) {
-      var len = (a[2] as num).toInt();
-      if (len < 0) len = 0;
-      final end = (idx + len).clamp(0, s.length);
+      final len = _sqlTextToNum(a[2]).toInt();
+      if (len < 0) {
+        // SQLite: a negative length returns the |len| characters that
+        // precede the start position (walking backward from `idx`).
+        final back = (idx + len).clamp(0, s.length);
+        return s.substring(back, idx);
+      }
+      final end = (idx + (len - consumed).clamp(0, s.length)).clamp(0, s.length);
       return s.substring(idx, end);
     }
     return s.substring(idx);
@@ -1083,6 +1972,140 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
   'CHR': (a) => _propagateNull(a, () {
         return String.fromCharCode((a[0] as num).toInt());
       }),
+  // Oracle NLSSORT: a collation sort key (we fold to upper-case for a
+  // case-insensitive linguistic-ish ordering).
+  'NLSSORT': (a) => _propagateNull(a, () => a[0].toString().toUpperCase()),
+  // NCHR(n): national-charset character for a codepoint (same as CHR here).
+  'NCHR': (a) => _propagateNull(a, () {
+        return String.fromCharCode((a[0] as num).toInt());
+      }),
+  // COMPOSE / TO_SINGLE_BYTE: identity for the ASCII/BMP subset we model.
+  'COMPOSE': (a) => _propagateNull(a, () => a[0].toString()),
+  'TO_SINGLE_BYTE': (a) => _propagateNull(a, () => a[0].toString()),
+  // NEW_TIME(d, z1, z2): timezone shift; modelled as a no-op on the text date.
+  'NEW_TIME': (a) => a.isEmpty ? null : a[0],
+  // TO_YMINTERVAL('y-m'): year-month interval as a day count.
+  'TO_YMINTERVAL': (a) => _propagateNull(a, () {
+        final m = RegExp(r'(-?\d+)-(\d+)').firstMatch(a[0].toString());
+        if (m == null) return null;
+        return int.parse(m.group(1)!) * 365 + int.parse(m.group(2)!) * 30;
+      }),
+  // TO_DSINTERVAL('d hh:mi:ss'): day-to-second interval as a day count.
+  'TO_DSINTERVAL': (a) => _propagateNull(a, () {
+        final s = a[0].toString().trim();
+        var dayPart = 0;
+        var timePart = s;
+        if (s.contains(' ')) {
+          final sp = s.split(RegExp(r'\s+'));
+          dayPart = int.tryParse(sp[0]) ?? 0;
+          timePart = sp[1];
+        }
+        final tp = timePart.split(':');
+        final h = tp.isNotEmpty ? (int.tryParse(tp[0]) ?? 0) : 0;
+        final mi = tp.length > 1 ? (int.tryParse(tp[1]) ?? 0) : 0;
+        final sec = tp.length > 2 ? (double.tryParse(tp[2]) ?? 0) : 0;
+        final days = dayPart + h / 24 + mi / 1440 + sec / 86400;
+        return days == days.roundToDouble() ? days.toInt() : days;
+      }),
+  // SYS_GUID(): a random 32-char uppercase hex RAW id.
+  'SYS_GUID': (a) {
+    final b = List<int>.generate(16, (_) => _rng.nextInt(256));
+    return b.map((x) => x.toRadixString(16).padLeft(2, '0')).join().toUpperCase();
+  },
+  // SESSIONTIMEZONE / DBTIMEZONE: UTC in this engine.
+  'SESSIONTIMEZONE': (a) => '+00:00',
+  'DBTIMEZONE': (a) => '+00:00',
+  // ROWID pseudocolumn: a synthetic non-null rowid token.
+  'ROWID': (a) => 'AAAAAAAAAA',
+  // (s1, e1) OVERLAPS (s2, e2): the two periods share any instant.
+  '__OVERLAPS': (a) {
+    if (a.length < 2 || a[0] is! List || a[1] is! List) return null;
+    final p1 = a[0] as List;
+    final p2 = a[1] as List;
+    if (p1.length < 2 || p2.length < 2) return null;
+    final s1 = _parseDateTime(p1[0]?.toString());
+    final e1 = _parseDateTime(p1[1]?.toString());
+    final s2 = _parseDateTime(p2[0]?.toString());
+    final e2 = _parseDateTime(p2[1]?.toString());
+    if (s1 == null || e1 == null || s2 == null || e2 == null) return null;
+    return s1.isBefore(e2) && s2.isBefore(e1);
+  },
+  // ASCIISTR: non-ASCII characters become \XXXX escapes.
+  'ASCIISTR': (a) => _propagateNull(a, () {
+        final sb = StringBuffer();
+        for (final r in a[0].toString().runes) {
+          if (r < 128) {
+            sb.writeCharCode(r);
+          } else {
+            sb.write('\\${r.toRadixString(16).toUpperCase().padLeft(4, '0')}');
+          }
+        }
+        return sb.toString();
+      }),
+  // UNISTR: decode \XXXX escapes back to Unicode characters.
+  'UNISTR': (a) => _propagateNull(a, () {
+        return a[0].toString().replaceAllMapped(
+            RegExp(r'\\([0-9A-Fa-f]{4})'),
+            (m) => String.fromCharCode(int.parse(m.group(1)!, radix: 16)));
+      }),
+  // GROUP_ID distinguishes duplicate rows in GROUPING SETS; 0 here.
+  'GROUP_ID': (a) => 0,
+  // LNNVL(condition): TRUE when the condition is FALSE or UNKNOWN (NULL).
+  'LNNVL': (a) {
+    if (a.isEmpty) return true;
+    final v = a[0];
+    final isTrue = v == true || (v is num && v != 0);
+    return !isTrue;
+  },
+  // NANVL(n, default): returns [default] when n is NaN, else n.
+  'NANVL': (a) {
+    if (a.isEmpty) return null;
+    final v = a[0];
+    if (v is double && v.isNaN) return a.length > 1 ? a[1] : null;
+    return v;
+  },
+  // XMLELEMENT("name", content…): a minimal XML element string.
+  'XMLELEMENT': (a) {
+    if (a.isEmpty) return null;
+    final name = a[0]?.toString() ?? '';
+    final content =
+        a.length > 1 ? a.sublist(1).map((x) => x?.toString() ?? '').join() : '';
+    return '<$name>$content</$name>';
+  },
+  // XMLQUERY(xquery RETURNING CONTENT): evaluate a constant XQuery expression.
+  // We support the common case of a scalar arithmetic expression (e.g. '1+2'),
+  // returning the computed value; otherwise the query text is returned as-is.
+  'XMLQUERY': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final q = a[0].toString().trim();
+    final v = _evalConstArith(q);
+    return v ?? q;
+  },
+  // XMLSERIALIZE([DOCUMENT|CONTENT] value ...): render the value as text.
+  'XMLSERIALIZE': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    return a[0].toString();
+  },
+  // XMLFOREST(name, value, …): concat `<name>value</name>` for each pair,
+  // omitting NULL-valued elements.
+  'XMLFOREST': (a) {
+    final sb = StringBuffer();
+    for (var i = 0; i + 1 < a.length; i += 2) {
+      final name = a[i]?.toString() ?? 'C';
+      final v = a[i + 1];
+      if (v == null) continue;
+      sb.write('<$name>$v</$name>');
+    }
+    return sb.toString();
+  },
+  // XMLTYPE(doc): the engine keeps XML as its text, so this is a passthrough.
+  'XMLTYPE': (a) => a.isEmpty || a[0] == null ? null : a[0].toString(),
+  // EXTRACTVALUE(xml, xpath): the text of the first node matched by a simple
+  // `/a/b` child-navigation XPath.
+  'EXTRACTVALUE': (a) {
+    if (a.length < 2 || a[0] == null || a[1] == null) return null;
+    return _xmlExtractText(a[0].toString(), a[1].toString());
+  },
   // SPACE(n) -- string of n spaces.
   'SPACE': (a) => _propagateNull(a, () {
         final n = (a[0] as num).toInt();
@@ -1094,9 +2117,12 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
         if (s.isEmpty) return s;
         final out = StringBuffer();
         var nextUpper = true;
+        final alnum = RegExp(r'[0-9A-Za-z]');
         for (var i = 0; i < s.length; i++) {
           final c = s[i];
-          if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+          // Oracle word-breaks on any non-alphanumeric (space, apostrophe,
+          // hyphen, …), so the letter after it is capitalised (O'Brien).
+          if (!alnum.hasMatch(c)) {
             out.write(c);
             nextUpper = true;
             continue;
@@ -1108,7 +2134,14 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
       }),
   'REPLACE': (a) => _propagateNull(
         a,
-        () => a[0].toString().replaceAll(a[1].toString(), a[2].toString()),
+        () {
+          final search = a[1].toString();
+          // An empty search string matches nothing (SQLite): return unchanged.
+          if (search.isEmpty) return a[0].toString();
+          // Oracle 2-arg REPLACE(s, sub) removes sub (replacement defaults to '').
+          final repl = a.length > 2 && a[2] != null ? a[2].toString() : '';
+          return a[0].toString().replaceAll(search, repl);
+        },
       ),
   'CONCAT': (a) => a.map((v) => v ?? '').join(),
   // CONCAT_WS(sep, args...) — joins non-NULL args with the given separator.
@@ -1156,30 +2189,120 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     if (a[1] == null) return a[0];
     return sqlEq(a[0]!, a[1]!) ? null : a[0];
   },
-  'ABS': (a) => _propagateNull(a, () => (a[0] as num).abs()),
+  'ABS': (a) => _propagateNull(a, () => _sqlTextToNum(a[0]).abs()),
   'ROUND': (a) {
     if (a.isEmpty || a[0] == null) return null;
-    final v = (a[0] as num).toDouble();
-    final digits = a.length > 1 && a[1] != null ? (a[1] as num).toInt() : 0;
-    final p = _pow10(digits);
-    return (v * p).round() / p;
+    final v0 = a[0];
+    // ROUND(date[, fmt]) rounds a date to the nearest unit (Oracle rounding
+    // model). Default rounds to the nearest day (noon rounds up).
+    if (v0 is String && RegExp(r'^\d{4}-\d{2}-\d{2}').hasMatch(v0.trim())) {
+      final dt = _parseDateTime(v0);
+      if (dt != null) {
+        final fmt = a.length > 1 && a[1] != null
+            ? a[1].toString().toUpperCase()
+            : 'DD';
+        DateTime out;
+        switch (fmt) {
+          case 'YYYY':
+          case 'YYY':
+          case 'YY':
+          case 'Y':
+          case 'YEAR':
+          case 'SYYYY':
+          case 'SYEAR':
+            out = dt.month >= 7
+                ? DateTime.utc(dt.year + 1, 1, 1)
+                : DateTime.utc(dt.year, 1, 1);
+            break;
+          case 'MM':
+          case 'MON':
+          case 'MONTH':
+          case 'RM':
+            out = dt.day >= 16
+                ? DateTime.utc(dt.year, dt.month + 1, 1)
+                : DateTime.utc(dt.year, dt.month, 1);
+            break;
+          case 'HH':
+          case 'HH12':
+          case 'HH24':
+            out = DateTime.utc(dt.year, dt.month, dt.day, dt.hour)
+                .add(Duration(hours: dt.minute >= 30 ? 1 : 0));
+            break;
+          case 'MI':
+            out = DateTime.utc(dt.year, dt.month, dt.day, dt.hour, dt.minute)
+                .add(Duration(minutes: dt.second >= 30 ? 1 : 0));
+            break;
+          case 'DAY':
+          case 'DY':
+          case 'D':
+            // Round to the nearest week start (Sunday).
+            final day = DateTime.utc(dt.year, dt.month, dt.day);
+            final sinceSun = day.weekday % 7; // Sun=0 .. Sat=6
+            out = sinceSun <= 3
+                ? day.subtract(Duration(days: sinceSun))
+                : day.add(Duration(days: 7 - sinceSun));
+            break;
+          default:
+            final day = DateTime.utc(dt.year, dt.month, dt.day);
+            out = dt.hour >= 12 ? day.add(const Duration(days: 1)) : day;
+        }
+        final hasTime = out.hour != 0 || out.minute != 0 || out.second != 0;
+        return hasTime ? _fmtDateTime(out) : _fmtDate(out);
+      }
+    }
+    final v = _sqlTextToNum(v0).toDouble();
+    final digits = a.length > 1 && a[1] != null ? _sqlTextToNum(a[1]).toInt() : 0;
+    // Oracle NUMBER is exact decimal: ROUND(1.005, 2) = 1.01, not the binary
+    // double's 1.00.
+    if (digits >= 0) {
+      final r = _roundHalfUpDecimal(v, digits);
+      return r is double && r == r.truncateToDouble() && digits == 0
+          ? r.toInt()
+          : r;
+    }
+    final p = _pow10(-digits);
+    return (v / p).round() * p;
   },
-  'MOD': (a) => _propagateNull(a, () => (a[0] as num) % (a[1] as num)),
-  'FLOOR': (a) => _propagateNull(a, () => (a[0] as num).floor()),
-  'CEIL': (a) => _propagateNull(a, () => (a[0] as num).ceil()),
-  'CEILING': (a) => _propagateNull(a, () => (a[0] as num).ceil()),
+  'MOD': (a) => _propagateNull(a, () {
+        final n = _sqlTextToNum(a[0]);
+        final m = _sqlTextToNum(a[1]);
+        // Oracle: MOD(n, 0) returns n (no divide-by-zero error).
+        if (m == 0) return n;
+        return n.remainder(m);
+      }),
+  // Oracle REMAINDER(n, m) = n - m * ROUND(n/m) — rounds the quotient (ties to
+  // even) rather than flooring like MOD: REMAINDER(17, 6) = -1.
+  'REMAINDER': (a) => _propagateNull(a, () {
+        final n = _sqlTextToNum(a[0]).toDouble();
+        final m = _sqlTextToNum(a[1]).toDouble();
+        if (m == 0) return null;
+        // Oracle rounds the quotient half-to-even (banker's rounding).
+        final x = n / m;
+        final fl = x.floorToDouble();
+        final diff = x - fl;
+        final q = diff < 0.5
+            ? fl
+            : diff > 0.5
+                ? fl + 1
+                : (fl % 2 == 0 ? fl : fl + 1);
+        final r = n - m * q;
+        return r == r.truncateToDouble() ? r.toInt() : r;
+      }),
+  'FLOOR': (a) => _propagateNull(a, () => _sqlTextToNum(a[0]).floor()),
+  'CEIL': (a) => _propagateNull(a, () => _sqlTextToNum(a[0]).ceil()),
+  'CEILING': (a) => _propagateNull(a, () => _sqlTextToNum(a[0]).ceil()),
   'SQRT': (a) => _propagateNull(a, () {
-        final v = (a[0] as num).toDouble();
+        final v = _sqlTextToNum(a[0]).toDouble();
         if (v < 0) return null;
         return _sqrt(v);
       }),
   'POWER': (a) => _propagateNull(
         a,
-        () => _intPow((a[0] as num).toDouble(), (a[1] as num).toDouble()),
+        () => _intPow(_sqlTextToNum(a[0]).toDouble(), _sqlTextToNum(a[1]).toDouble()),
       ),
   'POW': (a) => kScalarFunctions['POWER']!(a),
   'SIGN': (a) => _propagateNull(a, () {
-        final v = (a[0] as num).toDouble();
+        final v = _sqlTextToNum(a[0]).toDouble();
         if (v == 0) return 0;
         return v > 0 ? 1 : -1;
       }),
@@ -1191,6 +2314,28 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
   // results from GROUPING SETS / ROLLUP / CUBE so this default 0
   // applies only when the expression IS in the current grouping set.
   'GROUPING': (a) => 0,
+  // Default 0; overwritten to the per-set bit vector by _selectGroupingSets.
+  'GROUPING_ID': (a) => 0,
+  // WIDTH_BUCKET(expr, min, max, buckets): equi-width histogram bucket.
+  // 0 for below-range, buckets+1 for at/above max.
+  'WIDTH_BUCKET': (a) {
+    if (a.length < 4 || a[0] == null || a[1] == null || a[2] == null ||
+        a[3] == null) {
+      return null;
+    }
+    final e = _sqlTextToNum(a[0]).toDouble();
+    final lo = _sqlTextToNum(a[1]).toDouble();
+    final hi = _sqlTextToNum(a[2]).toDouble();
+    final n = _sqlTextToNum(a[3]).toInt();
+    if (lo == hi || n <= 0) return null;
+    final asc = hi > lo;
+    final mn = asc ? lo : hi;
+    final mx = asc ? hi : lo;
+    if (e < mn) return asc ? 0 : n + 1;
+    if (e >= mx) return asc ? n + 1 : 0;
+    final b = ((e - lo) / (hi - lo) * n).floor() + 1;
+    return b.clamp(1, n);
+  },
   'IIF': (a) {
     if (a.length < 3) return null;
     final c = a[0];
@@ -1298,7 +2443,82 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
       _propagateNull(a, () => (a[0] as num).toDouble() * math.pi / 180),
   'DEGREES': (a) =>
       _propagateNull(a, () => (a[0] as num).toDouble() * 180 / math.pi),
-  'TRUNC': (a) => _propagateNull(a, () => (a[0] as num).truncate()),
+  'TRUNC': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final v0 = a[0];
+    // TRUNC(date[, fmt]) truncates a date to the unit implied by [fmt]
+    // (default: start of day).
+    if (v0 is String && RegExp(r'^\d{4}-\d{2}-\d{2}').hasMatch(v0.trim())) {
+      final dt = _parseDateTime(v0);
+      if (dt != null) {
+        final fmt = a.length > 1 && a[1] != null
+            ? a[1].toString().toUpperCase()
+            : 'DD';
+        DateTime out;
+        switch (fmt) {
+          case 'YYYY':
+          case 'YYY':
+          case 'YY':
+          case 'Y':
+          case 'YEAR':
+          case 'SYYYY':
+          case 'SYEAR':
+          case 'CC':
+          case 'SCC':
+            out = DateTime.utc(dt.year, 1, 1);
+            break;
+          case 'Q':
+            out = DateTime.utc(dt.year, ((dt.month - 1) ~/ 3) * 3 + 1, 1);
+            break;
+          case 'MM':
+          case 'MON':
+          case 'MONTH':
+          case 'RM':
+            out = DateTime.utc(dt.year, dt.month, 1);
+            break;
+          case 'IW':
+            // ISO week starts on Monday.
+            final iwDay = DateTime.utc(dt.year, dt.month, dt.day);
+            out = iwDay.subtract(Duration(days: iwDay.weekday - 1));
+            break;
+          case 'IYYY':
+          case 'IYY':
+          case 'IY':
+          case 'I':
+            // ISO year start: the Monday beginning ISO week 1 (the week that
+            // contains Jan 4 of the ISO year).
+            final isoY = _isoYear(dt);
+            final jan4 = DateTime.utc(isoY, 1, 4);
+            out = jan4.subtract(Duration(days: jan4.weekday - 1));
+            break;
+          case 'WW':
+          case 'DAY':
+          case 'DY':
+          case 'D':
+            final day = DateTime.utc(dt.year, dt.month, dt.day);
+            out = day.subtract(Duration(days: day.weekday % 7)); // week start Sun
+            break;
+          case 'HH':
+          case 'HH12':
+          case 'HH24':
+            out = DateTime.utc(dt.year, dt.month, dt.day, dt.hour);
+            break;
+          case 'MI':
+            out = DateTime.utc(dt.year, dt.month, dt.day, dt.hour, dt.minute);
+            break;
+          default:
+            out = DateTime.utc(dt.year, dt.month, dt.day);
+        }
+        final hasTime = out.hour != 0 || out.minute != 0 || out.second != 0;
+        return hasTime ? _fmtDateTime(out) : _fmtDate(out);
+      }
+    }
+    final n = _sqlTextToNum(v0).toDouble();
+    final places = a.length > 1 && a[1] != null ? _sqlTextToNum(a[1]).toInt() : 0;
+    final p = _pow10(places);
+    final t = (n * p).truncateToDouble() / p;
+    return places <= 0 ? t.toInt() : t;
+  },
   // REGEXP family. SQLite's REGEXP operator desugars to regexp(pat, val);
   // we accept both forms. Pattern is Dart's RegExp (PCRE-like).
   'REGEXP': (a) {
@@ -1307,18 +2527,111 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
   },
   'REGEXP_LIKE': (a) {
     if (a.length < 2 || a[0] == null || a[1] == null) return null;
-    return RegExp(a[1].toString()).hasMatch(a[0].toString());
+    final mp = a.length > 2 && a[2] != null ? a[2].toString() : null;
+    return _oracleRegex(a[1].toString(), mp).hasMatch(a[0].toString());
   },
   'REGEXP_SUBSTR': (a) {
     if (a.length < 2 || a[0] == null || a[1] == null) return null;
-    final m = RegExp(a[1].toString()).firstMatch(a[0].toString());
-    return m?.group(0);
+    final src = a[0].toString();
+    final re = _oracleRegex(
+        a[1].toString(), a.length > 4 && a[4] != null ? a[4].toString() : null);
+    // REGEXP_SUBSTR(src, pat [, position [, occurrence [, match_param
+    // [, subexpr]]]]): 1-based position/occurrence.
+    final position = a.length > 2 && a[2] != null ? _sqlTextToNum(a[2]).toInt() : 1;
+    final occurrence = a.length > 3 && a[3] != null ? _sqlTextToNum(a[3]).toInt() : 1;
+    if (position < 1 || occurrence < 1) return null;
+    final start = (position - 1).clamp(0, src.length);
+    final matches = re.allMatches(src, start).toList();
+    if (occurrence > matches.length) return null;
+    final m = matches[occurrence - 1];
+    // 6th arg selects a capture group (subexpression); 0/absent = whole match.
+    final subexpr =
+        a.length > 5 && a[5] != null ? _sqlTextToNum(a[5]).toInt() : 0;
+    if (subexpr > 0) {
+      return subexpr <= m.groupCount ? m.group(subexpr) : null;
+    }
+    return m.group(0);
+  },
+  'REGEXP_COUNT': (a) {
+    if (a.length < 2 || a[0] == null || a[1] == null) return null;
+    final src = a[0].toString();
+    final re = _oracleRegex(
+        a[1].toString(), a.length > 3 && a[3] != null ? a[3].toString() : null);
+    final position = a.length > 2 && a[2] != null ? _sqlTextToNum(a[2]).toInt() : 1;
+    final start = (position - 1).clamp(0, src.length);
+    return re.allMatches(src, start).length;
+  },
+  'REGEXP_INSTR': (a) {
+    if (a.length < 2 || a[0] == null || a[1] == null) return null;
+    final src = a[0].toString();
+    final re = _oracleRegex(
+        a[1].toString(), a.length > 5 && a[5] != null ? a[5].toString() : null);
+    // REGEXP_INSTR(src, pat [, position [, occurrence [, return_opt …]]]):
+    // return_opt 0 => start of match, 1 => position after the match. 1-based.
+    final position = a.length > 2 && a[2] != null ? _sqlTextToNum(a[2]).toInt() : 1;
+    final occurrence = a.length > 3 && a[3] != null ? _sqlTextToNum(a[3]).toInt() : 1;
+    final returnOpt = a.length > 4 && a[4] != null ? _sqlTextToNum(a[4]).toInt() : 0;
+    if (position < 1 || occurrence < 1) return 0;
+    final start = (position - 1).clamp(0, src.length);
+    final matches = re.allMatches(src, start).toList();
+    if (occurrence > matches.length) return 0;
+    final m = matches[occurrence - 1];
+    return (returnOpt == 0 ? m.start : m.end) + 1;
   },
   'REGEXP_REPLACE': (a) {
-    if (a.length < 3 || a[0] == null || a[1] == null || a[2] == null) {
-      return null;
+    if (a.length < 2 || a[0] == null || a[1] == null) return null;
+    final src = a[0].toString();
+    final re = _oracleRegex(
+        a[1].toString(), a.length > 5 && a[5] != null ? a[5].toString() : null);
+    // Replacement may be omitted (removes matches) and supports Oracle
+    // backreferences \1..\9 (and \0 for the whole match).
+    final repl = a.length > 2 && a[2] != null ? a[2].toString() : '';
+    final position =
+        a.length > 3 && a[3] != null ? _sqlTextToNum(a[3]).toInt() : 1;
+    // Occurrence 0 (default) replaces every match; n replaces only the nth.
+    final occurrence =
+        a.length > 4 && a[4] != null ? _sqlTextToNum(a[4]).toInt() : 0;
+    String expand(Match m) {
+      final sb = StringBuffer();
+      for (var i = 0; i < repl.length; i++) {
+        final ch = repl[i];
+        if (ch == r'\' && i + 1 < repl.length) {
+          final nx = repl[i + 1];
+          if (nx == r'\') {
+            sb.write(r'\');
+            i++;
+            continue;
+          }
+          final d = int.tryParse(nx);
+          if (d != null) {
+            if (d == 0) {
+              sb.write(m.group(0) ?? '');
+            } else {
+              sb.write(d <= m.groupCount ? (m.group(d) ?? '') : '');
+            }
+            i++;
+            continue;
+          }
+        }
+        sb.write(ch);
+      }
+      return sb.toString();
     }
-    return a[0].toString().replaceAll(RegExp(a[1].toString()), a[2].toString());
+
+    final cut = (position - 1).clamp(0, src.length);
+    final prefix = src.substring(0, cut);
+    final rest = src.substring(cut);
+    String result;
+    if (occurrence == 0) {
+      result = rest.replaceAllMapped(re, expand);
+    } else {
+      var count = 0;
+      result = rest.replaceAllMapped(re, (m) {
+        count++;
+        return count == occurrence ? expand(m) : m.group(0)!;
+      });
+    }
+    return prefix + result;
   },
   'RANDOM': (a) => _rng.nextInt(1 << 31),
   'INSTR': (a) {
@@ -1326,7 +2639,32 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     final hay = a[0].toString();
     final needle = a[1].toString();
     if (needle.isEmpty) return 1;
-    return hay.indexOf(needle) + 1; // 1-based; 0 == not found
+    if (a.length <= 2) return hay.indexOf(needle) + 1; // 1-based; 0 = not found
+    // Oracle INSTR(str, sub, position, occurrence): 1-based; a negative
+    // position searches backward from the end.
+    final pos = a[2] == null ? 1 : _sqlTextToNum(a[2]).toInt();
+    final occ = a.length > 3 && a[3] != null ? _sqlTextToNum(a[3]).toInt() : 1;
+    if (pos == 0 || occ < 1) return 0;
+    if (pos > 0) {
+      var idx = pos - 1;
+      var found = -1;
+      for (var k = 0; k < occ; k++) {
+        if (idx > hay.length) return 0;
+        found = hay.indexOf(needle, idx);
+        if (found < 0) return 0;
+        idx = found + 1;
+      }
+      return found + 1;
+    }
+    var start = hay.length + pos;
+    var found = -1;
+    for (var k = 0; k < occ; k++) {
+      if (start < 0) return 0;
+      found = hay.lastIndexOf(needle, start);
+      if (found < 0) return 0;
+      start = found - 1;
+    }
+    return found + 1;
   },
   'LPAD': (a) {
     if (a.isEmpty || a[0] == null) return null;
@@ -1622,6 +2960,7 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     }
     if (a.length >= 2) {
       v = jsonPathLookup(v, a[1].toString());
+      if (v == null) return null; // missing path -> SQL NULL (not 'null')
     }
     if (v == null) return 'null';
     if (v is bool) return v ? 'true' : 'false';
@@ -1653,16 +2992,103 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     }
     return jsonEncode(out);
   },
-  'JSON_ARRAY': (a) => jsonEncode(a.map(_jsonValueOf).toList()),
+  // Oracle JSON_ARRAY defaults to ABSENT ON NULL: NULL elements are omitted.
+  'JSON_ARRAY': (a) =>
+      jsonEncode([for (final e in a) if (e != null) _jsonValueOf(e)]),
+  // Oracle JSON_VALUE(json, path): the scalar at [path] (NULL for object/array
+  // results, matching Oracle). JSON_QUERY returns the object/array fragment.
+  'JSON_VALUE': (a) {
+    if (a.length < 2 || a[0] == null || a[1] == null) return null;
+    final root = _decodeJsonSource(a[0]);
+    if (root == null) return null;
+    var v = jsonPathLookup(root, a[1].toString());
+    v = (v is List || v is Map) ? null : v;
+    // Optional `\u0001JV:{ret,def}` marker from RETURNING / DEFAULT ON ERROR.
+    if (a.length >= 3 && a[2] is String && (a[2] as String).startsWith('\u0001JV:')) {
+      final opts =
+          jsonDecode((a[2] as String).substring(4)) as Map<String, Object?>;
+      final ret = (opts['ret'] as String?)?.toUpperCase();
+      final hasDef = opts.containsKey('def');
+      if (ret != null &&
+          (ret.startsWith('NUMBER') ||
+              ret.startsWith('INT') ||
+              ret.startsWith('FLOAT') ||
+              ret.startsWith('DEC'))) {
+        final n = v is num ? v : (v == null ? null : num.tryParse(v.toString()));
+        if (n == null) return hasDef ? opts['def'] : null;
+        return n;
+      }
+      if (v == null && hasDef) return opts['def'];
+    }
+    return v;
+  },
+  'JSON_QUERY': (a) {
+    if (a.length < 2 || a[0] == null || a[1] == null) return null;
+    final root = _decodeJsonSource(a[0]);
+    if (root == null) return null;
+    final wrapper =
+        a.length >= 3 && a[2] is String && a[2] == '\u0001JQW';
+    final v = jsonPathLookup(root, a[1].toString());
+    if (v is List || v is Map) return jsonEncode(v);
+    // WITH WRAPPER wraps a scalar (or missing) result in a JSON array.
+    return wrapper ? jsonEncode(v == null ? [] : [v]) : null;
+  },
+  // Oracle JSON_EXISTS(json, path): true when the path matches a value.
+  'JSON_EXISTS': (a) {
+    if (a.length < 2 || a[0] == null || a[1] == null) return false;
+    final root = _decodeJsonSource(a[0]);
+    if (root == null) return false;
+    return jsonPathLookup(root, a[1].toString()) != null;
+  },
+  // Oracle VSIZE / DUMP datatype-introspection. VSIZE returns the internal
+  // storage size in bytes (NUMBER ≈ 1 + ceil(significant digits / 2)).
+  'VSIZE': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final v = a[0];
+    if (v is List<int>) return v.length;
+    if (v is num) {
+      final digits = v
+          .toString()
+          .replaceAll(RegExp(r'[-.]'), '')
+          .replaceAll(RegExp(r'^0+(?=\d)|0+$'), '');
+      final d = digits.isEmpty ? 1 : digits.length;
+      return 1 + ((d + 1) ~/ 2);
+    }
+    return utf8.encode(v.toString()).length;
+  },
+  'DUMP': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final v = a[0];
+    final bytes = v is List<int> ? v : utf8.encode(v.toString());
+    return 'Len=${bytes.length}: ${bytes.join(',')}';
+  },
   'JSON_OBJECT': (a) {
-    if (a.length.isOdd) {
+    // A trailing `__ABSENT__` marker (added by the parser for ABSENT ON NULL)
+    // omits keys whose value is NULL.
+    var args = a;
+    var absentOnNull = false;
+    if (args.isNotEmpty && args.last == '\u0001ABSENT') {
+      absentOnNull = true;
+      args = args.sublist(0, args.length - 1);
+    }
+    if (args.length.isOdd) {
       throw StateError('json_object requires an even number of arguments');
     }
     final m = <String, Object?>{};
-    for (var i = 0; i < a.length; i += 2) {
-      m[a[i].toString()] = _jsonValueOf(a[i + 1]);
+    for (var i = 0; i < args.length; i += 2) {
+      final v = _jsonValueOf(args[i + 1]);
+      if (absentOnNull && v == null) continue;
+      m[args[i].toString()] = v;
     }
     return jsonEncode(m);
+  },
+  // Oracle JSON_MERGEPATCH(target, patch): RFC 7386 merge; a null in the patch
+  // deletes the key, nested objects merge recursively.
+  'JSON_MERGEPATCH': (a) {
+    if (a.length < 2 || a[0] == null || a[1] == null) return null;
+    final target = _decodeJsonSource(a[0]);
+    final patch = _decodeJsonSource(a[1]);
+    return jsonEncode(_jsonMergePatch(target, patch));
   },
   'JSON_ARRAY_LENGTH': (a) {
     if (a.isEmpty || a[0] == null) return null;
@@ -1672,7 +3098,10 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
     } catch (_) {
       return null;
     }
-    if (a.length >= 2) v = jsonPathLookup(v, a[1].toString());
+    if (a.length >= 2) {
+      v = jsonPathLookup(v, a[1].toString());
+      if (v == null) return null; // missing path -> SQL NULL
+    }
     return v is List ? v.length : 0;
   },
   'JSON_QUOTE': (a) {
@@ -1860,6 +3289,292 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
   // --- MySQL datetime aliases ----------------------------------------
   'NOW': (a) => _fmtDateTime(DateTime.now().toUtc(), full: true),
   'SYSDATE': (a) => _fmtDateTime(DateTime.now().toUtc(), full: true),
+  'SYSTIMESTAMP': (a) => _fmtDateTime(DateTime.now().toUtc(), full: true),
+  'LOCALTIMESTAMP': (a) => _fmtDateTime(DateTime.now().toUtc(), full: true),
+  // Oracle FROM_TZ(ts, tz): tag a naive timestamp with a UTC offset; encoded
+  // as "<ts><±HH:MM>" so AT TIME ZONE can read the source offset.
+  'FROM_TZ': (a) {
+    if (a.length < 2 || a[0] == null || a[1] == null) return null;
+    final ts = a[0].toString().trim();
+    var tz = a[1].toString().trim();
+    if (!RegExp(r'^[+-]\d{2}:\d{2}$').hasMatch(tz)) tz = '+00:00';
+    return '$ts$tz';
+  },
+  // `expr AT TIME ZONE tz`: shift a (possibly offset-tagged) timestamp to [tz],
+  // returning the target wall-clock time.
+  '__AT_TIME_ZONE': (a) {
+    if (a.length < 2 || a[0] == null || a[1] == null) return null;
+    final raw = a[0].toString().trim();
+    final m = RegExp(r'^(.*?)([+-]\d{2}:\d{2})$').firstMatch(raw);
+    final tsStr = m != null ? m.group(1)!.trim() : raw;
+    final srcMin = _tzOffsetMinutes(m != null ? m.group(2)! : '+00:00');
+    final tgtMin = _tzOffsetMinutes(a[1].toString().trim());
+    final dt = _parseDateTime(tsStr);
+    if (dt == null) return null;
+    final shifted = dt.add(Duration(minutes: tgtMin - srcMin));
+    return _fmtDateTime(shifted);
+  },
+  // Oracle conversion functions. TO_CHAR returns a value's canonical text; a
+  // format model (second arg) is accepted but not interpreted. TO_NUMBER
+  // parses a numeric string.
+  'TO_CHAR': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final v = a[0];
+    final fmt = a.length > 1 && a[1] != null ? a[1].toString() : null;
+    if (fmt != null && fmt.isNotEmpty) {
+      // Date/datetime value with a date format model.
+      if (v is String) {
+        final dt = DateTime.tryParse(v.replaceFirst(' ', 'T'));
+        if (dt != null && _looksLikeDateFormat(fmt)) {
+          return _formatOracleDate(dt, fmt);
+        }
+      }
+      // Numeric value with a number format model.
+      num? n;
+      if (v is num) {
+        n = v;
+      } else if (v is String) {
+        n = num.tryParse(v.trim());
+      }
+      if (n != null) {
+        final upperFmt = fmt.toUpperCase().replaceAll('FM', '');
+        // Roman numerals (RN): 1..3999.
+        if (upperFmt == 'RN') {
+          final r = _toRoman(n.toInt());
+          if (r != null) {
+            return fmt.toUpperCase().startsWith('FM') ? r : r.padLeft(15);
+          }
+        }
+        // Negative sign in angle brackets (PR): -5 -> <5>.
+        if (RegExp(r'PR$', caseSensitive: false).hasMatch(fmt)) {
+          final body = _formatOracleNumber(n.abs(), fmt.replaceAll(
+              RegExp('PR', caseSensitive: false), '')).trim();
+          return n < 0 ? '<$body>' : ' $body ';
+        }
+        // Hexadecimal format model (FMXXX / XXXX): emit uppercase hex.
+        final hexFmt = RegExp(r'^(FM)?X+$', caseSensitive: false);
+        if (hexFmt.hasMatch(fmt)) {
+          final hex = n.toInt().toRadixString(16).toUpperCase();
+          final width = fmt.toUpperCase().replaceAll('FM', '').length;
+          final padded = hex.padLeft(width, '0');
+          return fmt.toUpperCase().startsWith('FM') ? hex : ' $padded';
+        }
+        if (_looksLikeNumberFormat(fmt) || RegExp(r'[90]').hasMatch(fmt)) {
+          // NLS_NUMERIC_CHARACTERS='<decimal><group>' (3rd arg) overrides the
+          // decimal / group separators.
+          var dec = '.';
+          var grp = ',';
+          if (a.length > 2 && a[2] != null) {
+            final m = RegExp(
+                    "NLS_NUMERIC_CHARACTERS\\s*=\\s*'?(..)'?",
+                    caseSensitive: false)
+                .firstMatch(a[2].toString());
+            if (m != null) {
+              dec = m.group(1)![0];
+              grp = m.group(1)![1];
+            }
+          }
+          return _formatOracleNumber(n, fmt, decimalChar: dec, groupChar: grp);
+        }
+      }
+    }
+    return v is String ? v : v.toString();
+  },
+  'TO_NUMBER': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final v = a[0];
+    if (v is num) return v;
+    var s = v.toString().trim();
+    // With a format model, strip currency / grouping characters first.
+    if (a.length > 1 && a[1] != null) {
+      s = s.replaceAll(RegExp(r'[^0-9.\-]'), '');
+    }
+    return num.tryParse(s);
+  },
+  // TO_BINARY_FLOAT / TO_BINARY_DOUBLE: parse to a floating-point number.
+  'TO_BINARY_FLOAT': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final v = a[0];
+    return v is num ? v.toDouble() : double.tryParse(v.toString().trim());
+  },
+  'TO_BINARY_DOUBLE': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final v = a[0];
+    return v is num ? v.toDouble() : double.tryParse(v.toString().trim());
+  },
+  // CLOB/NCLOB conversions are no-ops in this engine (text is already text).
+  'TO_CLOB': (a) => a.isEmpty || a[0] == null ? null : a[0].toString(),
+  'TO_NCLOB': (a) => a.isEmpty || a[0] == null ? null : a[0].toString(),
+  // Oracle JSON(expr) / JSON constructor: keep the JSON text as-is.
+  'JSON': (a) => a.isEmpty || a[0] == null ? null : a[0].toString(),
+  // NLS case functions: the linguistic parameter is accepted and ignored; the
+  // transform matches UPPER / LOWER / INITCAP.
+  'NLS_UPPER': (a) =>
+      a.isEmpty || a[0] == null ? null : a[0].toString().toUpperCase(),
+  'NLS_LOWER': (a) =>
+      a.isEmpty || a[0] == null ? null : a[0].toString().toLowerCase(),
+  'NLS_INITCAP': (a) =>
+      a.isEmpty || a[0] == null ? null : kScalarFunctions['INITCAP']!([a[0]]),
+  // Oracle RAW hex round-trip: HEXTORAW('DEADBEEF') -> bytes, RAWTOHEX -> hex.
+  'HEXTORAW': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final hex = a[0].toString();
+    if (hex.isEmpty || hex.length.isOdd) return null;
+    final out = <int>[];
+    for (var i = 0; i < hex.length; i += 2) {
+      final b = int.tryParse(hex.substring(i, i + 2), radix: 16);
+      if (b == null) return null;
+      out.add(b);
+    }
+    return out;
+  },
+  'RAWTOHEX': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final v = a[0];
+    final bytes = v is List<int> ? v : utf8.encode(v.toString());
+    return bytes
+        .map((b) => b.toRadixString(16).padLeft(2, '0').toUpperCase())
+        .join();
+  },
+  // Oracle UTL_RAW package: byte/RAW conversions.
+  'UTL_RAW.CAST_TO_RAW': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final v = a[0];
+    return v is List<int> ? v : utf8.encode(v.toString());
+  },
+  'UTL_RAW.CAST_TO_VARCHAR2': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final v = a[0];
+    return v is List<int> ? utf8.decode(v, allowMalformed: true) : v.toString();
+  },
+  // Oracle interval constructors, modelled as a day count so they compose with
+  // DATE arithmetic (DATE + NUMTODSINTERVAL(5,'DAY')).
+  'NUMTODSINTERVAL': (a) {
+    if (a.length < 2 || a[0] == null || a[1] == null) return null;
+    final n = _sqlTextToNum(a[0]).toDouble();
+    const per = {
+      'DAY': 1.0, 'HOUR': 1 / 24, 'MINUTE': 1 / 1440, 'SECOND': 1 / 86400,
+    };
+    final days = n * (per[a[1].toString().toUpperCase()] ?? 1);
+    return days == days.roundToDouble() ? days.toInt() : days;
+  },
+  'NUMTOYMINTERVAL': (a) {
+    if (a.length < 2 || a[0] == null || a[1] == null) return null;
+    final n = _sqlTextToNum(a[0]).toInt();
+    // A YEAR-TO-MONTH interval (months), so DATE arithmetic adds calendar
+    // months rather than ~30-day approximations.
+    final months = a[1].toString().toUpperCase() == 'YEAR' ? n * 12 : n;
+    return YmInterval(months);
+  },
+  // TO_DATE(text [, fmt]) parses [text] by the Oracle format model [fmt] (a
+  // useful subset) and returns the engine's ISO text date/datetime.
+  'TO_DATE': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final dt = _parseOracleDate(
+        a[0].toString(), a.length > 1 ? a[1]?.toString() : null);
+    if (dt == null) return null;
+    final hasTime = dt.hour != 0 || dt.minute != 0 || dt.second != 0;
+    return hasTime ? _fmtDateTime(dt) : _fmtDate(dt);
+  },
+  'TO_TIMESTAMP': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final dt = _parseOracleDate(
+        a[0].toString(), a.length > 1 ? a[1]?.toString() : null);
+    return dt == null ? null : _fmtDateTime(dt);
+  },
+  // TO_TIMESTAMP_TZ(text [, fmt]): parse a timestamp with a timezone. The
+  // engine keeps wall-clock time, so the TZH/TZM/TZR tokens and the text's
+  // trailing offset are stripped before parsing.
+  'TO_TIMESTAMP_TZ': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final text = a[0]
+        .toString()
+        .replaceFirst(RegExp(r'\s*[+-]\d{1,2}:\d{2}\s*$'), '')
+        .trim();
+    final fmt = a.length > 1 && a[1] != null
+        ? a[1].toString().replaceFirst(
+            RegExp(r'\s*TZ[HMRD].*$', caseSensitive: false), '').trim()
+        : null;
+    final dt = _parseOracleDate(text, fmt);
+    return dt == null ? null : _fmtDateTime(dt);
+  },
+  // TZ_OFFSET(region): the engine runs in UTC; a numeric offset passes through.
+  'TZ_OFFSET': (a) {
+    if (a.isEmpty || a[0] == null) return null;
+    final s = a[0].toString().trim();
+    final m = RegExp(r'^[+-]\d{1,2}:\d{2}$').firstMatch(s);
+    return m != null ? s : '+00:00';
+  },
+  // TRANSLATE(str, from, to): maps each char in [from] to the char at the same
+  // position in [to]; chars past [to]'s length are removed.
+  'TRANSLATE': (a) {
+    if (a.length < 3 || a[0] == null || a[1] == null || a[2] == null) {
+      return null;
+    }
+    final src = a[0].toString();
+    final from = a[1].toString();
+    final to = a[2].toString();
+    final map = <String, String?>{};
+    for (var i = 0; i < from.length; i++) {
+      map.putIfAbsent(from[i], () => i < to.length ? to[i] : null);
+    }
+    final buf = StringBuffer();
+    for (var i = 0; i < src.length; i++) {
+      final ch = src[i];
+      if (!map.containsKey(ch)) {
+        buf.write(ch);
+      } else if (map[ch] != null) {
+        buf.write(map[ch]);
+      }
+    }
+    return buf.toString();
+  },
+  // ADD_MONTHS(date, n): add n months, clamping the day to the target month's
+  // last day (Oracle semantics: Jan 31 + 1 -> Feb 28/29).
+  'ADD_MONTHS': (a) {
+    if (a.length < 2 || a[0] == null || a[1] == null) return null;
+    final dt = _parseDateTime(a[0].toString());
+    if (dt == null) return null;
+    final total = dt.year * 12 + (dt.month - 1) + _sqlTextToNum(a[1]).toInt();
+    final y = total ~/ 12;
+    final mo = total % 12 + 1;
+    final lastDay = DateTime.utc(y, mo + 1, 0).day;
+    // Oracle: if the input is the last day of its month, the result is the last
+    // day of the target month (clamp down AND extend up).
+    final inputEom = dt.day == DateTime.utc(dt.year, dt.month + 1, 0).day;
+    final day = inputEom || dt.day > lastDay ? lastDay : dt.day;
+    final r = DateTime.utc(y, mo, day, dt.hour, dt.minute, dt.second);
+    final hasTime = dt.hour != 0 || dt.minute != 0 || dt.second != 0;
+    return hasTime ? _fmtDateTime(r) : _fmtDate(r);
+  },
+  // MONTHS_BETWEEN(d1, d2): months between the dates (fractional on a 31-day
+  // basis); a whole-number result is returned as an integer.
+  'MONTHS_BETWEEN': (a) {
+    if (a.length < 2 || a[0] == null || a[1] == null) return null;
+    final d1 = _parseDateTime(a[0].toString());
+    final d2 = _parseDateTime(a[1].toString());
+    if (d1 == null || d2 == null) return null;
+    final months = (d1.year - d2.year) * 12 + (d1.month - d2.month);
+    bool isEom(DateTime d) =>
+        d.day == DateTime.utc(d.year, d.month + 1, 0).day;
+    // Oracle: two last-day-of-month dates give a whole-month result.
+    final dayFrac =
+        (d1.day == d2.day) || (isEom(d1) && isEom(d2)) ? 0.0 : (d1.day - d2.day) / 31.0;
+    final result = months + dayFrac;
+    return result == result.truncateToDouble() ? result.toInt() : result;
+  },
+  // NEXT_DAY(date, weekday): the first [weekday] strictly after [date].
+  'NEXT_DAY': (a) {
+    if (a.length < 2 || a[0] == null || a[1] == null) return null;
+    final dt = _parseDateTime(a[0].toString());
+    final target = _weekdayFromName(a[1].toString());
+    if (dt == null || target == null) return null;
+    var d = DateTime.utc(dt.year, dt.month, dt.day);
+    do {
+      d = d.add(const Duration(days: 1));
+    } while (d.weekday % 7 != target % 7);
+    return _fmtDate(d);
+  },
   'CURDATE': (a) => _fmtDate(DateTime.now().toUtc()),
   'CURTIME': (a) => _fmtTime(DateTime.now().toUtc()),
   'UTC_TIMESTAMP': (a) => _fmtDateTime(DateTime.now().toUtc(), full: true),
@@ -1878,6 +3593,79 @@ final Map<String, ScalarFn> kScalarFunctions = <String, ScalarFn>{
       return _strftime(_mysqlFmtToStrftime(a[1].toString()), dt);
     }
     return _fmtDateTime(dt, full: true);
+  },
+  // SQL-standard EXTRACT(field FROM source). The parser rewrites the special
+  // `field FROM expr` grammar into EXTRACT(<field-name-literal>, expr).
+  'EXTRACT': (a) {
+    if (a.length != 2 || a[0] == null) return null;
+    final field = a[0].toString().toUpperCase();
+    // TIMEZONE_HOUR / TIMEZONE_MINUTE read the signed offset off the raw
+    // TIMESTAMP WITH TIME ZONE text (e.g. '… +05:30'); the minute field carries
+    // the offset's sign (so -05:30 -> -30).
+    if (field == 'TIMEZONE_HOUR' || field == 'TIMEZONE_MINUTE') {
+      final m = RegExp(r'([+-])(\d{1,2}):(\d{2})\s*$')
+          .firstMatch(a[1]?.toString() ?? '');
+      if (m == null) return 0;
+      final sign = m[1] == '-' ? -1 : 1;
+      return field == 'TIMEZONE_HOUR'
+          ? sign * int.parse(m[2]!)
+          : sign * int.parse(m[3]!);
+    }
+    // A numeric operand is a day-to-second INTERVAL (e.g. TIMESTAMP - TIMESTAMP
+    // yields a day count). Extract its day/hour/minute/second components.
+    if (a[1] is num) {
+      // Work in whole seconds to avoid binary-fraction drift (e.g. 1.0833…
+      // days * 24 = 1.9999… truncating to 1 instead of 2 hours).
+      final totalSecs = ((a[1] as num).toDouble() * 86400).round();
+      final days = totalSecs ~/ 86400;
+      final hours = (totalSecs % 86400) ~/ 3600;
+      final mins = (totalSecs % 3600) ~/ 60;
+      final secs = totalSecs % 60;
+      switch (field) {
+        case 'DAY':
+          return days;
+        case 'HOUR':
+          return hours;
+        case 'MINUTE':
+          return mins;
+        case 'SECOND':
+          return secs;
+        default:
+          return 0;
+      }
+    }
+    // A YEAR-TO-MONTH interval value: extract its year / month components.
+    if (a[1] is YmInterval) {
+      final months = (a[1] as YmInterval).months;
+      switch (field) {
+        case 'YEAR':
+          return months ~/ 12;
+        case 'MONTH':
+          return months % 12;
+        default:
+          return 0;
+      }
+    }
+    final dt = _resolveDateTime([a[1]]);
+    if (dt == null) return null;
+    switch (field) {
+      case 'YEAR':
+        return dt.year;
+      case 'MONTH':
+        return dt.month;
+      case 'DAY':
+        return dt.day;
+      case 'HOUR':
+        return dt.hour;
+      case 'MINUTE':
+        return dt.minute;
+      case 'SECOND':
+        // Oracle EXTRACT(SECOND ...) includes fractional seconds.
+        final frac = dt.millisecond / 1000 + dt.microsecond / 1000000;
+        return frac == 0 ? dt.second : dt.second + frac;
+      default:
+        return null;
+    }
   },
   'YEAR': (a) {
     final dt = _resolveDateTime(a);
@@ -2179,6 +3967,28 @@ Object? jsonPathLookup(Object? root, String path) {
 /// Render the result of a JSON lookup as SQLite would: scalars (number,
 /// string, bool, null) come back unwrapped; arrays/objects stay as JSON
 /// text.
+/// Decodes a JSON source value into its parsed tree. BLOB/RAW bytes (List<int>)
+/// are UTF-8 decoded first (Oracle stores JSON in BLOB columns); returns null
+/// when the payload is not valid JSON.
+Object? _decodeJsonSource(Object? v) {
+  if (v == null) return null;
+  String s;
+  if (v is List<int>) {
+    try {
+      s = utf8.decode(v);
+    } catch (_) {
+      return null;
+    }
+  } else {
+    s = v.toString();
+  }
+  try {
+    return jsonDecode(s);
+  } catch (_) {
+    return null;
+  }
+}
+
 Object? _jsonScalarOrText(Object? v) {
   if (v == null) return null;
   if (v is num || v is String || v is bool) return v;
@@ -2200,6 +4010,24 @@ Object? _jsonValueOf(Object? v) {
     }
   }
   return v;
+}
+
+/// RFC 7386 JSON Merge Patch: applies [patch] to [target]. Object members merge
+/// recursively; a `null` member in the patch deletes the target key; any
+/// non-object patch replaces the target wholesale.
+Object? _jsonMergePatch(Object? target, Object? patch) {
+  if (patch is! Map) return patch;
+  final result = <String, Object?>{
+    if (target is Map) for (final e in target.entries) '${e.key}': e.value,
+  };
+  patch.forEach((k, v) {
+    if (v == null) {
+      result.remove(k.toString());
+    } else {
+      result[k.toString()] = _jsonMergePatch(result[k.toString()], v);
+    }
+  });
+  return result;
 }
 
 /// Implementation of the `->` and `->>` JSON operators.
@@ -2283,9 +4111,8 @@ double _intPow(double base, double exp) {
     }
     return result;
   }
-  // For non-integer exponents we'd ideally use math.pow; do log/exp series.
-  // Tests only exercise integer exponents.
-  throw StateError('POWER with non-integer exponent not supported');
+  // Non-integer exponents: use the platform pow (Oracle computes these).
+  return math.pow(base, exp).toDouble();
 }
 
 enum _DTKind { date, time, full }
@@ -2450,11 +4277,10 @@ DateTime? _applyModifier(DateTime dt, String mod) {
         );
       case 'month':
         final totalMonths = dt.month - 1 + n.toInt();
-        final y = dt.year + (totalMonths ~/ 12);
-        var mo = totalMonths % 12;
-        if (mo < 0) {
-          mo += 12;
-        }
+        // Floor division carries the year on underflow (e.g. Jan - 1 month ->
+        // previous Dec); `~/` truncates toward zero and would keep the year.
+        final y = dt.year + (totalMonths / 12).floor();
+        final mo = totalMonths % 12; // Dart's % is Euclidean -> 0..11.
         return DateTime.utc(
           y,
           mo + 1,
@@ -2498,8 +4324,635 @@ String _fmtTime(DateTime d) => '${d.hour.toString().padLeft(2, "0")}:'
     '${d.minute.toString().padLeft(2, "0")}:'
     '${d.second.toString().padLeft(2, "0")}';
 
+const Map<String, int> _oracleMonthAbbr = {
+  'JAN': 1, 'FEB': 2, 'MAR': 3, 'APR': 4, 'MAY': 5, 'JUN': 6, //
+  'JUL': 7, 'AUG': 8, 'SEP': 9, 'OCT': 10, 'NOV': 11, 'DEC': 12,
+};
+
+final RegExp _isoDateRe =
+    RegExp(r'^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2})?)?$');
+
+/// Returns the [DateTime] for an ISO date / datetime string, or null for any
+/// other value (including bare numbers). Used to drive Oracle date arithmetic.
+DateTime? _asSqlDate(Object? v) {
+  if (v is! String) return null;
+  if (!_isoDateRe.hasMatch(v.trim())) return null;
+  return DateTime.tryParse(v.trim().replaceFirst(' ', 'T'));
+}
+
+/// Shifts [d] by [days] (fractional days become hours/seconds) and formats the
+/// result as ISO date or datetime depending on whether a time component is
+/// present in [original] or the shifted value.
+Object _shiftDate(DateTime d, double days, Object? original) {
+  final wholeDays = days.truncate();
+  final fracSeconds = ((days - wholeDays) * 86400).round();
+  final shifted = d.add(Duration(days: wholeDays, seconds: fracSeconds));
+  final hadTime = original is String && original.contains(RegExp(r'\d:\d'));
+  final hasTime =
+      shifted.hour != 0 || shifted.minute != 0 || shifted.second != 0;
+  return (hadTime || hasTime) ? _fmtDateTime(shifted) : _fmtDate(shifted);
+}
+
+/// Shifts [d] by [months] *calendar* months (preserving the day-of-month,
+/// clamping to the target month's last day), for DATE + INTERVAL YEAR TO MONTH.
+Object _shiftMonths(DateTime d, int months, Object? original) {
+  final total = d.year * 12 + (d.month - 1) + months;
+  final y = total ~/ 12;
+  final mo = total % 12 + 1;
+  final lastDay = DateTime.utc(y, mo + 1, 0).day;
+  final day = d.day > lastDay ? lastDay : d.day;
+  final shifted = DateTime.utc(y, mo, day, d.hour, d.minute, d.second);
+  final hadTime = original is String && original.contains(RegExp(r'\d:\d'));
+  final hasTime =
+      shifted.hour != 0 || shifted.minute != 0 || shifted.second != 0;
+  return (hadTime || hasTime) ? _fmtDateTime(shifted) : _fmtDate(shifted);
+}
+int? _weekdayFromName(String name) {
+  const days = {
+    'MON': 1, 'TUE': 2, 'WED': 3, 'THU': 4, 'FRI': 5, 'SAT': 6, 'SUN': 7,  };
+  final k = name.trim().toUpperCase();
+  return k.length >= 3 ? days[k.substring(0, 3)] : null;
+}
+
+/// Parses [text] by an Oracle date format model [fmt] (a common subset: YYYY,
+/// RRRR, YY, MM, MON, MONTH, DD, HH24/HH, MI, SS). Falls back to ISO parsing
+/// when [fmt] is absent or does not match.
+DateTime? _parseOracleDate(String text, String? fmt) {
+  final t = text.trim();
+  if (fmt == null || fmt.trim().isEmpty) {
+    return _parseDateTime(t) ?? DateTime.tryParse(t);
+  }
+  final f = fmt.trim().toUpperCase();
+  // Julian day number mask: the whole text is a JDN.
+  if (f == 'J') {
+    final jdn = int.tryParse(t);
+    return jdn == null ? null : _dateFromJulianDayNumber(jdn);
+  }
+  // Longest-first so YYYY beats YY, MONTH beats MON, HH24 beats HH.
+  const order = [
+    'YYYY', 'RRRR', 'YYY', 'MONTH', 'MON', 'HH24', 'HH12', 'DDD', 'YY', 'RR',
+    'MM', 'DD', 'HH', 'MI', 'SS',
+  ];
+  final pattern = StringBuffer('^');
+  final captured = <String>[];
+  var i = 0;
+  while (i < f.length) {
+    // Fractional seconds FF[1-9]: match the digit run as microseconds.
+    if (f.startsWith('FF', i)) {
+      i += 2;
+      if (i < f.length && RegExp(r'\d').hasMatch(f[i])) i++; // FFn precision
+      pattern.write(r'(\d{1,9})');
+      captured.add('FF');
+      continue;
+    }
+    var matched = false;
+    for (final tok in order) {
+      if (!f.startsWith(tok, i)) continue;
+      switch (tok) {
+        case 'YYYY':
+        case 'RRRR':
+          pattern.write(r'(\d{4})');
+          captured.add('Y4');
+        case 'YYY':
+          pattern.write(r'(\d{3})');
+          captured.add('Y3');
+        case 'YY':
+        case 'RR':
+          pattern.write(r'(\d{2})');
+          captured.add('Y2');
+        case 'MONTH':
+          pattern.write(r'([A-Za-z]+)');
+          captured.add('MON');
+        case 'MON':
+          pattern.write(r'([A-Za-z]{3,})');
+          captured.add('MON');
+        case 'MM':
+          pattern.write(r'(\d{1,2})');
+          captured.add('MM');
+        case 'DDD':
+          pattern.write(r'(\d{1,3})');
+          captured.add('DDD');
+        case 'DD':
+          pattern.write(r'(\d{1,2})');
+          captured.add('DD');
+        case 'HH24':
+        case 'HH12':
+        case 'HH':
+          pattern.write(r'(\d{1,2})');
+          captured.add('HH');
+        case 'MI':
+          pattern.write(r'(\d{1,2})');
+          captured.add('MI');
+        case 'SS':
+          pattern.write(r'(\d{1,2})');
+          captured.add('SS');
+      }
+      i += tok.length;
+      matched = true;
+      break;
+    }
+    if (!matched) {
+      pattern.write(RegExp.escape(f[i]));
+      i++;
+    }
+  }
+  pattern.write(r'$');
+  final m =
+      RegExp(pattern.toString(), caseSensitive: false).firstMatch(t);
+  if (m == null) return _parseDateTime(t) ?? DateTime.tryParse(t);
+  var year = 2000, month = 1, day = 1, hour = 0, minute = 0, second = 0;
+  var millis = 0, micros = 0;
+  int? dayOfYear;
+  for (var g = 0; g < captured.length; g++) {
+    final v = m.group(g + 1);
+    if (v == null) continue;
+    switch (captured[g]) {
+      case 'Y4':
+        year = int.parse(v);
+      case 'Y3':
+        year = 2000 + int.parse(v);
+      case 'Y2':
+        final yy = int.parse(v);
+        year = yy < 50 ? 2000 + yy : 1900 + yy;
+      case 'MON':
+        month = _oracleMonthAbbr[v.substring(0, 3).toUpperCase()] ?? month;
+      case 'MM':
+        month = int.parse(v);
+      case 'DDD':
+        dayOfYear = int.parse(v);
+      case 'DD':
+        day = int.parse(v);
+      case 'HH':
+        hour = int.parse(v);
+      case 'MI':
+        minute = int.parse(v);
+      case 'SS':
+        second = int.parse(v);
+      case 'FF':
+        final frac = v.padRight(6, '0').substring(0, 6);
+        millis = int.parse(frac.substring(0, 3));
+        micros = int.parse(frac.substring(3, 6));
+    }
+  }
+  try {
+    // DDD (day-of-year) overrides month/day: Jan 1 + (dayOfYear - 1) days.
+    if (dayOfYear != null) {
+      final base = DateTime.utc(year, 1, 1, hour, minute, second, millis, micros)
+          .add(Duration(days: dayOfYear - 1));
+      return base;
+    }
+    return DateTime.utc(year, month, day, hour, minute, second, millis, micros);
+  } catch (_) {
+    return null;
+  }
+}
+
 String _fmtDateTime(DateTime d, {bool full = false}) =>
     '${_fmtDate(d)} ${_fmtTime(d)}';
+
+const List<String> _monthFullNames = [
+  'JANUARY', 'FEBRUARY', 'MARCH', 'APRIL', 'MAY', 'JUNE', //
+  'JULY', 'AUGUST', 'SEPTEMBER', 'OCTOBER', 'NOVEMBER', 'DECEMBER',
+];
+const List<String> _monthAbbrNames = [
+  'JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', //
+  'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC',
+];
+// Indexed by Dart weekday (Mon=1..Sun=7).
+const List<String> _weekdayFullNames = [
+  '', 'MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY', 'SATURDAY',
+  'SUNDAY',
+];
+const List<String> _weekdayAbbrNames = [
+  '', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN',
+];
+
+/// Re-cases [value] (an all-uppercase name) to mirror [token]'s case style:
+/// all-caps -> caps, all-lower -> lower, otherwise title-case.
+String _applyNameCase(String value, String token) {
+  if (token == token.toUpperCase()) return value;
+  if (token == token.toLowerCase()) return value.toLowerCase();
+  return value.isEmpty
+      ? value
+      : value[0].toUpperCase() + value.substring(1).toLowerCase();
+}
+
+bool _looksLikeDateFormat(String fmt) =>
+    RegExp(r'Y{2,4}|R{2,4}|RM|MON|MM|DD|DAY|DY|HH|MI|SS|FF|WW|IW|CC|\bW\b|\bQ\b|\bJ\b|\bD\b|"',
+            caseSensitive: false)
+        .hasMatch(fmt);
+
+bool _looksLikeNumberFormat(String fmt) =>
+    RegExp(r'[90]').hasMatch(fmt) &&
+    !RegExp(r'Y{2,4}|MON|DD|DAY|DY|HH|MI|SS', caseSensitive: false)
+        .hasMatch(fmt);
+
+/// Formats [d] by an Oracle date format model [fmt] (a common subset). Honours
+/// token case for alphabetic names (MON -> JUN, Mon -> Jun, mon -> jun).
+String _formatOracleDate(DateTime d, String fmt) {
+  // Leading fill-mode modifier `FM` (any case) trims padding; our names are
+  // already unpadded, so it's simply stripped.
+  if (fmt.length >= 2 && fmt.substring(0, 2).toUpperCase() == 'FM') {
+    fmt = fmt.substring(2);
+  }
+  // Longest tokens first so e.g. MONTH wins over MON over MM, DDD over DD.
+  const tokens = [
+    'YYYY', 'RRRR', 'IYYY', 'YEAR', 'MONTH', 'SSSSS', 'HH24', 'HH12', 'DDD',
+    'MON', 'DAY', 'CC', 'RM', 'YY', 'RR', 'MM', 'DD', 'DY', 'HH', 'MI', 'WW',
+    'IW', 'SS', 'AM', 'PM', 'Q', 'J', 'W', 'D',
+  ];
+  final sb = StringBuffer();
+  var i = 0;
+  while (i < fmt.length) {
+    // Double-quoted literal text is emitted verbatim (without the quotes).
+    if (fmt[i] == '"') {
+      i++;
+      while (i < fmt.length && fmt[i] != '"') {
+        sb.write(fmt[i]);
+        i++;
+      }
+      if (i < fmt.length) i++; // closing quote
+      continue;
+    }
+    // Fractional seconds FF[1-9]: emit that many leading fraction digits.
+    if (i + 1 < fmt.length &&
+        fmt.substring(i, i + 2).toUpperCase() == 'FF') {
+      i += 2;
+      var n = 6;
+      if (i < fmt.length && '0123456789'.contains(fmt[i])) {
+        n = int.parse(fmt[i]);
+        i++;
+      }
+      final micros = d.millisecond * 1000 + d.microsecond;
+      final frac = micros.toString().padLeft(6, '0');
+      sb.write(frac.substring(0, n.clamp(0, 6)));
+      continue;
+    }
+    String? matched;
+    for (final t in tokens) {
+      if (i + t.length <= fmt.length &&
+          fmt.substring(i, i + t.length).toUpperCase() == t) {
+        matched = fmt.substring(i, i + t.length);
+        break;
+      }
+    }
+    if (matched == null) {
+      sb.write(fmt[i]);
+      i++;
+      continue;
+    }
+    final up = matched.toUpperCase();
+    switch (up) {
+      case 'YYYY':
+      case 'RRRR':
+        sb.write(d.year.toString().padLeft(4, '0'));
+        break;
+      case 'IYYY':
+        sb.write(_isoYear(d).toString().padLeft(4, '0'));
+        break;
+      case 'RM':
+        sb.write((_toRoman(d.month) ?? '').toUpperCase());
+        break;
+      case 'W':
+        sb.write(((d.day - 1) ~/ 7 + 1).toString());
+        break;
+      case 'SSSSS':
+        sb.write((d.hour * 3600 + d.minute * 60 + d.second).toString());
+        break;
+      case 'YY':
+      case 'RR':
+        sb.write((d.year % 100).toString().padLeft(2, '0'));
+        break;
+      case 'CC':
+        sb.write(((d.year - 1) ~/ 100 + 1).toString().padLeft(2, '0'));
+        break;
+      case 'YEAR':
+        sb.write(_applyNameCase(_spellYear(d.year), matched));
+        break;
+      case 'MM':
+        sb.write(d.month.toString().padLeft(2, '0'));
+        break;
+      case 'MON':
+        sb.write(_applyNameCase(_monthAbbrNames[d.month - 1], matched));
+        break;
+      case 'MONTH':
+        sb.write(_applyNameCase(_monthFullNames[d.month - 1], matched));
+        break;
+      case 'DD':
+        sb.write(d.day.toString().padLeft(2, '0'));
+        break;
+      case 'DY':
+        sb.write(_applyNameCase(_weekdayAbbrNames[d.weekday], matched));
+        break;
+      case 'DAY':
+        sb.write(_applyNameCase(_weekdayFullNames[d.weekday], matched));
+        break;
+      case 'HH24':
+        sb.write(d.hour.toString().padLeft(2, '0'));
+        break;
+      case 'HH':
+      case 'HH12':
+        final h = d.hour % 12 == 0 ? 12 : d.hour % 12;
+        sb.write(h.toString().padLeft(2, '0'));
+        break;
+      case 'MI':
+        sb.write(d.minute.toString().padLeft(2, '0'));
+        break;
+      case 'SS':
+        sb.write(d.second.toString().padLeft(2, '0'));
+        break;
+      case 'AM':
+      case 'PM':
+        sb.write(d.hour < 12 ? 'AM' : 'PM');
+        break;
+      case 'Q':
+        sb.write(((d.month - 1) ~/ 3 + 1).toString());
+        break;
+      case 'DDD':
+        final doy = DateTime.utc(d.year, d.month, d.day)
+                .difference(DateTime.utc(d.year, 1, 1))
+                .inDays +
+            1;
+        sb.write(doy.toString().padLeft(3, '0'));
+        break;
+      case 'WW':
+        final doy = DateTime.utc(d.year, d.month, d.day)
+                .difference(DateTime.utc(d.year, 1, 1))
+                .inDays +
+            1;
+        sb.write(((doy - 1) ~/ 7 + 1).toString().padLeft(2, '0'));
+        break;
+      case 'IW':
+        sb.write(_isoWeek(d).toString().padLeft(2, '0'));
+        break;
+      case 'J':
+        sb.write(_julianDay(d).toString());
+        break;
+      case 'D':
+        // Oracle day-of-week: 1=Sunday..7=Saturday.
+        sb.write((d.weekday % 7 + 1).toString());
+        break;
+    }
+    i += matched.length;
+  }
+  return sb.toString();
+}
+
+/// Parses a `±HH:MM` timezone offset to a signed minute count.
+int _tzOffsetMinutes(String tz) {
+  final m = RegExp(r'^([+-])(\d{2}):(\d{2})$').firstMatch(tz.trim());
+  if (m == null) return 0;
+  final sign = m.group(1) == '-' ? -1 : 1;
+  return sign * (int.parse(m.group(2)!) * 60 + int.parse(m.group(3)!));
+}
+
+/// Roman numeral for 1..3999 (Oracle TO_CHAR 'RN'); null outside that range.
+String? _toRoman(int n) {
+  if (n < 1 || n > 3999) return null;
+  const vals = [1000, 900, 500, 400, 100, 90, 50, 40, 10, 9, 5, 4, 1];
+  const syms = [
+    'M', 'CM', 'D', 'CD', 'C', 'XC', 'L', 'XL', 'X', 'IX', 'V', 'IV', 'I',
+  ];
+  final sb = StringBuffer();
+  var x = n;
+  for (var i = 0; i < vals.length; i++) {
+    while (x >= vals[i]) {
+      sb.write(syms[i]);
+      x -= vals[i];
+    }
+  }
+  return sb.toString();
+}
+
+/// Spells a year in words (Oracle TO_CHAR 'YEAR'), upper-case; the caller
+/// re-cases per the token. e.g. 2024 -> "TWO THOUSAND TWENTY-FOUR".
+String _spellYear(int year) {
+  const ones = [
+    'ZERO', 'ONE', 'TWO', 'THREE', 'FOUR', 'FIVE', 'SIX', 'SEVEN', 'EIGHT',
+    'NINE', 'TEN', 'ELEVEN', 'TWELVE', 'THIRTEEN', 'FOURTEEN', 'FIFTEEN',
+    'SIXTEEN', 'SEVENTEEN', 'EIGHTEEN', 'NINETEEN',
+  ];
+  const tens = [
+    '', '', 'TWENTY', 'THIRTY', 'FORTY', 'FIFTY', 'SIXTY', 'SEVENTY', 'EIGHTY',
+    'NINETY',
+  ];
+  String two(int n) {
+    if (n < 20) return ones[n];
+    final t = tens[n ~/ 10];
+    final o = n % 10;
+    return o == 0 ? t : '$t-${ones[o]}';
+  }
+
+  String three(int n) {
+    final h = n ~/ 100;
+    final rest = n % 100;
+    if (h == 0) return two(rest);
+    final head = '${ones[h]} HUNDRED';
+    return rest == 0 ? head : '$head ${two(rest)}';
+  }
+
+  final th = year ~/ 1000;
+  final rest = year % 1000;
+  final sb = StringBuffer();
+  if (th > 0) sb.write('${ones[th]} THOUSAND');
+  if (rest > 0) {
+    if (sb.isNotEmpty) sb.write(' ');
+    sb.write(three(rest));
+  }
+  return sb.isEmpty ? 'ZERO' : sb.toString();
+}
+
+/// Oracle Julian day number (days since 4712 BC); J for 2024-07-20 is 2460512.
+int _julianDay(DateTime d) {
+  final a = (14 - d.month) ~/ 12;
+  final y = d.year + 4800 - a;
+  final m = d.month + 12 * a - 3;
+  return d.day +
+      (153 * m + 2) ~/ 5 +
+      365 * y +
+      y ~/ 4 -
+      y ~/ 100 +
+      y ~/ 400 -
+      32045;
+}
+
+/// Inverse of [_julianDay]: a Julian day number back to a proleptic-Gregorian
+/// UTC date.
+DateTime _dateFromJulianDayNumber(int jdn) {
+  final a = jdn + 32044;
+  final b = (4 * a + 3) ~/ 146097;
+  final c = a - (146097 * b) ~/ 4;
+  final d = (4 * c + 3) ~/ 1461;
+  final e = c - (1461 * d) ~/ 4;
+  final m = (5 * e + 2) ~/ 153;
+  final day = e - (153 * m + 2) ~/ 5 + 1;
+  final month = m + 3 - 12 * (m ~/ 10);
+  final year = 100 * b + d - 4800 + m ~/ 10;
+  return DateTime.utc(year, month, day);
+}
+
+/// ISO-8601 week number (weeks start Monday; week 1 contains the first
+/// Thursday of the year).
+int _isoWeek(DateTime d) {
+  final day = DateTime.utc(d.year, d.month, d.day);
+  final thursday = day.add(Duration(days: 4 - day.weekday));
+  final week1 = DateTime.utc(thursday.year, 1, 1);
+  return thursday.difference(week1).inDays ~/ 7 + 1;
+}
+
+/// ISO-8601 year (the year owning the ISO week that contains [d]).
+int _isoYear(DateTime d) {
+  final day = DateTime.utc(d.year, d.month, d.day);
+  return day.add(Duration(days: 4 - day.weekday)).year;
+}
+
+/// Returns the text content of the first node matched by a simple absolute
+/// XPath (`/a/b/c`, child navigation only) within [xml]; null if unmatched.
+String? _xmlExtractText(String xml, String xpath) {
+  final segs = xpath.split('/').where((s) => s.isNotEmpty).toList();
+  var content = xml.trim();
+  for (final seg in segs) {
+    final tag = seg.replaceAll(RegExp(r'\[.*\]$'), ''); // drop a [predicate]
+    final m = RegExp('<$tag\\b[^>]*>(.*?)</$tag>', dotAll: true)
+        .firstMatch(content);
+    if (m == null) return null;
+    content = m.group(1)!.trim();
+  }
+  return content;
+}
+
+/// Public entry point for [_xmlExtractText], used by XMLTABLE materialization.
+String? xmlExtractText(String xml, String xpath) =>
+    _xmlExtractText(xml, xpath);
+
+/// Evaluates a constant arithmetic expression string (`+ - * /` over numeric
+/// literals, with parentheses) and returns the result, or null when the text
+/// is not a pure arithmetic expression. Used for XMLQUERY content evaluation.
+num? _evalConstArith(String src) {
+  final s = src.trim();
+  if (s.isEmpty || !RegExp(r'^[\d\s.+\-*/()]+$').hasMatch(s)) return null;
+  var pos = 0;
+  late num? Function() parseExpr;
+  void skip() {
+    while (pos < s.length && s[pos] == ' ') pos++;
+  }
+
+  num? parseFactor() {
+    skip();
+    if (pos >= s.length) return null;
+    if (s[pos] == '(') {
+      pos++;
+      final v = parseExpr();
+      skip();
+      if (pos < s.length && s[pos] == ')') pos++;
+      return v;
+    }
+    final start = pos;
+    if (s[pos] == '+' || s[pos] == '-') pos++;
+    while (pos < s.length && RegExp(r'[\d.]').hasMatch(s[pos])) {
+      pos++;
+    }
+    return num.tryParse(s.substring(start, pos));
+  }
+
+  num? parseTerm() {
+    var v = parseFactor();
+    if (v == null) return null;
+    skip();
+    while (pos < s.length && (s[pos] == '*' || s[pos] == '/')) {
+      final op = s[pos++];
+      final r = parseFactor();
+      if (r == null) return null;
+      v = op == '*' ? v! * r : v! / r;
+      skip();
+    }
+    return v;
+  }
+
+  parseExpr = () {
+    var v = parseTerm();
+    if (v == null) return null;
+    skip();
+    while (pos < s.length && (s[pos] == '+' || s[pos] == '-')) {
+      final op = s[pos++];
+      final r = parseTerm();
+      if (r == null) return null;
+      v = op == '+' ? v! + r : v! - r;
+      skip();
+    }
+    return v;
+  };
+
+  final result = parseExpr();
+  skip();
+  if (pos != s.length) return null;
+  if (result == null) return null;
+  return result == result.roundToDouble() ? result.toInt() : result;
+}
+
+/// Formats [n] by an Oracle number format model [fmt] (9/0 digits, comma
+/// grouping, decimal point, optional leading FM to drop the sign blank).
+String _formatOracleNumber(num n, String fmt,
+    {String decimalChar = '.', String groupChar = ','}) {
+  var f = fmt;
+  final fm = f.toUpperCase().startsWith('FM');
+  if (fm) f = f.substring(2);
+  // MI: trailing sign for negatives (space for positives).
+  final trailingSign = f.toUpperCase().endsWith('MI');
+  if (trailingSign) f = f.substring(0, f.length - 2);
+  // S: explicit sign (+/-), leading or trailing.
+  var signElem = false;
+  var signTrailing = false;
+  if (f.toUpperCase().startsWith('S')) {
+    signElem = true;
+    f = f.substring(1);
+  } else if (f.toUpperCase().endsWith('S')) {
+    signElem = true;
+    signTrailing = true;
+    f = f.substring(0, f.length - 1);
+  }
+  // G / D are locale group/decimal placeholders for , / .
+  f = f.replaceAll(RegExp('G', caseSensitive: false), ',');
+  f = f.replaceAll(RegExp('D', caseSensitive: false), '.');
+  final grouping = f.contains(',');
+  final dotIdx = f.indexOf('.');
+  final intFmt = dotIdx >= 0 ? f.substring(0, dotIdx) : f;
+  // `0` elements zero-pad the integer part to the format's digit width.
+  final zeroPad = intFmt.contains('0');
+  final intWidth = intFmt.replaceAll(RegExp('[^90]'), '').length;
+  final decimals = dotIdx >= 0
+      ? f.substring(dotIdx + 1).replaceAll(RegExp('[^90]'), '').length
+      : 0;
+  final neg = n < 0;
+  final fixed = n.abs().toStringAsFixed(decimals);
+  final parts = fixed.split('.');
+  var intPart = parts[0];
+  final decPart = parts.length > 1 ? parts[1] : '';
+  if (zeroPad && intPart.length < intWidth) {
+    intPart = intPart.padLeft(intWidth, '0');
+  }
+  if (grouping) {
+    final buf = StringBuffer();
+    for (var i = 0; i < intPart.length; i++) {
+      if (i > 0 && (intPart.length - i) % 3 == 0) buf.write(groupChar);
+      buf.write(intPart[i]);
+    }
+    intPart = buf.toString();
+  }
+  var out = intPart;
+  if (decimals > 0) out = '$out$decimalChar$decPart';
+  if (trailingSign) {
+    out = neg ? '$out-' : (fm ? out : '$out ');
+  } else if (signElem) {
+    final sign = neg ? '-' : '+';
+    out = signTrailing ? '$out$sign' : '$sign$out';
+  } else if (neg) {
+    out = '-$out';
+  } else if (!fm) {
+    out = ' $out';
+  }
+  return out;
+}
 
 String _strftime(String fmt, DateTime d) {
   final buf = StringBuffer();
@@ -2819,6 +5272,22 @@ const Set<String> kAggregateFunctions = {
   'COVAR_POP',
   'COVAR_SAMP',
   'CORR',
+  'PERCENTILE_CONT',
+  'PERCENTILE_DISC',
+  'APPROX_PERCENTILE',
+  'STATS_MODE',
+  'APPROX_COUNT_DISTINCT',
+  'REGR_COUNT',
+  'REGR_AVGX',
+  'REGR_AVGY',
+  'REGR_SLOPE',
+  'REGR_INTERCEPT',
+  'REGR_SXX',
+  'REGR_SYY',
+  'REGR_SXY',
+  'REGR_R2',
+  'JSON_ARRAYAGG',
+  'JSON_OBJECTAGG',
   // Vector aggregates — batch-oriented centroid / sum operations.
   // See _aggregateValue in database.dart for implementation.
   'VEC_AVG',

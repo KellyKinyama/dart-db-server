@@ -8,6 +8,8 @@ export 'server/blob.dart';
 export 'server/session.dart';
 export 'server/expression.dart' show Expr;
 export 'server/mysql_wire.dart' show MySqlServer;
+export 'server/mysqlx_wire.dart' show MysqlxServer;
+export 'server/oracle_wire.dart' show OracleServer;
 export 'server/fts5.dart'
     show
         tokenizeFts,
@@ -19,6 +21,7 @@ export 'server/fts5.dart'
         Fts5Index;
 export 'server/prepared.dart';
 export 'server/result.dart';
+export 'server/routine.dart';
 export 'server/rtree.dart' show BBox, RTreeIndex;
 export 'server/vector.dart'
     show

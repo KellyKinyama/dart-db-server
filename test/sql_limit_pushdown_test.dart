@@ -125,4 +125,29 @@ void main() {
       await db.close();
     }
   });
+
+  // F58: SQLite treats a negative LIMIT as "no limit" (the idiom paired with
+  // OFFSET); the engine's parser used to reject the '-'.
+  test('negative LIMIT is parsed as unlimited', () async {
+    final db = await Database.open();
+    try {
+      await db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY)');
+      await db.execute('INSERT INTO t VALUES (1),(2),(3)');
+      final r = await db.execute('SELECT id FROM t ORDER BY id LIMIT -1');
+      expect(r.rows, [
+        [1],
+        [2],
+        [3]
+      ]);
+      // LIMIT -1 OFFSET 1 still applies the offset.
+      final r2 =
+          await db.execute('SELECT id FROM t ORDER BY id LIMIT -1 OFFSET 1');
+      expect(r2.rows, [
+        [2],
+        [3]
+      ]);
+    } finally {
+      await db.close();
+    }
+  });
 }

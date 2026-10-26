@@ -7,6 +7,14 @@ running `Database`, or lift the Dart snippets into your app.
 For a runnable walkthrough, see
 [`example/vector_semantic_search.dart`](../example/vector_semantic_search.dart).
 
+## Reference
+
+| Doc | What it covers |
+| --- | --- |
+| [sql-dialect-parity.md](sql-dialect-parity.md) | How the engine lines up against Oracle and MySQL — wire protocols, statements, functions, types, and known gaps. |
+| [parity-roadmap.md](parity-roadmap.md) | The ordered plan to close the remaining Oracle/MySQL gaps — scope, implementation sketch, effort, and dependencies per item. |
+| [reliability-gap-closure-plan.md](reliability-gap-closure-plan.md) | Prioritized plan to fix the 18 engine reliability bugs (F1–F18) the reliability harness surfaced — root cause, code location, approach, and effort per item. |
+
 ## Recipes
 
 | Doc | When to reach for it |
@@ -65,3 +73,9 @@ provider.
 - [ ] A recurring `PRAGMA vector_verify_all` runs in a health check.
 - [ ] `PRAGMA vector_analyze('t.col')` has been run once on real data
       to record the expected recall of the chosen index kind.
+
+## Design docs
+
+| Doc | Topic |
+| --- | --- |
+| [oracle-wire-protocol-plan.md](oracle-wire-protocol-plan.md) | Roadmap for an Oracle-compatible server front-end (reverse-engineering the TNS/TTC wire protocol). |

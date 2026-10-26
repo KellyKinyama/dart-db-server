@@ -131,7 +131,8 @@ void main() {
         final r = await db
             .execute("SELECT PRINTF('%.2f', 3.14159), PRINTF('%.3e', 1234.5)");
         expect(r.rows.first[0], '3.14');
-        expect(r.rows.first[1], '1.235e+3');
+        // SQLite/C printf uses a >=2-digit exponent.
+        expect(r.rows.first[1], '1.235e+03');
       } finally {
         await db.close();
       }

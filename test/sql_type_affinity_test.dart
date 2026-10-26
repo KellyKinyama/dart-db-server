@@ -98,5 +98,110 @@ void main() {
         await db.close();
       }
     });
+
+    // F55: an INTEGER PRIMARY KEY is a rowid alias — it must hold an integer,
+    // and SQLite raises "datatype mismatch" for a non-integer value (unlike a
+    // regular INTEGER column's loose affinity).
+    test('INTEGER PRIMARY KEY rejects a non-integer text value', () async {
+      final db = await Database.open();
+      try {
+        await db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)');
+        await expectLater(db.execute("INSERT INTO t VALUES ('x', 1)"),
+            throwsA(isA<FormatException>()));
+      } finally {
+        await db.close();
+      }
+    });
+
+    test('INTEGER PRIMARY KEY rejects a non-integer float value', () async {
+      final db = await Database.open();
+      try {
+        await db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)');
+        await expectLater(db.execute('INSERT INTO t VALUES (1.5, 1)'),
+            throwsA(isA<FormatException>()));
+      } finally {
+        await db.close();
+      }
+    });
+
+    test('INTEGER PRIMARY KEY still accepts an integer-valued string/float',
+        () async {
+      final db = await Database.open();
+      try {
+        await db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)');
+        await db.execute("INSERT INTO t VALUES ('7', 1)"); // '7' -> 7
+        await db.execute('INSERT INTO t VALUES (8.0, 2)'); // 8.0 -> 8
+        final r = await db.execute('SELECT id FROM t ORDER BY id');
+        expect(r.rows, [
+          [7],
+          [8]
+        ]);
+      } finally {
+        await db.close();
+      }
+    });
+
+    test('WITHOUT ROWID INTEGER PRIMARY KEY keeps loose affinity', () async {
+      final db = await Database.open();
+      try {
+        // Not a rowid alias, so the non-integer value is stored verbatim.
+        await db.execute(
+            'CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER) WITHOUT ROWID');
+        await db.execute("INSERT INTO t VALUES ('x', 1)");
+        final r = await db.execute('SELECT id FROM t');
+        expect(r.rows, [
+          ['x']
+        ]);
+      } finally {
+        await db.close();
+      }
+    });
+
+    // F56: a plain INTEGER PRIMARY KEY is a rowid alias and auto-assigns the
+    // id when omitted/NULL, like SQLite — even without the AUTOINCREMENT keyword.
+    test('plain INTEGER PRIMARY KEY auto-assigns the rowid when omitted',
+        () async {
+      final db = await Database.open();
+      try {
+        await db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)');
+        await db.execute('INSERT INTO t (v) VALUES (10)');
+        await db.execute('INSERT INTO t (v) VALUES (20)');
+        await db.execute('INSERT INTO t (id, v) VALUES (5, 30)'); // explicit
+        await db.execute('INSERT INTO t (v) VALUES (40)'); // max(5)+1 -> 6
+        final r = await db.execute('SELECT id, v FROM t ORDER BY v');
+        expect(r.rows, [
+          [1, 10],
+          [2, 20],
+          [5, 30],
+          [6, 40]
+        ]);
+      } finally {
+        await db.close();
+      }
+    });
+
+    // F57: the rowid pseudo-column (and aliases _rowid_/oid) resolves to the
+    // INTEGER PRIMARY KEY on a rowid table, in both the SELECT list and WHERE.
+    test('rowid / _rowid_ / oid resolve to the INTEGER PRIMARY KEY', () async {
+      final db = await Database.open();
+      try {
+        await db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)');
+        await db.execute('INSERT INTO t VALUES (5, 50)');
+        expect((await db.execute('SELECT rowid FROM t')).rows, [
+          [5]
+        ]);
+        expect((await db.execute('SELECT _rowid_ FROM t')).rows, [
+          [5]
+        ]);
+        expect((await db.execute('SELECT oid FROM t')).rows, [
+          [5]
+        ]);
+        expect((await db.execute('SELECT v FROM t WHERE rowid = 5')).rows, [
+          [50]
+        ]);
+      } finally {
+        await db.close();
+      }
+    });
   });
 }

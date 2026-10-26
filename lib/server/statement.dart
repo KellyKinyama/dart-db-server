@@ -2,6 +2,7 @@
 library;
 
 import 'expression.dart';
+import 'routine.dart';
 import 'schema.dart';
 
 abstract class Statement {}
@@ -20,6 +21,10 @@ class CreateTableStmt extends Statement {
   /// Database._executePagedStmt).
   final bool usingPaged;
 
+  /// `CREATE TABLE name AS SELECT …` (CTAS). When set, [columns] is empty and
+  /// the schema + data are derived from running this query at execution time.
+  final SelectStmt? asSelect;
+
   CreateTableStmt(
     this.name,
     this.columns, {
@@ -28,6 +33,7 @@ class CreateTableStmt extends Statement {
     this.strict = false,
     this.withoutRowid = false,
     this.usingPaged = false,
+    this.asSelect,
   });
 }
 
@@ -44,14 +50,29 @@ class TruncateTableStmt extends Statement {
 
 class AlterTableAddColumnStmt extends Statement {
   final String table;
-  final ColumnDef column;
-  AlterTableAddColumnStmt(this.table, this.column);
+  final List<ColumnDef> columns;
+  AlterTableAddColumnStmt(this.table, this.columns);
+}
+
+/// `ALTER TABLE t MODIFY [(] col <new-attrs>[, …] [)]` — changes attributes
+/// (type/size, DEFAULT, NOT NULL) of existing columns.
+class AlterTableModifyColumnStmt extends Statement {
+  final String table;
+  final List<ColumnDef> columns;
+  AlterTableModifyColumnStmt(this.table, this.columns);
 }
 
 class AlterTableDropColumnStmt extends Statement {
   final String table;
   final String column;
   AlterTableDropColumnStmt(this.table, this.column);
+}
+
+/// `ALTER TABLE t DROP CONSTRAINT <name>` — removes a named constraint.
+class AlterTableDropConstraintStmt extends Statement {
+  final String table;
+  final String constraint;
+  AlterTableDropConstraintStmt(this.table, this.constraint);
 }
 
 class AlterTableRenameColumnStmt extends Statement {
@@ -65,6 +86,58 @@ class AlterTableRenameStmt extends Statement {
   final String oldName;
   final String newName;
   AlterTableRenameStmt(this.oldName, this.newName);
+}
+
+/// `ALTER TABLE t ADD [(] CONSTRAINT ... | PRIMARY KEY/UNIQUE/CHECK/FOREIGN ... [)]`
+class AlterTableAddConstraintStmt extends Statement {
+  final String table;
+  final List<TableConstraint> constraints;
+  AlterTableAddConstraintStmt(this.table, this.constraints);
+}
+
+/// `ALTER TABLE t ENABLE|DISABLE CONSTRAINT <name>` — toggles constraint
+/// enforcement (used by the circular-FK deferred-load flow).
+class AlterTableSetConstraintStmt extends Statement {
+  final String table;
+  final String constraint;
+  final bool enable;
+  AlterTableSetConstraintStmt(this.table, this.constraint, this.enable);
+}
+
+/// `COMMENT ON TABLE/COLUMN <name> IS '<text>'` — Oracle metadata DDL; accepted
+/// as a no-op (the engine stores no object comments).
+class CommentStmt extends Statement {}
+
+/// `CREATE [PUBLIC] SYNONYM <name> FOR <target>` — modeled as an alias view
+/// (`SELECT * FROM <target>`) so queries through the synonym resolve.
+class CreateSynonymStmt extends Statement {
+  final String name;
+  final String target;
+  CreateSynonymStmt(this.name, this.target);
+}
+
+/// An Oracle DDL statement accepted and ignored (e.g. `CREATE TYPE …`); [kind]
+/// names it for the status message.
+class DdlNoopStmt extends Statement {
+  final String kind;
+  DdlNoopStmt(this.kind);
+}
+
+/// `CREATE TYPE <name> AS OBJECT (attrs)` — records the object type's attribute
+/// columns so an object table (`CREATE TABLE t OF <name>`) can resolve them.
+class CreateTypeStmt extends Statement {
+  final String name;
+  final List<ColumnDef> columns;
+  CreateTypeStmt(this.name, this.columns);
+}
+
+/// `CREATE TABLE <name> OF <object_type>` — an object table whose columns come
+/// from the named object type.
+class CreateObjectTableStmt extends Statement {
+  final String name;
+  final String typeName;
+  final bool ifNotExists;
+  CreateObjectTableStmt(this.name, this.typeName, {this.ifNotExists = false});
 }
 
 class CreateIndexStmt extends Statement {
@@ -119,11 +192,16 @@ class CreateViewStmt extends Statement {
   /// preserved so views can be persisted and re-parsed verbatim across
   /// open/close cycles. Empty for views created programmatically.
   final String selectSql;
+
+  /// Optional explicit output-column names: `CREATE VIEW v (a, b) AS …`.
+  /// Renames the view's columns positionally; null when omitted.
+  final List<String>? columns;
   CreateViewStmt(
     this.name,
     this.select, {
     this.ifNotExists = false,
     this.selectSql = '',
+    this.columns,
   });
 }
 
@@ -133,8 +211,161 @@ class DropViewStmt extends Statement {
   DropViewStmt(this.name, {this.ifExists = false});
 }
 
+/// `CREATE SEQUENCE name [START WITH n] [INCREMENT BY n] [MINVALUE n|NOMINVALUE]
+/// [MAXVALUE n|NOMAXVALUE] [CYCLE|NOCYCLE] [CACHE n|NOCACHE]`. Only the value
+/// generation is modelled; CACHE is parsed and ignored.
+class CreateSequenceStmt extends Statement {
+  final String name;
+  final int startWith;
+  final int incrementBy;
+  final int? minValue;
+  final int? maxValue;
+  final bool cycle;
+  final bool ifNotExists;
+  CreateSequenceStmt(
+    this.name, {
+    this.startWith = 1,
+    this.incrementBy = 1,
+    this.minValue,
+    this.maxValue,
+    this.cycle = false,
+    this.ifNotExists = false,
+  });
+}
+
+class DropSequenceStmt extends Statement {
+  final String name;
+  final bool ifExists;
+  DropSequenceStmt(this.name, {this.ifExists = false});
+}
+
+/// `CREATE PROCEDURE` / `CREATE FUNCTION` — stores a procedural routine.
+class CreateProcedureStmt extends Statement {
+  final StoredRoutine routine;
+  final bool orReplace;
+  CreateProcedureStmt(this.routine, {this.orReplace = false});
+}
+
+/// `DROP PROCEDURE|FUNCTION [IF EXISTS] name`.
+class DropProcedureStmt extends Statement {
+  final String name;
+  final bool isFunction;
+  final bool ifExists;
+  DropProcedureStmt(this.name,
+      {this.isFunction = false, this.ifExists = false});
+}
+
+/// `CALL name(args)` — invoke a stored procedure.
+class CallStmt extends Statement {
+  final String name;
+  final List<Expr> args;
+  CallStmt(this.name, this.args);
+}
+
+/// `CREATE [OR REPLACE] PACKAGE [BODY] name` — Oracle package. The spec
+/// (isBody=false) declares the public API and is accepted as a no-op; the body
+/// (isBody=true) carries the member routines with qualified `pkg.member` names.
+class CreatePackageStmt extends Statement {
+  final String name;
+  final bool isBody;
+  final bool orReplace;
+  final List<StoredRoutine> routines;
+
+  /// Body-level variable/constant declarations backing persistent package state.
+  final List<RoutineDecl> packageVars;
+  CreatePackageStmt(this.name, this.routines,
+      {this.isBody = false,
+      this.orReplace = false,
+      this.packageVars = const []});
+}
+
+/// `DROP PACKAGE [BODY] [IF EXISTS] name` — drops every member routine.
+class DropPackageStmt extends Statement {
+  final String name;
+  final bool ifExists;
+  DropPackageStmt(this.name, {this.ifExists = false});
+}
+
+/// An Oracle PL/SQL anonymous block: `[DECLARE …] BEGIN … END;`.
+class PlsqlBlockStmt extends Statement {
+  final RoutineBlock block;
+  PlsqlBlockStmt(this.block);
+}
+
+/// `MERGE INTO target [alias] USING {table|(subquery)} [alias] ON (cond)
+/// [WHEN MATCHED THEN UPDATE SET ... [WHERE c]]
+/// [WHEN NOT MATCHED THEN INSERT (cols) VALUES (exprs) [WHERE c]]`.
+class MergeStmt extends Statement {
+  final String targetTable;
+  final String? targetAlias;
+
+  /// Exactly one of [sourceTable] / [sourceSubquery] is non-null.
+  final String? sourceTable;
+  final SelectStmt? sourceSubquery;
+  final String? sourceAlias;
+  final Expr onCondition;
+
+  /// WHEN MATCHED THEN UPDATE SET ... (null when the clause is absent).
+  final Map<String, Expr>? matchedAssignments;
+  final Expr? matchedWhere;
+
+  /// Oracle `WHEN MATCHED THEN UPDATE SET ... DELETE WHERE <cond>`: after the
+  /// update, matched rows satisfying this predicate are removed (null absent).
+  final Expr? matchedDeleteWhere;
+
+  /// WHEN NOT MATCHED THEN INSERT ... (null when the clause is absent).
+  /// [insertColumns] may be null to mean "all target columns in order".
+  final List<String>? insertColumns;
+  final List<Expr>? insertValues;
+  final Expr? notMatchedWhere;
+
+  MergeStmt({
+    required this.targetTable,
+    this.targetAlias,
+    this.sourceTable,
+    this.sourceSubquery,
+    this.sourceAlias,
+    required this.onCondition,
+    this.matchedAssignments,
+    this.matchedWhere,
+    this.matchedDeleteWhere,
+    this.insertColumns,
+    this.insertValues,
+    this.notMatchedWhere,
+  });
+}
+
 /// Conflict-resolution mode for INSERT.
 enum InsertMode { normal, orReplace, orIgnore }
+
+/// One `INTO target [(cols)] VALUES (exprs)` target of a multi-table insert.
+/// When [values] is null the driving subquery's selected row is used
+/// positionally for [columns] (or all target columns).
+class InsertAllInto {
+  final String table;
+  final List<String>? columns;
+  final List<Expr>? values;
+  InsertAllInto(this.table, this.columns, this.values);
+}
+
+/// One arm of a conditional multi-table insert. [when] is null for the
+/// unconditional form and for the trailing `ELSE`.
+class InsertAllClause {
+  final Expr? when;
+  final bool isElse;
+  final List<InsertAllInto> intos;
+  InsertAllClause(this.when, this.isElse, this.intos);
+}
+
+/// Oracle `INSERT ALL` / `INSERT FIRST` multi-table insert driven by a
+/// subquery. `FIRST` stops at the first matching `WHEN` per source row;
+/// `ALL` applies every matching arm. `ELSE` arms fire when no `WHEN` matched.
+class InsertAllStmt extends Statement {
+  final bool first;
+  final List<InsertAllClause> clauses;
+  final SelectStmt select;
+  InsertAllStmt(this.first, this.clauses, this.select);
+}
 
 /// `ON CONFLICT (cols) DO {NOTHING | UPDATE SET ... [WHERE ...]}` clause
 /// attached to an INSERT to form an UPSERT.
@@ -227,6 +458,11 @@ class JoinClause {
   /// Optional `INDEXED BY` / `NOT INDEXED` hint on this joined relation.
   final IndexHint? indexedBy;
 
+  /// True for a correlated derived table: `LATERAL (…)`, `CROSS APPLY (…)`,
+  /// `OUTER APPLY (…)`. The [subquery] is re-evaluated per left row with that
+  /// row visible as outer scope.
+  final bool lateral;
+
   JoinClause(
     this.type,
     this.table,
@@ -236,6 +472,7 @@ class JoinClause {
     this.using,
     this.natural = false,
     this.indexedBy,
+    this.lateral = false,
   });
 }
 
@@ -255,6 +492,10 @@ class SelectStmt extends Statement {
   final int? limit;
   final int? offset;
   final bool distinct;
+
+  /// True when [limit] is a percentage of the row count (Oracle
+  /// `FETCH FIRST n PERCENT ROWS ONLY`): the effective count is `CEIL(n% * N)`.
+  final bool limitPercent;
 
   /// Optional set-operation chain (UNION / UNION ALL / EXCEPT / INTERSECT).
   /// When present, this SELECT's result is combined with [setOpRight].
@@ -295,6 +536,23 @@ class SelectStmt extends Statement {
   /// aggregation per set, and unions the results.
   final List<List<Expr>>? groupingSets;
 
+  /// Oracle hierarchical query: `START WITH ... CONNECT BY ...`.
+  final ConnectByClause? connectBy;
+
+  /// Inline PL/SQL routines declared in the WITH clause (`WITH FUNCTION f ...`),
+  /// registered for the duration of this query.
+  final List<StoredRoutine> withFunctions;
+
+  /// Oracle `ROWNUM <= n` limit lifted from the WHERE clause. Unlike [limit]
+  /// (a post-aggregate result cap), a ROWNUM limit restricts the *input* rows
+  /// before aggregation / GROUP BY, so `SELECT COUNT(*) FROM t WHERE ROWNUM <=
+  /// n` counts at most n rows.
+  final int? rownumLimit;
+
+  /// Oracle `MATCH_RECOGNIZE (...)` row-pattern clause attached to the FROM
+  /// source; applied to the materialized source rows before joins.
+  final MatchRecognizeClause? matchRecognize;
+
   SelectStmt({
     required this.projection,
     this.fromTable,
@@ -308,6 +566,7 @@ class SelectStmt extends Statement {
     this.limit,
     this.offset,
     this.distinct = false,
+    this.limitPercent = false,
     this.setOp,
     this.setOpRight,
     this.ctes = const {},
@@ -318,6 +577,55 @@ class SelectStmt extends Statement {
     this.namedWindows = const {},
     this.indexedBy,
     this.groupingSets,
+    this.connectBy,
+    this.withFunctions = const [],
+    this.rownumLimit,
+    this.matchRecognize,
+  });
+}
+
+/// One element of a `MATCH_RECOGNIZE` PATTERN: a pattern variable with a
+/// repetition quantifier. [maxRep] of -1 means unbounded (`*`/`+`).
+class MatchPatternElem {
+  final String variable;
+  final int minRep;
+  final int maxRep;
+  MatchPatternElem(this.variable, this.minRep, this.maxRep);
+}
+
+/// Oracle `MATCH_RECOGNIZE` clause: a bounded row-pattern matcher supporting
+/// PARTITION BY / ORDER BY, MEASURES, a flat PATTERN of quantified variables,
+/// and per-variable DEFINE predicates. ONE ROW PER MATCH is the default.
+class MatchRecognizeClause {
+  final List<Expr> partitionBy;
+  final List<OrderByItem> orderBy;
+  final List<SelectItem> measures;
+  final bool allRowsPerMatch;
+  final List<MatchPatternElem> pattern;
+  final Map<String, Expr> defines;
+  MatchRecognizeClause({
+    this.partitionBy = const [],
+    this.orderBy = const [],
+    this.measures = const [],
+    this.allRowsPerMatch = false,
+    this.pattern = const [],
+    this.defines = const {},
+  });
+}
+
+/// Oracle hierarchical query clause. [startWith] selects the root rows (all
+/// rows when null); [connectBy] is the parent→child join predicate, where
+/// `PRIOR expr` refers to the parent row.
+class ConnectByClause {
+  final Expr? startWith;
+  final Expr connectBy;
+  final bool nocycle;
+  final List<OrderByItem> orderSiblings;
+  ConnectByClause(
+    this.startWith,
+    this.connectBy, {
+    this.nocycle = false,
+    this.orderSiblings = const [],
   });
 }
 
@@ -450,6 +758,13 @@ class SetSessionStmt extends Statement {
   SetSessionStmt(this.raw);
 }
 
+/// MySQL `SET @x = expr [, @y = expr]` — assigns session user-variables,
+/// which persist for the connection and can be read back as `@x`.
+class SetUserVarStmt extends Statement {
+  final List<(String name, Expr value)> assignments;
+  SetUserVarStmt(this.assignments);
+}
+
 class CreateVirtualTableStmt extends Statement {
   final String name;
   final String module; // e.g. fts5, rtree
@@ -514,6 +829,10 @@ class CreateTriggerStmt extends Statement {
   final Expr? when;
   final List<Statement> body;
   final bool ifNotExists;
+
+  /// `:new.col := expr` assignments recovered from a PL/SQL trigger body,
+  /// applied to the NEW row of a BEFORE row trigger. Empty for SQL triggers.
+  final List<TriggerNewAssign> newAssignments;
   CreateTriggerStmt(
     this.name,
     this.timing,
@@ -522,7 +841,15 @@ class CreateTriggerStmt extends Statement {
     this.when,
     this.body, {
     this.ifNotExists = false,
+    this.newAssignments = const [],
   });
+}
+
+/// A PL/SQL `:new.column := expr` assignment in a BEFORE row trigger.
+class TriggerNewAssign {
+  final String column;
+  final Expr expr;
+  TriggerNewAssign(this.column, this.expr);
 }
 
 class DropTriggerStmt extends Statement {

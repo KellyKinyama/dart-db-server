@@ -1,0 +1,388 @@
+# Native (thick) Oracle client authentication — field notes
+
+> **Status:** implemented and validated. A real PHP `oci8` thick client
+> (Instant Client 23.9) authenticates against `dart_db_server`'s Oracle wire
+> front-end (`oci_connect` returns a usable connection). This document records
+> what the native OCI/OCCI client does differently from thin clients and the
+> non-obvious things that have to be exactly right — so nobody has to
+> re-derive them from a packet trace again.
+>
+> Code: [`lib/server/oracle_wire.dart`](../lib/server/oracle_wire.dart),
+> [`oracle_native_auth.dart`](../lib/server/oracle_native_auth.dart),
+> [`oracle_tns.dart`](../lib/server/oracle_tns.dart),
+> [`oracle_native_datatypes.dart`](../lib/server/oracle_native_datatypes.dart),
+> [`oracle_native_replay.dart`](../lib/server/oracle_native_replay.dart).
+> In-process emulator (the "other gun", no Instant Client needed):
+> [`test/oracle_native_client.dart`](../test/oracle_native_client.dart),
+> exercised by [`test/oracle_native_handshake_test.dart`](../test/oracle_native_handshake_test.dart).
+> Importable pure-Dart thick client with a full query round-trip:
+> [`lib/oracle_thick_client.dart`](../lib/oracle_thick_client.dart). For driving
+> all three clients (thin, pure-Dart thick, real `oci8`) against the server, see
+> [oracle-triple-threat-testing.md](./oracle-triple-threat-testing.md).
+
+## Why this was hard
+
+Thin clients (node-oracledb, python-oracledb, the pure-Dart `oracledb`) are
+open source, so their wire behaviour can be read off the source. The **thick**
+client is `libclntsh` (closed source). It negotiates differently, marshals
+authentication differently, and — critically — **validates the server back**
+(mutual auth). Get any byte wrong and the failure modes are opaque: a silent
+hang, an `ORA-12592: packet`, a `TNS-12535` timeout, or a blanket
+`ORA-01017: invalid credential`.
+
+The only reliable way to learn the exact bytes was to capture a real client
+talking to a real Oracle 23ai container and diff it against our server (see
+[Capturing the wire](#capturing-the-wire)).
+
+## The authenticated flow
+
+Each arrow is one TTC message inside a TNS DATA packet. After the ACCEPT, all
+DATA packets use the **4-byte large-SDU** length header (`v >= 315`).
+
+```mermaid
+sequenceDiagram
+    participant C as Native client (oci8)
+    participant S as dart_db_server
+
+    C->>S: CONNECT (descriptor out-of-line → "overflow")
+    S-->>C: ACCEPT (v320, flag2=0x1A000000, svcOpt 0x0841)
+    C->>S: MARKER break / RESET (OOB self-test)
+    S-->>C: MARKER RESET
+    C->>S: FAST_AUTH (TTC msg 34: protocol+datatypes+auth combined)
+    S-->>C: PROTOCOL-only reply (TTC msg 28)  ← decline!
+    C->>S: DATA TYPES (TTC msg 2)
+    S-->>C: DATA TYPES response
+    C->>S: AUTH_PHASE_ONE (TTC msg 3, func 0x76)
+    S-->>C: AUTH params (msg 8): AUTH_SESSKEY, salt, iters…
+    C->>S: AUTH_PHASE_TWO (TTC msg 3, func 0x73): AUTH_SESSKEY, AUTH_PASSWORD
+    S-->>C: AUTH params (msg 8): AUTH_SVR_RESPONSE + session attrs
+    Note over C: client validates AUTH_SVR_RESPONSE, then connected
+```
+
+## The gotchas, in the order they bite
+
+### 1. The client is detected by its *overflow* CONNECT
+
+A thick client sends the connect descriptor in a **separate DATA packet** after
+the CONNECT (the CONNECT announces a descriptor length but the data offset
+points past the packet). Thin clients inline it. The server tags the session as
+native from this "overflow" and switches to the native code path for everything
+that follows (`_nativeClient` in `oracle_wire.dart`).
+
+### 2. The out-of-band break probe → negotiate version 320
+
+**Symptom:** the client sends an out-of-band (urgent TCP) break probe during
+setup that a Dart `Socket` can't service; the handshake then stalls / aborts.
+
+**Cause:** the client picks asynchronous I/O (and the OOB probe) when the
+negotiated **version < 320** *and* the service-option bit `0x400` (PACKET_IO)
+is set — together they turn on the `0x200` async-I/O bit (`gbl`).
+
+**Fix:** negotiate **version 320** for native clients, and return the ACCEPT
+with `0x400` **cleared** (the client's `0x0C41` → `0x0841`). A real 23ai
+listener does exactly this. The v320 ACCEPT is a **61-byte** layout with the
+`flag2` word at absolute offset 41 and a 16-byte break cookie at 45–60. With
+both in place the OOB probe count drops to zero.
+
+### 3. FAST_AUTH must be *declined*, not answered
+
+**This is the big one.** The native client opens with a **FAST_AUTH** message
+(TTC type **34**) that batches PROTOCOL + DATA-TYPES + AUTH_PHASE_ONE into one
+round trip. The intuitive move — reply with a combined response — makes the
+client **hang**.
+
+A real 23ai listener **declines** fast auth: it replies with a **protocol-only**
+response (TTC type **28**, carrying just the server banner + charset
+negotiation). The client then falls back to the **classical** path: a separate
+DATA TYPES exchange, then AUTH_PHASE_ONE, then AUTH_PHASE_TWO.
+
+So the server ignores the FAST_AUTH body and replays the captured type-28
+response (`nativeProtocolResponse28`). The ACCEPT still advertises
+`flag2 = 0x1A000000` (which *includes* the FAST_AUTH bit `0x10000000`) — the
+client is *allowed* to try fast auth; the server just says "no, do it the long
+way".
+
+### 4. The DATA-TYPES response must match the client build
+
+The native client strictly parses the DATA-TYPES type list. The response is
+replayed verbatim from a capture of the **same client build** (oci8 /
+Instant Client 23.9) in `nativeDataTypesResponse`. An older capture (from a
+different build) is 122 bytes different and makes the client **abort after
+phase one** — so if you upgrade the client, re-capture this blob.
+
+### 5. Native key/value marshaling is OCI-RPC, not the thin UB layout
+
+Native AUTH messages marshal very differently from the thin client's
+self-describing UB4 key/value pairs:
+
+* **Pointer indicators:** 8-byte `FE FF FF FF FF FF FF FF` arguments punctuate
+  the request preamble. Parsing starts by skipping to the first `0xFE`.
+* **Preamble:** `IND, UB4LE(userLen), UB4LE(authMode), IND, UB4LE(numPairs),
+  IND, IND, U8(userLen), username`. (The FAST_AUTH-embedded variant carries an
+  *extra* 4-byte flag word after `numPairs` — but we decline fast auth, so the
+  classical preamble above is what the server parses.)
+* **Each pair:** `UB4LE(keyLen) U8(keyLen) key  <value>  UB4LE(flags)`. The
+  server ignores the flags.
+* **Values** are the subtle part:
+  * length `0` → just `UB4LE(0)`, **no** inline byte, no data;
+  * short (`< 254`) → `UB4LE(len) U8(len) bytes`;
+  * long (`>= 254`, e.g. `AUTH_CONNECT_STRING`) → `UB4LE(len) 0xFE`
+    then **chunked**: `UB4LE(chunkSize) bytes … UB4LE(0)` terminator.
+    Chunk sizes are **4-byte little-endian**, *not* Oracle UB4 varint — the
+    first wrong assumption here throws `integer too large`.
+
+See `parseNativeAuthPairs` / `_readNativeValue` in `oracle_native_auth.dart`.
+
+### 6. O5LOGON / PBKDF2 crypto (12c verifier `0x4815`)
+
+The native client requires the 12c PBKDF2 verifier (`addPbkdf2User`); a SHA512
+user won't do. Phase one hands the client the challenge; phase two proves the
+password. Both sides derive the same keys:
+
+```
+passwordHash = SHA512( PBKDF2-HMAC-SHA512(password,
+                 salt + "AUTH_PBKDF2_SPEEDY_KEY", iterations, 64) + salt )[0:32]
+
+serverNonce  = AES-256-CBC-decrypt(key=passwordHash, iv=0, AUTH_SESSKEY_phase1)
+clientNonce  = 32 random bytes
+AUTH_SESSKEY = hex( AES-256-CBC-encrypt(key=passwordHash, iv=0, clientNonce) )   (phase 2)
+
+comboKey     = PBKDF2-HMAC-SHA512( hex(clientNonce[0:32] + serverNonce[0:32]),
+                 mixingSalt, mixingIterations, 32 )
+
+AUTH_PASSWORD = hex( AES-256-CBC-PKCS7(key=comboKey, iv=0, random16 + password) )
+```
+
+The server decrypts `AUTH_PASSWORD`, drops the 16-byte prefix, re-derives
+`passwordHash`, and compares it to the stored verifier. The IV is always 16
+zero bytes.
+
+### 7. AUTH_SVR_RESPONSE — the mutual-auth proof (the `ORA-01017` culprit)
+
+**Symptom:** the server verifies the password and sends a success response, but
+the client *still* reports `ORA-01017`.
+
+**Cause:** the thick client validates the **server** too. The success response
+must carry `AUTH_SVR_RESPONSE`, a 96-hex-char value the client decrypts under
+the combo key and checks. Thin clients don't require it; the OCI client does.
+
+**Algorithm** (reverse-engineered by decrypting a captured value with the known
+combo key):
+
+```
+plaintext         = random16 + "SERVER_TO_CLIENT"            (32 bytes)
+AUTH_SVR_RESPONSE = hex( AES-256-CBC-PKCS7(key=comboKey, iv=0, plaintext) )
+```
+
+The client decrypts under the combo key and checks that bytes **[16:32]** equal
+the ASCII literal `SERVER_TO_CLIENT`. That proves the server also derived the
+combo key — i.e. it knew the password — without revealing it. See
+`_buildServerResponse` in `oracle_native_auth.dart`; the combo key is stashed in
+`AuthPhaseState.comboKey` during verification.
+
+### 8. After auth: native query execution
+
+Authentication is complete; the next frontier is **EXECUTE** (OALL8, RPC
+function `0x5E`). The native call packet is `piggyback(107) + piggyback(176) +
+OALL8`, where the piggybacks and the OALL8 argument list use the OCI-RPC layout
+(8-byte `FE FF…` pointer indicators, 4-byte little-endian scalars) — which the
+thin piggyback walker and `decodeExecuteRequest` can't step over (`integer too
+large`). The server handles the **request** side:
+
+* native post-auth DATA packets are routed to `_handleNativeCall`
+  (`oracle_wire.dart`), bypassing the thin piggyback loop;
+* `decodeNativeExecuteRequest` (`oracle_execute.dart`) recovers the SQL by
+  scanning for its inline `U8(len)` length-prefixed ASCII run, runs it through
+  the engine, and the statement executes (server log: `EXECUTE [cursor 1]
+  "select 1 as v from dual"`). Re-executed cursors and binds are not yet
+  decoded on this path.
+
+What remains is the **response**: the native describe/row format differs from
+thin. A thin `buildQueryResponse` for one NUMBER column is
+`10 00 00 01 01 00 02 …` (117 bytes); a real listener returns
+`10 17 00 00 00 <16-byte describe signature> …` (307 bytes) — message type 16
+(describe-info) but with the native marshaling (4-byte little-endian scalars,
+`U8(len)`-prefixed strings), the column metadata, the base-100 NUMBER row value
+(`C1 02` for `1`), and an `ORA-01403: no data found` terminal.
+
+`buildNativeQueryResponse` (`oracle_native_execute.dart`) now builds this for
+results of any number of NUMBER / VARCHAR2 columns **and any number of rows**,
+and a real `oci8` client round-trips `select 1 from dual`, `select 'AB' c1, 7 c2
+from dual`, single- and multi-column multi-row selects, and empty result sets.
+Two findings from the capture made it tractable: the 16-byte describe signature
+is **not validated** (zeros work), and the describe timestamp + the per-execute
+sequence counters in the status block are **not validated** either (constant
+blocks captured once are replayed for every query). The column-count shows up in
+three places — `ncols` in the header, `0x22,ncols` in the mid block, `ncols+5`
+in the status block — and each column carries its 0-based index in its record;
+everything else is a fixed template.
+
+**Row-count encoding.** Each column record carries its exact value size with the
+`0x81` flag; the header's size field is the sum of the column sizes. The fetched
+row count is echoed into several status-block slots (`[11]`, `[42]`, `[52]`,
+`[106]` = rowCount, `[40]` = 10 + rowCount, `[80]` = rowCount + 4). Rows one and
+two are emitted back-to-back; every row from index 2 on is prefixed with a
+4-byte inter-row marker `15 <ncols> 00 <mask>`, where `mask` is an
+all-columns-present bitmap `(1<<ncols)−1` (`15 01 00 01` for one column,
+`15 02 00 03` for two, `15 03 00 07` for three, `15 04 00 0f` for four).
+**Empty (0-row)** results use a truncated mid
+block (no row-metadata tail), no row data, and a distinct status block.
+
+A subtlety that cost real debugging time: the in-memory SQL engine is
+SQLite-like and does **not** understand Oracle's `connect by level … / dual`,
+so the natural multi-row probe returned an engine error (not a describe) and the
+client appeared to "hang" — the encoder was never reached. Use `SELECT … UNION
+ALL SELECT …` to exercise multi-row paths against the in-memory engine. The one
+field the engine cannot reproduce is a column's **declared** size (e.g.
+`cast(x as varchar2(10))` → size 10); it advertises the widest observed value
+instead, which the client accepts since the describe size is only an upper
+bound.
+
+**DML (INSERT/UPDATE/DELETE/DDL).** Non-query statements get a native status
+reply (`buildNativeDmlResponse`, message type 8) carrying the affected-row count
+that `oci8` surfaces as `oci_num_rows`. The count lives at byte 42 (a 4-byte
+little-endian scalar) and is echoed at byte 120; a statement that changes no
+rows (DDL, or a zero-row DML) uses a shorter template. One gotcha: the `app`
+user needs `CREATE TABLE` + quota (`grant create table, unlimited tablespace to
+app`) before DDL/DML capture works.
+
+**Clean teardown.** A control call with no SQL (commit / close / logoff) must be
+answered with the native end-of-call terminal `09 01 00 00 00 00 00 1d`
+(`buildNativeStatusOk`), **not** the thin `buildStatusOk` (`09 00 00`) — the
+short form leaves the client blocked, most visibly as a stalled `oci_close`
+after any statement.
+
+**Errors.** A failing statement must come back as a native error
+(`buildNativeExecuteError`, TTC message type `0x04`), not the thin
+`buildExecuteError` — the thin form is unparseable to OCI and hangs the client on
+*any* error (missing table, syntax, constraint). The frame is a fixed 79-byte
+header carrying the `ORA-` number as a 4-byte little-endian scalar at byte 11
+(echoed at byte 66), then `U8(len)` + the `ORA-ddddd: …\n` text + the `1d`
+terminator. With it, `oci8` surfaces a normal `oci_error()` and — importantly —
+the **session survives**: the next statement on the same connection runs fine.
+
+**Bind variables.** `oci8` keeps the `:name` placeholders in the SQL text and
+appends the bound values at the very end of the OALL8 body as a single `0x07`
+marker followed by one `U8(len) + bytes` value per distinct placeholder — and it
+sends them as **text** (`:v = 42` arrives as the two bytes `34 32`, i.e. `"42"`,
+not an Oracle number). So the whole 300+-byte OCI-RPC bind-descriptor block in
+the middle can be ignored: `decodeNativeExecuteRequest` counts the `:name`
+placeholders in the recovered SQL, then walks the trailing `0x07` block for that
+many length-prefixed values. The existing `_executeWithBinds` already maps those
+positional values onto the placeholders (first-appearance order) and the engine
+substitutes them, so a real `oci8` client round-trips `select :a, :b` and
+`insert into t values (:id, :nm)` with correct results and row counts. Binary
+(non-text) number binds would need the OCI-RPC value section decoded properly;
+the common `oci8` / PDO path binds as text.
+
+**NULLs.** A NULL column value in a row is a zero-length field (`00`, no bytes) —
+which the row encoder already produces for a null. A NULL *bind* is the odd one:
+instead of a length-prefixed value it is the marker `fd 01` (a `0xFD` byte plus a
+one-byte indicator), so the bind scanner must treat a `0xFD` length as NULL and
+skip the indicator rather than reading it as a 253-byte value. With that, a
+NULL binds and reads back as NULL in either column position.
+
+**Long values and typed binds.** A value longer than 253 bytes — a bind value
+*or* a fetched column — is not `U8(len)`-prefixed; it uses the same `0xFE`
+chunked long form as a long SQL statement (`0xFE + LE32(len) + bytes + LE32(0)`).
+Both the bind scanner and the row encoder handle it, so a 300-char string binds
+and reads back intact. Binds also arrive as **text**, so a clean decimal (no
+leading zeros) is coerced to a number — otherwise `where num_col = :v` with a
+bound `10` would compare the string `"10"` against the number and miss;
+leading-zero strings (zip codes) stay text. Statement-cache **re-execute** (the
+client replays a cached cursor by id with new binds and no SQL text) is not yet
+handled — it needs per-cursor-id SQL tracking.
+
+One sharp edge the first cut got wrong: the SQL text was recovered as the
+*longest* printable run, but a string bind value longer than the statement
+(routine — any `insert … values (:name)` with a long name) would then be picked
+as the SQL and executed verbatim (the server logged `EXECUTE "Christopher
+Alexander Wren the Architect"` and the client hung). Fix: the statement always
+leads with a SQL verb and, on the wire, precedes the bind-value block, so
+`_scanNativeSqlText` now returns the **first verb-anchored** run (SELECT /
+INSERT / UPDATE / … / BEGIN), falling back to longest-printable only for forms
+outside that set.
+
+A second, bigger edge: the SQL is only `U8(len)`-prefixed when it is **≤ 253
+bytes**. A longer statement is sent as a native **long string** — a `0xFE`
+marker, then repeated `LE32(chunkLen) + bytes` terminated by `LE32(0)` (a
+330-byte query marshals as `fe 4a 01 00 00 …330 bytes… 00 00 00 00`). The
+U8-only scan couldn't see it and latched onto an inner fragment, so *any*
+statement over 253 bytes ran as garbage. `_scanNativeSqlText` now also decodes
+the `0xFE`-chunked form; the `FE FF…` pointer indicators are rejected by the
+1 MiB chunk-size sanity cap.
+
+**Large result sets need FETCH pagination.** The client's prefetch buffer holds
+only ~100 rows (its own default), so inlining every row in the describe
+overflows it and hangs — advertising a bigger prefetch in the describe does
+*not* change the client's buffer. Real Oracle sends the first prefetch batch in
+the EXECUTE describe with a **"more rows"** terminal (an `08 06 00` status
+block *without* `ORA-01403`), then the client pulls each further batch with a
+FETCH call (TTC message `0x03`, function `0x05`, carrying the row count as an
+LE32); each FETCH is answered with a `0x06` row-data message (plain `07`-framed
+rows, no inter-row `15` markers) ending in a "more rows" or `ORA-01403`
+terminal. `NativeResultCursor` keeps the decoded result on the connection across
+the describe and the FETCH calls, so single- and multi-column results of any
+size round-trip (verified at 250/300 rows). The one remaining gap is a statement
+whose text alone exceeds the SDU (~8 KB) — that EXECUTE request spans multiple
+packets, which the native call path does not yet reassemble.
+
+**`ALTER SESSION` (connect-time NLS).** Drivers — Laravel's `oci8` in
+particular — issue a burst of `alter session set NLS_DATE_FORMAT = …` /
+`NLS_TIMESTAMP_FORMAT` / `NLS_NUMERIC_CHARACTERS` statements right after connect.
+The SQLite-like engine rejects that syntax, and the error (sent as a thin error)
+hangs the native client. A real listener answers `ALTER SESSION` with a ~500-byte
+NLS parameter block (message type 8), but — consistent with the leniency seen
+everywhere else — `oci8` does **not** require it: the server intercepts
+`alter session …` in `_systemQueryResult` and acknowledges it as a no-op success
+(empty result → the native DML-zero status), and the client proceeds to run real
+queries on the "configured" session. The server models no NLS state, so these
+are genuine no-ops. With this in place the full
+connect → `ALTER SESSION` → query/DML/bind round-trip works end-to-end — exactly
+the Laravel connection bootstrap.
+
+**End-to-end against Laravel.** Verified through the real
+`yajra/laravel-oci8` + `laravel-pdo-via-oci8` stack (PHP `oci8`, Instant Client
+23.9): `DB::connection('oracle')` connects, yajra emits a **single combined**
+`ALTER SESSION SET NLS_TIME_FORMAT … NLS_NUMERIC_CHARACTERS = '.,'` at connect
+(hence the broad `startsWith('alter session')` match), then a multi-row `select`,
+a named-bind `select :v`, a `create table`, a named-bind `insert`, and a
+`drop table` all return correct results / row counts and the connection tears
+down cleanly. That is the complete native thick-client lifecycle a web app
+exercises.
+
+
+
+
+## Capturing the wire
+
+SQLNET client tracing (`TRACE_LEVEL_CLIENT=16`) proved unreliable here — the
+Instant Client didn't honour `TNS_ADMIN` in the test setup, so no trace files
+appeared. The reliable method was a **tiny TCP relay** between the client and a
+real Oracle container that logs every chunk in both directions as hex:
+
+1. Run a ~20-line Dart proxy: listen on `127.0.0.1:1523`, forward to the
+   container on `127.0.0.1:1521`, and append `C->S <len> <hex>` /
+   `S->C <len> <hex>` lines to a log.
+2. Point the client at the proxy port.
+3. Decode each chunk: 4-byte big-endian length at `[0..3]`, packet type at
+   `[4]`, data flags at `[8..9]`, TTC message type at `[10]`.
+
+Because each TCP chunk corresponded to exactly one large-SDU NS packet, the log
+was directly decodable. The static responses (type-28 protocol decline,
+DATA-TYPES) were lifted verbatim into `oracle_native_replay.dart` /
+`oracle_native_datatypes.dart`; the crypto values (`AUTH_SESSKEY`,
+`AUTH_SVR_RESPONSE`) were decrypted offline with the known password to recover
+the algorithms above.
+
+> The proxy and decode scripts are throwaway — they are **not** checked in, and
+> traces can contain an encrypted password, so delete them after use.
+
+## The emulator mirrors all of this
+
+`test/oracle_native_client.dart` is a pure-Dart stand-in for the thick client.
+`NativeThickClient.login(username:, password:)` drives the entire flow —
+overflow CONNECT, break/reset, FAST_AUTH decline, DATA TYPES, AUTH_PHASE_ONE,
+and AUTH_PHASE_TWO — running the real O5LOGON/PBKDF2 client crypto and
+**validating `AUTH_SVR_RESPONSE`** just like `oci8` does. It lets the native
+auth path be tested end-to-end in CI without an Instant Client install.

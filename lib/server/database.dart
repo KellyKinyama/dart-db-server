@@ -17,6 +17,7 @@ import 'fts5.dart';
 import 'parser.dart';
 import 'prepared.dart';
 import 'result.dart';
+import 'routine.dart';
 import 'rtree.dart';
 import 'schema.dart';
 import 'session.dart';
@@ -78,7 +79,7 @@ class _VectorIndexBinding {
   _VectorIndexBinding(this.spec);
 }
 
-class Database {
+class Database implements SequenceProvider {
   final Map<String, Table> _tables = <String, Table>{};
 
   /// Cache of parsed expressions keyed by source SQL. Used to avoid
@@ -104,6 +105,42 @@ class Database {
   /// Original SELECT SQL text for each view, keyed by view name.
   /// Used to persist views faithfully through save/reload cycles.
   final Map<String, String> _viewSql = <String, String>{};
+
+  /// Explicit output-column names for views created with `CREATE VIEW v (a, b)`,
+  /// keyed by view name. Renames the view's columns positionally.
+  final Map<String, List<String>> _viewColumns = <String, List<String>>{};
+
+  /// Attribute columns of Oracle object types (`CREATE TYPE … AS OBJECT`),
+  /// keyed by upper-cased type name; used by object tables (`… OF type`).
+  final Map<String, List<ColumnDef>> _objectTypes =
+      <String, List<ColumnDef>>{};
+
+  /// Named sequences (Oracle CREATE SEQUENCE). Sequence value generation is
+  /// intentionally non-transactional (NEXTVAL is not rolled back), matching
+  /// Oracle, so this map is not snapshotted by transactions.
+  final Map<String, _SequenceState> _sequences = <String, _SequenceState>{};
+
+  /// Monotonic "row epoch" for the once-per-row NEXTVAL guarantee. Bumped at
+  /// each statement and at every per-row evaluation boundary; all NEXTVAL
+  /// references sharing an epoch return the same value. Bumping too often is
+  /// harmless (it just falls back to advancing per reference).
+  int _seqEpoch = 0;
+  void _beginSeqRow() => _seqEpoch++;
+
+  /// Stored procedures/functions (MySQL CREATE PROCEDURE/FUNCTION), keyed by
+  /// uppercased name.
+  final Map<String, StoredRoutine> _routines = <String, StoredRoutine>{};
+
+  /// Default MySQL session user-variable store (`@name` → value), used when a
+  /// caller does not supply its own per-connection map. The wire layer passes a
+  /// connection-scoped map instead so variables don't leak between clients.
+  final Map<String, Object?> _userVars = <String, Object?>{};
+
+  /// Persistent Oracle package state: `PKG` → {var → value}. Body-declared
+  /// package variables live here across member calls (process-wide, a
+  /// simplification of Oracle's per-session package state).
+  final Map<String, Map<String, Object?>> _packageState =
+      <String, Map<String, Object?>>{};
   final String? path;
 
   /// When true, [_persist] writes the database as a real SQLite-format
@@ -150,6 +187,11 @@ class Database {
 
   bool get _deferFks => _truthy(_pragmas['defer_foreign_keys']);
   bool get _deferChecks => _truthy(_pragmas['defer_checks']);
+
+  /// Whether FK constraints are enforced (`PRAGMA foreign_keys`). When off,
+  /// enforcement is skipped entirely, which also permits forward references to
+  /// not-yet-created parent tables (SQLite semantics).
+  bool get _fkEnabled => _truthy(_pragmas['foreign_keys']);
 
   static bool _truthy(Object? v) {
     if (v == null) return false;
@@ -2123,16 +2165,17 @@ class Database {
   // ---------------------------------------------------------------------------
   // Public API
   // ---------------------------------------------------------------------------
-  Future<QueryResult> execute(String sql) async {
+  Future<QueryResult> execute(String sql, {Map<String, Object?>? userVars}) async {
     final stmt = Parser.fromString(sql).parseStatement();
-    return executeStmt(stmt);
+    return executeStmt(stmt, userVars: userVars);
   }
 
-  Future<List<QueryResult>> executeScript(String sql) async {
+  Future<List<QueryResult>> executeScript(String sql,
+      {Map<String, Object?>? userVars}) async {
     final stmts = Parser.fromString(sql).parseScript();
     final results = <QueryResult>[];
     for (final s in stmts) {
-      results.add(await executeStmt(s));
+      results.add(await executeStmt(s, userVars: userVars));
     }
     return results;
   }
@@ -2168,7 +2211,23 @@ class Database {
     return prepare(sql).execute(positional: positional, named: named);
   }
 
-  Future<QueryResult> executeStmt(Statement stmt) async {
+  /// Run a procedural [block] (the Phase-3a routine core) against this
+  /// database, seeding its local scope with [args]. Each embedded SQL
+  /// statement/expression executes through the normal locked path, so call
+  /// this at the top level (not from inside a held write lock).
+  Future<RoutineResult> runRoutine(
+    RoutineBlock block, {
+    Map<String, Object?> args = const {},
+  }) {
+    return RoutineInterpreter(this, initialVars: args).run(block);
+  }
+
+  Future<QueryResult> executeStmt(Statement stmt,
+      {Map<String, Object?>? userVars}) async {
+    // CALL runs the procedural interpreter, whose embedded statements each
+    // take the lock themselves — so it must not run inside an outer lock.
+    if (stmt is CallStmt) return _call(stmt, userVars);
+    if (stmt is PlsqlBlockStmt) return _runPlsqlBlock(stmt);
     // Statements that span a transaction boundary always need exclusive
     // access; otherwise SELECT-ish statements take the shared arm.
     final wantsWrite = inTransaction ||
@@ -2228,7 +2287,7 @@ class Database {
           if (asyncPragma != null) {
             result = asyncPragma;
           } else {
-            result = _dispatch(stmt);
+            result = _dispatch(stmt, userVars);
           }
         }
       } finally {
@@ -2333,96 +2392,186 @@ class Database {
     return body(snap);
   }
 
+  /// Begin an isolated per-session (wire connection) transaction. Returns a
+  /// detached [Database] holding a deep clone of the committed tables/views/
+  /// sequences, so this session's writes stay private to the returned handle
+  /// until [commitSessionTransaction] merges them back (ROLLBACK just discards
+  /// it). This gives each connection its own transaction context, independent
+  /// of any other connection sharing this [Database].
+  Future<Database> beginSessionTransaction() => _lock.read(() {
+        final snap = Database();
+        for (final e in _tables.entries) {
+          snap._tables[e.key] = e.value.clone();
+        }
+        snap._views.addAll(_views);
+        snap._sequences.addAll(_sequences);
+        return snap;
+      });
+
+  /// Merge a session transaction's state back into this database on COMMIT.
+  Future<void> commitSessionTransaction(Database tx) => _lock.write(() {
+        _tables
+          ..clear()
+          ..addAll(tx._tables);
+        _views
+          ..clear()
+          ..addAll(tx._views);
+        _sequences
+          ..clear()
+          ..addAll(tx._sequences);
+        return;
+      });
+
   /// Synchronous dispatch \u2014 used directly by trigger bodies (which must run\n  /// in-line with their host INSERT/UPDATE/DELETE).
-  QueryResult _dispatch(Statement stmt) {
+  QueryResult _dispatch(Statement stmt, [Map<String, Object?>? userVars]) {
     // Reset per-statement observability state.
     _lastCteHints = const {};
     QueryResult result;
-    if (stmt is CreateTableStmt) {
-      result = _createTable(stmt);
-    } else if (stmt is DropTableStmt) {
-      result = _dropTable(stmt);
-    } else if (stmt is TruncateTableStmt) {
-      result = _truncate(stmt);
-    } else if (stmt is AlterTableAddColumnStmt) {
-      result = _alterAddColumn(stmt);
-    } else if (stmt is AlterTableDropColumnStmt) {
-      result = _alterDropColumn(stmt);
-    } else if (stmt is AlterTableRenameColumnStmt) {
-      result = _alterRenameColumn(stmt);
-    } else if (stmt is AlterTableRenameStmt) {
-      result = _alterRenameTable(stmt);
-    } else if (stmt is CreateIndexStmt) {
-      result = _createIndex(stmt);
-    } else if (stmt is DropIndexStmt) {
-      result = _dropIndex(stmt);
-    } else if (stmt is CreateViewStmt) {
-      result = _createView(stmt);
-    } else if (stmt is DropViewStmt) {
-      result = _dropView(stmt);
-    } else if (stmt is InsertStmt) {
-      result = _insert(stmt);
-    } else if (stmt is SelectStmt) {
-      result = _selectTopLevel(stmt);
-    } else if (stmt is UpdateStmt) {
-      result = _update(stmt);
-    } else if (stmt is DeleteStmt) {
-      result = _delete(stmt);
-    } else if (stmt is BeginStmt) {
-      result = _begin();
-    } else if (stmt is CommitStmt) {
-      result = _commit();
-    } else if (stmt is RollbackStmt) {
-      result = _rollback();
-    } else if (stmt is ShowTablesStmt) {
-      result = _showTables();
-    } else if (stmt is DescribeStmt) {
-      result = _describe(stmt);
-    } else if (stmt is ShowDatabasesStmt) {
-      result = _showDatabases();
-    } else if (stmt is ShowColumnsStmt) {
-      result = _describe(DescribeStmt(stmt.table));
-    } else if (stmt is ShowCreateTableStmt) {
-      result = _showCreateTable(stmt.table);
-    } else if (stmt is ShowVariablesStmt) {
-      result = _showVariables(stmt.likePattern);
-    } else if (stmt is ShowStatusStmt) {
-      result = QueryResult(
-        columns: const ['Variable_name', 'Value'],
-        rows: const [],
-      );
-    } else if (stmt is UseDatabaseStmt) {
-      result = QueryResult.message('Database changed');
-    } else if (stmt is SetSessionStmt) {
-      result = QueryResult.message('OK');
-    } else if (stmt is ExplainStmt) {
-      result = _explain(stmt);
-    } else if (stmt is PragmaStmt) {
-      result = _pragma(stmt);
-    } else if (stmt is CreateTriggerStmt) {
-      result = _createTrigger(stmt);
-    } else if (stmt is DropTriggerStmt) {
-      result = _dropTrigger(stmt);
-    } else if (stmt is SavepointStmt) {
-      result = _savepoint(stmt);
-    } else if (stmt is ReleaseSavepointStmt) {
-      result = _releaseSavepoint(stmt);
-    } else if (stmt is RollbackToSavepointStmt) {
-      result = _rollbackToSavepoint(stmt);
-    } else if (stmt is AttachDatabaseStmt) {
-      result = _attachDatabase(stmt);
-    } else if (stmt is DetachDatabaseStmt) {
-      result = _detachDatabase(stmt);
-    } else if (stmt is VacuumStmt) {
-      result = _vacuum(stmt);
-    } else if (stmt is AnalyzeStmt) {
-      result = _analyze(stmt);
-    } else if (stmt is ReindexStmt) {
-      result = _reindex(stmt);
-    } else if (stmt is CreateVirtualTableStmt) {
-      result = _createVirtualTable(stmt);
-    } else {
-      throw StateError('Unknown statement: $stmt');
+    // Make this database the sequence provider for NEXTVAL/CURRVAL evaluated
+    // while running the statement (nested trigger dispatch re-pushes safely).
+    SequenceExpr.providerStack.add(this);
+    _beginSeqRow();
+    // Resolve user-defined functions against this database for the duration.
+    final prevFnResolver = FunctionCallExpr.storedFunctionResolver;
+    FunctionCallExpr.storedFunctionResolver = _invokeStoredFunctionSync;
+    // Expose the session user-variable store to `@name` references.
+    final effUserVars = userVars ?? _userVars;
+    BindParamExpr.userVarStack.add(effUserVars);
+    try {
+      if (stmt is CreateTableStmt) {
+        result = _createTable(stmt);
+      } else if (stmt is DropTableStmt) {
+        result = _dropTable(stmt);
+      } else if (stmt is TruncateTableStmt) {
+        result = _truncate(stmt);
+      } else if (stmt is AlterTableAddColumnStmt) {
+        result = _alterAddColumn(stmt);
+      } else if (stmt is AlterTableModifyColumnStmt) {
+        result = _alterModifyColumn(stmt);
+      } else if (stmt is AlterTableDropColumnStmt) {
+        result = _alterDropColumn(stmt);
+      } else if (stmt is AlterTableDropConstraintStmt) {
+        result = _alterDropConstraint(stmt);
+      } else if (stmt is AlterTableRenameColumnStmt) {
+        result = _alterRenameColumn(stmt);
+      } else if (stmt is AlterTableRenameStmt) {
+        result = _alterRenameTable(stmt);
+      } else if (stmt is AlterTableAddConstraintStmt) {
+        result = _alterAddConstraint(stmt);
+      } else if (stmt is AlterTableSetConstraintStmt) {
+        result = _alterSetConstraint(stmt);
+      } else if (stmt is CommentStmt) {
+        result = QueryResult.message('Comment accepted');
+      } else if (stmt is CreateSynonymStmt) {
+        result = _createSynonym(stmt);
+      } else if (stmt is DdlNoopStmt) {
+        result = QueryResult.message('${stmt.kind} accepted');
+      } else if (stmt is CreateTypeStmt) {
+        _objectTypes[stmt.name.toUpperCase()] = stmt.columns;
+        result = QueryResult.message('Type ${stmt.name} created');
+      } else if (stmt is CreateObjectTableStmt) {
+        result = _createTable(CreateTableStmt(
+          stmt.name,
+          _objectTypes[stmt.typeName.toUpperCase()] ?? const <ColumnDef>[],
+          ifNotExists: stmt.ifNotExists,
+        ));
+      } else if (stmt is CreateIndexStmt) {
+        result = _createIndex(stmt);
+      } else if (stmt is DropIndexStmt) {
+        result = _dropIndex(stmt);
+      } else if (stmt is CreateViewStmt) {
+        result = _createView(stmt);
+      } else if (stmt is DropViewStmt) {
+        result = _dropView(stmt);
+      } else if (stmt is CreateSequenceStmt) {
+        result = _createSequence(stmt);
+      } else if (stmt is DropSequenceStmt) {
+        result = _dropSequence(stmt);
+      } else if (stmt is CreateProcedureStmt) {
+        result = _createProcedure(stmt);
+      } else if (stmt is DropProcedureStmt) {
+        result = _dropProcedure(stmt);
+      } else if (stmt is CreatePackageStmt) {
+        result = _createPackage(stmt);
+      } else if (stmt is DropPackageStmt) {
+        result = _dropPackage(stmt);
+      } else if (stmt is MergeStmt) {
+        result = _merge(stmt);
+      } else if (stmt is InsertAllStmt) {
+        result = _insertAll(stmt);
+      } else if (stmt is InsertStmt) {
+        result = _insert(stmt);
+      } else if (stmt is SelectStmt) {
+        result = _attachColumnTypes(stmt, _selectTopLevel(stmt));
+      } else if (stmt is UpdateStmt) {
+        result = _update(stmt);
+      } else if (stmt is DeleteStmt) {
+        result = _delete(stmt);
+      } else if (stmt is BeginStmt) {
+        result = _begin();
+      } else if (stmt is CommitStmt) {
+        result = _commit();
+      } else if (stmt is RollbackStmt) {
+        result = _rollback();
+      } else if (stmt is ShowTablesStmt) {
+        result = _showTables();
+      } else if (stmt is DescribeStmt) {
+        result = _describe(stmt);
+      } else if (stmt is ShowDatabasesStmt) {
+        result = _showDatabases();
+      } else if (stmt is ShowColumnsStmt) {
+        result = _describe(DescribeStmt(stmt.table));
+      } else if (stmt is ShowCreateTableStmt) {
+        result = _showCreateTable(stmt.table);
+      } else if (stmt is ShowVariablesStmt) {
+        result = _showVariables(stmt.likePattern);
+      } else if (stmt is ShowStatusStmt) {
+        result = QueryResult(
+          columns: const ['Variable_name', 'Value'],
+          rows: const [],
+        );
+      } else if (stmt is UseDatabaseStmt) {
+        result = QueryResult.message('Database changed');
+      } else if (stmt is SetSessionStmt) {
+        result = QueryResult.message('OK');
+      } else if (stmt is SetUserVarStmt) {
+        for (final (name, expr) in stmt.assignments) {
+          effUserVars[name] = expr.eval(const {});
+        }
+        result = QueryResult.message('OK');
+      } else if (stmt is ExplainStmt) {
+        result = _explain(stmt);
+      } else if (stmt is PragmaStmt) {
+        result = _pragma(stmt);
+      } else if (stmt is CreateTriggerStmt) {
+        result = _createTrigger(stmt);
+      } else if (stmt is DropTriggerStmt) {
+        result = _dropTrigger(stmt);
+      } else if (stmt is SavepointStmt) {
+        result = _savepoint(stmt);
+      } else if (stmt is ReleaseSavepointStmt) {
+        result = _releaseSavepoint(stmt);
+      } else if (stmt is RollbackToSavepointStmt) {
+        result = _rollbackToSavepoint(stmt);
+      } else if (stmt is AttachDatabaseStmt) {
+        result = _attachDatabase(stmt);
+      } else if (stmt is DetachDatabaseStmt) {
+        result = _detachDatabase(stmt);
+      } else if (stmt is VacuumStmt) {
+        result = _vacuum(stmt);
+      } else if (stmt is AnalyzeStmt) {
+        result = _analyze(stmt);
+      } else if (stmt is ReindexStmt) {
+        result = _reindex(stmt);
+      } else if (stmt is CreateVirtualTableStmt) {
+        result = _createVirtualTable(stmt);
+      } else {
+        throw StateError('Unknown statement: $stmt');
+      }
+    } finally {
+      SequenceExpr.providerStack.removeLast();
+      FunctionCallExpr.storedFunctionResolver = prevFnResolver;
+      BindParamExpr.userVarStack.removeLast();
     }
     return result;
   }
@@ -2439,6 +2588,14 @@ class Database {
       s is DropIndexStmt ||
       s is CreateViewStmt ||
       s is DropViewStmt ||
+      s is CreateSequenceStmt ||
+      s is DropSequenceStmt ||
+      s is CreateProcedureStmt ||
+      s is DropProcedureStmt ||
+      s is CreatePackageStmt ||
+      s is DropPackageStmt ||
+      s is MergeStmt ||
+      s is InsertAllStmt ||
       s is InsertStmt ||
       s is UpdateStmt ||
       s is DeleteStmt ||
@@ -4446,12 +4603,43 @@ class Database {
   // ---------------------------------------------------------------------------
   // DDL
   // ---------------------------------------------------------------------------
+  /// Infer a column's storage type for `CREATE TABLE … AS SELECT` from the
+  /// first non-null value produced for that column.
+  DataType _inferColumnType(List<List<Object?>> rows, int col) {
+    for (final r in rows) {
+      final v = col >= 0 && col < r.length ? r[col] : null;
+      if (v == null) continue;
+      if (v is int || v is bool) return DataType.integer;
+      if (v is double) return DataType.real;
+      if (v is List<int>) return DataType.blob;
+      return DataType.text;
+    }
+    return DataType.text;
+  }
+
   QueryResult _createTable(CreateTableStmt s) {
     if (_tables.containsKey(s.name) || _views.containsKey(s.name)) {
       if (s.ifNotExists) {
         return QueryResult.message('Table ${s.name} already exists');
       }
       throw StateError('Table ${s.name} already exists');
+    }
+    // CREATE TABLE … AS SELECT: derive the schema from the query result, then
+    // insert its rows.
+    if (s.asSelect != null) {
+      final res = _selectTopLevel(s.asSelect!);
+      final cols = <ColumnDef>[
+        for (final name in res.columns)
+          ColumnDef(name, _inferColumnType(res.rows, res.columns.indexOf(name))),
+      ];
+      final t = Table(s.name, cols);
+      _tables[s.name] = t;
+      for (final row in res.rows) {
+        t.insertRow(List<Object?>.from(row));
+      }
+      _persist();
+      return QueryResult.message(
+          'Table ${s.name} created', affected: res.rows.length);
     }
     final t = Table(
       s.name,
@@ -4592,19 +4780,131 @@ class Database {
     );
   }
 
+  /// Evaluates a routine parameter's `DEFAULT <expr>` (used when the argument
+  /// is omitted at the call site), or null when the parameter has no default.
+  Object? _routineParamDefault(RoutineParam p) {
+    if (p.defaultSql == null) return null;
+    try {
+      return _bindExpr(_parseSelectExprCached(p.defaultSql!)).eval(const {});
+    } catch (_) {
+      return null;
+    }
+  }
+
   QueryResult _alterAddColumn(AlterTableAddColumnStmt s) {
     final t = _requireTable(s.table);
-    t.addColumn(s.column);
-    if (s.column.primaryKey || s.column.unique) {
-      t.createIndex(
-        IndexDef('${t.name}__${s.column.name}', s.column.name, unique: true),
+    for (final col in s.columns) {
+      t.addColumn(col);
+      if (col.primaryKey || col.unique) {
+        t.createIndex(
+          IndexDef('${t.name}__${col.name}', col.name, unique: true),
+        );
+      }
+      // Backfill GENERATED ALWAYS values for existing rows.
+      if (col.generatedExprSql != null) {
+        _recomputeGenerated(t, col);
+      }
+    }
+    return QueryResult.message(
+        '${s.columns.length} column(s) added to ${s.table}');
+  }
+
+  QueryResult _alterModifyColumn(AlterTableModifyColumnStmt s) {
+    final t = _requireTable(s.table);
+    for (final mod in s.columns) {
+      final idx = t.columnIndex(mod.name);
+      final old = t.columns[idx];
+      // Apply the modified attributes, keeping existing ones the modifier
+      // didn't restate (DEFAULT / NOT NULL default to the old values).
+      t.columns[idx] = ColumnDef(
+        old.name,
+        mod.type,
+        primaryKey: old.primaryKey,
+        notNull: mod.notNull || old.notNull,
+        unique: old.unique,
+        autoIncrement: old.autoIncrement,
+        defaultValue: mod.defaultValue ?? old.defaultValue,
+        defaultExprSql: mod.defaultExprSql ?? old.defaultExprSql,
+        checkExprSql: old.checkExprSql,
+        references: old.references,
+        generatedExprSql: old.generatedExprSql,
+        generatedStored: old.generatedStored,
+        collate: old.collate,
+        charLength: mod.charLength,
+        numericPrecision: mod.numericPrecision,
+        numericScale: mod.numericScale,
+        declaredType: mod.declaredType ?? old.declaredType,
       );
     }
-    // Backfill GENERATED ALWAYS values for existing rows.
-    if (s.column.generatedExprSql != null) {
-      _recomputeGenerated(t, s.column);
+    t.invalidateKeyCache();
+    return QueryResult.message('Column(s) modified on ${s.table}');
+  }
+
+  QueryResult _alterDropConstraint(AlterTableDropConstraintStmt s) {
+    final t = _requireTable(s.table);
+    if (s.constraint == '__PRIMARY__') {
+      t.constraints.removeWhere((c) => c is PrimaryKeyConstraint);
     }
-    return QueryResult.message('Column ${s.column.name} added to ${s.table}');
+    // Clear a column-level CHECK recorded under this constraint name.
+    for (var i = 0; i < t.columns.length; i++) {
+      final c = t.columns[i];
+      if (c.checkName != null &&
+          c.checkName!.toLowerCase() == s.constraint.toLowerCase()) {
+        t.columns[i] = ColumnDef(
+          c.name,
+          c.type,
+          declaredType: c.declaredType,
+          primaryKey: c.primaryKey,
+          notNull: c.notNull,
+          unique: c.unique,
+          autoIncrement: c.autoIncrement,
+          defaultValue: c.defaultValue,
+          defaultExprSql: c.defaultExprSql,
+          references: c.references,
+          generatedExprSql: c.generatedExprSql,
+          generatedStored: c.generatedStored,
+          collate: c.collate,
+          charLength: c.charLength,
+          numericPrecision: c.numericPrecision,
+          numericScale: c.numericScale,
+        );
+      }
+    }
+    t.invalidateKeyCache();
+    return QueryResult.message(
+        'Constraint ${s.constraint} dropped from ${s.table}');
+  }
+
+  QueryResult _alterAddConstraint(AlterTableAddConstraintStmt s) {
+    final t = _requireTable(s.table);
+    for (final c in s.constraints) {
+      t.constraints.add(c);
+      // Back a single-column PRIMARY KEY / UNIQUE with a unique index so it is
+      // enforced on later inserts (composite keys use the row-scan path).
+      final cols = c is PrimaryKeyConstraint
+          ? c.columns
+          : (c is UniqueConstraint ? c.columns : null);
+      if (cols != null && cols.length == 1) {
+        final idxName = '${t.name}__${cols.first}';
+        if (!t.indexDefs.containsKey(idxName)) {
+          t.createIndex(IndexDef(idxName, cols.first, unique: true));
+        }
+      }
+    }
+    t.invalidateKeyCache();
+    return QueryResult.message('Constraint(s) added to ${s.table}');
+  }
+
+  QueryResult _alterSetConstraint(AlterTableSetConstraintStmt s) {
+    final t = _requireTable(s.table);
+    if (s.enable) {
+      t.disabledConstraints.remove(s.constraint);
+    } else {
+      t.disabledConstraints.add(s.constraint);
+    }
+    return QueryResult.message(
+        'Constraint ${s.constraint} ${s.enable ? 'enabled' : 'disabled'} '
+        'on ${s.table}');
   }
 
   QueryResult _alterDropColumn(AlterTableDropColumnStmt s) {
@@ -4644,6 +4944,7 @@ class Database {
       references: old.references,
       generatedExprSql: old.generatedExprSql,
       generatedStored: old.generatedStored,
+      collate: old.collate,
     );
     // Rename in autoInc + index defs that reference this column.
     if (t.autoInc.containsKey(s.oldName)) {
@@ -4692,6 +4993,11 @@ class Database {
   }
 
   QueryResult _createIndex(CreateIndexStmt s) {
+    // An index on a view / materialized view is an optimization the engine does
+    // not model (the relation is materialized on demand); accept it as a no-op.
+    if (!_tables.containsKey(s.table) && _views.containsKey(s.table)) {
+      return QueryResult.message('Index ${s.indexName} created');
+    }
     final t = _requireTable(s.table);
     final hasNonBinary = s.collations.any((c) => c.toUpperCase() != 'BINARY');
     t.createIndex(
@@ -4739,7 +5045,26 @@ class Database {
     }
     _views[s.name] = s.select;
     if (s.selectSql.isNotEmpty) _viewSql[s.name] = s.selectSql;
+    if (s.columns != null && s.columns!.isNotEmpty) {
+      _viewColumns[s.name] = s.columns!;
+    }
     return QueryResult.message('View ${s.name} created');
+  }
+
+  /// Models `CREATE SYNONYM syn FOR t` as an alias view (`SELECT * FROM t`) so
+  /// queries through the synonym resolve. Does not require the target to exist
+  /// yet (resolved lazily at query time, like any view).
+  QueryResult _createSynonym(CreateSynonymStmt s) {
+    if (_tables.containsKey(s.name) || _views.containsKey(s.name)) {
+      throw StateError('Object ${s.name} already exists');
+    }
+    final sql = 'SELECT * FROM ${s.target}';
+    final stmt = Parser.fromString(sql).parseStatement();
+    if (stmt is SelectStmt) {
+      _views[s.name] = stmt;
+      _viewSql[s.name] = sql;
+    }
+    return QueryResult.message('Synonym ${s.name} created');
   }
 
   QueryResult _dropView(DropViewStmt s) {
@@ -4751,7 +5076,494 @@ class Database {
     }
     _views.remove(s.name);
     _viewSql.remove(s.name);
+    _viewColumns.remove(s.name);
     return QueryResult.message('View ${s.name} dropped');
+  }
+
+  // ---------------------------------------------------------------------------
+  // CREATE / DROP SEQUENCE
+  // ---------------------------------------------------------------------------
+
+  QueryResult _createSequence(CreateSequenceStmt s) {
+    if (_sequences.containsKey(s.name)) {
+      if (s.ifNotExists) {
+        return QueryResult.message('Sequence ${s.name} already exists');
+      }
+      throw StateError('Sequence ${s.name} already exists');
+    }
+    _sequences[s.name] = _SequenceState(
+      startWith: s.startWith,
+      incrementBy: s.incrementBy,
+      minValue: s.minValue,
+      maxValue: s.maxValue,
+      cycle: s.cycle,
+    );
+    return QueryResult.message('Sequence ${s.name} created');
+  }
+
+  QueryResult _dropSequence(DropSequenceStmt s) {
+    if (!_sequences.containsKey(s.name)) {
+      if (s.ifExists) {
+        return QueryResult.message('Sequence ${s.name} did not exist');
+      }
+      throw StateError('No such sequence: ${s.name}');
+    }
+    _sequences.remove(s.name);
+    return QueryResult.message('Sequence ${s.name} dropped');
+  }
+
+  _SequenceState _lookupSequence(String name) {
+    final seq = _sequences[name] ??
+        _sequences[name.toUpperCase()] ??
+        _sequences[name.toLowerCase()];
+    if (seq == null) throw StateError('No such sequence: $name');
+    return seq;
+  }
+
+  @override
+  int sequenceNextval(String name) =>
+      _lookupSequence(name).next(name, _seqEpoch);
+
+  @override
+  int sequenceCurrval(String name) => _lookupSequence(name).current(name);
+
+  // ---------------------------------------------------------------------------
+  // Stored procedures / functions (MySQL CREATE PROCEDURE/FUNCTION, CALL)
+  // ---------------------------------------------------------------------------
+
+  QueryResult _createProcedure(CreateProcedureStmt s) {
+    final key = s.routine.name.toUpperCase();
+    final kind = s.routine.isFunction ? 'Function' : 'Procedure';
+    if (_routines.containsKey(key) && !s.orReplace) {
+      throw StateError('$kind ${s.routine.name} already exists');
+    }
+    _routines[key] = s.routine;
+    return QueryResult.message('$kind ${s.routine.name} created');
+  }
+
+  QueryResult _dropProcedure(DropProcedureStmt s) {
+    final key = s.name.toUpperCase();
+    final kind = s.isFunction ? 'Function' : 'Procedure';
+    if (!_routines.containsKey(key)) {
+      if (s.ifExists) {
+        return QueryResult.message('$kind ${s.name} did not exist');
+      }
+      throw StateError('No such ${kind.toLowerCase()}: ${s.name}');
+    }
+    _routines.remove(key);
+    return QueryResult.message('$kind ${s.name} dropped');
+  }
+
+  /// Register an Oracle package. The spec is accepted as a no-op; the body's
+  /// member routines are stored under qualified `PKG.MEMBER` keys (replacing any
+  /// previously-registered members of the same package), and its package-level
+  /// variables seed the persistent package state.
+  QueryResult _createPackage(CreatePackageStmt s) {
+    if (!s.isBody) {
+      return QueryResult.message('Package ${s.name} created');
+    }
+    final key = s.name.toUpperCase();
+    final prefix = '$key.';
+    _routines.removeWhere((k, _) => k.startsWith(prefix));
+    for (final r in s.routines) {
+      _routines[r.name.toUpperCase()] = r;
+    }
+    final state = <String, Object?>{};
+    for (final d in s.packageVars) {
+      state[d.name] = d.initSql == null ? null : _evalPackageInit(d.initSql!);
+    }
+    _packageState[key] = state;
+    return QueryResult.message('Package body ${s.name} created');
+  }
+
+  /// Evaluate a package-variable initializer expression to a scalar.
+  Object? _evalPackageInit(String expr) {
+    final stmt = Parser.fromString('SELECT $expr').parseStatement();
+    final res = _dispatch(stmt);
+    return res.rows.isEmpty ? null : res.rows.first.first;
+  }
+
+  /// The package name of a qualified `PKG.MEMBER` routine, or null.
+  String? _packageOf(String name) {
+    final i = name.indexOf('.');
+    return i < 0 ? null : name.substring(0, i).toUpperCase();
+  }
+
+  QueryResult _dropPackage(DropPackageStmt s) {
+    final prefix = '${s.name.toUpperCase()}.';
+    final had = _routines.keys.any((k) => k.startsWith(prefix));
+    if (!had && !s.ifExists) {
+      throw StateError('No such package: ${s.name}');
+    }
+    _routines.removeWhere((k, _) => k.startsWith(prefix));
+    _packageState.remove(s.name.toUpperCase());
+    return QueryResult.message('Package ${s.name} dropped');
+  }
+
+  /// Execute `CALL name(args)` on the top-level (async) path so the routine's
+  /// embedded statements can take the lock themselves. Argument values seed the
+  /// routine scope; a bare SELECT in the body becomes the CALL's result set.
+  Future<QueryResult> _call(CallStmt s,
+      [Map<String, Object?>? userVars]) async {
+    final routine = _routines[s.name.toUpperCase()];
+    if (routine == null) {
+      // Oracle built-in packages (DBMS_STATS, DBMS_OUTPUT, …) aren't modeled;
+      // accept such calls as a no-op rather than erroring.
+      if (s.name.toUpperCase().startsWith('DBMS_')) {
+        return QueryResult.message('CALL ${s.name}');
+      }
+      throw StateError('No such procedure: ${s.name}');
+    }
+    final argValues = <Object?>[];
+    if (s.args.isNotEmpty) {
+      final sel = SelectStmt(
+        projection: [for (final e in s.args) SelectItem.expr(e)],
+      );
+      final res = await executeStmt(sel, userVars: userVars);
+      if (res.rows.isNotEmpty) argValues.addAll(res.rows.first);
+    }
+    final scope = <String, Object?>{};
+    final pkgState = _packageStateFor(s.name);
+    if (pkgState != null) scope.addAll(pkgState);
+    for (var i = 0; i < routine.params.length; i++) {
+      scope[routine.params[i].name] = i < argValues.length
+          ? argValues[i]
+          : _routineParamDefault(routine.params[i]);
+    }
+    final out = await runRoutine(routine.block, args: scope);
+    _writeBackPackageState(pkgState, out.variables);
+    // Surface any ref-cursor (`OUT SYS_REFCURSOR` or function RETURN) as the
+    // CALL's result set; write other OUT/INOUT values back to their `@var`.
+    final cursors = <QueryResult>[];
+    if (out.returnValue is CursorValue) {
+      cursors.add((out.returnValue as CursorValue).result);
+    }
+    final target = userVars ?? _userVars;
+    for (var i = 0;
+        i < routine.params.length && i < s.args.length;
+        i++) {
+      final p = routine.params[i];
+      if (p.mode == RoutineParamMode.inParam) continue;
+      final v = out.variables[p.name];
+      if (v is CursorValue) {
+        cursors.add(v.result);
+        continue;
+      }
+      final arg = s.args[i];
+      if (arg is BindParamExpr &&
+          arg.name != null &&
+          arg.spelling.startsWith('@') &&
+          !arg.spelling.startsWith('@@')) {
+        target[arg.name!] = v;
+      }
+    }
+    if (cursors.isNotEmpty) return cursors.first;
+    if (out.resultSets.isNotEmpty) return out.resultSets.last;
+    return QueryResult.message('CALL ${s.name}');
+  }
+
+  /// Run an Oracle PL/SQL anonymous block on the top-level (async) path. A bare
+  /// SELECT in the block becomes the result set; otherwise a success message is
+  /// returned (DBMS_OUTPUT lines are captured but not yet surfaced to clients).
+  Future<QueryResult> _runPlsqlBlock(PlsqlBlockStmt s) async {
+    final out = await runRoutine(s.block);
+    if (out.returnValue is CursorValue) {
+      return (out.returnValue as CursorValue).result;
+    }
+    if (out.resultSets.isNotEmpty) return out.resultSets.last;
+    return QueryResult.message('PL/SQL block executed');
+  }
+
+  /// Synchronously invoke a stored FUNCTION from within expression evaluation
+  /// (the caller already holds the lock, so embedded SQL runs via nested
+  /// [_dispatch]). Throws when [name] is not a defined function.
+  Object? _invokeStoredFunctionSync(String name, List<Object?> args) {
+    // Oracle object-type default constructor: TYPE_NAME(attr1, …) builds a
+    // JSON object keyed by the type's declared attribute names.
+    final objType = _objectTypes[name.toUpperCase()];
+    if (objType != null) {
+      final m = <String, Object?>{};
+      for (var i = 0; i < objType.length; i++) {
+        m[objType[i].name] = i < args.length ? args[i] : null;
+      }
+      return jsonEncode(m);
+    }
+    final r = _routines[name.toUpperCase()];
+    if (r == null || !r.isFunction) {
+      throw StateError('Unknown function: $name');
+    }
+    final scope = <String, Object?>{};
+    final pkgState = _packageStateFor(name);
+    if (pkgState != null) scope.addAll(pkgState);
+    for (var i = 0; i < r.params.length; i++) {
+      scope[r.params[i].name] = i < args.length
+          ? args[i]
+          : _routineParamDefault(r.params[i]);
+    }
+    final runner = SyncRoutineRunner(
+      (sql, sc) {
+        final stmt = Parser.fromString(sql).parseStatement();
+        ColumnExpr.routineScopes.add(sc);
+        try {
+          return _dispatch(stmt);
+        } finally {
+          ColumnExpr.routineScopes.removeLast();
+        }
+      },
+      initialVars: scope,
+    );
+    final result = runner.run(r.block);
+    _writeBackPackageState(pkgState, runner.vars);
+    return result;
+  }
+
+  /// The persistent state map for the package owning [routineName], or null.
+  Map<String, Object?>? _packageStateFor(String routineName) {
+    final pkg = _packageOf(routineName);
+    return pkg == null ? null : _packageState[pkg];
+  }
+
+  /// Copy a member's final package-variable values back into [pkgState].
+  void _writeBackPackageState(
+      Map<String, Object?>? pkgState, Map<String, Object?> finalVars) {
+    if (pkgState == null) return;
+    for (final k in pkgState.keys.toList()) {
+      if (finalVars.containsKey(k)) pkgState[k] = finalVars[k];
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // MERGE
+  // ---------------------------------------------------------------------------
+
+  QueryResult _merge(MergeStmt s) {
+    final t = _requireTable(s.targetTable);
+
+    // Materialize the source rows as maps keyed by both the bare column name
+    // and the source alias (so the ON condition and SET/INSERT expressions can
+    // reference either).
+    final List<Map<String, Object?>> sourceRows;
+    if (s.sourceSubquery != null) {
+      final res = _selectTopLevel(s.sourceSubquery!);
+      sourceRows = [
+        for (final row in res.rows)
+          {
+            for (var i = 0; i < res.columns.length; i++) ...{
+              res.columns[i]: row[i],
+              if (s.sourceAlias != null)
+                '${s.sourceAlias}.${res.columns[i]}': row[i],
+            },
+          },
+      ];
+    } else {
+      sourceRows = _materializeRelation(s.sourceTable!, s.sourceAlias);
+    }
+
+    final on = _bindExpr(s.onCondition);
+    final matchedWhere =
+        s.matchedWhere == null ? null : _bindExpr(s.matchedWhere!);
+    final matchedDeleteWhere =
+        s.matchedDeleteWhere == null ? null : _bindExpr(s.matchedDeleteWhere!);
+    final notMatchedWhere =
+        s.notMatchedWhere == null ? null : _bindExpr(s.notMatchedWhere!);
+    final boundAssignments = s.matchedAssignments?.map(
+      (col, expr) => MapEntry(col, _bindExpr(expr)),
+    );
+
+    var updated = 0;
+    var inserted = 0;
+
+    // Rows to insert are accumulated and applied after the matched pass so
+    // newly inserted rows can't match a later source row (Oracle semantics).
+    final toInsert = <List<Object?>>[];
+    // Rows (by identity) deleted by a WHEN MATCHED ... DELETE WHERE sub-clause,
+    // removed after the matched pass.
+    final toDelete = <List<Object?>>[];
+
+    for (final srow in sourceRows) {
+      _beginSeqRow();
+      // Find the first target row satisfying ON, building a combined view of
+      // target columns (bare, real-name- and alias-qualified) plus the source
+      // columns already present in [srow].
+      int? matchIdx;
+      Map<String, Object?>? matchedView;
+      for (var ri = 0; ri < t.rows.length; ri++) {
+        final view = <String, Object?>{
+          ...srow,
+          ...t.rowToMap(t.rows[ri], alias: s.targetAlias),
+        };
+        if (evalPredicate(on, view)) {
+          matchIdx = ri;
+          matchedView = view;
+          break;
+        }
+      }
+
+      if (matchIdx != null) {
+        if (boundAssignments == null) continue; // no WHEN MATCHED clause
+        if (matchedWhere != null &&
+            !evalPredicate(matchedWhere, matchedView!)) {
+          continue;
+        }
+        final row = t.rows[matchIdx];
+        final old = List<Object?>.from(row);
+        _fireTriggers(t.name, 'UPDATE', 'BEFORE',
+            oldRow: old, newRow: row, sourceTable: t);
+        boundAssignments.forEach((col, expr) {
+          final colIdx = t.columnIndex(col);
+          if (t.columns[colIdx].generatedExprSql != null) {
+            throw StateError(
+              'cannot UPDATE generated column "${t.columns[colIdx].name}"',
+            );
+          }
+          row[colIdx] = coerceForColumn(
+            _evalScalar(expr, matchedView!),
+            t.columns[colIdx],
+            strict: t.strict,
+            tableHasRowid: !t.withoutRowid,
+          );
+        });
+        _captureVectorRowUpdate(t.name, matchIdx);
+        _evaluateGenerated(t, row);
+        _enforceChecks(t, row);
+        _enforceVectorDims(t, row);
+        _enforceForeignKeysOnInsert(t, row);
+        _cascadeOnUpdate(t, old, row);
+        _fireTriggers(t.name, 'UPDATE', 'AFTER',
+            oldRow: old, newRow: row, sourceTable: t);
+        _recordChange(t, 'UPDATE', old, row);
+        updated++;
+        // Oracle MERGE ... DELETE WHERE: delete the just-updated row when it
+        // satisfies the delete predicate (evaluated on the new values).
+        if (matchedDeleteWhere != null) {
+          final newView = <String, Object?>{
+            ...srow,
+            ...t.rowToMap(row, alias: s.targetAlias),
+          };
+          if (evalPredicate(matchedDeleteWhere, newView)) {
+            toDelete.add(row);
+          }
+        }
+      } else if (s.insertValues != null) {
+        if (notMatchedWhere != null && !evalPredicate(notMatchedWhere, srow)) {
+          continue;
+        }
+        // Map the INSERT column list (or all target columns) to evaluated
+        // source-row values, filling defaults for unlisted columns.
+        final cols = s.insertColumns ?? [for (final c in t.columns) c.name];
+        final built = <String, Object?>{};
+        for (var i = 0; i < cols.length; i++) {
+          built[cols[i]] = _evalScalar(_bindExpr(s.insertValues![i]), srow);
+        }
+        final newRow = <Object?>[];
+        for (final c in t.columns) {
+          newRow.add(built.containsKey(c.name) ? built[c.name] : null);
+        }
+        toInsert.add(newRow);
+      }
+    }
+
+    // Apply the collected inserts through the normal INSERT path so all
+    // constraints, indexes, defaults and triggers are enforced.
+    for (final values in toInsert) {
+      final insert = InsertStmt(
+        s.targetTable,
+        [for (final c in t.columns) c.name],
+        [
+          [for (final v in values) LiteralExpr(v)],
+        ],
+      );
+      _insert(insert);
+      inserted++;
+    }
+
+    // Apply DELETE-sub-clause removals (identity match against the live rows).
+    var deleted = 0;
+    if (toDelete.isNotEmpty) {
+      for (final dead in toDelete) {
+        final idx = t.rows.indexOf(dead);
+        if (idx < 0) continue;
+        final old = List<Object?>.from(dead);
+        _fireTriggers(t.name, 'DELETE', 'BEFORE',
+            oldRow: old, newRow: null, sourceTable: t);
+        _enforceForeignKeysOnDelete(t, dead);
+        t.rows.removeAt(idx);
+        _fireTriggers(t.name, 'DELETE', 'AFTER',
+            oldRow: old, newRow: null, sourceTable: t);
+        _recordChange(t, 'DELETE', old, null);
+        deleted++;
+      }
+    }
+
+    if (updated > 0 || deleted > 0) _rebuildIndexes(t);
+    final affected = updated + inserted + deleted;
+    return QueryResult.message(
+      '$affected row(s) merged ($updated updated, $inserted inserted, '
+      '$deleted deleted)',
+      affected: affected,
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // INSERT ALL / INSERT FIRST (Oracle multi-table insert)
+  // ---------------------------------------------------------------------------
+
+  QueryResult _insertAll(InsertAllStmt s) {
+    final res = _selectTopLevel(s.select);
+    var inserted = 0;
+
+    void applyInto(
+        InsertAllInto into, Map<String, Object?> srow, List<Object?> rowVals) {
+      final t = _requireTable(into.table);
+      // Target columns: explicit list, else all columns in order.
+      final cols = into.columns ?? [for (final c in t.columns) c.name];
+      // Values: explicit VALUES exprs evaluated against the source row, else
+      // the driving subquery's selected row taken positionally.
+      final List<Object?> vals;
+      if (into.values != null) {
+        vals = [for (final e in into.values!) _evalScalar(_bindExpr(e), srow)];
+      } else {
+        vals = rowVals;
+      }
+      if (vals.length != cols.length) {
+        throw StateError(
+          'INSERT ALL INTO ${into.table}: ${cols.length} columns but '
+          '${vals.length} values',
+        );
+      }
+      _insert(InsertStmt(
+        into.table,
+        cols,
+        [
+          [for (final v in vals) LiteralExpr(v)],
+        ],
+      ));
+      inserted++;
+    }
+
+    for (final rowVals in res.rows) {
+      _beginSeqRow();
+      // Scope for WHEN / VALUES: driving columns by bare name.
+      final srow = <String, Object?>{
+        for (var i = 0; i < res.columns.length; i++) res.columns[i]: rowVals[i],
+      };
+      var matchedAny = false;
+      for (final clause in s.clauses) {
+        if (clause.isElse) {
+          if (matchedAny) continue; // ELSE fires only when no WHEN matched
+        } else if (clause.when != null) {
+          if (!evalPredicate(_bindExpr(clause.when!), srow)) continue;
+          matchedAny = true;
+        }
+        for (final into in clause.intos) {
+          applyInto(into, srow, rowVals);
+        }
+        // INSERT FIRST: stop after the first matching conditional arm.
+        if (s.first && clause.when != null) break;
+      }
+    }
+
+    return QueryResult.message('$inserted row(s) inserted', affected: inserted);
   }
 
   // ---------------------------------------------------------------------------
@@ -4793,6 +5605,10 @@ class Database {
 
     var inserted = 0;
     final returnedRows = <List<Object?>>[];
+    // Plain INSERT must be statement-atomic: if any row fails, undo rows this
+    // statement already added. OR IGNORE / OR REPLACE / UPSERT keep their own
+    // per-row conflict semantics and are excluded from the rollback.
+    final insertSnapshotLen = t.rows.length;
     final returningExprs = <Expr>[];
     final returningCols = <String>[];
     if (s.returning != null) {
@@ -4809,8 +5625,10 @@ class Database {
       }
     }
 
-    for (final values in sourceRows) {
-      final row = List<Object?>.filled(t.columns.length, null, growable: true);
+    try {
+      for (final values in sourceRows) {
+        _beginSeqRow();
+        final row = List<Object?>.filled(t.columns.length, null, growable: true);
       // Apply column defaults first.
       for (var i = 0; i < t.columns.length; i++) {
         final c = t.columns[i];
@@ -4833,6 +5651,7 @@ class Database {
               _evalScalar(values[i]),
               t.columns[i],
               strict: t.strict,
+              tableHasRowid: !t.withoutRowid,
             );
           }
         }
@@ -4852,6 +5671,7 @@ class Database {
             _evalScalar(values[i]),
             t.columns[colIdx],
             strict: t.strict,
+            tableHasRowid: !t.withoutRowid,
           );
         }
       }
@@ -4867,11 +5687,31 @@ class Database {
           if ((row[i] as int) > cur) t.autoInc[c.name] = row[i] as int;
         }
       }
+      // A plain INTEGER PRIMARY KEY is a rowid alias: SQLite auto-assigns the
+      // rowid (max + 1) when it is omitted/NULL, even without AUTOINCREMENT.
+      if (!t.withoutRowid) {
+        for (var i = 0; i < t.columns.length; i++) {
+          final c = t.columns[i];
+          if (c.primaryKey &&
+              c.type == DataType.integer &&
+              !c.autoIncrement &&
+              row[i] == null) {
+            row[i] = _maxIntColumn(t, i) + 1;
+          }
+        }
+      }
       _evaluateGenerated(t, row);
       _enforceChecks(t, row);
       _enforceVectorDims(t, row);
       _enforceForeignKeysOnInsert(t, row);
       _fireTriggers(t.name, 'INSERT', 'BEFORE', newRow: row, sourceTable: t);
+
+      // Composite PRIMARY KEY / UNIQUE tuples aren't backed by a row-store
+      // index, so detect duplicates explicitly on the plain path (single
+      // columns are enforced by insertRow's index build).
+      if (s.onConflict == null && s.mode == InsertMode.normal) {
+        _assertNoCompositeConflict(t, row);
+      }
 
       try {
         t.insertRow(row);
@@ -4934,6 +5774,18 @@ class Database {
         }
         rethrow;
       }
+    }
+    } catch (_) {
+      // Plain INSERT is statement-atomic: undo any rows this statement already
+      // committed before surfacing the error. OR IGNORE / OR REPLACE / UPSERT
+      // manage their own per-row conflicts and never trigger this rollback.
+      if (s.onConflict == null &&
+          s.mode == InsertMode.normal &&
+          t.rows.length > insertSnapshotLen) {
+        t.rows.removeRange(insertSnapshotLen, t.rows.length);
+        _rebuildIndexes(t);
+      }
+      rethrow;
     }
     if (s.returning != null) {
       return QueryResult(
@@ -5018,6 +5870,73 @@ class Database {
     }
   }
 
+  /// Throw if committing [newRow] into [t] (an UPDATE of the row at
+  /// [excludeRi], or a candidate row when [excludeRi] is -1) would duplicate
+  /// an existing PRIMARY KEY / UNIQUE value. Covers column-level keys and
+  /// table-level composite keys. NULLs never conflict. Used to validate a
+  /// proposed row image BEFORE it is committed, so a violation rejects the
+  /// statement instead of corrupting stored data.
+  void _assertRowUniqueExcluding(Table t, List<Object?> newRow, int excludeRi) {
+    for (var i = 0; i < t.columns.length; i++) {
+      final c = t.columns[i];
+      if (!(c.primaryKey || c.unique)) continue;
+      final v = newRow[i];
+      if (v == null) continue;
+      for (var ri = 0; ri < t.rows.length; ri++) {
+        if (ri == excludeRi) continue;
+        final ev = t.rows[ri][i];
+        if (ev != null && sqlEq(ev, v)) {
+          throw StateError(
+            c.primaryKey
+                ? 'PRIMARY KEY constraint failed: ${t.name}.${c.name}'
+                : 'UNIQUE constraint failed: ${t.name}.${c.name}',
+          );
+        }
+      }
+    }
+    _assertNoCompositeConflict(t, newRow, excludeRi: excludeRi);
+  }
+
+  /// Throw if [row] duplicates an existing table-level composite PRIMARY KEY
+  /// or UNIQUE tuple (single-column keys are enforced by the row-store index).
+  /// Skips the row at [excludeRi] (for in-place UPDATE). Any NULL in the key
+  /// makes it unconstrained, per SQL.
+  void _assertNoCompositeConflict(
+    Table t,
+    List<Object?> row, {
+    int excludeRi = -1,
+  }) {
+    for (final con in t.constraints) {
+      List<String>? cols;
+      final isPk = con is PrimaryKeyConstraint;
+      if (con is PrimaryKeyConstraint) cols = con.columns;
+      if (con is UniqueConstraint) cols = con.columns;
+      if (cols == null || cols.length < 2) continue;
+      final idxs = cols.map(t.columnIndex).toList();
+      final key = idxs.map((i) => row[i]).toList();
+      if (key.any((v) => v == null)) continue;
+      for (var ri = 0; ri < t.rows.length; ri++) {
+        if (ri == excludeRi) continue;
+        final existing = t.rows[ri];
+        var match = true;
+        for (var k = 0; k < idxs.length; k++) {
+          final ev = existing[idxs[k]];
+          if (ev == null || !sqlEq(ev, key[k] as Object)) {
+            match = false;
+            break;
+          }
+        }
+        if (match) {
+          throw StateError(
+            isPk
+                ? 'PRIMARY KEY constraint failed: ${t.name}(${cols.join(", ")})'
+                : 'UNIQUE constraint failed: ${t.name}(${cols.join(", ")})',
+          );
+        }
+      }
+    }
+  }
+
   /// Like [_findUniqueConflicts] but optionally restricted to a specific
   /// `ON CONFLICT (cols)` target. Empty [target] => any unique conflict.
   Set<int> _findUniqueConflictsForTarget(
@@ -5076,6 +5995,7 @@ class Database {
         _bindExpr(expr).eval(ctx),
         t.columns[ci],
         strict: t.strict,
+        tableHasRowid: !t.withoutRowid,
       );
     });
     _evaluateGenerated(t, newRow);
@@ -5149,8 +6069,25 @@ class Database {
       var skip = s.offset == null
           ? 0
           : ((_evalScalar(s.offset!, const {}) as num?)?.toInt() ?? 0);
+      // Oracle ROWNUM in `SET col = ROWNUM` lowers to ROW_NUMBER() OVER ();
+      // supply it a running 1-based counter over the updated rows. Bind the
+      // assignment expressions once so the window nodes keep a stable identity.
+      final boundAssign = <String, Expr>{
+        for (final e in s.assignments.entries) e.key: _bindExpr(e.value)
+      };
+      final assignWinFns = <FunctionCallExpr>[];
+      for (final expr in boundAssign.values) {
+        _collectWindowFns(expr, assignWinFns);
+      }
+      var rownumCtr = 0;
+      final prevWinValues = FunctionCallExpr.windowRowValues;
+      if (assignWinFns.isNotEmpty) {
+        FunctionCallExpr.windowRowValues = <FunctionCallExpr, Object?>{};
+      }
+      try {
       for (final ri in rowOrder) {
         if (lim == 0 || (lim > 0 && count >= lim)) break;
+        _beginSeqRow();
         final row = t.rows[ri];
         final view = t.rowToMap(row);
         // For UPDATE ... FROM other, look for the first `other` row that
@@ -5180,12 +6117,19 @@ class Database {
           continue;
         }
         final old = List<Object?>.from(row);
+        final newRow = List<Object?>.from(row);
+        if (assignWinFns.isNotEmpty) {
+          rownumCtr++;
+          for (final fn in assignWinFns) {
+            FunctionCallExpr.windowRowValues![fn] = rownumCtr;
+          }
+        }
         _fireTriggers(
           t.name,
           'UPDATE',
           'BEFORE',
           oldRow: old,
-          newRow: row,
+          newRow: newRow,
           sourceTable: t,
         );
         s.assignments.forEach((col, expr) {
@@ -5195,20 +6139,29 @@ class Database {
               'cannot UPDATE generated column "${t.columns[colIdx].name}"',
             );
           }
-          row[colIdx] = coerceForColumn(
-            _evalScalar(expr, matchedView!),
+          newRow[colIdx] = coerceForColumn(
+            boundAssign[col]!.eval(matchedView!),
             t.columns[colIdx],
             strict: t.strict,
+            tableHasRowid: !t.withoutRowid,
           );
         });
+        _evaluateGenerated(t, newRow);
+        // Validate the proposed image BEFORE committing it, so a failed
+        // CHECK / UNIQUE / PK rejects the row instead of corrupting the
+        // stored data (UPDATE is validate-then-commit, per row).
+        _enforceChecks(t, newRow);
+        _enforceVectorDims(t, newRow);
+        _enforceForeignKeysOnInsert(t, newRow);
+        _assertRowUniqueExcluding(t, newRow, ri);
         // V23: capture position so the vector-index invalidation hook
         // can replay a targeted remove+add instead of dropping the
         // entire index.
         _captureVectorRowUpdate(t.name, ri);
-        _evaluateGenerated(t, row);
-        _enforceChecks(t, row);
-        _enforceVectorDims(t, row);
-        _enforceForeignKeysOnInsert(t, row);
+        // Commit in place, preserving the row list's identity.
+        for (var k = 0; k < newRow.length; k++) {
+          row[k] = newRow[k];
+        }
         _cascadeOnUpdate(t, old, row);
         _fireTriggers(
           t.name,
@@ -5234,6 +6187,11 @@ class Database {
         );
       }
       return QueryResult.message('$count row(s) updated', affected: count);
+      } finally {
+        if (assignWinFns.isNotEmpty) {
+          FunctionCallExpr.windowRowValues = prevWinValues;
+        }
+      }
     } finally {
       if (pushed) _cteStack.removeLast();
     }
@@ -5456,6 +6414,10 @@ class Database {
   }
 
   void _enforceForeignKeysOnInsert(Table child, List<Object?> row) {
+    if (!_fkEnabled) return;
+    // A disabled constraint (ALTER TABLE … DISABLE CONSTRAINT) suspends the
+    // table's FK checks — the circular-FK deferred-load flow.
+    if (child.disabledConstraints.isNotEmpty) return;
     if (_deferFks && inTransaction) {
       _deferredFkChecks.add(_DeferredFk(child.name, List<Object?>.from(row)));
       return;
@@ -5501,6 +6463,7 @@ class Database {
   }
 
   void _enforceForeignKeysOnDelete(Table parent, List<Object?> parentRow) {
+    if (!_fkEnabled) return;
     for (final child in _tables.values) {
       for (final fk in _foreignKeysOf(child)) {
         if (fk.references.table != parent.name) continue;
@@ -5563,6 +6526,7 @@ class Database {
     List<Object?> oldRow,
     List<Object?> newRow,
   ) {
+    if (!_fkEnabled) return;
     final pkCols = _primaryKeyColumns(parent);
     if (pkCols.isEmpty) return;
     final oldPk = pkCols.map((c) => oldRow[parent.columnIndex(c)]).toList();
@@ -5632,12 +6596,72 @@ class Database {
   // ---------------------------------------------------------------------------
   // SELECT (top-level entry — handles UNION chaining)
   // ---------------------------------------------------------------------------
+
+  /// Attaches declared per-column types to a simple single-table SELECT result
+  /// (no joins, no subquery): maps each direct column projection to its source
+  /// [ColumnDef.declaredType] (following aliases), and `*` to every column in
+  /// order. Expression columns get null, and anything more complex leaves
+  /// [QueryResult.columnTypes] null for the consumer to fall back to value
+  /// inference.
+  QueryResult _attachColumnTypes(SelectStmt s, QueryResult res) {
+    if (res.columnTypes != null || res.columns.isEmpty) return res;
+    if (s.joins.isNotEmpty || s.fromSubquery != null) return res;
+    final from = s.fromTable;
+    if (from == null) return res;
+    var table = _tables[from];
+    if (table == null) {
+      for (final e in _tables.entries) {
+        if (e.key.toLowerCase() == from.toLowerCase()) {
+          table = e.value;
+          break;
+        }
+      }
+    }
+    if (table == null) return res;
+    final byName = <String, String?>{
+      for (final c in table.columns) c.name.toLowerCase(): c.declaredType,
+    };
+    final types = <String?>[];
+    for (final p in s.projection) {
+      if (p.isStar) {
+        for (final c in table.columns) {
+          types.add(c.declaredType);
+        }
+        continue;
+      }
+      final e = p.expr;
+      types.add(e is ColumnExpr ? byName[e.name.toLowerCase()] : null);
+    }
+    // A shape mismatch (e.g. `*` that expanded differently) or an all-null
+    // result is not worth attaching.
+    if (types.length != res.columns.length || types.every((e) => e == null)) {
+      return res;
+    }
+    return QueryResult(
+      columns: res.columns,
+      columnTypes: types,
+      rows: res.rows,
+      affected: res.affected,
+      message: res.message,
+    );
+  }
+
   QueryResult _selectTopLevel(
     SelectStmt s, [
     Map<String, Object?> outer = const {},
   ]) {
     if (s.cteMaterialized.isNotEmpty) {
       _lastCteHints = Map<String, bool>.from(s.cteMaterialized);
+    }
+    // Inline WITH FUNCTION routines are registered for the duration of the
+    // query (removed afterwards so they don't leak into later statements).
+    final inlineFnKeys = <String>[];
+    for (final r in s.withFunctions) {
+      final key = r.name.toUpperCase();
+      if (!_routines.containsKey(key)) {
+        _routines[key] = r;
+        inlineFnKeys.add(key);
+      }
     }
     final pushed = _pushCtes(
       s.ctes,
@@ -5689,6 +6713,9 @@ class Database {
       return acc;
     } finally {
       if (pushed) _cteStack.removeLast();
+      for (final k in inlineFnKeys) {
+        _routines.remove(k);
+      }
     }
   }
 
@@ -5789,7 +6816,11 @@ class Database {
     for (final entry in ctes.entries) {
       final body = entry.value;
       _CteRel rel;
-      if (recursive && _isRecursiveCte(entry.key, body)) {
+      // Oracle auto-detects recursion from a self-reference in a UNION [ALL]
+      // arm; the SQLite-style RECURSIVE keyword is optional. [_isRecursiveCte]
+      // only fires on a genuine self-reference, so honouring it unconditionally
+      // is safe for both dialects.
+      if (_isRecursiveCte(entry.key, body)) {
         rel = _materializeRecursive(
           entry.key,
           body,
@@ -5957,6 +6988,47 @@ class Database {
           rows: out,
           affected: out.length,
         );
+      case 'INTERSECT ALL':
+        // Multiset intersection: each row appears min(countLeft, countRight)
+        // times. Consume one right-side occurrence per matched left row.
+        final rCounts = <String, int>{};
+        for (final r in right.rows) {
+          rCounts[key(r)] = (rCounts[key(r)] ?? 0) + 1;
+        }
+        final out = <List<Object?>>[];
+        for (final r in left.rows) {
+          final k = key(r);
+          if ((rCounts[k] ?? 0) > 0) {
+            rCounts[k] = rCounts[k]! - 1;
+            out.add(r);
+          }
+        }
+        return QueryResult(
+          columns: left.columns,
+          rows: out,
+          affected: out.length,
+        );
+      case 'EXCEPT ALL':
+        // Multiset difference: each row appears max(countLeft - countRight, 0)
+        // times. Consume one right-side occurrence per removed left row.
+        final rCounts = <String, int>{};
+        for (final r in right.rows) {
+          rCounts[key(r)] = (rCounts[key(r)] ?? 0) + 1;
+        }
+        final out = <List<Object?>>[];
+        for (final r in left.rows) {
+          final k = key(r);
+          if ((rCounts[k] ?? 0) > 0) {
+            rCounts[k] = rCounts[k]! - 1;
+          } else {
+            out.add(r);
+          }
+        }
+        return QueryResult(
+          columns: left.columns,
+          rows: out,
+          affected: out.length,
+        );
     }
     throw StateError('Unknown set op: $op');
   }
@@ -6000,21 +7072,77 @@ class Database {
     }
 
     final allKeyStrings = allKeys.map(key).toSet();
+    // Rewrite GROUPING(expr) / GROUPING_ID(...) calls in a HAVING predicate to
+    // the literal flag for the current grouping set, so HAVING can filter
+    // ROLLUP/CUBE superaggregate rows (the default scalar always returns 0).
+    Expr rewriteGrouping(Expr e, Set<String> setKeys) {
+      if (e is FunctionCallExpr) {
+        final nm = e.name.toUpperCase();
+        if (nm == 'GROUPING' && e.args.length == 1) {
+          final ak = key(e.args.first);
+          final rolled = allKeyStrings.contains(ak) && !setKeys.contains(ak);
+          return LiteralExpr(rolled ? 1 : 0);
+        }
+        if (nm == 'GROUPING_ID' && e.args.isNotEmpty) {
+          var bits = 0;
+          for (final arg in e.args) {
+            final ak = key(arg);
+            final rolled = allKeyStrings.contains(ak) && !setKeys.contains(ak);
+            bits = (bits << 1) | (rolled ? 1 : 0);
+          }
+          return LiteralExpr(bits);
+        }
+        return e;
+      }
+      if (e is BinaryExpr) {
+        return BinaryExpr(e.op, rewriteGrouping(e.left, setKeys),
+            rewriteGrouping(e.right, setKeys));
+      }
+      if (e is UnaryExpr) {
+        return UnaryExpr(e.op, rewriteGrouping(e.operand, setKeys));
+      }
+      return e;
+    }
+    // ORDER BY on a grouping column that isn't projected (allowed under plain
+    // GROUP BY): project it as a hidden trailing sort column, then trim it.
+    final projectedKeys = {
+      for (final p in s.projection)
+        if (p.expr != null) key(p.expr!)
+    };
+    final hiddenExprs = <ColumnExpr>[];
+    for (final ob in s.orderBy) {
+      final e = ob.expr;
+      if (e is ColumnExpr &&
+          allKeyStrings.contains(key(e)) &&
+          !projectedKeys.contains(key(e)) &&
+          !hiddenExprs.any((h) => key(h) == key(e))) {
+        hiddenExprs.add(e);
+      }
+    }
+    final effProjection = hiddenExprs.isEmpty
+        ? s.projection
+        : [
+            ...s.projection,
+            for (final e in hiddenExprs) SelectItem.expr(e, alias: e.name),
+          ];
     final unionRows = <List<Object?>>[];
     List<String>? cols;
     for (final set in s.groupingSets!) {
       final setKeyStrings = set.map(key).toSet();
+      final perSetHaving = s.having == null
+          ? null
+          : rewriteGrouping(s.having!, setKeyStrings);
       // Build a copy with this set's GROUP BY active and groupingSets
       // cleared so we hit the normal aggregation path.
       final perSet = SelectStmt(
-        projection: s.projection,
+        projection: effProjection,
         fromTable: s.fromTable,
         fromSubquery: s.fromSubquery,
         fromAlias: s.fromAlias,
         joins: s.joins,
         where: s.where,
         groupBy: List<Expr>.from(set),
-        having: s.having,
+        having: perSetHaving,
         orderBy: const [],
         limit: null,
         offset: null,
@@ -6042,6 +7170,9 @@ class Database {
       // (i.e. NOT in setKeyStrings). If so, overwrite the column's
       // value with 1 instead of the default 0.
       final groupingOne = <int>[];
+      // GROUPING_ID(a, b, …) bit vector: MSB is the first argument. Each arg
+      // contributes 1 when rolled up in the current set.
+      final groupingIdVals = <int, int>{};
       for (var i = 0; i < s.projection.length; i++) {
         final p = s.projection[i];
         if (p.expr == null) continue;
@@ -6058,14 +7189,54 @@ class Database {
             groupingOne.add(i);
           }
         }
+        if (pe is FunctionCallExpr &&
+            pe.name.toUpperCase() == 'GROUPING_ID' &&
+            pe.args.isNotEmpty) {
+          var bits = 0;
+          for (final arg in pe.args) {
+            final ak = key(arg);
+            final rolledUp =
+                allKeyStrings.contains(ak) && !setKeyStrings.contains(ak);
+            bits = (bits << 1) | (rolledUp ? 1 : 0);
+          }
+          groupingIdVals[i] = bits;
+        }
       }
-      for (final row in res.rows) {
+      // Hidden sort columns are NULL for the sets that roll their key up.
+      for (var h = 0; h < hiddenExprs.length; h++) {
+        if (!setKeyStrings.contains(key(hiddenExprs[h]))) {
+          blank.add(s.projection.length + h);
+        }
+      }
+      // The empty grouping set `()` is a single grand-total group: when the
+      // projection has no aggregate to collapse it, keep just one row.
+      final setRows =
+          set.isEmpty && res.rows.length > 1 ? res.rows.take(1) : res.rows;
+      // An empty grouping set with a non-aggregate HAVING (e.g. filtering by
+      // GROUPING(g)) isn't run through the aggregate HAVING path, so apply the
+      // rewritten predicate to the grand-total row here.
+      final postFilterHaving = set.isEmpty &&
+              perSetHaving != null &&
+              !_containsAggregate(perSetHaving)
+          ? _bindExpr(perSetHaving)
+          : null;
+      for (final row in setRows) {
         final r = List<Object?>.from(row);
         for (final i in blank) {
           r[i] = null;
         }
         for (final i in groupingOne) {
           r[i] = 1;
+        }
+        groupingIdVals.forEach((i, bits) {
+          r[i] = bits;
+        });
+        if (postFilterHaving != null) {
+          final rowMap = <String, Object?>{
+            for (var ci = 0; ci < (cols?.length ?? 0) && ci < r.length; ci++)
+              cols![ci]: r[ci],
+          };
+          if (!evalPredicate(postFilterHaving, rowMap)) continue;
         }
         unionRows.add(r);
       }
@@ -6075,13 +7246,118 @@ class Database {
     if (s.orderBy.isNotEmpty || s.limit != null || s.offset != null) {
       combined = _applyCompoundOrderLimit(combined, s);
     }
+    // Drop the hidden sort columns added for non-projected ORDER BY keys.
+    if (hiddenExprs.isNotEmpty) {
+      final n = s.projection.length;
+      combined = QueryResult(
+        columns: combined.columns.sublist(0, n),
+        rows: [for (final r in combined.rows) r.sublist(0, n)],
+      );
+    }
     return combined;
+  }
+
+  /// Wraps references to CHAR(n) columns of this single-table query in an RTRIM
+  /// collation so their comparisons are blank-padded (Oracle CHAR semantics).
+  /// Only applied to the simple `FROM <table>` shape.
+  SelectStmt _applyCharPadding(SelectStmt s) {
+    if (s.fromTable == null ||
+        s.joins.isNotEmpty ||
+        s.fromSubquery != null ||
+        s.fromFunction != null) {
+      return s;
+    }
+    final t = _tables[s.fromTable];
+    if (t == null) return s;
+    const charTypes = {'CHAR', 'NCHAR', 'CHARACTER'};
+    final charCols = <String>{
+      for (final c in t.columns)
+        if (charTypes.contains(c.declaredType?.toUpperCase()))
+          c.name.toLowerCase(),
+    };
+    if (charCols.isEmpty) return s;
+    Expr? wrap(Expr? e) => e == null ? null : _rtrimCharCols(e, charCols);
+    return SelectStmt(
+      projection: [
+        for (final p in s.projection)
+          p.expr == null
+              ? p
+              : SelectItem.expr(_rtrimCharCols(p.expr!, charCols),
+                  alias: p.alias),
+      ],
+      fromTable: s.fromTable,
+      fromSubquery: s.fromSubquery,
+      fromAlias: s.fromAlias,
+      joins: s.joins,
+      where: wrap(s.where),
+      groupBy: s.groupBy,
+      having: wrap(s.having),
+      orderBy: s.orderBy,
+      limit: s.limit,
+      offset: s.offset,
+      distinct: s.distinct,
+      limitPercent: s.limitPercent,
+      setOp: s.setOp,
+      setOpRight: s.setOpRight,
+      ctes: s.ctes,
+      cteColumns: s.cteColumns,
+      ctesRecursive: s.ctesRecursive,
+      cteMaterialized: s.cteMaterialized,
+      fromFunction: s.fromFunction,
+      namedWindows: s.namedWindows,
+      indexedBy: s.indexedBy,
+      groupingSets: s.groupingSets,
+      connectBy: s.connectBy,
+      withFunctions: s.withFunctions,
+      rownumLimit: s.rownumLimit,
+    );
+  }
+
+  /// Recursively wraps every `ColumnExpr` naming a CHAR column in [charCols]
+  /// with an RTRIM collation (so comparisons blank-pad trailing spaces).
+  Expr _rtrimCharCols(Expr e, Set<String> charCols) {
+    if (e is ColumnExpr) {
+      return charCols.contains(e.name.toLowerCase())
+          ? CollateExpr(e, 'RTRIM')
+          : e;
+    }
+    if (e is BinaryExpr) {
+      return BinaryExpr(e.op, _rtrimCharCols(e.left, charCols),
+          _rtrimCharCols(e.right, charCols));
+    }
+    if (e is UnaryExpr) {
+      return UnaryExpr(e.op, _rtrimCharCols(e.operand, charCols));
+    }
+    if (e is CaseExpr) {
+      return CaseExpr(
+        [for (final w in e.whens) _rtrimCharCols(w, charCols)],
+        [for (final th in e.thens) _rtrimCharCols(th, charCols)],
+        e.elseExpr == null ? null : _rtrimCharCols(e.elseExpr!, charCols),
+      );
+    }
+    if (e is InExpr) {
+      return InExpr(_rtrimCharCols(e.value, charCols),
+          [for (final v in e.values) _rtrimCharCols(v, charCols)],
+          negated: e.negated);
+    }
+    if (e is BetweenExpr) {
+      return BetweenExpr(
+        _rtrimCharCols(e.value, charCols),
+        _rtrimCharCols(e.low, charCols),
+        _rtrimCharCols(e.high, charCols),
+        negated: e.negated,
+      );
+    }
+    return e;
   }
 
   QueryResult _selectInnerCore(
     SelectStmt s, [
     Map<String, Object?> outer = const {},
   ]) {
+    // Oracle CHAR(n) comparison is blank-padded: wrap references to this
+    // query's CHAR columns in an RTRIM collation so `CHAR(5) 'ab   ' = 'ab'`.
+    s = _applyCharPadding(s);
     _planTrace = const [];
     _planScanOrderedAsc = const [];
     _planScanEqualityCols = const {};
@@ -6091,34 +7367,47 @@ class Database {
     // shape `SELECT [DISTINCT] <indexed_col> FROM <table> [ORDER BY ... ]
     // [LIMIT ...]`, we can answer entirely from the index without
     // touching the row store.
-    final cov = _tryCoveringScan(s);
-    if (cov != null) return cov;
+    //
+    // A hierarchical (CONNECT BY) query changes the row multiset, so none of
+    // the table-level fast paths below are valid for it. A ROWNUM input limit
+    // also disables the aggregate fast paths so the row cap is applied before
+    // the aggregate (see the truncation after WHERE below). A MATCH_RECOGNIZE
+    // clause likewise reshapes the source relation (one row per match), so the
+    // table-level fast paths must not short-circuit it.
+    if (s.connectBy == null && s.matchRecognize == null) {
+      final cov = _tryCoveringScan(s);
+      if (cov != null) return cov;
 
-    // Phase 1.2: bare COUNT(*) fast path on in-memory tables. Avoids
-    // hydrating any row map — counts directly from the index posting
-    // lists (when WHERE is index-classifiable) or from t.rows.length
-    // (when there is no WHERE). Falls through to the generic aggregate
-    // path on any shape mismatch.
-    final cnt = _tryCountStarFast(s, outer);
-    if (cnt != null) return cnt;
+      if (s.rownumLimit == null) {
+        // Phase 1.2: bare COUNT(*) fast path on in-memory tables. Avoids
+        // hydrating any row map — counts directly from the index posting
+        // lists (when WHERE is index-classifiable) or from t.rows.length
+        // (when there is no WHERE). Falls through to the generic aggregate
+        // path on any shape mismatch.
+        final cnt = _tryCountStarFast(s, outer);
+        if (cnt != null) return cnt;
 
-    // Phase 1.3: bare MIN(col) / MAX(col) fast path on in-memory tables
-    // backed by a single-column non-partial, non-NOCASE index. Reads
-    // the first / last non-null entry of the SplayTreeMap directly
-    // instead of scanning every row.
-    final mm = _tryMinMaxFast(s);
-    if (mm != null) return mm;
+        // Phase 1.3: bare MIN(col) / MAX(col) fast path on in-memory tables
+        // backed by a single-column non-partial, non-NOCASE index. Reads
+        // the first / last non-null entry of the SplayTreeMap directly
+        // instead of scanning every row.
+        final mm = _tryMinMaxFast(s);
+        if (mm != null) return mm;
 
-    // Phase 2.4: bare aggregate with WHERE on the same indexed column.
-    // Walks only the matching subrange of the index — no row hydration.
-    final agw = _tryAggregateWithWhereFast(s);
-    if (agw != null) return agw;
+        // Phase 2.4: bare aggregate with WHERE on the same indexed column.
+        // Walks only the matching subrange of the index — no row hydration.
+        final agw = _tryAggregateWithWhereFast(s);
+        if (agw != null) return agw;
+      }
+    }
 
     // Phase 3.1: `SELECT col, COUNT(*) FROM t GROUP BY col` on a
     // single-column non-NOCASE non-partial index — one row per index
     // key with `posting.length`, in ascending key order.
-    final gbc = _tryGroupByCountFast(s);
-    if (gbc != null) return gbc;
+    if (s.rownumLimit == null) {
+      final gbc = _tryGroupByCountFast(s);
+      if (gbc != null) return gbc;
+    }
 
     // Phase 3.8: `SELECT DISTINCT col1, col2[, ...] FROM t
     // [ORDER BY col1[, col2[, ...]]] [LIMIT/OFFSET]` covered by a
@@ -6141,8 +7430,9 @@ class Database {
     if (vrn != null) return vrn;
 
     final reordered = _reorderInnerJoins(s);
-    final fromRows =
-        _planScan(reordered, outer) ?? _resolveFromRows(reordered, outer);
+    final fromRows = s.connectBy != null
+        ? _resolveHierarchicalRows(s, outer)
+        : (_planScan(reordered, outer) ?? _resolveFromRows(reordered, outer));
 
     // WHERE
     var working = fromRows;
@@ -6152,6 +7442,13 @@ class Database {
       // calling it per row turns an O(N) scan into O(N * depth(expr)).
       final boundWhere = _bindExpr(s.where!, outer);
       working = fromRows.where((r) => evalPredicate(boundWhere, r)).toList();
+    }
+
+    // Oracle ROWNUM input cap (`WHERE ROWNUM <= n`): restrict the input rows
+    // BEFORE aggregation / GROUP BY, so `SELECT COUNT(*) FROM t WHERE ROWNUM <=
+    // n` counts at most n rows (unlike a post-aggregate LIMIT).
+    if (s.rownumLimit != null && working.length > s.rownumLimit!) {
+      working = working.sublist(0, s.rownumLimit!);
     }
 
     // Detect aggregates anywhere in projection or HAVING.
@@ -6195,15 +7492,17 @@ class Database {
       // Build projection in non-aggregate path.
       final proj = _buildProjection(s);
       outCols = proj.outCols;
-      // Detect window functions at the top level of the bound projection.
+      // Detect window functions anywhere in the bound projection (top level or
+      // nested inside a larger scalar expression, e.g. `'r' || ROWNUM`).
       final winFns = <FunctionCallExpr>[];
       for (final e in proj.exprs) {
-        if (e is FunctionCallExpr && e.isWindow) winFns.add(e);
+        _collectWindowFns(e, winFns);
       }
       if (winFns.isEmpty) {
-        resultRows = working
-            .map((src) => proj.exprs.map((e) => e.eval(src)).toList())
-            .toList();
+        resultRows = working.map((src) {
+          _beginSeqRow();
+          return proj.exprs.map((e) => e.eval(src)).toList();
+        }).toList();
       } else {
         // Pre-compute window values per-row, indexed by FunctionCallExpr.
         final winValues = <FunctionCallExpr, List<Object?>>{};
@@ -6211,14 +7510,17 @@ class Database {
           winValues[fn] = _evalWindowFn(fn, working, s.namedWindows);
         }
         resultRows = List.generate(working.length, (i) {
+          _beginSeqRow();
           final src = working[i];
-          return List.generate(proj.exprs.length, (j) {
-            final e = proj.exprs[j];
-            if (e is FunctionCallExpr && e.isWindow) {
-              return winValues[e]![i];
-            }
-            return e.eval(src);
-          });
+          // Publish this row's window values so nested window calls resolve.
+          FunctionCallExpr.windowRowValues = {
+            for (final fn in winFns) fn: winValues[fn]![i],
+          };
+          try {
+            return [for (final e in proj.exprs) e.eval(src)];
+          } finally {
+            FunctionCallExpr.windowRowValues = null;
+          }
         });
       }
       orderingMaps = working;
@@ -6243,7 +7545,8 @@ class Database {
           (i) => _Pair(orderingMaps[i], resultRows[i]),
         );
         paired.sort((a, b) {
-          for (final ob in s.orderBy) {
+          for (var oi = 0; oi < s.orderBy.length; oi++) {
+            final ob = s.orderBy[oi];
             // ORDER BY <integer literal> => 1-based projected column position.
             if (ob.expr is LiteralExpr &&
                 (ob.expr as LiteralExpr).value is int) {
@@ -6253,6 +7556,20 @@ class Database {
               }
               final av = a.row[pos];
               final bv = b.row[pos];
+              final nullsFirst = ob.nullsFirst ?? !ob.descending;
+              if (av == null && bv == null) continue;
+              if (av == null) return nullsFirst ? -1 : 1;
+              if (bv == null) return nullsFirst ? 1 : -1;
+              final c = sqlCompare(av, bv);
+              if (c != 0) return ob.descending ? -c : c;
+              continue;
+            }
+            // ORDER BY <aggregate> that is not projected can't be recomputed
+            // from a single group-context row; _runAggregate precomputed it
+            // per group under `__orderagg<oi>`.
+            if (hasAggregates && _containsAggregate(ob.expr)) {
+              final av = a.src['__orderagg$oi'];
+              final bv = b.src['__orderagg$oi'];
               final nullsFirst = ob.nullsFirst ?? !ob.descending;
               if (av == null && bv == null) continue;
               if (av == null) return nullsFirst ? -1 : 1;
@@ -6323,7 +7640,13 @@ class Database {
     // LIMIT / OFFSET
     final start = (s.offset ?? 0).clamp(0, resultRows.length);
     var end = resultRows.length;
-    if (s.limit != null) end = (start + s.limit!).clamp(0, resultRows.length);
+    if (s.limit != null) {
+      // Oracle FETCH FIRST n PERCENT: CEIL of n% of the (post-offset) rows.
+      final effLimit = s.limitPercent
+          ? ((s.limit! * (resultRows.length - start)) / 100).ceil()
+          : s.limit!;
+      end = (start + effLimit).clamp(0, resultRows.length);
+    }
     resultRows = resultRows.sublist(start, end);
 
     return QueryResult(
@@ -6350,6 +7673,8 @@ class Database {
     if (s.fromTable == null) return null;
     if (s.joins.isNotEmpty) return null;
     if (s.fromSubquery != null || s.fromFunction != null) return null;
+    if (s.matchRecognize != null) return null; // row pattern changes the count
+    if (s.connectBy != null) return null; // hierarchical walk changes the count
     if (s.groupBy.isNotEmpty || s.having != null) return null;
     if (s.orderBy.isNotEmpty) return null;
     if (s.setOp != null) return null;
@@ -6769,6 +8094,7 @@ class Database {
       }
       if (e.window != null) return null;
       if (e.filterExpr != null) return null;
+      if (e.keepOrderBy != null) return null; // KEEP needs the general path
       if (name == 'COUNT' && e.isStarArg) {
         if (dist) return null; // COUNT(DISTINCT *) is invalid SQL
         cols.add(p.alias ?? 'count(*)');
@@ -6921,6 +8247,7 @@ class Database {
     }
     if (e.window != null) return null;
     if (e.filterExpr != null) return null;
+    if (e.keepOrderBy != null) return null; // KEEP needs the general path
     if (e.isStarArg) return null;
     if (name != 'MIN' &&
         name != 'MAX' &&
@@ -9798,6 +11125,137 @@ class Database {
     return direction ?? 1;
   }
 
+  /// Build the rows of an Oracle hierarchical (CONNECT BY) query in depth-first
+  /// pre-order, injecting the LEVEL and CONNECT_BY_ISLEAF pseudo-columns. The
+  /// caller still applies WHERE / projection / ORDER BY to the result, matching
+  /// Oracle (WHERE filters *after* the hierarchy is built).
+  List<Map<String, Object?>> _resolveHierarchicalRows(
+    SelectStmt s, [
+    Map<String, Object?> outer = const {},
+  ]) {
+    final cb = s.connectBy!;
+    final base = _resolveFromRows(s, outer);
+    final startWith =
+        cb.startWith == null ? null : _bindExpr(cb.startWith!, outer);
+    final connectBy = _bindExpr(cb.connectBy, outer);
+    // A CONNECT BY with no PRIOR reference is a pure row generator (e.g.
+    // `SELECT LEVEL FROM dual CONNECT BY LEVEL <= 5`): each level re-expands
+    // the base rows, so the identity-based cycle guard must not apply (it would
+    // stop after one level because the same source row object is revisited).
+    final usesPrior = _exprUsesPrior(cb.connectBy);
+
+    List<Map<String, Object?>> sortSiblings(List<Map<String, Object?>> rows) {
+      if (cb.orderSiblings.isEmpty) return rows;
+      final copy = List<Map<String, Object?>>.from(rows);
+      copy.sort((a, b) {
+        for (final item in cb.orderSiblings) {
+          final e = _bindExpr(item.expr, outer);
+          final va = e.eval(a);
+          final vb = e.eval(b);
+          if (va == null && vb == null) continue;
+          if (va == null) return item.descending ? 1 : -1;
+          if (vb == null) return item.descending ? -1 : 1;
+          final cmp = sqlCompare(va, vb);
+          if (cmp != 0) return item.descending ? -cmp : cmp;
+        }
+        return 0;
+      });
+      return copy;
+    }
+
+    final out = <Map<String, Object?>>[];
+
+    void visit(Map<String, Object?> node, int level, Set<int> pathIds,
+        List<Map<String, Object?>> ancestry) {
+      final children = <Map<String, Object?>>[];
+      for (final cand in base) {
+        final scope = <String, Object?>{...cand};
+        node.forEach((k, v) => scope['PRIOR.$k'] = v);
+        // LEVEL of the candidate child, so `CONNECT BY ... AND LEVEL <= n`
+        // limits the walk.
+        scope['LEVEL'] = level + 1;
+        if (evalPredicate(connectBy, scope)) children.add(cand);
+      }
+      // Drop children already on the current path (cycle guard).
+      final isCycle =
+          children.any((c) => pathIds.contains(identityHashCode(c))) ? 1 : 0;
+      final next = usesPrior
+          ? sortSiblings(children)
+              .where((c) => !pathIds.contains(identityHashCode(c)))
+              .toList()
+          // Pure generator: a safety cap (matching Oracle's default 1000-level
+          // hierarchy limit, generously bounded) prevents a runaway walk when
+          // the CONNECT BY condition never becomes false.
+          : (level >= 50000 ? const <Map<String, Object?>>[] : sortSiblings(children));
+      final chain = [...ancestry, node];
+      out.add(<String, Object?>{
+        ...node,
+        'LEVEL': level,
+        'CONNECT_BY_ISLEAF': next.isEmpty ? 1 : 0,
+        'CONNECT_BY_ISCYCLE': isCycle,
+        '__CBP': chain, // ancestor chain for SYS_CONNECT_BY_PATH
+      });
+      for (final c in next) {
+        visit(c, level + 1, {...pathIds, identityHashCode(c)}, chain);
+      }
+    }
+
+    final roots = <Map<String, Object?>>[];
+    for (final r in base) {
+      if (startWith == null || evalPredicate(startWith, r)) roots.add(r);
+    }
+    for (final root in sortSiblings(roots)) {
+      visit(root, 1, {identityHashCode(root)}, const []);
+    }
+    return out;
+  }
+
+  /// True when [e] (a CONNECT BY condition) references a `PRIOR` expression,
+  /// i.e. the walk is a genuine parent/child hierarchy rather than a pure
+  /// `LEVEL`-bounded row generator.
+  static bool _exprUsesPrior(Expr e) {
+    var found = false;
+    void walk(Expr x) {
+      if (found) return;
+      if (x is PriorExpr) {
+        found = true;
+        return;
+      }
+      if (x is BinaryExpr) {
+        walk(x.left);
+        walk(x.right);
+      } else if (x is UnaryExpr) {
+        walk(x.operand);
+      } else if (x is FunctionCallExpr) {
+        for (final a in x.args) {
+          walk(a);
+        }
+      } else if (x is CaseExpr) {
+        for (final w in x.whens) {
+          walk(w);
+        }
+        for (final t in x.thens) {
+          walk(t);
+        }
+        if (x.elseExpr != null) walk(x.elseExpr!);
+      } else if (x is InExpr) {
+        walk(x.value);
+        for (final v in x.values) {
+          walk(v);
+        }
+      } else if (x is BetweenExpr) {
+        walk(x.value);
+        walk(x.low);
+        walk(x.high);
+      } else if (x is CastExpr) {
+        walk(x.expr);
+      }
+    }
+
+    walk(e);
+    return found;
+  }
+
   List<Map<String, Object?>> _resolveFromRows(
     SelectStmt s, [
     Map<String, Object?> outer = const {},
@@ -9817,7 +11275,30 @@ class Database {
       left = _materializeRelation(s.fromTable!, s.fromAlias, outer);
     }
     var working = left;
-    for (final j in s.joins) {
+    if (s.matchRecognize != null) {
+      working = _applyMatchRecognize(
+          left, s.matchRecognize!, s.fromAlias ?? s.fromTable);
+    }
+    for (var ji = 0; ji < s.joins.length; ji++) {
+      final j = s.joins[ji];
+      // LATERAL / CROSS APPLY / OUTER APPLY: the right subquery is correlated,
+      // so re-materialise it per left row with that row visible as outer scope.
+      if (j.lateral && j.subquery != null) {
+        final next = <Map<String, Object?>>[];
+        for (final l in working) {
+          final rightRows =
+              _materializeSubquery(j.subquery!, j.alias, {...outer, ...l});
+          if (rightRows.isEmpty && j.type == 'LEFT') {
+            next.add(l); // OUTER APPLY keeps the unmatched left row
+          } else {
+            for (final r in rightRows) {
+              next.add({...l, ...r});
+            }
+          }
+        }
+        working = next;
+        continue;
+      }
       final right = j.subquery != null
           ? _materializeSubquery(j.subquery!, j.alias, outer)
           : _materializeRelation(j.table!, j.alias, outer);
@@ -9907,7 +11388,7 @@ class Database {
               }
             }
             if (!matched) {
-              final nulls = _nullSideOf(_keyTableName(s, working));
+              final nulls = _leftNullsFor(s, ji);
               next.add({...nulls, ...r});
             }
           }
@@ -9930,7 +11411,7 @@ class Database {
             }
           }
           // Unmatched right rows
-          final leftNulls = _nullSideOf(_keyTableName(s, working));
+          final leftNulls = _leftNullsFor(s, ji);
           for (var ri = 0; ri < right.length; ri++) {
             if (!matchedRightIdx.contains(ri)) {
               next.add({...leftNulls, ...right[ri]});
@@ -10183,19 +11664,278 @@ class Database {
     }
     if (_views.containsKey(name)) {
       final res = _selectTopLevel(_views[name]!, outer);
+      final pub = _viewColumnsFor(name, res.columns);
       final out = <Map<String, Object?>>[];
       for (final row in res.rows) {
         final m = <String, Object?>{...outer};
-        for (var i = 0; i < res.columns.length; i++) {
-          m[res.columns[i]] = row[i];
-          m['$name.${res.columns[i]}'] = row[i];
-          if (alias != null) m['$alias.${res.columns[i]}'] = row[i];
+        for (var i = 0; i < pub.length; i++) {
+          m[pub[i]] = row[i];
+          m['$name.${pub[i]}'] = row[i];
+          if (alias != null) m['$alias.${pub[i]}'] = row[i];
         }
         out.add(m);
       }
       return out;
     }
+    // Catalog / data-dictionary views (INFORMATION_SCHEMA.*, USER_*/ALL_*),
+    // checked after real tables/views so a user object of the same name wins.
+    final catalog = _buildCatalogData(name);
+    if (catalog != null) {
+      return _emitSynthRows(name, alias, outer, catalog.$1, catalog.$2);
+    }
+    // Oracle's synthetic one-row table: `SELECT <expr> FROM DUAL`. Only
+    // synthesized when no real table/view named DUAL exists.
+    if (name.toUpperCase() == 'DUAL') {
+      final m = <String, Object?>{...outer, 'DUMMY': 'X', 'dummy': 'X'};
+      m['$name.DUMMY'] = 'X';
+      m['$name.dummy'] = 'X';
+      if (alias != null) {
+        m['$alias.DUMMY'] = 'X';
+        m['$alias.dummy'] = 'X';
+      }
+      return [m];
+    }
     throw StateError('No such table or view: $name');
+  }
+
+  /// Builds keyed row maps (bare + table-qualified + alias-qualified) from a
+  /// synthesized [columns] / [data] pair, matching how real relations expose
+  /// columns to the evaluator.
+  List<Map<String, Object?>> _emitSynthRows(
+    String name,
+    String? alias,
+    Map<String, Object?> outer,
+    List<String> columns,
+    List<List<Object?>> data,
+  ) {
+    final out = <Map<String, Object?>>[];
+    for (final row in data) {
+      final m = <String, Object?>{...outer};
+      for (var i = 0; i < columns.length; i++) {
+        m[columns[i]] = row[i];
+        m['$name.${columns[i]}'] = row[i];
+        if (alias != null) m['$alias.${columns[i]}'] = row[i];
+      }
+      out.add(m);
+    }
+    return out;
+  }
+
+  /// Catalog / data-dictionary views backing both dialects' schema
+  /// introspection: MySQL `INFORMATION_SCHEMA.{TABLES,COLUMNS,SCHEMATA,VIEWS}`
+  /// and Oracle `USER_*`/`ALL_*` (+ the `TABS`/`COLS` synonyms) for tables,
+  /// columns, views and sequences. Returns the view's `(columns, rows)` or
+  /// null when [name] is not a recognised catalog view (case-insensitive).
+  (List<String>, List<List<Object?>>)? _buildCatalogData(String name) {
+    final u = name.toUpperCase();
+    final tableNames = _tables.keys.toList()..sort();
+    final viewNames = _views.keys.toList()..sort();
+    const schema = 'main'; // matches DATABASE()/SCHEMA()
+
+    String oraType(ColumnDef c) {
+      final d = c.declaredType;
+      if (d != null) return d.toUpperCase();
+      switch (c.type) {
+        case DataType.text:
+          return 'VARCHAR2';
+        case DataType.blob:
+          return 'BLOB';
+        case DataType.real:
+          return 'FLOAT';
+        default:
+          return 'NUMBER';
+      }
+    }
+
+    String myType(ColumnDef c) {
+      final d = c.declaredType?.toLowerCase();
+      if (d != null) {
+        if (d.contains('clob') || d.contains('text')) return 'text';
+        if (d.contains('blob') || d.contains('raw')) return 'blob';
+        if (d.contains('json')) return 'json';
+        if (d.contains('char')) return 'varchar';
+        if (d.contains('int')) return 'int';
+        if (d.contains('float') || d.contains('real') || d.contains('double')) {
+          return 'double';
+        }
+        if (d.contains('num') || d.contains('dec')) return 'decimal';
+        return d;
+      }
+      switch (c.type) {
+        case DataType.text:
+          return 'text';
+        case DataType.blob:
+          return 'blob';
+        case DataType.real:
+          return 'double';
+        case DataType.integer:
+          return 'int';
+        default:
+          return 'decimal';
+      }
+    }
+
+    String colKey(ColumnDef c) =>
+        c.primaryKey ? 'PRI' : (c.unique ? 'UNI' : '');
+
+    switch (u) {
+      case 'INFORMATION_SCHEMA.TABLES':
+        return (
+          [
+            'TABLE_CATALOG',
+            'TABLE_SCHEMA',
+            'TABLE_NAME',
+            'TABLE_TYPE',
+            'ENGINE',
+            'TABLE_ROWS',
+            'TABLE_COLLATION'
+          ],
+          [
+            for (final tn in tableNames)
+              [
+                'def',
+                schema,
+                tn,
+                'BASE TABLE',
+                'InnoDB',
+                _tables[tn]!.rows.length,
+                'utf8mb4_general_ci'
+              ],
+            for (final vn in viewNames)
+              ['def', schema, vn, 'VIEW', null, null, null],
+          ],
+        );
+      case 'INFORMATION_SCHEMA.COLUMNS':
+        final rows = <List<Object?>>[];
+        for (final tn in tableNames) {
+          final t = _tables[tn]!;
+          for (var i = 0; i < t.columns.length; i++) {
+            final c = t.columns[i];
+            rows.add([
+              'def',
+              schema,
+              tn,
+              c.name,
+              i + 1,
+              c.defaultValue,
+              c.notNull ? 'NO' : 'YES',
+              myType(c),
+              myType(c),
+              colKey(c),
+              c.autoIncrement ? 'auto_increment' : ''
+            ]);
+          }
+        }
+        return (
+          [
+            'TABLE_CATALOG',
+            'TABLE_SCHEMA',
+            'TABLE_NAME',
+            'COLUMN_NAME',
+            'ORDINAL_POSITION',
+            'COLUMN_DEFAULT',
+            'IS_NULLABLE',
+            'DATA_TYPE',
+            'COLUMN_TYPE',
+            'COLUMN_KEY',
+            'EXTRA'
+          ],
+          rows,
+        );
+      case 'INFORMATION_SCHEMA.SCHEMATA':
+        return (
+          [
+            'CATALOG_NAME',
+            'SCHEMA_NAME',
+            'DEFAULT_CHARACTER_SET_NAME',
+            'DEFAULT_COLLATION_NAME'
+          ],
+          [
+            ['def', schema, 'utf8mb4', 'utf8mb4_general_ci']
+          ],
+        );
+      case 'INFORMATION_SCHEMA.VIEWS':
+        return (
+          [
+            'TABLE_CATALOG',
+            'TABLE_SCHEMA',
+            'TABLE_NAME',
+            'VIEW_DEFINITION',
+            'CHECK_OPTION',
+            'IS_UPDATABLE'
+          ],
+          [
+            for (final vn in viewNames)
+              ['def', schema, vn, _viewSql[vn] ?? '', 'NONE', 'NO'],
+          ],
+        );
+      case 'USER_TABLES':
+      case 'ALL_TABLES':
+      case 'TABS':
+        return (
+          ['TABLE_NAME', 'TABLESPACE_NAME', 'NUM_ROWS', 'STATUS'],
+          [
+            for (final tn in tableNames)
+              [tn, 'USERS', _tables[tn]!.rows.length, 'VALID'],
+          ],
+        );
+      case 'USER_TAB_COLUMNS':
+      case 'ALL_TAB_COLUMNS':
+      case 'COLS':
+        final rows = <List<Object?>>[];
+        for (final tn in tableNames) {
+          final t = _tables[tn]!;
+          for (var i = 0; i < t.columns.length; i++) {
+            final c = t.columns[i];
+            rows.add([tn, c.name, oraType(c), 0, c.notNull ? 'N' : 'Y', i + 1]);
+          }
+        }
+        return (
+          [
+            'TABLE_NAME',
+            'COLUMN_NAME',
+            'DATA_TYPE',
+            'DATA_LENGTH',
+            'NULLABLE',
+            'COLUMN_ID'
+          ],
+          rows,
+        );
+      case 'USER_VIEWS':
+      case 'ALL_VIEWS':
+        return (
+          ['VIEW_NAME', 'TEXT_LENGTH', 'TEXT'],
+          [
+            for (final vn in viewNames)
+              [vn, (_viewSql[vn] ?? '').length, _viewSql[vn] ?? ''],
+          ],
+        );
+      case 'USER_SEQUENCES':
+      case 'ALL_SEQUENCES':
+        final seqNames = _sequences.keys.toList()..sort();
+        return (
+          [
+            'SEQUENCE_NAME',
+            'MIN_VALUE',
+            'MAX_VALUE',
+            'INCREMENT_BY',
+            'CYCLE_FLAG',
+            'LAST_NUMBER'
+          ],
+          [
+            for (final sn in seqNames)
+              [
+                sn,
+                _sequences[sn]!.minValue,
+                _sequences[sn]!.maxValue,
+                _sequences[sn]!.incrementBy,
+                _sequences[sn]!.cycle ? 'Y' : 'N',
+                _sequences[sn]!._last ?? _sequences[sn]!.startWith
+              ],
+          ],
+        );
+    }
+    return null;
   }
 
   /// Build the schema-introspection rows for `sqlite_master` /
@@ -10316,6 +12056,127 @@ class Database {
     return out;
   }
 
+  /// Applies an Oracle `MATCH_RECOGNIZE` clause to the already-materialized
+  /// source [rows]: partitions, orders, greedily matches the row pattern, and
+  /// (for ONE ROW PER MATCH) emits one row per match carrying the MEASURES.
+  List<Map<String, Object?>> _applyMatchRecognize(
+    List<Map<String, Object?>> rows,
+    MatchRecognizeClause mr,
+    String? qual,
+  ) {
+    final q = qual ?? 'match_recognize';
+    final partitions = <String, List<Map<String, Object?>>>{};
+    final partOrder = <String>[];
+    if (mr.partitionBy.isEmpty) {
+      partitions[''] = rows;
+      partOrder.add('');
+    } else {
+      final partBound = [for (final e in mr.partitionBy) _bindExpr(e)];
+      for (final r in rows) {
+        final key = partBound.map((b) => '${b.eval(r)}').join('\u0001');
+        final bucket = partitions.putIfAbsent(key, () {
+          partOrder.add(key);
+          return <Map<String, Object?>>[];
+        });
+        bucket.add(r);
+      }
+    }
+    final out = <Map<String, Object?>>[];
+    for (final key in partOrder) {
+      var part = partitions[key]!;
+      if (mr.orderBy.isNotEmpty) {
+        final bound = [for (final ob in mr.orderBy) (_bindExpr(ob.expr), ob)];
+        part = List<Map<String, Object?>>.from(part)
+          ..sort((a, b) {
+            for (final (ex, ob) in bound) {
+              final av = ex.eval(a);
+              final bv = ex.eval(b);
+              final nullsFirst = ob.nullsFirst ?? ob.descending;
+              if (av == null && bv == null) continue;
+              if (av == null) return nullsFirst ? -1 : 1;
+              if (bv == null) return nullsFirst ? 1 : -1;
+              final c = sqlCompare(av, bv);
+              if (c != 0) return ob.descending ? -c : c;
+            }
+            return 0;
+          });
+      }
+      bool satisfies(String v, Map<String, Object?> row) {
+        final def = mr.defines[v.toUpperCase()];
+        if (def == null) return true; // an undefined variable always matches
+        final val = _bindExpr(def).eval(row);
+        return val == true || (val is num && val != 0);
+      }
+
+      // Greedy pattern matcher with backtracking; returns the exclusive end
+      // index of a match starting at [ri], or null if no match.
+      int? matchFrom(int pi, int ri) {
+        if (pi == mr.pattern.length) return ri;
+        final el = mr.pattern[pi];
+        final maxR = el.maxRep < 0 ? part.length - ri : el.maxRep;
+        var avail = 0;
+        while (avail < maxR &&
+            ri + avail < part.length &&
+            satisfies(el.variable, part[ri + avail])) {
+          avail++;
+        }
+        for (var take = avail; take >= el.minRep; take--) {
+          final res = matchFrom(pi + 1, ri + take);
+          if (res != null) return res;
+        }
+        return null;
+      }
+
+      var i = 0;
+      while (i < part.length) {
+        final end = matchFrom(0, i);
+        if (end != null && end > i) {
+          final matched = part.sublist(i, end);
+          if (mr.allRowsPerMatch) {
+            for (final mrow in matched) {
+              out.add(_matchMeasureRow(mr, matched, mrow, q));
+            }
+          } else {
+            out.add(_matchMeasureRow(mr, matched, matched.last, q));
+          }
+          i = end; // AFTER MATCH SKIP PAST LAST ROW (the default)
+        } else {
+          i++;
+        }
+      }
+    }
+    return out;
+  }
+
+  /// Builds one MATCH_RECOGNIZE output row: partition keys plus each MEASURES
+  /// expression (aggregates evaluated over [matched]; scalar expressions over
+  /// [current]), exposed under both bare and `qual.col` qualified keys.
+  Map<String, Object?> _matchMeasureRow(
+    MatchRecognizeClause mr,
+    List<Map<String, Object?>> matched,
+    Map<String, Object?> current,
+    String qual,
+  ) {
+    final row = <String, Object?>{};
+    for (final pb in mr.partitionBy) {
+      if (pb is ColumnExpr) row[pb.name] = matched.first[pb.name];
+    }
+    for (final m in mr.measures) {
+      final e = m.expr;
+      if (e == null) continue;
+      final name = m.alias ?? 'MEASURE';
+      if (e is FunctionCallExpr && e.isAggregate) {
+        row[name] = _aggregateValue(e, matched);
+      } else {
+        row[name] = _bindExpr(e).eval(current);
+      }
+    }
+    for (final entry in row.entries.toList()) {
+      row['$qual.${entry.key}'] = entry.value;
+    }
+    return row;
+  }
+
   /// Materialize a table-valued function call (e.g. `json_each(...)`) into
   /// a relation. Result column names follow SQLite conventions: each
   /// supported function exposes a fixed schema.
@@ -10333,6 +12194,12 @@ class Database {
         break;
       case 'JSON_TREE':
         rows = _jsonEachRows(args, recursive: true);
+        break;
+      case 'JSON_TABLE':
+        rows = _jsonTableRows(args, qual);
+        break;
+      case 'XMLTABLE':
+        rows = _xmlTableRows(args, qual);
         break;
       case 'GENERATE_SERIES':
         rows = _generateSeriesRows(args);
@@ -12240,6 +14107,183 @@ class Database {
     return out;
   }
 
+  /// Implementation of Oracle `JSON_TABLE(src, rowPath COLUMNS (…))`. [args] is
+  /// `[src, rowPath, name1, colPath1, name2, colPath2, …]`. Produces one row
+  /// per node selected by [rowPath] (a trailing `[*]` iterates array elements),
+  /// each exposing the declared columns (bare and `qual.col` qualified).
+  List<Map<String, Object?>> _jsonTableRows(List<Object?> args, String qual) {
+    if (args.isEmpty || args[0] == null) return const [];
+    Object? root;
+    try {
+      final src = args[0];
+      final text = src is List<int> ? utf8.decode(src) : src.toString();
+      root = jsonDecode(text);
+    } catch (_) {
+      return const [];
+    }
+    if (root == null) return const [];
+    final rowPath =
+        args.length >= 2 && args[1] != null ? args[1].toString() : r'$';
+    final specs = args.length >= 3 && args[2] != null
+        ? (jsonDecode(args[2].toString()) as List).cast<Map<String, Object?>>()
+        : const <Map<String, Object?>>[];
+    final nodes = _jsonTableNodes(root, rowPath);
+    final out = <Map<String, Object?>>[];
+    final ord = [0]; // shared 1-based ordinality counter
+    for (final node in nodes) {
+      out.addAll(_expandJsonTableNode(node, specs, qual, ord));
+    }
+    return out;
+  }
+
+  /// Resolves a JSON_TABLE row/nested path to the list of nodes it addresses;
+  /// a trailing `[*]` iterates array elements.
+  List<Object?> _jsonTableNodes(Object? root, String path) {
+    if (path.endsWith('[*]')) {
+      final prefix = path.substring(0, path.length - 3);
+      final arr =
+          prefix.isEmpty || prefix == r'$' ? root : jsonPathLookup(root, prefix);
+      return arr is List ? List<Object?>.from(arr) : const [];
+    }
+    final node = path == r'$' ? root : jsonPathLookup(root, path);
+    return node == null ? const [] : [node];
+  }
+
+  /// Builds the JSON_TABLE output rows for one [node] against [specs], handling
+  /// FOR ORDINALITY, EXISTS PATH, typed PATH columns (with DEFAULT … ON ERROR),
+  /// and NESTED PATH subtrees ([ord] is the shared ordinality counter).
+  List<Map<String, Object?>> _expandJsonTableNode(Object? node,
+      List<Map<String, Object?>> specs, String qual, List<int> ord) {
+    final base = <String, Object?>{};
+    final ordNames = <String>[];
+    final nested = <Map<String, Object?>>[];
+    for (final spec in specs) {
+      final kind = spec['kind'];
+      if (kind == 'ord') {
+        ordNames.add(spec['name'] as String);
+      } else if (kind == 'exists') {
+        base[spec['name'] as String] =
+            jsonPathLookup(node, spec['path'] as String) != null ? 1 : 0;
+      } else if (kind == 'nested') {
+        nested.add(spec);
+      } else {
+        final name = spec['name'] as String;
+        final raw = jsonPathLookup(node, spec['path'] as String);
+        base[name] = _coerceJsonTableValue(raw, spec);
+      }
+    }
+    var rows = <Map<String, Object?>>[Map<String, Object?>.from(base)];
+    for (final n in nested) {
+      final subNodes =
+          _jsonTableNodes(node, n['path'] as String);
+      final subSpecs = (n['cols'] as List).cast<Map<String, Object?>>();
+      final next = <Map<String, Object?>>[];
+      for (final r in rows) {
+        for (final sn in subNodes) {
+          for (final sr in _expandJsonTableNode(sn, subSpecs, qual, ord)) {
+            next.add({...r, ...sr});
+          }
+        }
+      }
+      rows = next.isEmpty ? rows : next;
+    }
+    for (final r in rows) {
+      for (final on in ordNames) {
+        r[on] = ++ord[0];
+      }
+      // Expose bare and qualified keys for every column in the row.
+      for (final e in r.entries.toList()) {
+        r['$qual.${e.key}'] = e.value;
+      }
+    }
+    return rows;
+  }
+
+  /// Coerces a JSON_TABLE PATH value by its declared [spec] type, applying the
+  /// column's `DEFAULT … ON ERROR` when the value can't be coerced.
+  Object? _coerceJsonTableValue(Object? raw, Map<String, Object?> spec) {
+    final type = (spec['type'] as String?)?.toUpperCase() ?? '';
+    final hasDefault = spec.containsKey('default');
+    final isNumeric = type.startsWith('NUMBER') ||
+        type.startsWith('INT') ||
+        type.startsWith('DEC') ||
+        type.startsWith('FLOAT') ||
+        type.startsWith('NUMERIC');
+    if (raw is List || raw is Map) {
+      return hasDefault ? spec['default'] : jsonEncode(raw);
+    }
+    if (isNumeric && raw is! num) {
+      final n = raw == null ? null : num.tryParse(raw.toString());
+      if (n != null) return n;
+      return hasDefault ? spec['default'] : null;
+    }
+    if (raw == null && hasDefault) return spec['default'];
+    return raw;
+  }
+
+  /// Implementation of Oracle `XMLTABLE(rowXPath PASSING doc COLUMNS …)`.
+  /// [args] is `[xmlDoc, rowXPath, jsonEncode(columnSpecs)]`. Produces one row
+  /// per element matched by [rowXPath]; each column's PATH (relative, `.` for
+  /// the current node) selects its text, coerced by the declared type.
+  List<Map<String, Object?>> _xmlTableRows(List<Object?> args, String qual) {
+    if (args.isEmpty || args[0] == null) return const [];
+    final src = args[0];
+    final xml = src is List<int> ? utf8.decode(src) : src.toString();
+    final rowXPath =
+        args.length >= 2 && args[1] != null ? args[1].toString() : '/';
+    final specs = args.length >= 3 && args[2] != null
+        ? (jsonDecode(args[2].toString()) as List).cast<Map<String, Object?>>()
+        : const <Map<String, Object?>>[];
+    final nodes = _xmlSelectNodes(xml, rowXPath);
+    final out = <Map<String, Object?>>[];
+    var ord = 0;
+    for (final node in nodes) {
+      ord++;
+      final row = <String, Object?>{};
+      for (final spec in specs) {
+        final name = spec['name'] as String;
+        if (spec['kind'] == 'ord') {
+          row[name] = ord;
+          continue;
+        }
+        final path = (spec['path'] as String?) ?? '.';
+        String? text;
+        if (path == '.' || path.isEmpty) {
+          text = node;
+        } else {
+          text = xmlExtractText('<__x__>$node</__x__>', '/__x__/$path') ??
+              xmlExtractText(node, path);
+        }
+        row[name] = _coerceJsonTableValue(text, spec);
+      }
+      for (final e in row.entries.toList()) {
+        row['$qual.${e.key}'] = e.value;
+      }
+      out.add(row);
+    }
+    return out;
+  }
+
+  /// Selects the inner text of every element addressed by [xpath]. All but the
+  /// final segment resolve to the first matching element; the final segment
+  /// collects every matching sibling (one per output row).
+  List<String> _xmlSelectNodes(String xml, String xpath) {
+    final segs = xpath.split('/').where((s) => s.isNotEmpty).toList();
+    var content = xml.trim();
+    if (segs.isEmpty) return [content];
+    for (var i = 0; i < segs.length; i++) {
+      final tag = segs[i].replaceAll(RegExp(r'\[.*\]$'), '');
+      final re = RegExp('<$tag\\b[^>]*>(.*?)</$tag>', dotAll: true);
+      if (i == segs.length - 1) {
+        return [for (final m in re.allMatches(content)) m.group(1)!.trim()];
+      }
+      final m = re.firstMatch(content);
+      if (m == null) return const [];
+      content = m.group(1)!.trim();
+    }
+    return const [];
+  }
+
   /// Implementation of `json_each` / `json_tree`. Returns rows with the
   /// SQLite-standard columns `key, value, type, atom, id, parent, fullkey,
   /// path`. [recursive] = true visits descendants too (json_tree).
@@ -12325,26 +14369,50 @@ class Database {
     if (_tables.containsKey(name)) {
       for (final c in _tables[name]!.columns) {
         out[c.name] = null;
-        out['$name.${c.name}'] = null;
-        if (alias != null) out['$alias.${c.name}'] = null;
+        // An alias hides the base table name (SQL scoping), so key by the alias
+        // only — otherwise a self-join's `e.col` null-pad clobbers the left
+        // row's own `e.col` when the two row maps merge.
+        if (alias != null) {
+          out['$alias.${c.name}'] = null;
+        } else {
+          out['$name.${c.name}'] = null;
+        }
       }
     }
     return out;
   }
 
-  Map<String, Object?> _nullSideOf(String tableName) {
-    if (!_tables.containsKey(tableName)) return const {};
-    final t = _tables[tableName]!;
+  /// Null map for the left side of a RIGHT/FULL join: every column of the base
+  /// relation plus all joins preceding [joinIdx], keyed bare, by real table
+  /// name, and by alias, so a projection of `alias.col` sees NULL (not a stale
+  /// fall-through to the bare name carried by the right row).
+  Map<String, Object?> _leftNullsFor(SelectStmt s, int joinIdx) {
     final out = <String, Object?>{};
-    for (final c in t.columns) {
-      out[c.name] = null;
-      out['${t.name}.${c.name}'] = null;
+    void addRel(String? table, String? alias, SelectStmt? sub) {
+      List<String> cols;
+      if (sub != null) {
+        cols = _selectTopLevel(sub).columns;
+      } else if (table != null) {
+        cols = _materializeColumns(table);
+      } else {
+        return;
+      }
+      for (final c in cols) {
+        out[c] = null;
+        // An alias hides the base table name, so key by alias only.
+        if (alias != null) {
+          out['$alias.$c'] = null;
+        } else if (table != null) {
+          out['$table.$c'] = null;
+        }
+      }
+    }
+
+    addRel(s.fromTable, s.fromAlias, s.fromSubquery);
+    for (var i = 0; i < joinIdx; i++) {
+      addRel(s.joins[i].table, s.joins[i].alias, s.joins[i].subquery);
     }
     return out;
-  }
-
-  String _keyTableName(SelectStmt s, List<Map<String, Object?>> working) {
-    return s.fromAlias ?? s.fromTable ?? '';
   }
 
   _Projection _buildProjection(SelectStmt s) {
@@ -12353,7 +14421,7 @@ class Database {
     for (final item in s.projection) {
       if (item.isStar) {
         if (item.starTable != null) {
-          final src = _materializeColumns(item.starTable!);
+          final src = _starColumns(s, item.starTable!);
           for (final c in src) {
             outCols.add(c);
             exprs.add(_bindExpr(ColumnExpr(c, table: item.starTable)));
@@ -12417,9 +14485,61 @@ class Database {
     if (_views.containsKey(name)) {
       // Materialize once (small; cached by caller's structure).
       final res = _selectTopLevel(_views[name]!);
-      return res.columns;
+      return _viewColumnsFor(name, res.columns);
     }
+    final catalog = _buildCatalogData(name);
+    if (catalog != null) return catalog.$1;
+    // Oracle's synthetic one-row DUAL table exposes a single DUMMY column.
+    if (name.toUpperCase() == 'DUAL') return const ['DUMMY'];
     throw StateError('No such table or view: $name');
+  }
+
+  /// A view's public column names follow SQLite: an explicitly qualified
+  /// projection like `a.id` is exposed as `id`, not `a.id`, so the inner FROM
+  /// alias does not leak to queries over the view. Star-expanded and
+  /// expression/aliased labels are already bare and pass through unchanged.
+  static final RegExp _qualifiedColLabel = RegExp(r'^\w+\.\w+$');
+  List<String> _viewPublicColumns(List<String> cols) {
+    return [
+      for (final c in cols)
+        if (_qualifiedColLabel.hasMatch(c))
+          c.substring(c.indexOf('.') + 1)
+        else
+          c,
+    ];
+  }
+
+  /// Public column names for view [name]: its explicit `CREATE VIEW v (…)`
+  /// list (positionally, padded from the derived names) when present, else the
+  /// derived [_viewPublicColumns].
+  List<String> _viewColumnsFor(String name, List<String> cols) {
+    final explicit = _viewColumns[name];
+    if (explicit == null) return _viewPublicColumns(cols);
+    final derived = _viewPublicColumns(cols);
+    return [
+      for (var i = 0; i < derived.length; i++)
+        i < explicit.length ? explicit[i] : derived[i],
+    ];
+  }
+
+  /// Column list for a `qualifier.*` projection, resolving [qualifier] as a
+  /// FROM/JOIN **alias** first (e.g. `SELECT e.* FROM emp e`), then falling
+  /// back to a bare table/view name.
+  List<String> _starColumns(SelectStmt s, String qualifier) {
+    final q = qualifier.toLowerCase();
+    if (s.fromAlias?.toLowerCase() == q ||
+        (s.fromAlias == null && s.fromTable?.toLowerCase() == q)) {
+      if (s.fromSubquery != null) return _selectTopLevel(s.fromSubquery!).columns;
+      if (s.fromTable != null) return _materializeColumns(s.fromTable!);
+    }
+    for (final j in s.joins) {
+      if (j.alias?.toLowerCase() == q ||
+          (j.alias == null && j.table?.toLowerCase() == q)) {
+        if (j.subquery != null) return _selectTopLevel(j.subquery!).columns;
+        if (j.table != null) return _materializeColumns(j.table!);
+      }
+    }
+    return _materializeColumns(qualifier);
   }
 
   String _exprLabel(Expr e) {
@@ -12453,6 +14573,21 @@ class Database {
         }
         return _bindExpr(item.expr!);
       }
+      // MySQL/SQLite extension: GROUP BY may reference a SELECT-list alias.
+      // Only when the bare name isn't a real column (checked against the
+      // incoming rows) does an output alias take over.
+      if (g is ColumnExpr &&
+          g.table == null &&
+          !(rows.isNotEmpty && rows.first.containsKey(g.name))) {
+        for (final item in s.projection) {
+          if (!item.isStar &&
+              item.expr != null &&
+              item.alias != null &&
+              item.alias!.toLowerCase() == g.name.toLowerCase()) {
+            return _bindExpr(item.expr!);
+          }
+        }
+      }
       return _bindExpr(g);
     }
 
@@ -12484,7 +14619,7 @@ class Database {
       if (item.isStar) {
         // Expanding * with aggregates is unusual; do the non-aggregate cols.
         if (item.starTable != null) {
-          for (final c in _materializeColumns(item.starTable!)) {
+          for (final c in _starColumns(s, item.starTable!)) {
             outCols.add(c);
             projExprs.add(_bindExpr(ColumnExpr(c, table: item.starTable)));
           }
@@ -12504,6 +14639,26 @@ class Database {
 
     final outRows = <List<Object?>>[];
     final orderingMaps = <Map<String, Object?>>[];
+    // Per-output-row source rows, for a window-over-GROUP BY pass.
+    final grpRowsList = <List<Map<String, Object?>>>[];
+    // ORDER BY keys that reference aggregates must be computed per group here
+    // (the post-aggregation sort only sees one group-context row and can't
+    // recompute an aggregate). Bind them once and stash values in the ctx.
+    final boundOrderAgg = <int, Expr>{};
+    for (var oi = 0; oi < s.orderBy.length; oi++) {
+      if (_containsAggregate(s.orderBy[oi].expr)) {
+        boundOrderAgg[oi] = _bindExpr(s.orderBy[oi].expr);
+      }
+    }
+    // Oracle nested aggregate over GROUP BY (e.g. MAX(MIN(s)) GROUP BY d):
+    // two-level aggregation collapsing all groups to a single output row.
+    if (s.groupBy.isNotEmpty && projExprs.any(_containsNestedAggregate)) {
+      final row = [
+        for (final e in projExprs)
+          _collapseNestedAggregate(e, s, groups, groupOrder, groupKeys)
+      ];
+      return _AggResult(outCols, [row], [<String, Object?>{}]);
+    }
     for (final key in groupOrder) {
       final grpRows = groups[key]!;
       // Group context map: columns of an arbitrary row (used by non-aggregate
@@ -12525,10 +14680,144 @@ class Database {
       for (final e in projExprs) {
         row.add(_evalProjectedWithAggregates(e, grpRows, ctx));
       }
+      for (final entry in boundOrderAgg.entries) {
+        ctx['__orderagg${entry.key}'] =
+            _evalProjectedWithAggregates(entry.value, grpRows, ctx);
+      }
       outRows.add(row);
       orderingMaps.add(ctx);
+      grpRowsList.add(grpRows);
     }
+    _windowOverAggregate(
+        s, projExprs, outCols, outRows, orderingMaps, grpRowsList);
     return _AggResult(outCols, outRows, orderingMaps);
+  }
+
+  /// Window functions in a GROUP BY query operate on the *grouped* rows. After
+  /// the aggregation has produced one row per group (with window items left as
+  /// NULL placeholders), evaluate each window function over those rows and fill
+  /// the placeholders. Window `PARTITION BY` / `ORDER BY` expressions that
+  /// reference an aggregate (e.g. `ORDER BY SUM(v)`) are precomputed per group
+  /// and the spec rewritten to read them.
+  void _windowOverAggregate(
+    SelectStmt s,
+    List<Expr> projExprs,
+    List<String> outCols,
+    List<List<Object?>> outRows,
+    List<Map<String, Object?>> orderingMaps,
+    List<List<Map<String, Object?>>> grpRowsList,
+  ) {
+    final winFns = <FunctionCallExpr>[];
+    for (final e in projExprs) {
+      _collectWindowFns(e, winFns);
+    }
+    if (winFns.isEmpty || outRows.isEmpty) return;
+
+    // Row maps for the window pass: group context + the projected output cols.
+    final winRows = <Map<String, Object?>>[];
+    for (var i = 0; i < outRows.length; i++) {
+      final m = Map<String, Object?>.from(orderingMaps[i]);
+      for (var j = 0; j < outCols.length && j < outRows[i].length; j++) {
+        m[outCols[j]] = outRows[i][j];
+      }
+      winRows.add(m);
+    }
+
+    // Rewrite each spec's aggregate PARTITION/ORDER expressions to synthetic
+    // columns precomputed per group.
+    var k = 0;
+    final rewritten = <FunctionCallExpr, FunctionCallExpr>{};
+    for (final fn in winFns) {
+      final spec = fn.window!;
+      final newPart = <Expr>[];
+      for (final p in spec.partitionBy) {
+        if (_containsAggregate(p)) {
+          final key = '__winagg${k++}';
+          for (var i = 0; i < winRows.length; i++) {
+            winRows[i][key] =
+                _evalProjectedWithAggregates(p, grpRowsList[i], winRows[i]);
+          }
+          newPart.add(ColumnExpr(key));
+        } else {
+          newPart.add(p);
+        }
+      }
+      final newOrder = <WindowOrderItem>[];
+      for (final ob in spec.orderBy) {
+        if (_containsAggregate(ob.expr)) {
+          final key = '__winagg${k++}';
+          for (var i = 0; i < winRows.length; i++) {
+            winRows[i][key] = _evalProjectedWithAggregates(
+                ob.expr, grpRowsList[i], winRows[i]);
+          }
+          newOrder.add(WindowOrderItem(ColumnExpr(key),
+              descending: ob.descending, nullsFirst: ob.nullsFirst));
+        } else {
+          newOrder.add(ob);
+        }
+      }
+      // Rewrite aggregate arguments too: an analytic over an aggregate such as
+      // `SUM(COUNT(*)) OVER ()` precomputes the inner aggregate per group into a
+      // synthetic column, so the window pass sums the per-group values.
+      final newArgs = <Expr>[];
+      for (final arg in fn.args) {
+        if (_containsAggregate(arg)) {
+          final key = '__winagg${k++}';
+          for (var i = 0; i < winRows.length; i++) {
+            winRows[i][key] =
+                _evalProjectedWithAggregates(arg, grpRowsList[i], winRows[i]);
+          }
+          newArgs.add(ColumnExpr(key));
+        } else {
+          newArgs.add(arg);
+        }
+      }
+      rewritten[fn] = FunctionCallExpr(
+        fn.name,
+        newArgs,
+        isStarArg: fn.isStarArg,
+        distinct: fn.distinct,
+        window: WindowSpec(
+          baseName: spec.baseName,
+          partitionBy: newPart,
+          orderBy: newOrder,
+          frame: spec.frame,
+        ),
+        filterExpr: fn.filterExpr,
+        aggOrderBy: fn.aggOrderBy,
+      );
+    }
+
+    final winValues = <FunctionCallExpr, List<Object?>>{};
+    for (final fn in winFns) {
+      winValues[fn] = _evalWindowFn(rewritten[fn]!, winRows, s.namedWindows);
+    }
+
+    // Fill the window placeholders by re-evaluating only the projection items
+    // that contain a window function, with per-row window values published.
+    final itemHasWindow = [
+      for (final e in projExprs)
+        () {
+          final tmp = <FunctionCallExpr>[];
+          _collectWindowFns(e, tmp);
+          return tmp.isNotEmpty;
+        }()
+    ];
+    for (var i = 0; i < outRows.length; i++) {
+      FunctionCallExpr.windowRowValues = {
+        for (final fn in winFns) fn: winValues[fn]![i],
+      };
+      try {
+        for (var j = 0; j < projExprs.length; j++) {
+          if (itemHasWindow[j]) {
+            outRows[i][j] = _evalProjectedWithAggregates(
+                projExprs[j], grpRowsList[i], winRows[i]);
+          }
+        }
+      } finally {
+        FunctionCallExpr.windowRowValues = null;
+      }
+    }
   }
 
   bool _containsAggregate(Expr? e) {
@@ -12556,11 +14845,144 @@ class Database {
     return false;
   }
 
+  /// True when [e] contains an aggregate whose argument itself contains an
+  /// aggregate (Oracle's two-level `MAX(MIN(x))` over GROUP BY).
+  bool _containsNestedAggregate(Expr? e) {
+    if (e == null) return false;
+    if (e is FunctionCallExpr && e.isAggregate && !e.isWindow) {
+      if (e.args.any(_containsAggregate)) return true;
+    }
+    if (e is FunctionCallExpr) return e.args.any(_containsNestedAggregate);
+    if (e is BinaryExpr) {
+      return _containsNestedAggregate(e.left) ||
+          _containsNestedAggregate(e.right);
+    }
+    if (e is UnaryExpr) return _containsNestedAggregate(e.operand);
+    if (e is CastExpr) return _containsNestedAggregate(e.expr);
+    if (e is CaseExpr) {
+      return e.whens.any(_containsNestedAggregate) ||
+          e.thens.any(_containsNestedAggregate) ||
+          _containsNestedAggregate(e.elseExpr);
+    }
+    return false;
+  }
+
+  /// Collapse a projection containing a nested aggregate into a single value:
+  /// the inner aggregate is computed per group, then the outer aggregate runs
+  /// across the per-group results.
+  Object? _collapseNestedAggregate(
+    Expr e,
+    SelectStmt s,
+    Map<String, List<Map<String, Object?>>> groups,
+    List<String> groupOrder,
+    Map<String, List<Object?>> groupKeys,
+  ) {
+    if (e is FunctionCallExpr &&
+        e.isAggregate &&
+        !e.isWindow &&
+        e.args.any(_containsAggregate)) {
+      final innerRows = <Map<String, Object?>>[];
+      for (final key in groupOrder) {
+        final grpRows = groups[key]!;
+        final ctx = grpRows.isEmpty
+            ? <String, Object?>{}
+            : Map<String, Object?>.from(grpRows.first);
+        for (var gi = 0; gi < s.groupBy.length; gi++) {
+          ctx['__group$gi'] = groupKeys[key]![gi];
+        }
+        if (s.having != null && !_evalHaving(s.having!, grpRows, ctx)) continue;
+        final iv = e.args.isEmpty
+            ? null
+            : _evalProjectedWithAggregates(e.args.first, grpRows, ctx);
+        innerRows.add({'__v': iv});
+      }
+      final rebuilt = FunctionCallExpr(
+        e.name,
+        [ColumnExpr('__v')],
+        distinct: e.distinct,
+        aggOrderBy: e.aggOrderBy,
+        keepFirst: e.keepFirst,
+        keepOrderBy: e.keepOrderBy,
+      );
+      return _aggregateValue(rebuilt, innerRows);
+    }
+    if (e is BinaryExpr) {
+      final l = _collapseNestedAggregate(e.left, s, groups, groupOrder, groupKeys);
+      final r =
+          _collapseNestedAggregate(e.right, s, groups, groupOrder, groupKeys);
+      return BinaryExpr(e.op, LiteralExpr(l), LiteralExpr(r)).eval(const {});
+    }
+    if (e is UnaryExpr) {
+      final v =
+          _collapseNestedAggregate(e.operand, s, groups, groupOrder, groupKeys);
+      return UnaryExpr(e.op, LiteralExpr(v)).eval(const {});
+    }
+    // Non-nested leaf: aggregate / evaluate over all rows flattened.
+    final allRows = [for (final key in groupOrder) ...groups[key]!];
+    final ctx = allRows.isEmpty
+        ? <String, Object?>{}
+        : Map<String, Object?>.from(allRows.first);
+    return _evalProjectedWithAggregates(e, allRows, ctx);
+  }
+
+  /// Collect every window-function call nested anywhere in [e] (top level or
+  /// inside a larger scalar expression) so the SELECT executor can precompute
+  /// their per-row values and publish them via FunctionCallExpr.windowRowValues.
+  void _collectWindowFns(Expr? e, List<FunctionCallExpr> out) {
+    if (e == null) return;
+    if (e is FunctionCallExpr) {
+      if (e.isWindow) out.add(e);
+      for (final a in e.args) {
+        _collectWindowFns(a, out);
+      }
+      _collectWindowFns(e.filterExpr, out);
+      return;
+    }
+    if (e is BinaryExpr) {
+      _collectWindowFns(e.left, out);
+      _collectWindowFns(e.right, out);
+      return;
+    }
+    if (e is UnaryExpr) {
+      _collectWindowFns(e.operand, out);
+      return;
+    }
+    if (e is BetweenExpr) {
+      _collectWindowFns(e.value, out);
+      _collectWindowFns(e.low, out);
+      _collectWindowFns(e.high, out);
+      return;
+    }
+    if (e is InExpr) {
+      _collectWindowFns(e.value, out);
+      for (final v in e.values) {
+        _collectWindowFns(v, out);
+      }
+      return;
+    }
+    if (e is CaseExpr) {
+      for (final w in e.whens) {
+        _collectWindowFns(w, out);
+      }
+      for (final t in e.thens) {
+        _collectWindowFns(t, out);
+      }
+      _collectWindowFns(e.elseExpr, out);
+      return;
+    }
+    if (e is CastExpr) _collectWindowFns(e.expr, out);
+  }
+
   Object? _evalProjectedWithAggregates(
     Expr e,
     List<Map<String, Object?>> grp,
     Map<String, Object?> ctx,
   ) {
+    // Window functions are computed in a separate pass over the grouped rows
+    // (see _windowOverAggregate); leave a placeholder here.
+    if (e is FunctionCallExpr && e.isWindow) {
+      return FunctionCallExpr.windowRowValues?[e];
+    }
     if (e is FunctionCallExpr && e.isAggregate) {
       return _aggregateValue(e, grp);
     }
@@ -12596,7 +15018,9 @@ class Database {
     }
     if (e is CastExpr) {
       final v = _evalProjectedWithAggregates(e.expr, grp, ctx);
-      return CastExpr(LiteralExpr(v), e.targetType).eval(ctx);
+      return CastExpr(LiteralExpr(v), e.targetType,
+              numericScale: e.numericScale, charLength: e.charLength)
+          .eval(ctx);
     }
     return e.eval(ctx);
   }
@@ -12610,12 +15034,90 @@ class Database {
     return v is bool && v;
   }
 
+  /// Numeric coercion for aggregate accumulators (SQLite affinity): bool->1/0,
+  /// numeric string->parsed value, non-numeric->0.
+  num _aggNum(Object? v) {
+    if (v is num) return v;
+    if (v is bool) return v ? 1 : 0;
+    if (v is String) return num.tryParse(v.trim()) ?? 0;
+    return 0;
+  }
+
+  /// Exact-decimal sum of [vals] (Oracle NUMBER arithmetic is decimal, not
+  /// binary — SUM(0.1, 0.2) is 0.3, not 0.30000000000000004). Scales every
+  /// value to a common power of ten and accumulates with BigInt. Returns null
+  /// when a value uses scientific notation or needs more than 15 fraction
+  /// digits, so the caller falls back to a plain double sum.
+  num? _decimalSum(List<num> vals) {
+    if (vals.isEmpty) return null;
+    var maxDec = 0;
+    for (final v in vals) {
+      final s = v.toString();
+      if (s.contains('e') || s.contains('E')) return null;
+      final dot = s.indexOf('.');
+      if (dot >= 0) {
+        final d = s.length - dot - 1;
+        if (d > maxDec) maxDec = d;
+      }
+    }
+    if (maxDec > 15) return null;
+    final scale = BigInt.from(10).pow(maxDec);
+    var acc = BigInt.zero;
+    for (final v in vals) {
+      var s = v.toString();
+      final neg = s.startsWith('-');
+      if (neg) s = s.substring(1);
+      final dot = s.indexOf('.');
+      final intp = dot < 0 ? s : s.substring(0, dot);
+      var frac = dot < 0 ? '' : s.substring(dot + 1);
+      frac = frac.padRight(maxDec, '0').substring(0, maxDec);
+      final digits = '$intp$frac';
+      var big = BigInt.parse(digits.isEmpty ? '0' : digits);
+      if (neg) big = -big;
+      acc += big;
+    }
+    if (maxDec == 0) {
+      return acc.isValidInt ? acc.toInt() : acc.toDouble();
+    }
+    return acc.toDouble() / scale.toDouble();
+  }
+
+  /// Strips binary floating-point noise by round-tripping through a 15-digit
+  /// decimal (1.0150000000000001 -> 1.015), mirroring Oracle's exact NUMBER.
+  double _cleanDecimal(double v) {
+    if (v == 0 || !v.isFinite) return v;
+    return double.parse(v.toStringAsPrecision(15));
+  }
+
   Object? _aggregateValue(FunctionCallExpr e, List<Map<String, Object?>> grp) {
     if (e.filterExpr != null) {
       grp = grp.where((r) {
         final v = e.filterExpr!.eval(r);
         return v == true || (v is num && v != 0);
       }).toList();
+    }
+    // KEEP (DENSE_RANK FIRST|LAST ORDER BY …): restrict the group to the rows
+    // holding the first/last rank, then aggregate over those.
+    if (e.keepOrderBy != null && e.keepOrderBy!.isNotEmpty && grp.isNotEmpty) {
+      final bound = [for (final ob in e.keepOrderBy!) (_bindExpr(ob.expr), ob)];
+      int cmpKeep(Map<String, Object?> a, Map<String, Object?> b) {
+        for (final (ex, ob) in bound) {
+          final av = ex.eval(a);
+          final bv = ex.eval(b);
+          // Oracle default null ordering: NULLS LAST for ASC, FIRST for DESC.
+          final nullsFirst = ob.nullsFirst ?? ob.descending;
+          if (av == null && bv == null) continue;
+          if (av == null) return nullsFirst ? -1 : 1;
+          if (bv == null) return nullsFirst ? 1 : -1;
+          final c = sqlCompare(av, bv);
+          if (c != 0) return ob.descending ? -c : c;
+        }
+        return 0;
+      }
+      final first = e.keepFirst ?? true;
+      final extreme = grp.reduce((a, b) =>
+          (first ? cmpKeep(a, b) <= 0 : cmpKeep(a, b) >= 0) ? a : b);
+      grp = grp.where((r) => cmpKeep(r, extreme) == 0).toList();
     }
     if (e.aggOrderBy != null && e.aggOrderBy!.isNotEmpty) {
       final bound = [for (final ob in e.aggOrderBy!) (_bindExpr(ob.expr), ob)];
@@ -12648,35 +15150,53 @@ class Database {
         if (e.args.isEmpty) return grp.length;
         final boundArg = _bindExpr(e.args.first);
         final values = grp.map((r) => boundArg.eval(r)).where((v) => v != null);
-        if (e.distinct) return values.map((v) => jsonEncode(v)).toSet().length;
+        if (e.distinct) {
+          // Dedup under the argument's COLLATE override (NOCASE/RTRIM).
+          final coll = collationOf(e.args.first);
+          return values
+              .map((v) => jsonEncode(applyCollation(v, coll)))
+              .toSet()
+              .length;
+        }
         return values.length;
       case 'SUM':
         {
-          var acc = 0.0;
-          var any = false;
+          final vals = <num>[];
           var allInt = true;
-          final iter = _aggValues(e, grp);
-          for (final v in iter) {
+          for (final v in _aggValues(e, grp)) {
             if (v == null) continue;
-            any = true;
-            if (v is! num) {
-              throw StateError('SUM requires numeric, got ${v.runtimeType}');
+            final n = _aggNum(v);
+            if (n is! int) allInt = false;
+            vals.add(n);
+          }
+          if (vals.isEmpty) return null;
+          if (allInt) {
+            var acc = 0;
+            for (final v in vals) {
+              acc += v as int;
             }
-            if (v is! int) allInt = false;
+            return acc;
+          }
+          final dec = _decimalSum(vals);
+          if (dec != null) return dec;
+          var acc = 0.0;
+          for (final v in vals) {
             acc += v.toDouble();
           }
-          if (!any) return null;
-          return allInt ? acc.toInt() : acc;
+          return acc;
         }
       case 'TOTAL':
         {
           // SQLite TOTAL: always returns a float, returns 0.0 on empty.
-          var acc = 0.0;
+          final vals = <num>[];
           for (final v in _aggValues(e, grp)) {
             if (v == null) continue;
-            if (v is! num) {
-              throw StateError('TOTAL requires numeric, got ${v.runtimeType}');
-            }
+            vals.add(_aggNum(v));
+          }
+          final dec = _decimalSum(vals);
+          if (dec != null) return dec.toDouble();
+          var acc = 0.0;
+          for (final v in vals) {
             acc += v.toDouble();
           }
           return acc;
@@ -12688,10 +15208,11 @@ class Database {
           // GROUP_CONCAT(expr [, sep]) -- defaults to ','.
           // STRING_AGG(expr, sep) -- separator is required, but we accept
           // a missing one too for symmetry.
-          String sep = ',';
+          // LISTAGG(expr) with no separator concatenates with nothing.
+          String sep = e.name == 'LISTAGG' ? '' : ',';
           if (e.args.length > 1) {
             final s = _bindExpr(e.args[1]).eval(grp.isEmpty ? {} : grp.first);
-            sep = s?.toString() ?? ',';
+            sep = s?.toString() ?? sep;
           }
           final parts = <String>[];
           if (e.args.isNotEmpty) {
@@ -12721,10 +15242,7 @@ class Database {
           var n = 0;
           for (final v in _aggValues(e, grp)) {
             if (v == null) continue;
-            if (v is! num) {
-              throw StateError('AVG requires numeric');
-            }
-            acc += v.toDouble();
+            acc += _aggNum(v).toDouble();
             n++;
           }
           if (n == 0) return null;
@@ -12732,6 +15250,10 @@ class Database {
         }
       case 'MIN':
         {
+          if (e.isStarArg || e.args.length != 1) {
+            throw FormatException(
+                'wrong number of arguments to function min()');
+          }
           Object? best;
           for (final v in _aggValues(e, grp)) {
             if (v == null) continue;
@@ -12741,6 +15263,10 @@ class Database {
         }
       case 'MAX':
         {
+          if (e.isStarArg || e.args.length != 1) {
+            throw FormatException(
+                'wrong number of arguments to function max()');
+          }
           Object? best;
           for (final v in _aggValues(e, grp)) {
             if (v == null) continue;
@@ -12840,6 +15366,129 @@ class Database {
           }
           return null;
         }
+      case 'STATS_MODE':
+        {
+          // Most frequent value; ties resolved by first-seen order.
+          final counts = <Object?, int>{};
+          final order = <Object?>[];
+          for (final v in _aggValues(e, grp)) {
+            if (v == null) continue;
+            if (!counts.containsKey(v)) order.add(v);
+            counts[v] = (counts[v] ?? 0) + 1;
+          }
+          if (order.isEmpty) return null;
+          Object? best;
+          var bestCount = -1;
+          for (final v in order) {
+            if (counts[v]! > bestCount) {
+              bestCount = counts[v]!;
+              best = v;
+            }
+          }
+          return best;
+        }
+      case 'APPROX_COUNT_DISTINCT':
+        {
+          // Exact distinct count (the engine is in-memory; no approximation).
+          final seen = <Object?>{};
+          for (final v in _aggValues(e, grp)) {
+            if (v == null) continue;
+            seen.add(v);
+          }
+          return seen.length;
+        }
+      case 'REGR_COUNT':
+      case 'REGR_AVGX':
+      case 'REGR_AVGY':
+      case 'REGR_SLOPE':
+      case 'REGR_INTERCEPT':
+      case 'REGR_SXX':
+      case 'REGR_SYY':
+      case 'REGR_SXY':
+      case 'REGR_R2':
+        {
+          // Linear-regression aggregates over (y, x) pairs with both non-null.
+          if (e.args.length < 2) return null;
+          final ey = _bindExpr(e.args[0]);
+          final ex = _bindExpr(e.args[1]);
+          final xs = <double>[];
+          final ys = <double>[];
+          for (final r in grp) {
+            final yv = ey.eval(r);
+            final xv = ex.eval(r);
+            if (yv is num && xv is num) {
+              ys.add(yv.toDouble());
+              xs.add(xv.toDouble());
+            }
+          }
+          final n = xs.length;
+          if (e.name == 'REGR_COUNT') return n;
+          if (n == 0) return null;
+          final avgX = xs.reduce((a, b) => a + b) / n;
+          final avgY = ys.reduce((a, b) => a + b) / n;
+          if (e.name == 'REGR_AVGX') return avgX;
+          if (e.name == 'REGR_AVGY') return avgY;
+          var sxx = 0.0, syy = 0.0, sxy = 0.0;
+          for (var i = 0; i < n; i++) {
+            sxx += (xs[i] - avgX) * (xs[i] - avgX);
+            syy += (ys[i] - avgY) * (ys[i] - avgY);
+            sxy += (xs[i] - avgX) * (ys[i] - avgY);
+          }
+          switch (e.name) {
+            case 'REGR_SXX':
+              return sxx;
+            case 'REGR_SYY':
+              return syy;
+            case 'REGR_SXY':
+              return sxy;
+            case 'REGR_SLOPE':
+              return sxx == 0 ? null : sxy / sxx;
+            case 'REGR_INTERCEPT':
+              return sxx == 0 ? null : avgY - (sxy / sxx) * avgX;
+            case 'REGR_R2':
+              return (sxx == 0 || syy == 0) ? null : (sxy * sxy) / (sxx * syy);
+          }
+          return null;
+        }
+      case 'JSON_ARRAYAGG':
+        {
+          final arg = e.args.isNotEmpty ? _bindExpr(e.args.first) : null;
+          var rows = grp;
+          if (e.aggOrderBy != null && e.aggOrderBy!.isNotEmpty) {
+            final bound = [for (final ob in e.aggOrderBy!) (_bindExpr(ob.expr), ob)];
+            rows = List<Map<String, Object?>>.from(grp)
+              ..sort((a, b) {
+                for (final (ex2, ob) in bound) {
+                  final av = ex2.eval(a), bv = ex2.eval(b);
+                  if (av == null && bv == null) continue;
+                  if (av == null) return ob.descending ? 1 : -1;
+                  if (bv == null) return ob.descending ? -1 : 1;
+                  final c = sqlCompare(av, bv);
+                  if (c != 0) return ob.descending ? -c : c;
+                }
+                return 0;
+              });
+          }
+          final out = <Object?>[];
+          for (final r in rows) {
+            final v = arg?.eval(r);
+            if (v != null) out.add(v);
+          }
+          return jsonEncode(out);
+        }
+      case 'JSON_OBJECTAGG':
+        {
+          if (e.args.length < 2) return null;
+          final ek = _bindExpr(e.args[0]);
+          final ev = _bindExpr(e.args[1]);
+          final m = <String, Object?>{};
+          for (final r in grp) {
+            final k = ek.eval(r);
+            if (k == null) continue;
+            m[k.toString()] = ev.eval(r);
+          }
+          return jsonEncode(m);
+        }
       case 'MEDIAN':
         {
           final nums = <double>[];
@@ -12854,7 +15503,44 @@ class Database {
           nums.sort();
           final mid = nums.length ~/ 2;
           if (nums.length.isOdd) return nums[mid];
-          return (nums[mid - 1] + nums[mid]) / 2;
+          // Average the two middle values in exact decimal (Oracle NUMBER),
+          // not binary — MEDIAN(1.01, 1.02) is 1.015, not 1.0150000000000001.
+          return _cleanDecimal((nums[mid - 1] + nums[mid]) / 2);
+        }
+      case 'PERCENTILE_CONT':
+      case 'PERCENTILE_DISC':
+      case 'APPROX_PERCENTILE':
+        {
+          // PERCENTILE_x(frac) WITHIN GROUP (ORDER BY expr): the fraction is
+          // the first arg; the ordered-by expression supplies the values.
+          final p = e.args.isNotEmpty ? e.args.first.eval(const {}) : null;
+          final frac = (p is num ? p.toDouble() : 0.5).clamp(0.0, 1.0);
+          final orderExpr = (e.aggOrderBy != null && e.aggOrderBy!.isNotEmpty)
+              ? _bindExpr(e.aggOrderBy!.first.expr)
+              : null;
+          final nums = <double>[];
+          for (final row in grp) {
+            final v = orderExpr?.eval(row);
+            if (v is num) {
+              nums.add(v.toDouble());
+            } else if (v is String) {
+              final n = num.tryParse(v.trim());
+              if (n != null) nums.add(n.toDouble());
+            }
+          }
+          if (nums.isEmpty) return null;
+          nums.sort();
+          if (e.name == 'PERCENTILE_DISC' || e.name == 'APPROX_PERCENTILE') {
+            // Smallest value whose cumulative distribution >= frac.
+            final idx =
+                (frac * nums.length).ceil().clamp(1, nums.length) - 1;
+            return nums[idx];
+          }
+          final rank = frac * (nums.length - 1);
+          final lo = rank.floor();
+          final hi = rank.ceil();
+          if (lo == hi) return nums[lo];
+          return nums[lo] + (nums[hi] - nums[lo]) * (rank - lo);
         }
       case 'STDDEV':
       case 'STDDEV_SAMP':
@@ -13322,9 +16008,32 @@ class Database {
             final offset = fn.args.length >= 2
                 ? (fn.args[1].eval(const {}) as num).toInt()
                 : 1;
-            final defaultVal =
-                fn.args.length >= 3 ? fn.args[2].eval(const {}) : null;
             for (var k = 0; k < ordered.length; k++) {
+              // The default (3rd) argument is evaluated against the current
+              // row, so a column reference (e.g. LAG(v,1,v)) resolves.
+              final defaultVal = fn.args.length >= 3
+                  ? fn.args[2].eval(rows[ordered[k]])
+                  : null;
+              if (fn.ignoreNulls && fn.args.isNotEmpty) {
+                // Step over NULL-valued rows when counting the offset.
+                var remaining = offset;
+                var idx = k;
+                Object? val;
+                while (remaining > 0) {
+                  idx += dir;
+                  if (idx < 0 || idx >= ordered.length) {
+                    val = defaultVal;
+                    break;
+                  }
+                  final cand = fn.args.first.eval(rows[ordered[idx]]);
+                  if (cand != null) {
+                    remaining--;
+                    val = cand;
+                  }
+                }
+                out[ordered[k]] = val;
+                continue;
+              }
               final target = k + dir * offset;
               if (target < 0 || target >= ordered.length) {
                 out[ordered[k]] = defaultVal;
@@ -13339,13 +16048,39 @@ class Database {
         case 'FIRST_VALUE':
           for (var k = 0; k < ordered.length; k++) {
             final fr = frameRows(k);
-            out[ordered[k]] = fr.isEmpty ? null : fn.args.first.eval(fr.first);
+            if (fn.ignoreNulls) {
+              Object? val;
+              for (final row in fr) {
+                final x = fn.args.first.eval(row);
+                if (x != null) {
+                  val = x;
+                  break;
+                }
+              }
+              out[ordered[k]] = val;
+            } else {
+              out[ordered[k]] =
+                  fr.isEmpty ? null : fn.args.first.eval(fr.first);
+            }
           }
           break;
         case 'LAST_VALUE':
           for (var k = 0; k < ordered.length; k++) {
             final fr = frameRows(k);
-            out[ordered[k]] = fr.isEmpty ? null : fn.args.first.eval(fr.last);
+            if (fn.ignoreNulls) {
+              Object? val;
+              for (final row in fr.reversed) {
+                final x = fn.args.first.eval(row);
+                if (x != null) {
+                  val = x;
+                  break;
+                }
+              }
+              out[ordered[k]] = val;
+            } else {
+              out[ordered[k]] =
+                  fr.isEmpty ? null : fn.args.first.eval(fr.last);
+            }
           }
           break;
         case 'NTH_VALUE':
@@ -13353,9 +16088,11 @@ class Database {
             final nth = (fn.args[1].eval(const {}) as num).toInt();
             for (var k = 0; k < ordered.length; k++) {
               final fr = frameRows(k);
-              out[ordered[k]] = (nth < 1 || nth > fr.length)
+              // FROM LAST: count the nth row from the end of the frame.
+              final idx = fn.fromLast ? fr.length - nth : nth - 1;
+              out[ordered[k]] = (nth < 1 || idx < 0 || idx >= fr.length)
                   ? null
-                  : fn.args.first.eval(fr[nth - 1]);
+                  : fn.args.first.eval(fr[idx]);
             }
           }
           break;
@@ -13392,6 +16129,20 @@ class Database {
             for (var k = 0; k < ordered.length; k++) {
               final slice = frameRows(k);
               out[ordered[k]] = _aggregateValue(fn, slice);
+            }
+          }
+          break;
+        case 'RATIO_TO_REPORT':
+          {
+            // value / SUM(value) over the whole partition (framing ignored).
+            num total = 0;
+            for (final idx in ordered) {
+              final v = fn.args.first.eval(rows[idx]);
+              if (v is num) total += v;
+            }
+            for (final idx in ordered) {
+              final v = fn.args.first.eval(rows[idx]);
+              out[idx] = (v is num && total != 0) ? v / total : null;
             }
           }
           break;
@@ -13445,8 +16196,11 @@ class Database {
       return ScalarSubqueryExpr((row) {
         final r = _selectTopLevel(e.select, {...outerScope, ...row});
         if (r.rows.isEmpty) return null;
-        if (r.rows.first.isEmpty) return null;
-        return r.rows.first.first;
+        final first = r.rows.first;
+        if (first.isEmpty) return null;
+        // A multi-column single-row subquery yields a row value so it can be
+        // compared against a tuple: `(a, b) = (SELECT 1, 10)`.
+        return first.length == 1 ? first.first : List<Object?>.from(first);
       });
     }
     if (e is SubqueryInExpr) {
@@ -13471,6 +16225,9 @@ class Database {
     if (e is UnaryExpr) {
       return UnaryExpr(e.op, _bindExpr(e.operand, outerScope));
     }
+    if (e is RowElementExpr) {
+      return RowElementExpr(_bindExpr(e.row, outerScope), e.index);
+    }
     if (e is BetweenExpr) {
       return BetweenExpr(
         _bindExpr(e.value, outerScope),
@@ -13494,7 +16251,8 @@ class Database {
       );
     }
     if (e is CastExpr) {
-      return CastExpr(_bindExpr(e.expr, outerScope), e.targetType);
+      return CastExpr(_bindExpr(e.expr, outerScope), e.targetType,
+          numericScale: e.numericScale, charLength: e.charLength);
     }
     if (e is FunctionCallExpr) {
       // Window arguments are evaluated in their own pass, but we still
@@ -13527,6 +16285,10 @@ class Database {
         filterExpr:
             e.filterExpr == null ? null : _bindExpr(e.filterExpr!, outerScope),
         aggOrderBy: e.aggOrderBy,
+        keepFirst: e.keepFirst,
+        keepOrderBy: e.keepOrderBy,
+        ignoreNulls: e.ignoreNulls,
+        fromLast: e.fromLast,
       );
     }
     return e;
@@ -13548,7 +16310,8 @@ class Database {
   }
 
   QueryResult _commit() {
-    if (!inTransaction) throw StateError('No transaction in progress');
+    // Oracle/MySQL treat COMMIT with no active transaction as a no-op.
+    if (!inTransaction) return QueryResult.message('OK');
     // Replay any deferred FK checks now. Failure rolls the txn back
     // and throws with a deferred-prefixed message.
     if (_deferredFkChecks.isNotEmpty && !_readOnlySnapshot) {
@@ -14114,12 +16877,22 @@ class Database {
             final t = _tables[target]!;
             for (var i = 0; i < t.columns.length; i++) {
               final c = t.columns[i];
+              // An INTEGER PRIMARY KEY is a rowid alias: SQLite reports
+              // notnull=0 for it even though it can't be null.
+              final rowidAlias = c.primaryKey && c.type == DataType.integer;
+              // SQLite quotes a string default literal (`'x'`), not `x`.
+              Object? dflt = c.defaultValue;
+              if (c.defaultExprSql != null) {
+                dflt = c.defaultExprSql;
+              } else if (dflt is String) {
+                dflt = "'$dflt'";
+              }
               rows.add([
                 i,
                 c.name,
                 c.type == DataType.any ? '' : c.type.name.toUpperCase(),
-                c.notNull ? 1 : 0,
-                c.defaultValue,
+                (!rowidAlias && c.notNull) ? 1 : 0,
+                dflt,
                 c.primaryKey ? 1 : 0,
               ]);
             }
@@ -14679,6 +17452,7 @@ class Database {
       s.table,
       s.when,
       s.body,
+      s.newAssignments,
     );
     return QueryResult.message('Trigger ${s.name} created');
   }
@@ -14831,6 +17605,18 @@ class Database {
       for (final tr in fired) {
         if (tr.when != null && !evalPredicate(_bindExpr(tr.when!), const {})) {
           continue;
+        }
+        // BEFORE row trigger: apply recovered `:new.col := expr` assignments to
+        // the live NEW row (and keep the scope consistent for later ones).
+        if (tr.timing == 'BEFORE' && newRow != null) {
+          for (final a in tr.newAssignments) {
+            final idx =
+                names.indexWhere((n) => n.toLowerCase() == a.column.toLowerCase());
+            if (idx < 0 || idx >= newRow.length) continue;
+            final val = _bindExpr(a.expr).eval(_triggerScope ?? const {});
+            newRow[idx] = val;
+            _triggerScope!['NEW.${names[idx]}'] = val;
+          }
         }
         try {
           for (final stmt in tr.body) {
@@ -15455,6 +18241,8 @@ class Database {
       '__schema__': 2,
       'tables': {for (final e in _tables.entries) e.key: e.value.toJson()},
       'views': {for (final e in _viewSql.entries) e.key: e.value},
+      if (_viewColumns.isNotEmpty)
+        'view_columns': {for (final e in _viewColumns.entries) e.key: e.value},
       if (_vectorIndexes.isNotEmpty)
         'vector_indexes': [
           for (final e in _vectorIndexes.entries)
@@ -15628,16 +18416,15 @@ class Database {
     }
   }
 
-  /// Crash-safe write: writes to `<dest>.tmp`, fsyncs the temp file's
-  /// contents, then atomically renames it over `dest`. On Windows the
-  /// rename can't overwrite an existing file, so we delete the
-  /// destination first; the surrounding [DbFileLock] keeps other
-  /// processes out of the brief gap.
-  ///
-  /// A torn write therefore manifests as either:
-  ///  * the original file unchanged (rename never ran); or
-  ///  * the new file fully written (rename completed),
-  /// and never as a half-written destination.
+  /// Crash-safe write: writes to `<dest>.tmp`, fsyncs it, then atomically
+  /// publishes it over `dest`. On POSIX the `rename` atomically replaces the
+  /// destination. On Windows `rename` can't overwrite, so rather than a plain
+  /// delete-then-rename (which leaves a window where neither the old nor the
+  /// new file exists), the current committed copy is first moved aside to
+  /// `<dest>.old`, then the new file is renamed into place, then `.old` is
+  /// removed. A crash in that gap is always recoverable (see
+  /// [_recoverAtomicTmp]): either `dest`, `<dest>.tmp`, or `<dest>.old` holds a
+  /// complete image, never a half-written destination.
   static Future<void> _atomicWriteBytes(String dest, List<int> bytes) async {
     final tmp = '$dest.tmp';
     final raf = await File(tmp).open(mode: FileMode.write);
@@ -15650,11 +18437,19 @@ class Database {
     if (Platform.isWindows) {
       final destFile = File(dest);
       if (await destFile.exists()) {
-        try {
-          await destFile.delete();
-        } catch (_) {
-          /* best-effort */
+        final old = '$dest.old';
+        final oldFile = File(old);
+        if (await oldFile.exists()) {
+          try {
+            await oldFile.delete();
+          } catch (_) {/* best-effort */}
         }
+        await destFile.rename(old); // preserve committed copy
+        await File(tmp).rename(dest); // publish new
+        try {
+          await oldFile.delete();
+        } catch (_) {/* best-effort */}
+        return;
       }
     }
     await File(tmp).rename(dest);
@@ -15674,35 +18469,129 @@ class Database {
     if (Platform.isWindows) {
       final destFile = File(dest);
       if (destFile.existsSync()) {
-        try {
-          destFile.deleteSync();
-        } catch (_) {
-          /* best-effort */
+        final old = '$dest.old';
+        final oldFile = File(old);
+        if (oldFile.existsSync()) {
+          try {
+            oldFile.deleteSync();
+          } catch (_) {/* best-effort */}
         }
+        destFile.renameSync(old);
+        File(tmp).renameSync(dest);
+        try {
+          oldFile.deleteSync();
+        } catch (_) {/* best-effort */}
+        return;
       }
     }
     File(tmp).renameSync(dest);
   }
 
-  /// Recover from a previous crash mid-[_atomicWriteBytes]: if a stale
-  /// `<path>.tmp` is sitting next to the data file, it's an incomplete
-  /// write that never made it to the rename step — discard it.
+  /// Recover from a crash mid-[_atomicWriteBytes] across every atomic-written
+  /// file (main image, WAL companions, wal2 meta, vector sidecar). Each may be
+  /// left as `dest`, `<dest>.tmp` (new, already fully written+flushed), and/or
+  /// `<dest>.old` (the previous committed copy, preserved across the Windows
+  /// rename gap). [_recoverAtomicTmp] restores the newest complete copy.
   Future<void> _reapStaleTempFiles() async {
     if (path == null) return;
-    for (final p in [
-      '$path.tmp',
-      '${path!}-wal.tmp',
-      '${path!}-wal2.tmp',
-      '${path!}.vec.json.tmp',
+    for (final dest in [
+      path!,
+      '${path!}-wal',
+      '${path!}-wal2',
+      '${path!}-wal2.meta',
+      '${path!}.vec.json',
     ]) {
-      final f = File(p);
-      if (await f.exists()) {
+      await _recoverAtomicTmp(dest);
+    }
+  }
+
+  Future<void> _recoverAtomicTmp(String dest) async {
+    final tmpF = File('$dest.tmp');
+    final oldF = File('$dest.old');
+    if (await File(dest).exists()) {
+      // The committed copy is in place; clean up any leftovers.
+      if (await tmpF.exists()) {
         try {
-          await f.delete();
-        } catch (_) {
-          /* best-effort */
+          await tmpF.delete();
+        } catch (_) {/* best-effort */}
+      }
+      if (await oldF.exists()) {
+        try {
+          await oldF.delete();
+        } catch (_) {/* best-effort */}
+      }
+      return;
+    }
+    // `dest` is missing: the crash hit the publish gap. Restore the newest
+    // complete copy. When `.old` exists the `.tmp` was fully written before
+    // `dest` was moved aside, so it is complete; otherwise validate it (guards
+    // against a torn first-ever write with no prior committed copy).
+    final oldExists = await oldF.exists();
+    if (await tmpF.exists() &&
+        (oldExists || await _atomicTmpIsComplete(tmpF, dest))) {
+      try {
+        await tmpF.rename(dest);
+        if (oldExists) {
+          try {
+            await oldF.delete();
+          } catch (_) {/* best-effort */}
+        }
+        return;
+      } catch (_) {/* fall through */}
+    }
+    if (oldExists) {
+      try {
+        await oldF.rename(dest);
+      } catch (_) {/* best-effort */}
+      if (await tmpF.exists()) {
+        try {
+          await tmpF.delete();
+        } catch (_) {/* best-effort */}
+      }
+      return;
+    }
+    if (await tmpF.exists()) {
+      try {
+        await tmpF.delete();
+      } catch (_) {/* best-effort */}
+    }
+  }
+
+  /// True when `<dest>.tmp` is a fully-written image (not a torn first write):
+  /// JSON parses cleanly; an SQLite image carries the format magic and its
+  /// header page-count matches the file length.
+  static Future<bool> _atomicTmpIsComplete(File tmp, String dest) async {
+    try {
+      final len = await tmp.length();
+      if (len == 0) return false;
+      final lower = dest.toLowerCase();
+      final isSqlite = lower.endsWith('.db') ||
+          lower.endsWith('.sqlite') ||
+          lower.endsWith('.sqlite3');
+      if (isSqlite) {
+        final raf = await tmp.open();
+        try {
+          final head = await raf.read(32);
+          if (head.length < 32) return false;
+          if (String.fromCharCodes(head.sublist(0, 15)) != 'SQLite format 3') {
+            return false;
+          }
+          var ps = (head[16] << 8) | head[17];
+          if (ps == 1) ps = 65536; // SQLite encodes 64KiB pages as 1.
+          if (ps < 512 || len % ps != 0) return false;
+          final pageCount =
+              (head[28] << 24) | (head[29] << 16) | (head[30] << 8) | head[31];
+          return pageCount > 0 && len == pageCount * ps;
+        } finally {
+          await raf.close();
         }
       }
+      // JSON backend (plain or `.vec.json`): a complete image parses; a
+      // truncated one throws.
+      jsonDecode(await tmp.readAsString());
+      return true;
+    } catch (_) {
+      return false;
     }
   }
 
@@ -15940,6 +18829,15 @@ class Database {
             }
           } catch (_) {
             // Best-effort: skip views we can no longer parse.
+          }
+        }
+      }
+      final viewColumns = (data['view_columns'] as Map?)?.cast<String, Object?>();
+      if (viewColumns != null) {
+        for (final e in viewColumns.entries) {
+          final cols = (e.value as List?)?.cast<Object?>();
+          if (cols != null) {
+            _viewColumns[e.key] = [for (final c in cols) c.toString()];
           }
         }
       }
@@ -16989,14 +19887,16 @@ class _TriggerSpec {
   final String table;
   final Expr? when;
   final List<Statement> body;
+  final List<TriggerNewAssign> newAssignments;
   _TriggerSpec(
     this.name,
     this.timing,
     this.event,
     this.table,
     this.when,
-    this.body,
-  );
+    this.body, [
+    this.newAssignments = const [],
+  ]);
 }
 
 class _Savepoint {
@@ -17004,6 +19904,72 @@ class _Savepoint {
   final Map<String, Table> tables;
   final Map<String, SelectStmt> views;
   _Savepoint(this.name, this.tables, this.views);
+}
+
+/// Mutable state backing a named sequence (CREATE SEQUENCE).
+class _SequenceState {
+  final int startWith;
+  final int incrementBy;
+  final int? minValue;
+  final int? maxValue;
+  final bool cycle;
+
+  /// Last value issued by NEXTVAL, or null before the first NEXTVAL.
+  int? _last;
+
+  /// Row-epoch memo: within one row (same epoch) all NEXTVAL references return
+  /// the same value, matching Oracle's once-per-row guarantee.
+  int? _memoEpoch;
+  int? _memoValue;
+
+  _SequenceState({
+    required this.startWith,
+    required this.incrementBy,
+    this.minValue,
+    this.maxValue,
+    required this.cycle,
+  });
+
+  int next(String name, int epoch) {
+    if (_memoEpoch == epoch && _memoValue != null) return _memoValue!;
+    final v = _advance(name);
+    _memoEpoch = epoch;
+    _memoValue = v;
+    return v;
+  }
+
+  int _advance(String name) {
+    if (_last == null) {
+      _last = startWith;
+      return _last!;
+    }
+    var candidate = _last! + incrementBy;
+    final ascending = incrementBy >= 0;
+    if (ascending && maxValue != null && candidate > maxValue!) {
+      if (!cycle) {
+        throw StateError('Sequence $name exceeded MAXVALUE ($maxValue)');
+      }
+      candidate = minValue ?? startWith;
+    } else if (!ascending && minValue != null && candidate < minValue!) {
+      if (!cycle) {
+        throw StateError('Sequence $name went below MINVALUE ($minValue)');
+      }
+      candidate = maxValue ?? startWith;
+    }
+    _last = candidate;
+    return candidate;
+  }
+
+  int current(String name) {
+    final v = _last;
+    if (v == null) {
+      throw StateError(
+        'CURRVAL of $name is not yet defined in this session '
+        '(call NEXTVAL first)',
+      );
+    }
+    return v;
+  }
 }
 
 /// Per-table planner statistics. Populated by `ANALYZE`.

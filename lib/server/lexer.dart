@@ -238,13 +238,32 @@ class Lexer {
         _skipBlockComment();
         continue;
       }
-      if (c == "'" || c == '"') {
+      if (c == "'") {
         out.add(_readString(c));
+        continue;
+      }
+      // Double-quoted identifier (SQL standard): `"my col"`. A doubled quote
+      // (`""`) escapes a literal quote.
+      if (c == '"') {
+        out.add(_readDoubleQuotedIdent());
         continue;
       }
       // MySQL-style backtick-quoted identifier.
       if (c == '`') {
         out.add(_readBacktickIdent());
+        continue;
+      }
+      // Oracle q-quote (alternative quoting): q'[...]', q'{...}', q'!...!',
+      // and the national nq'...' variant. The char after q' is the opening
+      // delimiter; []{}()<> are bracket pairs, any other char is its own close.
+      if ((c == 'q' || c == 'Q') && _peek(1) == "'") {
+        out.add(_readQQuote(_pos + 2));
+        continue;
+      }
+      if ((c == 'n' || c == 'N') &&
+          (_peek(1) == 'q' || _peek(1) == 'Q') &&
+          _peek(2) == "'") {
+        out.add(_readQQuote(_pos + 3));
         continue;
       }
       // X'...' BLOB literal (hex). Must be a standalone X immediately
@@ -313,33 +332,61 @@ class Lexer {
         _pos++;
         return Token(TokType.string, buf.toString(), start);
       }
-      if (c == '\\' && _pos + 1 < src.length) {
-        final n = src[_pos + 1];
-        if (n == 'n') {
-          buf.write('\n');
-          _pos += 2;
-          continue;
-        }
-        if (n == 't') {
-          buf.write('\t');
-          _pos += 2;
-          continue;
-        }
-        if (n == '\\') {
-          buf.write('\\');
-          _pos += 2;
-          continue;
-        }
-        if (n == quote) {
-          buf.write(quote);
-          _pos += 2;
-          continue;
-        }
-      }
       buf.write(c);
       _pos++;
     }
     throw FormatException('Unterminated string at $start');
+  }
+
+  /// Reads an Oracle q-quote literal body. [afterQuote] is the index of the
+  /// opening delimiter (just past `q'`). The closing delimiter (bracket-matched
+  /// for []{}()<>, else the same char) followed by `'` ends the literal.
+  Token _readQQuote(int afterQuote) {
+    final start = _pos;
+    if (afterQuote >= src.length) {
+      throw FormatException('Unterminated q-quote at $start');
+    }
+    final open = src[afterQuote];
+    final close = switch (open) {
+      '[' => ']',
+      '{' => '}',
+      '(' => ')',
+      '<' => '>',
+      _ => open,
+    };
+    final buf = StringBuffer();
+    var i = afterQuote + 1;
+    while (i < src.length) {
+      if (src[i] == close && i + 1 < src.length && src[i + 1] == "'") {
+        _pos = i + 2;
+        return Token(TokType.string, buf.toString(), start);
+      }
+      buf.write(src[i]);
+      i++;
+    }
+    throw FormatException('Unterminated q-quote at $start');
+  }
+
+  Token _readDoubleQuotedIdent() {
+    final start = _pos;
+    _pos++; // opening quote
+    final buf = StringBuffer();
+    while (_pos < src.length) {
+      final c = src[_pos];
+      if (c == '"') {
+        // Doubled quote is an escape for a literal double-quote.
+        if (_peek(1) == '"') {
+          buf.write('"');
+          _pos += 2;
+          continue;
+        }
+        _pos++;
+        return Token(TokType.ident, buf.toString(), start);
+      }
+      buf.write(c);
+      _pos++;
+    }
+    throw FormatException('Unterminated double-quoted identifier at $start');
   }
 
   Token _readBacktickIdent() {
@@ -391,6 +438,20 @@ class Lexer {
 
   Token _readNumber() {
     final start = _pos;
+    // Hex integer literal: 0x1F / 0XFF. Emit the decimal value so the parser's
+    // numeric parse works unchanged.
+    if (src[_pos] == '0' && (_peek(1) == 'x' || _peek(1) == 'X')) {
+      final hexStart = _pos + 2;
+      var p = hexStart;
+      while (p < src.length && _isHexDigit(src[p])) {
+        p++;
+      }
+      if (p > hexStart) {
+        _pos = p;
+        final value = int.parse(src.substring(hexStart, p), radix: 16);
+        return Token(TokType.number, value.toString(), start);
+      }
+    }
     bool dotSeen = false;
     while (_pos < src.length) {
       final c = src[_pos];
@@ -398,14 +459,35 @@ class Lexer {
         _pos++;
         continue;
       }
-      if (c == '.' && !dotSeen) {
+      if (c == '.' && !dotSeen && _isDigit(_peek(1) ?? '')) {
         dotSeen = true;
         _pos++;
         continue;
       }
       break;
     }
+    // Scientific-notation exponent: e[+-]?digits. Only consume when a valid
+    // exponent follows, so a trailing `e` stays available as an identifier.
+    if (_pos < src.length && (src[_pos] == 'e' || src[_pos] == 'E')) {
+      var p = _pos + 1;
+      if (p < src.length && (src[p] == '+' || src[p] == '-')) p++;
+      if (p < src.length && _isDigit(src[p])) {
+        p++;
+        while (p < src.length && _isDigit(src[p])) {
+          p++;
+        }
+        _pos = p;
+      }
+    }
     return Token(TokType.number, src.substring(start, _pos), start);
+  }
+
+  bool _isHexDigit(String c) {
+    if (c.isEmpty) return false;
+    final cu = c.codeUnitAt(0);
+    return (cu >= 48 && cu <= 57) ||
+        (cu >= 65 && cu <= 70) ||
+        (cu >= 97 && cu <= 102);
   }
 
   Token _readIdentOrKeyword() {
@@ -425,6 +507,18 @@ class Lexer {
     final start = _pos;
     final c = src[_pos];
     // multi-char operators
+    if (c == ':' && _peek(1) == '=') {
+      _pos += 2;
+      return Token(TokType.op, ':=', start); // PL/SQL assignment
+    }
+    if (c == '=' && _peek(1) == '>') {
+      _pos += 2;
+      return Token(TokType.op, '=>', start); // PL/SQL named-argument arrow
+    }
+    if (c == '.' && _peek(1) == '.') {
+      _pos += 2;
+      return Token(TokType.op, '..', start); // PL/SQL FOR range
+    }
     if (c == '<' && _peek(1) == '=') {
       _pos += 2;
       return Token(TokType.op, '<=', start);
@@ -469,6 +563,12 @@ class Lexer {
       _pos++;
       return Token(TokType.punct, c, start);
     }
+    // Square brackets: Oracle MODEL cell references (v[2020]) and other
+    // bracketed syntaxes. Tokenized so higher layers can consume them.
+    if (c == '[' || c == ']') {
+      _pos++;
+      return Token(TokType.punct, c, start);
+    }
     if (c == '?') {
       _pos++;
       // Optional digits for explicit numbering: ?12
@@ -499,6 +599,9 @@ class Lexer {
         _pos++;
       }
       if (ns == _pos) {
+        // A bare ':' with no following name is a punctuator (MySQL statement
+        // labels `label:`, etc.); the other sigils still require a name.
+        if (c == ':') return Token(TokType.punct, ':', start);
         throw FormatException(
           'Empty named-parameter at $start (expected $c<name>)',
         );

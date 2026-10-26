@@ -126,4 +126,18 @@ void main() {
       await db.close();
     }
   });
+
+  // F59: min/max are aggregate-only (use LEAST/GREATEST for the scalar form);
+  // a multi-arg call must error, not silently return the first argument.
+  test('multi-arg min()/max() raises a wrong-argument-count error', () async {
+    final db = await seed();
+    try {
+      await expectLater(db.execute('SELECT min(3, 1, 2) FROM t'),
+          throwsA(isA<FormatException>()));
+      await expectLater(db.execute('SELECT max(1, 9, 5) FROM t'),
+          throwsA(isA<FormatException>()));
+    } finally {
+      await db.close();
+    }
+  });
 }

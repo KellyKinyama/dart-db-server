@@ -43,6 +43,72 @@ void main() {
       ]);
     });
 
+    test('INFORMATION_SCHEMA introspection works through the driver', () async {
+      final tables = await conn.execute(
+          'SELECT table_name FROM information_schema.tables '
+          'WHERE table_schema = DATABASE() AND table_name = \'t\'');
+      expect(tables.rows.first.colAt(0), 't');
+
+      final cols = await conn.execute(
+          'SELECT column_name, is_nullable FROM information_schema.columns '
+          'WHERE table_name = \'t\' ORDER BY ordinal_position');
+      final rows = cols.rows.map((r) => [r.colAt(0), r.colAt(1)]).toList();
+      expect(rows, [
+        ['id', 'NO'],
+        ['name', 'YES'],
+      ]);
+    });
+
+    test('a stored procedure runs via CALL through the driver', () async {
+      await conn.execute('''
+        CREATE PROCEDURE bump(IN start_id INT, IN cnt INT)
+        BEGIN
+          DECLARE i INT DEFAULT 0;
+          WHILE i < cnt DO
+            INSERT INTO t VALUES (start_id + i, 'gen' || (start_id + i));
+            SET i = i + 1;
+          END WHILE;
+        END
+      ''');
+      await conn.execute('CALL bump(10, 2)');
+      final r =
+          await conn.execute('SELECT id, name FROM t WHERE id >= 10 ORDER BY id');
+      final rows = r.rows.map((row) => [row.colAt(0), row.colAt(1)]).toList();
+      expect(rows, [
+        ['10', 'gen10'],
+        ['11', 'gen11'],
+      ]);
+    });
+
+    test('a procedure can return a result set to the driver', () async {
+      await conn.execute('''
+        CREATE PROCEDURE all_names()
+        BEGIN
+          SELECT name FROM t ORDER BY id;
+        END
+      ''');
+      final r = await conn.execute('CALL all_names()');
+      expect(r.rows.map((row) => row.colAt(0)).toList(), ['alice', 'bob']);
+    });
+
+    test('session user-variables persist across statements', () async {
+      await conn.execute('SET @greeting = \'hi\'');
+      final r = await conn.execute('SELECT @greeting');
+      expect(r.rows.first.colAt(0), 'hi');
+    });
+
+    test('CALL OUT parameter writes back to a @var', () async {
+      await conn.execute('''
+        CREATE PROCEDURE row_count(OUT c INT)
+        BEGIN
+          SELECT COUNT(*) INTO c FROM t;
+        END
+      ''');
+      await conn.execute('CALL row_count(@n)');
+      final r = await conn.execute('SELECT @n');
+      expect(r.rows.first.colAt(0), '2');
+    });
+
     test('COM_QUERY INSERT reports affectedRows', () async {
       final r = await conn.execute(
         "INSERT INTO t VALUES (3, 'carol'), (4, 'dave')",

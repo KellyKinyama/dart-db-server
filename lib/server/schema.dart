@@ -154,6 +154,13 @@ String dataTypeName(DataType t) {
 class ColumnDef {
   final String name;
   final DataType type;
+
+  /// The raw DDL type token as written (e.g. `CLOB`, `JSON`, `BLOB`,
+  /// `VECTOR`), preserved because [type]'s affinity folds distinct Oracle
+  /// types together (CLOB/VARCHAR → text, JSON → numeric). Null for columns
+  /// with no declared type. Used by the Oracle wire layer to describe a column
+  /// with its true type.
+  final String? declaredType;
   final bool primaryKey;
   final bool notNull;
   final bool unique;
@@ -169,6 +176,11 @@ class ColumnDef {
   /// this on demand. Stored as text so it survives JSON serialization.
   final String? checkExprSql;
 
+  /// Name of the column-level CHECK constraint (`CONSTRAINT <name> CHECK ...`),
+  /// so `ALTER TABLE ... DROP CONSTRAINT <name>` can remove it. Null when the
+  /// check was unnamed.
+  final String? checkName;
+
   /// FOREIGN KEY target ("table" or "table(column)") for column-level FK.
   final ForeignKeyRef? references;
 
@@ -182,9 +194,23 @@ class ColumnDef {
   /// column. Map keys are lowercased attribute names.
   final Map<String, String>? vectorSpec;
 
+  /// Column-level default collation (`COLLATE NOCASE` / `RTRIM` / `BINARY`),
+  /// applied to comparisons, DISTINCT and GROUP BY on this column.
+  final String? collate;
+
+  /// Declared character length for `VARCHAR2(n)` / `CHAR(n)` / `NVARCHAR2(n)`;
+  /// enforced on INSERT/UPDATE (Oracle ORA-12899). Null when unconstrained.
+  final int? charLength;
+
+  /// Declared numeric precision/scale for `NUMBER(p[,s])`. [numericScale]
+  /// rounds stored values; [numericPrecision] is enforced (ORA-01438).
+  final int? numericPrecision;
+  final int? numericScale;
+
   const ColumnDef(
     this.name,
     this.type, {
+    this.declaredType,
     this.primaryKey = false,
     this.notNull = false,
     this.unique = false,
@@ -192,15 +218,21 @@ class ColumnDef {
     this.defaultValue,
     this.defaultExprSql,
     this.checkExprSql,
+    this.checkName,
     this.references,
     this.generatedExprSql,
     this.generatedStored = false,
     this.vectorSpec,
+    this.collate,
+    this.charLength,
+    this.numericPrecision,
+    this.numericScale,
   });
 
   Map<String, Object?> toJson() => {
         'name': name,
         'type': type.name,
+        if (declaredType != null) 'declaredType': declaredType,
         if (primaryKey) 'primaryKey': true,
         if (notNull) 'notNull': true,
         if (unique) 'unique': true,
@@ -208,15 +240,21 @@ class ColumnDef {
         if (defaultValue != null) 'default': defaultValue,
         if (defaultExprSql != null) 'defaultExpr': defaultExprSql,
         if (checkExprSql != null) 'check': checkExprSql,
+        if (checkName != null) 'checkName': checkName,
         if (references != null) 'references': references!.toJson(),
         if (generatedExprSql != null) 'generated': generatedExprSql,
         if (generatedStored) 'generatedStored': true,
         if (vectorSpec != null) 'vectorSpec': vectorSpec,
+        if (collate != null) 'collate': collate,
+        if (charLength != null) 'charLength': charLength,
+        if (numericPrecision != null) 'numericPrecision': numericPrecision,
+        if (numericScale != null) 'numericScale': numericScale,
       };
 
   factory ColumnDef.fromJson(Map<String, Object?> j) => ColumnDef(
         j['name'] as String,
         DataType.values.byName(j['type'] as String),
+        declaredType: j['declaredType'] as String?,
         primaryKey: j['primaryKey'] == true,
         notNull: j['notNull'] == true,
         unique: j['unique'] == true,
@@ -224,6 +262,7 @@ class ColumnDef {
         defaultValue: j['default'],
         defaultExprSql: j['defaultExpr'] as String?,
         checkExprSql: j['check'] as String?,
+        checkName: j['checkName'] as String?,
         references: j['references'] == null
             ? null
             : ForeignKeyRef.fromJson(
@@ -232,6 +271,10 @@ class ColumnDef {
         generatedExprSql: j['generated'] as String?,
         generatedStored: j['generatedStored'] == true,
         vectorSpec: (j['vectorSpec'] as Map?)?.cast<String, String>(),
+        collate: j['collate'] as String?,
+        charLength: j['charLength'] as int?,
+        numericPrecision: j['numericPrecision'] as int?,
+        numericScale: j['numericScale'] as int?,
       );
 }
 
