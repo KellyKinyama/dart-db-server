@@ -60,6 +60,31 @@ void main() {
       }
     });
 
+    test('SID-based login authenticates against a real listener', () async {
+      // The gvenzl/oracle-free listener registers its CDB instance as a SID
+      // ('FREE'), so (CONNECT_DATA=(SID=FREE)) resolves. Override with
+      // ORACLE_SID for other databases (e.g. the OMS ISDTRAIN instance).
+      final host = env['ORACLE_HOST'] ?? '127.0.0.1';
+      final port = int.tryParse(env['ORACLE_PORT'] ?? '1521') ?? 1521;
+      final user = env['ORACLE_USER'] ?? 'system';
+      final pass = env['ORACLE_PASSWORD'] ?? 'TestPw1234';
+      final sid = env['ORACLE_SID'] ?? 'FREE';
+
+      final client = await OracleThickClient.connect(port, host: host);
+      try {
+        final result = await client
+            .loginReal(username: user, password: pass, sid: sid)
+            .timeout(const Duration(seconds: 8));
+        expect(result.authenticated, isTrue);
+        final rows = await client.queryReal('SELECT 1 FROM dual');
+        expect(rows.rows, [
+          [1]
+        ]);
+      } finally {
+        await client.close();
+      }
+    });
+
     test('loginReal requires exactly one of serviceName / sid', () async {
       final host = env['ORACLE_HOST'] ?? '127.0.0.1';
       final port = int.tryParse(env['ORACLE_PORT'] ?? '1521') ?? 1521;
