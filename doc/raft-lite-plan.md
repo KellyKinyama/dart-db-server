@@ -66,40 +66,39 @@ Tasks:
 
 ---
 
-## Phase R1 — Persistent Raft state & term-aware log  ·  Status: TODO
+## Phase R1 — Persistent Raft state & term-aware log  ·  Status: WIP
 
 **Goal:** the durable state Raft safety depends on.
 
 Tasks:
-- [ ] **Per-entry term.** Add an optional `term` to `OpLogRecord`
-  (backward-compatible; absent ⇒ term 0). Log identity becomes `(term, lsn)`.
-- [ ] **Suffix truncation.** `OpLog.truncateAbove(lsn)` to delete conflicting
-  tail entries a new leader overwrites (complements the existing prefix
-  `truncateBelow`). Must be crash-safe (rewrite/trim the active segment).
-- [ ] **Durable Raft vars.** Persist `currentTerm` and `votedFor` (fsync before
-  responding to any RPC that depends on them) in `<db>.raft/state.json`.
+- [x] **Term-aware log.** `RaftLog` (`raft_log.dart`): 1-indexed `(term, index,
+  ops)` with `lastIndex`/`lastTerm`/`termAt`/`at`/`entriesAfter`/`append`/
+  `truncateAfter`. In-memory in v1; R5 backs it with the on-disk `OpLog`.
+- [x] **On-disk term + suffix truncation.** `OpLogRecord.term` (optional,
+  backward-compatible) and `OpLog.truncateAbove(maxLsn)` (byte-trims the
+  straddling segment, deletes segments above, survives reopen).
+  Tests in `test/oplog_test.dart`.
+- [ ] **Persist `currentTerm`/`votedFor`.** fsync to `<db>.raft/state.json`
+  before replying to any RPC that depends on them (R5 wiring).
 - [ ] **Generalize the fence.** `currentTerm` subsumes `ClusterEpoch`; keep
   `ClusterEpoch` as the single-node fallback but have Raft own the term.
 
 ---
 
-## Phase R2 — Leader election  ·  Status: TODO
+## Phase R2 — Leader election  ·  Status: LANDED
 
 **Goal:** exactly one leader per term, chosen only if its log is up to date.
 
 Tasks:
-- [ ] **Roles & timers.** Follower / Candidate / Leader state; a **randomized**
-  election timeout and a leader heartbeat interval (from an injectable clock).
-- [ ] **RequestVote.** On timeout: increment `currentTerm`, vote for self,
-  send `RequestVote` to peers. Grant a vote iff the candidate's term ≥ ours,
-  we haven't voted this term, and the candidate's log is **at least as
-  up-to-date** (compare `(lastTerm, lastLsn)` — the existing `lastLsn` plus the
-  new per-entry term). Become leader on a **majority**.
-- [ ] **Heartbeats.** The leader sends empty `AppendEntries` each interval to
-  suppress elections; a follower that hears from the current-term leader resets
-  its timer.
-- [ ] **Step-down.** Any RPC/response carrying a higher term ⇒ revert to
-  follower and adopt that term (prevents two leaders).
+- [x] **Roles & election.** `RaftNode` follower/candidate/leader;
+  `onElectionTimeout` increments the term, self-votes, gathers `RequestVote`
+  grants, becomes leader on a majority. Timeouts driven explicitly for
+  deterministic tests (a real timer driver is R5).
+- [x] **RequestVote.** Grants iff term ≥ ours, not already voted this term, and
+  the candidate's `(lastTerm, lastIndex)` is at least as up-to-date (§5.4.1).
+- [x] **Heartbeats + step-down.** `sendHeartbeats` suppresses elections; any
+  higher term seen ⇒ revert to follower and adopt it (no two leaders).
+- Tests: `test/raft_election_test.dart` + the R4 randomized simulation.
 
 **Delivers:** automatic, split-brain-free leader election — the quorum-safe
 replacement for `FailoverController` + `ClusterEpoch` fencing.

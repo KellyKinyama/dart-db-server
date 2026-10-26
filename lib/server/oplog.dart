@@ -45,15 +45,24 @@ class OpLogRecord {
   final int lsn;
   final int timestampMs;
   final List<String> ops;
-  OpLogRecord(this.lsn, this.timestampMs, this.ops);
 
-  Map<String, Object?> toJson() =>
-      {'lsn': lsn, 'ts': timestampMs, 'ops': ops};
+  /// Raft leader term that created this entry (0 for the non-Raft path).
+  final int term;
+
+  OpLogRecord(this.lsn, this.timestampMs, this.ops, {this.term = 0});
+
+  Map<String, Object?> toJson() => {
+        'lsn': lsn,
+        'ts': timestampMs,
+        'ops': ops,
+        if (term != 0) 'term': term,
+      };
 
   factory OpLogRecord.fromJson(Map<String, Object?> j) => OpLogRecord(
         (j['lsn'] as num).toInt(),
         (j['ts'] as num).toInt(),
         (j['ops'] as List).cast<String>(),
+        term: (j['term'] as num?)?.toInt() ?? 0,
       );
 }
 
@@ -183,13 +192,15 @@ class OpLog {
 
   /// Append one committed transaction and return its assigned LSN. The frame
   /// is fsync-requested (`flush`) before returning, so the LSN is durable.
-  Future<int> append(List<String> ops, {int? timestampMs}) async {
+  /// [term] stamps the Raft leader term (0 for the non-Raft path).
+  Future<int> append(List<String> ops, {int? timestampMs, int term = 0}) async {
     if (!_open) throw StateError('OpLog.append before open()');
     final lsn = _lastLsn + 1;
     final rec = OpLogRecord(
       lsn,
       timestampMs ?? DateTime.now().millisecondsSinceEpoch,
       ops,
+      term: term,
     );
     final payload = utf8.encode(jsonEncode(rec.toJson()));
     final header = ByteData(8)
@@ -252,6 +263,69 @@ class OpLog {
     _segments
       ..clear()
       ..addAll(keep);
+  }
+
+  /// Delete every record with `lsn > maxLsn` (Raft conflict resolution: a
+  /// follower discards a divergent suffix before appending the leader's). The
+  /// straddling segment is byte-truncated after [maxLsn]'s frame; segments
+  /// entirely above it are removed. No-op when nothing is above [maxLsn].
+  Future<void> truncateAbove(int maxLsn) async {
+    if (!_open || maxLsn >= _lastLsn) return;
+    await _active?.close();
+    _active = null;
+    final keep = <_Segment>[];
+    for (final seg in _segments) {
+      if (seg.lastLsn <= maxLsn || seg.lastLsn == 0) {
+        keep.add(seg);
+        continue;
+      }
+      if (seg.firstLsn > maxLsn) {
+        final f = File(seg.file);
+        if (await f.exists()) await f.delete();
+        continue;
+      }
+      // Straddles maxLsn: trim the file to the end of maxLsn's frame.
+      final cut = await _byteOffsetAfter(seg.file, seg.validBytes, maxLsn);
+      final raf = await File(seg.file).open(mode: FileMode.append);
+      await raf.truncate(cut);
+      await raf.close();
+      seg.lastLsn = maxLsn;
+      seg.validBytes = cut;
+      keep.add(seg);
+    }
+    _segments
+      ..clear()
+      ..addAll(keep.isEmpty
+          ? [_Segment('$dir${Platform.pathSeparator}${_segName(1)}', 0, 0, 0)]
+          : keep);
+    _lastLsn = maxLsn;
+    final last = _segments.last;
+    _active = await File(last.file).open(mode: FileMode.append);
+    _lastTimestampMs = 0;
+    if (_lastLsn > 0) {
+      final tail = await readFrom(_lastLsn - 1).toList();
+      if (tail.isNotEmpty) _lastTimestampMs = tail.last.timestampMs;
+    }
+  }
+
+  /// Byte length of the intact prefix of [file] up to and including the frame
+  /// whose record index is [targetLsn].
+  Future<int> _byteOffsetAfter(
+      String file, int limitBytes, int targetLsn) async {
+    final bytes = await File(file).readAsBytes();
+    var off = 0;
+    final end = limitBytes < bytes.length ? limitBytes : bytes.length;
+    while (off + 8 <= end) {
+      final bd = ByteData.sublistView(bytes, off, off + 8);
+      final len = bd.getUint32(0, Endian.little);
+      if (off + 8 + len > end) break;
+      final payload = bytes.sublist(off + 8, off + 8 + len);
+      final rec = OpLogRecord.fromJson(
+          (jsonDecode(utf8.decode(payload)) as Map).cast<String, Object?>());
+      off += 8 + len;
+      if (rec.lsn == targetLsn) break;
+    }
+    return off;
   }
 
   Future<void> close() async {

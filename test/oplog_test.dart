@@ -140,5 +140,50 @@ void main() {
       // CRC32("123456789") == 0xCBF43926.
       expect(opLogCrc32('123456789'.codeUnits), 0xCBF43926);
     });
+
+    test('records carry an optional Raft term that round-trips', () async {
+      final dir = _tmpDir('term');
+      final log = OpLog(dir);
+      await log.open();
+      await log.append(['a'], term: 0);
+      await log.append(['b'], term: 7);
+      await log.close();
+
+      final re = OpLog(dir);
+      await re.open();
+      final recs = await re.readFrom(0).toList();
+      expect(recs[0].term, 0);
+      expect(recs[1].term, 7);
+      await re.close();
+    });
+
+    test('truncateAbove discards a divergent suffix', () async {
+      final dir = _tmpDir('trunc_above');
+      var log = OpLog(dir, segmentBytes: 64); // force multiple segments
+      await log.open();
+      for (var i = 1; i <= 8; i++) {
+        await log.append(['op$i']);
+      }
+      expect(log.lastLsn, 8);
+
+      await log.truncateAbove(5); // keep 1..5
+      expect(log.lastLsn, 5);
+      final recs = await log.readFrom(0).toList();
+      expect(recs.map((r) => r.lsn), [1, 2, 3, 4, 5]);
+
+      // Appends continue monotonically from the new tail.
+      final n = await log.append(['op6b']);
+      expect(n, 6);
+      await log.close();
+
+      // The truncation survives reopen.
+      log = OpLog(dir, segmentBytes: 64);
+      await log.open();
+      expect(log.lastLsn, 6);
+      final recs2 = await log.readFrom(0).toList();
+      expect(recs2.map((r) => r.ops.single),
+          ['op1', 'op2', 'op3', 'op4', 'op5', 'op6b']);
+      await log.close();
+    });
   });
 }
