@@ -1186,10 +1186,12 @@ void _decodeOutBinds(ReadBuffer buf, _DecodeState s) {
       }
       final columns = _readEmbeddedCursorDescribe(buf, s.ttcFieldVersion);
       final cursorId = buf.readUB2();
-      s.refCursorColumns = columns;
-      s.refCursorId = cursorId;
+      // First cursor seeds the legacy single-cursor fields (openRefCursor);
+      // every cursor OUT bind is also a drainable value.
+      s.refCursorId ??= cursorId;
+      s.refCursorColumns ??= columns;
       buf.readSB4();
-      s.outBindValues.add(cursorId);
+      s.outBindValues.add(NativeNestedCursor(cursorId, columns));
       continue;
     }
     // Scalar OUT: decode by the declared bind type, then the SB4 trailer.

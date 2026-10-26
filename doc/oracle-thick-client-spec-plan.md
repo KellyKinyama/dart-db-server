@@ -146,11 +146,14 @@ round-tripped on real Oracle in `test/oracle_real_login_test.dart`.
 - [x] **Nested `CURSOR(SELECT …)` columns**: a cursor-typed column decodes to a
   `NativeNestedCursor` (embedded describe + id) and `queryReal` fetches it,
   replacing the cell with the inner rows (recursive). Verified vs 26ai.
+- [x] **Multiple REF CURSOR OUT binds** in one `callPlsql`: each cursor OUT bind
+  yields a `NativeNestedCursor` in `outBindValues`, drained via `fetchCursor`.
+  Verified vs 26ai (two cursors in one block).
 - [x] Gated tests pass vs 26ai (REF CURSOR, NUMBER/VARCHAR2/DATE OUT, IN→OUT,
-  IN OUT, implicit result, nested cursor).
-- [ ] (follow-up) multiple REF CURSOR OUT binds in one call; oversized CLOB IN
-  bind to a PL/SQL LOB parameter; eager per-batch nested-cursor materialization
-  for outer results that span multiple fetches.
+  IN OUT, implicit result, nested cursor, multi-cursor).
+- [ ] (follow-up) oversized CLOB IN bind to a PL/SQL LOB parameter; eager
+  per-batch nested-cursor materialization for outer results that span multiple
+  fetches.
 
 ## Phase T6 — Bulk & RETURNING  ·  Status: LANDED (DML, array DML, RETURNING, works vs 26ai)
 - [x] **DML execute** (`buildDmlExecute` + `executeDml`): INSERT/UPDATE/DELETE

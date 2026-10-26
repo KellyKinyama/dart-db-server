@@ -1197,6 +1197,12 @@ class OracleThickClient {
           ex.NativeImplicitResult result, {int prefetch = 100}) =>
       _drainCursor(result.cursorId, result.columns, prefetch: prefetch);
 
+  /// Fetches all rows from a cursor OUT bind ([NativeNestedCursor]) — e.g. one
+  /// of several `SYS_REFCURSOR` OUT binds returned by [callPlsql].
+  Future<List<List<Object?>>> fetchCursor(
+          ex.NativeNestedCursor cursor, {int prefetch = 100}) =>
+      _drainCursor(cursor.cursorId, cursor.columns, prefetch: prefetch);
+
   /// Runs [sql] (optionally parameterised by [binds], one value per `:name`
   /// placeholder in wire order) and returns the describe/DML result. Throws an
   /// [OracleThickException] on an `ORA-xxxxx` error.

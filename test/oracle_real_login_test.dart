@@ -6,7 +6,7 @@ import 'dart:typed_data';
 
 import 'package:dart_db_server/oracle_thick_client.dart';
 import 'package:dart_db_server/oracle_native_execute.dart'
-    show OracleYearMonth, NativeBind;
+    show OracleYearMonth, NativeBind, NativeNestedCursor;
 import 'package:test/test.dart';
 
 /// Real-Oracle integration test for the thick client's native FAST_AUTH +
@@ -422,6 +422,42 @@ void main() {
           [21],
           [22],
           [23]
+        ]);
+      } finally {
+        await client.close();
+      }
+    });
+
+    test('multiple REF CURSOR OUT binds each drain independently', () async {
+      final host = env['ORACLE_HOST'] ?? '127.0.0.1';
+      final port = int.tryParse(env['ORACLE_PORT'] ?? '1521') ?? 1521;
+      final user = env['ORACLE_USER'] ?? 'system';
+      final pass = env['ORACLE_PASSWORD'] ?? 'TestPw1234';
+      final service = env['ORACLE_SERVICE'] ?? 'FREEPDB1';
+
+      final client = await OracleThickClient.connect(port, host: host);
+      try {
+        await client.loginReal(
+          username: user,
+          password: pass,
+          serviceName: service,
+        );
+        final r = await client.callPlsql('''
+          BEGIN
+            OPEN :1 FOR SELECT level n FROM dual CONNECT BY level <= 2;
+            OPEN :2 FOR SELECT 'x' || level v FROM dual CONNECT BY level <= 3;
+          END;
+        ''', [NativeBind.outCursor(), NativeBind.outCursor()]);
+        final c0 = r.outBindValues[0] as NativeNestedCursor;
+        final c1 = r.outBindValues[1] as NativeNestedCursor;
+        expect(await client.fetchCursor(c0), [
+          [1],
+          [2]
+        ]);
+        expect(await client.fetchCursor(c1), [
+          ['x1'],
+          ['x2'],
+          ['x3']
         ]);
       } finally {
         await client.close();
