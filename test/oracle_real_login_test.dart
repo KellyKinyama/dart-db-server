@@ -5,7 +5,8 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:dart_db_server/oracle_thick_client.dart';
-import 'package:dart_db_server/oracle_native_execute.dart' show OracleYearMonth;
+import 'package:dart_db_server/oracle_native_execute.dart'
+    show OracleYearMonth, NativeBind;
 import 'package:test/test.dart';
 
 /// Real-Oracle integration test for the thick client's native FAST_AUTH +
@@ -237,6 +238,61 @@ void main() {
           [3, 'row3'],
           [4, 'row4'],
           [5, 'row5'],
+        ]);
+      } finally {
+        await client.close();
+      }
+    });
+
+    test('scalar OUT binds + implicit results from real Oracle', () async {
+      final host = env['ORACLE_HOST'] ?? '127.0.0.1';
+      final port = int.tryParse(env['ORACLE_PORT'] ?? '1521') ?? 1521;
+      final user = env['ORACLE_USER'] ?? 'system';
+      final pass = env['ORACLE_PASSWORD'] ?? 'TestPw1234';
+      final service = env['ORACLE_SERVICE'] ?? 'FREEPDB1';
+
+      final client = await OracleThickClient.connect(port, host: host);
+      try {
+        await client.loginReal(
+          username: user,
+          password: pass,
+          serviceName: service,
+        );
+        // NUMBER + VARCHAR2 + DATE OUT binds (appearance order :1,:2,:3).
+        final r = await client.callPlsql('''
+          BEGIN
+            :1 := 42 * 2;
+            :2 := 'hello out';
+            :3 := DATE '2026-10-26';
+          END;
+        ''', [
+          NativeBind.outNumber(),
+          NativeBind.outVarchar(),
+          NativeBind.outDate(),
+        ]);
+        expect(r.outBindValues[0], 84);
+        expect(r.outBindValues[1], 'hello out');
+        expect(r.outBindValues[2], DateTime(2026, 10, 26));
+
+        // IN feeding an OUT (appearance order :1 OUT, :2 IN).
+        final r2 = await client.callPlsql('BEGIN :1 := :2 * 10; END;', [
+          NativeBind.outNumber(),
+          NativeBind.value(7),
+        ]);
+        expect(r2.outBindValues, [70]);
+
+        // Implicit result set (DBMS_SQL.RETURN_RESULT).
+        final ir = await client.callPlsql('''
+          DECLARE c SYS_REFCURSOR;
+          BEGIN
+            OPEN c FOR SELECT 100 AS a, 'x' AS b FROM dual;
+            DBMS_SQL.RETURN_RESULT(c);
+          END;
+        ''', const []);
+        expect(ir.implicitResults, hasLength(1));
+        final rows = await client.fetchImplicitResult(ir.implicitResults.first);
+        expect(rows, [
+          [100, 'x']
         ]);
       } finally {
         await client.close();

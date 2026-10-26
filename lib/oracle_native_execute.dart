@@ -112,6 +112,8 @@ class NativeExecuteResponse {
     this.errorMessage,
     this.refCursorId,
     this.refCursorColumns,
+    this.outBindValues = const [],
+    this.implicitResults = const [],
   });
 
   final List<NativeColumn> columns;
@@ -137,7 +139,21 @@ class NativeExecuteResponse {
   /// The REF CURSOR's column metadata, decoded from its embedded describe.
   final List<NativeColumn>? refCursorColumns;
 
+  /// Decoded PL/SQL OUT bind values, one per OUT bind in declaration order.
+  final List<Object?> outBindValues;
+
+  /// Implicit result-set cursors (`DBMS_SQL.RETURN_RESULT`).
+  final List<NativeImplicitResult> implicitResults;
+
   bool get isSuccess => errorNum == null || errorNum == 0;
+}
+
+/// An implicit result set (a cursor returned via `DBMS_SQL.RETURN_RESULT`):
+/// its server cursor id and column metadata. FETCH the id to drain its rows.
+class NativeImplicitResult {
+  NativeImplicitResult(this.cursorId, this.columns);
+  final int cursorId;
+  final List<NativeColumn> columns;
 }
 
 /// Thrown when a column carries a type this increment does not decode yet.
@@ -147,6 +163,68 @@ class NativeUnsupportedTypeException implements Exception {
   @override
   String toString() =>
       'NativeUnsupportedTypeException: Oracle type $oraType not supported yet';
+}
+
+/// Bind direction for a PL/SQL bind.
+enum NativeBindDir { input, output }
+
+/// A PL/SQL bind — an IN value or an OUT placeholder of a declared type. Build
+/// with the factory constructors (`NativeBind.value`, `NativeBind.outNumber`,
+/// …) and pass a list to [buildPlsqlExecute].
+class NativeBind {
+  const NativeBind._({
+    required this.dir,
+    required this.oraType,
+    required this.maxSize,
+    required this.csfrm,
+    this.value,
+  });
+
+  /// An IN bind whose Oracle type is inferred from the Dart [value].
+  factory NativeBind.value(Object? value) {
+    final e = _encodeBind(value);
+    return NativeBind._(
+      dir: NativeBindDir.input,
+      oraType: e.oraType,
+      maxSize: e.maxSize,
+      csfrm: e.csfrm,
+      value: value,
+    );
+  }
+
+  /// An OUT NUMBER bind.
+  factory NativeBind.outNumber() => const NativeBind._(
+      dir: NativeBindDir.output, oraType: _oraTypeNumber, maxSize: 22, csfrm: 0);
+
+  /// An OUT VARCHAR2 bind; [maxSize] is the server-side buffer (bytes).
+  factory NativeBind.outVarchar({int maxSize = 4000}) => NativeBind._(
+      dir: NativeBindDir.output,
+      oraType: _oraTypeVarchar,
+      maxSize: maxSize,
+      csfrm: _csfrmImplicit);
+
+  /// An OUT DATE bind.
+  factory NativeBind.outDate() => const NativeBind._(
+      dir: NativeBindDir.output, oraType: _oraTypeDate, maxSize: 7, csfrm: 0);
+
+  /// An OUT TIMESTAMP bind.
+  factory NativeBind.outTimestamp() => const NativeBind._(
+      dir: NativeBindDir.output,
+      oraType: _oraTypeTimestamp,
+      maxSize: 11,
+      csfrm: 0);
+
+  /// An OUT `SYS_REFCURSOR` bind.
+  factory NativeBind.outCursor() => const NativeBind._(
+      dir: NativeBindDir.output, oraType: _oraTypeCursor, maxSize: 1, csfrm: 0);
+
+  final NativeBindDir dir;
+  final int oraType;
+  final int maxSize;
+  final int csfrm;
+  final Object? value;
+
+  bool get isOut => dir == NativeBindDir.output;
 }
 
 /// An Oracle `INTERVAL YEAR TO MONTH` value (Dart has no year-month duration).
@@ -434,12 +512,13 @@ Uint8List buildFetch(
 const int _execOptionPlSqlBind = 0x400;
 const int _oraTypeCursor = 102;
 
-/// Builds a PL/SQL OALL8 EXECUTE for a block with a single OUT `SYS_REFCURSOR`
-/// bind — the `BEGIN OPEN :1 FOR <query>; END;` shape. The server runs the
-/// block, opens the cursor, and returns its id + describe in the OUT bind;
-/// FETCH from that id drains the rows.
-Uint8List buildPlsqlRefCursor(
-  String plsql, {
+/// Builds a PL/SQL OALL8 EXECUTE for a block with [binds] (IN and/or OUT). The
+/// server runs the block and returns OUT bind values (and any opened REF
+/// CURSOR id + describe) in the response. A single OUT `SYS_REFCURSOR` bind is
+/// the `BEGIN OPEN :1 FOR <query>; END;` shape.
+Uint8List buildPlsqlExecute(
+  String plsql,
+  List<NativeBind> binds, {
   int ttcFieldVersion = _fieldVersion23_4,
   int sequence = 1,
 }) {
@@ -452,11 +531,9 @@ Uint8List buildPlsqlRefCursor(
   }
 
   final sqlBytes = utf8.encode(plsql);
-  // PL/SQL, fresh parse, one OUT cursor bind.
-  final options = _execOptionParse |
-      _execOptionExecute |
-      _execOptionBind |
-      _execOptionPlSqlBind;
+  final numParams = binds.length;
+  var options = _execOptionParse | _execOptionExecute;
+  if (numParams > 0) options |= _execOptionBind | _execOptionPlSqlBind;
   final dmlOptions = _execOptionImplicitResultset;
 
   b.writeUB4(options);
@@ -474,8 +551,13 @@ Uint8List buildPlsqlRefCursor(
   b.writeUB4(1); // prefetch num rows (1 for PL/SQL)
   b.writeUB4(_maxLongLength); // maximum long size
 
-  b.writeUint8(1); // numParams present
-  b.writeUB4(1); // one bind
+  if (numParams == 0) {
+    b.writeUint8(0);
+    b.writeUB4(0);
+  } else {
+    b.writeUint8(1);
+    b.writeUB4(numParams);
+  }
 
   b.writeUint8(0); // al8pp
   b.writeUint8(0); // al8txn
@@ -526,38 +608,60 @@ Uint8List buildPlsqlRefCursor(
   b.writeUB4(0); // al8i4[11]
   b.writeUB4(0); // al8i4[12]
 
-  // Bind metadata: one cursor OUT bind.
-  b.writeUint8(_oraTypeCursor);
-  b.writeUint8(_bindUseIndicators);
-  b.writeUint8(0); // precision
-  b.writeUint8(0); // scale
-  b.writeUB4(1); // maxSize
-  b.writeUB4(0); // max num elements
-  b.writeUB4(0); // cont flags
-  b.writeUB4(0); // OID
-  b.writeUB2(0); // version
-  b.writeUB2(0); // charset field
-  b.writeUint8(0); // csfrm
-  b.writeUB4(0); // LOB prefetch length
-  if (ttcFieldVersion >= _fieldVersion12_2) {
-    b.writeUB4(0); // oaccolid
+  if (numParams > 0) {
+    for (final bind in binds) {
+      b.writeUint8(bind.oraType);
+      b.writeUint8(_bindUseIndicators);
+      b.writeUint8(0); // precision
+      b.writeUint8(0); // scale
+      b.writeUB4(bind.maxSize);
+      b.writeUB4(0); // max num elements
+      b.writeUB4(0); // cont flags
+      b.writeUB4(0); // OID
+      b.writeUB2(0); // version
+      b.writeUB2(bind.csfrm != 0 ? _charsetUtf8 : 0); // charset field
+      b.writeUint8(bind.csfrm);
+      b.writeUB4(0); // LOB prefetch length
+      if (ttcFieldVersion >= _fieldVersion12_2) {
+        b.writeUB4(0); // oaccolid
+      }
+    }
+    // ROW_DATA with each bind's value (cursor OUT → [1][0]; other OUT → NULL
+    // indicator; IN → encoded value).
+    b.writeUint8(_msgTypeRowData);
+    for (final bind in binds) {
+      if (bind.oraType == _oraTypeCursor) {
+        b.writeUint8(1);
+        b.writeUint8(0);
+      } else if (bind.isOut) {
+        b.writeUint8(0); // NULL indicator for an OUT slot
+      } else {
+        final e = _encodeBind(bind.value);
+        if (e.bytes == null) {
+          b.writeUint8(0);
+        } else {
+          b.writeBytesWithLength(e.bytes!);
+        }
+      }
+    }
   }
-
-  // ROW_DATA with the cursor placeholder (length 1, cursor id 0).
-  b.writeUint8(_msgTypeRowData);
-  b.writeUint8(1);
-  b.writeUint8(0);
 
   return b.toBytes();
 }
 
-
 // --- response decode -------------------------------------------------------
 
 class _DecodeState {
-  _DecodeState({required this.isQuery, required this.ttcFieldVersion});
+  _DecodeState({
+    required this.isQuery,
+    required this.ttcFieldVersion,
+    this.binds = const [],
+  });
   final bool isQuery;
   final int ttcFieldVersion;
+
+  /// Bind metadata (PL/SQL), used to decode OUT bind values by type.
+  final List<NativeBind> binds;
   List<NativeColumn> columns = [];
   final List<List<Object?>> rows = [];
   int cursorId = 0;
@@ -571,11 +675,18 @@ class _DecodeState {
   /// OUT bind positions reported by the IO_VECTOR (PL/SQL OUT binds).
   final List<int> outBindIndices = [];
 
+  /// Decoded OUT bind values, one per entry of [outBindIndices], in order.
+  final List<Object?> outBindValues = [];
+
   /// A REF CURSOR OUT bind's server cursor id + its column metadata, decoded
   /// from the OUT-bind ROW_DATA. Null until seen.
   int? refCursorId;
   List<NativeColumn>? refCursorColumns;
   bool outBindsDecoded = false;
+
+  /// Implicit result-set cursors (`DBMS_SQL.RETURN_RESULT`, TTC msg 27): each
+  /// is a (cursorId, columns) pair the caller FETCH-drains.
+  final List<NativeImplicitResult> implicitResults = [];
 }
 
 /// Decodes a concatenated OALL8 response body ([body] = all DATA-packet TTC
@@ -589,9 +700,11 @@ NativeExecuteResponse decodeExecuteResponse(
   Uint8List body, {
   required bool isQuery,
   List<NativeColumn>? expectedColumns,
+  List<NativeBind> binds = const [],
   int ttcFieldVersion = _fieldVersion23_4,
 }) {
-  final s = _DecodeState(isQuery: isQuery, ttcFieldVersion: ttcFieldVersion);
+  final s = _DecodeState(
+      isQuery: isQuery, ttcFieldVersion: ttcFieldVersion, binds: binds);
   if (expectedColumns != null) s.columns = List.of(expectedColumns);
   final buf = ReadBuffer(body);
   try {
@@ -626,6 +739,8 @@ NativeExecuteResponse decodeExecuteResponse(
     errorMessage: s.errorMessage,
     refCursorId: s.refCursorId,
     refCursorColumns: s.refCursorColumns,
+    outBindValues: s.outBindValues,
+    implicitResults: s.implicitResults,
   );
 }
 
@@ -664,7 +779,8 @@ void _dispatch(int msgType, ReadBuffer buf, _DecodeState s) {
       _processServerSidePiggyback(buf);
       return;
     case _msgTypeImplicitResultSet:
-      throw NativeUnsupportedTypeException(-_msgTypeImplicitResultSet);
+      _processImplicitResultSet(buf, s);
+      return;
     case _msgTypeEndOfRequest:
       s.endOfResponse = true;
       return;
@@ -800,21 +916,34 @@ void _processRowData(ReadBuffer buf, _DecodeState s) {
   s.bitVector = null;
 }
 
-/// Decodes one OUT-bind ROW_DATA. This increment supports a single REF CURSOR
-/// OUT bind (SYS_REFCURSOR) — the cursor's embedded describe + server cursor
-/// id — which is the common `BEGIN OPEN :1 FOR ...; END;` shape.
+/// Decodes one OUT-bind ROW_DATA: one value per OUT bind (by its declared
+/// type). A cursor OUT bind yields an embedded describe + server cursor id; a
+/// scalar OUT bind yields its decoded value. Each value carries an SB4 "actual
+/// num bytes" trailer.
 void _decodeOutBinds(ReadBuffer buf, _DecodeState s) {
-  for (final _ in s.outBindIndices) {
-    // Cursor OUT value: UInt8 length (0 / 0xFF = NULL), embedded describe,
-    // then UB2 server cursor id.
-    final numBytes = buf.readUint8();
-    if (numBytes == 0 || numBytes == 0xFF) continue;
-    final columns = _readEmbeddedCursorDescribe(buf, s.ttcFieldVersion);
-    final cursorId = buf.readUB2();
-    s.refCursorColumns = columns;
-    s.refCursorId = cursorId;
-    // An OUT value carries an SB4 "actual num bytes" trailer after the value.
+  for (final idx in s.outBindIndices) {
+    final bind = idx < s.binds.length ? s.binds[idx] : null;
+    if (bind != null && bind.oraType == _oraTypeCursor) {
+      final numBytes = buf.readUint8();
+      if (numBytes == 0 || numBytes == 0xFF) {
+        s.outBindValues.add(null);
+        continue;
+      }
+      final columns = _readEmbeddedCursorDescribe(buf, s.ttcFieldVersion);
+      final cursorId = buf.readUB2();
+      s.refCursorColumns = columns;
+      s.refCursorId = cursorId;
+      buf.readSB4();
+      s.outBindValues.add(cursorId);
+      continue;
+    }
+    // Scalar OUT: decode by the declared bind type, then the SB4 trailer.
+    final oraType = bind?.oraType ?? _oraTypeVarchar;
+    final col = NativeColumn(
+        name: '', oracleType: oraType, maxLength: 0, csfrm: bind?.csfrm ?? 0);
+    final value = _decodeColumnValue(buf, col);
     buf.readSB4();
+    s.outBindValues.add(value);
   }
 }
 
@@ -862,8 +991,22 @@ void _processIoVector(ReadBuffer buf, _DecodeState s) {
   s.outBindIndices.clear();
   for (var i = 0; i < numBinds; i++) {
     final dir = buf.readUint8();
-    // 16 = IN, 32 = OUT, 48 = IN OUT. OUT/IN OUT binds carry return values.
-    if (dir != 16) s.outBindIndices.add(i);
+    // 32 = IN, 16 = OUT, 48 = IN OUT. OUT/IN OUT binds carry return values.
+    if (dir != 32) s.outBindIndices.add(i);
+  }
+}
+
+/// Decodes a TTC implicit result-set message (type 27,
+/// `DBMS_SQL.RETURN_RESULT`): UB4 count, then per result a UInt8 skip-length +
+/// opaque bytes, an embedded cursor describe, and a UB2 server cursor id.
+void _processImplicitResultSet(ReadBuffer buf, _DecodeState s) {
+  final numResults = buf.readUB4();
+  for (var i = 0; i < numResults; i++) {
+    final numBytes = buf.readUint8();
+    if (numBytes > 0) buf.skip(numBytes);
+    final columns = _readEmbeddedCursorDescribe(buf, s.ttcFieldVersion);
+    final cursorId = buf.readUB2();
+    s.implicitResults.add(NativeImplicitResult(cursorId, columns));
   }
 }
 

@@ -863,6 +863,7 @@ class OracleThickClient {
   Future<ex.NativeExecuteResponse> _readRealResponse({
     required bool isQuery,
     List<ex.NativeColumn>? expectedColumns,
+    List<ex.NativeBind> binds = const [],
   }) async {
     final acc = BytesBuilder();
     while (true) {
@@ -871,35 +872,18 @@ class OracleThickClient {
         acc.toBytes(),
         isQuery: isQuery,
         expectedColumns: expectedColumns,
+        binds: binds,
       );
       if (resp.complete) return resp;
     }
   }
 
-  /// Executes a PL/SQL block that opens a single OUT `SYS_REFCURSOR`
-  /// (`BEGIN OPEN :1 FOR <query>; END;`) against a **real Oracle** server and
-  /// returns the cursor's columns + fully-drained rows. Requires a prior
-  /// [loginReal]. Throws [OracleThickException] on an `ORA-xxxxx` error.
-  Future<ex.NativeExecuteResponse> openRefCursor(String plsql,
-      {int prefetch = 100}) async {
-    _socket.add(_wrapData(
-        ex.buildPlsqlRefCursor(plsql),
-        dataFlags: _realDataFlags));
-    final open = await _readRealResponse(isQuery: false);
-    if (!open.isSuccess) {
-      throw OracleThickException(
-          open.errorNum ?? -1,
-          'ORA-${(open.errorNum ?? 0).toString().padLeft(5, '0')}: '
-          '${open.errorMessage ?? ''}');
-    }
-    final cursorId = open.refCursorId;
-    final columns = open.refCursorColumns ?? const <ex.NativeColumn>[];
-    if (cursorId == null) {
-      throw OracleThickException(-1, 'PL/SQL block did not open a REF CURSOR');
-    }
-    // Drain the opened cursor with FETCH rounds.
+  /// Fetches all rows from an open server [cursorId] with the given [columns].
+  Future<List<List<Object?>>> _drainCursor(
+      int cursorId, List<ex.NativeColumn> columns,
+      {int prefetch = 100, int startSeq = 4}) async {
     final rows = <List<Object?>>[];
-    var seq = 4;
+    var seq = startSeq;
     var more = true;
     var cid = cursorId;
     while (more) {
@@ -918,21 +902,60 @@ class OracleThickClient {
       }
       more = fetch.moreRows;
     }
-    // Materialize any LOB cells in the cursor rows.
     for (final row in rows) {
       for (var i = 0; i < row.length; i++) {
         final cell = row[i];
         if (cell is ex.NativeLob) row[i] = await _readLob(cell);
       }
     }
+    return rows;
+  }
+
+  /// Executes a PL/SQL block with [binds] (IN and/or OUT) against a **real
+  /// Oracle** server and returns the response, whose `outBindValues` carry the
+  /// decoded OUT values (a REF CURSOR OUT bind's value is its server cursor id;
+  /// use [openRefCursor] to also drain it). Requires a prior [loginReal].
+  Future<ex.NativeExecuteResponse> callPlsql(
+      String plsql, List<ex.NativeBind> binds) async {
+    _socket.add(_wrapData(
+        ex.buildPlsqlExecute(plsql, binds),
+        dataFlags: _realDataFlags));
+    final resp = await _readRealResponse(isQuery: false, binds: binds);
+    if (!resp.isSuccess) {
+      throw OracleThickException(
+          resp.errorNum ?? -1,
+          'ORA-${(resp.errorNum ?? 0).toString().padLeft(5, '0')}: '
+          '${resp.errorMessage ?? ''}');
+    }
+    return resp;
+  }
+
+  /// Executes a PL/SQL block that opens a single OUT `SYS_REFCURSOR`
+  /// (`BEGIN OPEN :1 FOR <query>; END;`) against a **real Oracle** server and
+  /// returns the cursor's columns + fully-drained rows. Requires a prior
+  /// [loginReal]. Throws [OracleThickException] on an `ORA-xxxxx` error.
+  Future<ex.NativeExecuteResponse> openRefCursor(String plsql,
+      {int prefetch = 100}) async {
+    final open = await callPlsql(plsql, [ex.NativeBind.outCursor()]);
+    final cursorId = open.refCursorId;
+    final columns = open.refCursorColumns ?? const <ex.NativeColumn>[];
+    if (cursorId == null) {
+      throw OracleThickException(-1, 'PL/SQL block did not open a REF CURSOR');
+    }
+    final rows = await _drainCursor(cursorId, columns, prefetch: prefetch);
     return ex.NativeExecuteResponse(
       columns: columns,
       rows: rows,
-      cursorId: cid,
+      cursorId: cursorId,
       moreRows: false,
       complete: true,
     );
   }
+
+  /// Fetches all rows from an implicit result set ([NativeImplicitResult]).
+  Future<List<List<Object?>>> fetchImplicitResult(
+          ex.NativeImplicitResult result, {int prefetch = 100}) =>
+      _drainCursor(result.cursorId, result.columns, prefetch: prefetch);
 
   /// Runs [sql] (optionally parameterised by [binds], one value per `:name`
   /// placeholder in wire order) and returns the describe/DML result. Throws an

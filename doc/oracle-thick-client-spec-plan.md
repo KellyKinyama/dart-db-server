@@ -125,14 +125,21 @@ round-tripped on real Oracle in `test/oracle_real_login_test.dart`.
 - [ ] (follow-up) `LOB WRITE` / temporary-LOB binds, large (>252 byte) scalar
   binds (chunked ROW_DATA encoding), `BFILE`.
 
-## Phase T5 — Cursors & multiple results  ·  Status: PARTIAL (REF CURSOR OUT bind landed)
-- [x] **REF CURSOR OUT binds**: PL/SQL execute (`buildPlsqlRefCursor`) with one
+## Phase T5 — Cursors & multiple results  ·  Status: LANDED (REF CURSOR, scalar OUT binds, implicit results)
+- [x] **REF CURSOR OUT binds**: PL/SQL execute (`buildPlsqlExecute`) with one
   OUT cursor bind, IO_VECTOR parse, embedded-cursor describe decode, server
   cursor id extraction, and FETCH-drain via `openRefCursor`. LOB cells in cursor
-  rows are materialized. Gated test (`BEGIN OPEN :1 FOR … CONNECT BY …; END;`)
-  passes vs 26ai.
-- [ ] Nested cursors in a row; implicit result sets (`DBMS_SQL.RETURN_RESULT`,
-  TTC msg 27); multiple / non-cursor OUT binds (NUMBER/VARCHAR2 OUT).
+  rows are materialized.
+- [x] **Scalar OUT binds** (`NativeBind.outNumber/outVarchar/outDate/
+  outTimestamp`) via `callPlsql(sql, binds)`; IN+OUT mix; decoded by declared
+  type with the SB4 trailer. Positional binds follow Oracle's appearance order.
+- [x] **Implicit result sets** (`DBMS_SQL.RETURN_RESULT`, TTC msg 27): decoded
+  to `NativeImplicitResult` (cursor id + columns), FETCH-drained via
+  `fetchImplicitResult`.
+- [x] Gated tests pass vs 26ai (REF CURSOR, NUMBER/VARCHAR2/DATE OUT, IN→OUT,
+  implicit result).
+- [ ] (follow-up) nested `CURSOR(SELECT …)` columns; IN OUT binds; multiple REF
+  CURSOR OUT binds in one call.
 
 ## Phase T6 — Bulk & RETURNING  ·  Status: TODO
 - [ ] **Array DML** (`executeMany`) with per-row batch errors.
