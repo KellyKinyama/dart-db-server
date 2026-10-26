@@ -30,6 +30,8 @@ on-disk format, a TCP server, and an interactive REPL.
 >   / IVFPQ), four metrics (l2 / l2sq / inner_product / cosine),
 >   payload-filter pruning, range search, hybrid vector + BM25 retrieval.
 > - **FTS5-lite** full-text search with BM25.
+> - **High availability (opt-in)** — durable op-log, streaming read-replicas
+>   over TCP, bootstrap, epoch-fenced failover, and a read/write router.
 > - TCP server + JSON line protocol.
 
 ## Install
@@ -256,6 +258,53 @@ Deeper real-world recipes live in [`doc/`](doc/README.md):
 - [Duplicate detection](doc/duplicate-detection.md) — threshold-based range search.
 - [Index selection](doc/index-selection.md) — which of the six index kinds to pick.
 - [Operations](doc/operations.md) — warming, verifying, rebuilding, and monitoring.
+
+## Availability & replication
+
+`dart_db_server` has an opt-in **high-availability** stack built on a durable
+logical change log (op-log). It is single-writer (one primary) with streaming
+read-replicas and failover — not multi-master. Enable the op-log on a
+path-backed primary and everything else composes on top:
+
+```dart
+final primary = await Database.open('primary.json');
+await primary.enableOpLog(); // append every committed mutation to primary.json.oplog/
+
+// Stream it to replicas on other hosts.
+final server = ReplicationServer(primary.opLog!);
+final port = await server.start(port: 4600);
+
+final replica = await Database.open('replica.json');
+final client = ReplicationClient(replica);
+await client.connect('primary.host', port); // backlog + live tail, resumes on reconnect
+```
+
+What ships:
+
+- **Durable op-log** — CRC32-framed, fsync-on-commit records with segment
+  rotation and crash-safe torn-tail recovery; captures auto-commit statements,
+  explicit transactions, and **prepared/bind** statements (values inlined).
+- **Crash recovery** — on reopen, records above the snapshot's stamped LSN are
+  replayed, recovering a commit that was logged but lost before the snapshot was
+  rewritten. `gcOpLog(lsn)` bounds log growth.
+- **Streaming replication** — `ReplicationServer` / `ReplicationClient` stream
+  the op-log over TCP (on-disk backlog then live tail), applied in strict LSN
+  order; a replica is read-only and resumes from its `appliedLsn` on reconnect.
+- **Bootstrap** — `Replica.bootstrap(primary, path)` seeds a fresh replica from
+  the primary's snapshot, then follows the log.
+- **Failover** — `Replica.promote()` turns a replica into a writable primary;
+  `ClusterEpoch` fencing makes a superseded primary refuse writes (no
+  split-brain); `FailoverController` auto-promotes the most-caught-up replica
+  (quorum-gated); `ClusterRouter` sends reads to replicas, writes to the
+  primary, and redirects after a promotion.
+- **Backup / DR** — `checkpointForBackup()` quiesces the database for a
+  consistent file copy by an external tool such as the sibling
+  [`dbr`](../back_up_restore/dart-backup-restore) backup/restore/replication
+  engine (dedup, S3, GFS retention, 3-2-1).
+
+The full architecture, phased status, and the networked-coordinator roadmap
+(external arbiter / Raft, networked heartbeats, semi-sync) live in
+[`doc/high-availability-plan.md`](doc/high-availability-plan.md).
 
 ## Wire protocol
 
