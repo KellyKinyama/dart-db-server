@@ -158,10 +158,14 @@ round-tripped on real Oracle in `test/oracle_real_login_test.dart`.
 - [x] **Break/RESET marker handling** (`_nextDataFrame`): a server BREAK marker
   (packet type 12, dataType 1) is answered with a RESET marker — this is what
   DDL/DML responses send; previously desynced the stream. Also unblocks DDL.
+- [x] **Array-DML per-row batch errors** (`executeBatch`): the
+  `ttcExecOptionBatchErrors` option; failing rows return `NativeBatchError`
+  (offset + ORA code + message) while valid rows still apply. Verified vs 26ai
+  (3 applied, rows 2 & 4 → ORA-00001).
 - [x] Gated test (single DML, 3-row array DML with varying string lengths,
   RETURNING) passes vs 26ai.
-- [ ] (follow-up) array-DML per-row batch errors (`batchErrors`), array
-  RETURNING (multiple rows per iteration), DML row-count array.
+- [ ] (follow-up) array RETURNING (multiple rows per iteration), DML row-count
+  array.
 
 ## Phase T7 — Robustness & parity  ·  Status: PARTIAL (TNS request fragmentation landed)
 - [x] **TNS request fragmentation** (`_send`): large TTC requests (binds > one

@@ -1078,6 +1078,27 @@ class OracleThickClient {
     return resp.rowsAffected ?? 0;
   }
 
+  /// Runs an array DML (`executeMany`) with per-row **batch errors**: the valid
+  /// iterations are applied and each failing row's error is returned in
+  /// `batchErrors` (rather than aborting the whole call). `rowsAffected` counts
+  /// the applied rows. Requires a prior [loginReal].
+  Future<ex.NativeExecuteResponse> executeBatch(
+      String sql, List<List<Object?>> bulkRows) async {
+    final prepared = [for (final row in bulkRows) await _prepareBinds(row)];
+    final template = prepared.isEmpty ? const <Object?>[] : prepared.first;
+    final nativeBinds = [for (final v in template) ex.NativeBind.value(v)];
+    _send(ex.buildDmlExecute(sql, nativeBinds,
+        bulkRows: prepared, batchErrors: true));
+    final resp = await _readRealResponse(isQuery: false, binds: nativeBinds);
+    if (!resp.isSuccess) {
+      throw OracleThickException(
+          resp.errorNum ?? -1,
+          'ORA-${(resp.errorNum ?? 0).toString().padLeft(5, '0')}: '
+          '${resp.errorMessage ?? ''}');
+    }
+    return resp;
+  }
+
   /// Runs a DML `… RETURNING <cols> INTO <outs>` statement against a **real
   /// Oracle** server. [binds] are in appearance order (IN values + OUT
   /// returning targets). Returns each OUT bind's returned values as a `List`

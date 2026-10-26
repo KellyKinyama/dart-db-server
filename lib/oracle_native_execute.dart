@@ -114,6 +114,7 @@ class NativeExecuteResponse {
     this.refCursorColumns,
     this.outBindValues = const [],
     this.implicitResults = const [],
+    this.batchErrors = const [],
   });
 
   final List<NativeColumn> columns;
@@ -144,6 +145,10 @@ class NativeExecuteResponse {
 
   /// Implicit result-set cursors (`DBMS_SQL.RETURN_RESULT`).
   final List<NativeImplicitResult> implicitResults;
+
+  /// Per-row errors from an array-DML `executeMany(batchErrors: true)` call
+  /// (the valid rows were still applied; see `rowsAffected`).
+  final List<NativeBatchError> batchErrors;
 
   bool get isSuccess => errorNum == null || errorNum == 0;
 }
@@ -575,6 +580,7 @@ Uint8List buildFetch(
 
 const int _execOptionPlSqlBind = 0x400;
 const int _execOptionNotPlSql = 0x8000;
+const int _execOptionBatchErrors = 0x80000;
 const int _oraTypeCursor = 102;
 
 /// Builds a DML OALL8 EXECUTE (INSERT/UPDATE/DELETE), optionally with
@@ -589,6 +595,7 @@ Uint8List buildDmlExecute(
   String sql,
   List<NativeBind> binds, {
   bool returning = false,
+  bool batchErrors = false,
   List<List<Object?>>? bulkRows,
   int ttcFieldVersion = _fieldVersion23_4,
   int sequence = 1,
@@ -606,6 +613,7 @@ Uint8List buildDmlExecute(
   final numExecs = bulkRows?.length ?? 1;
   var options = _execOptionParse | _execOptionExecute | _execOptionNotPlSql;
   if (numParams > 0) options |= _execOptionBind;
+  if (batchErrors) options |= _execOptionBatchErrors;
   final dmlOptions = _execOptionImplicitResultset;
 
   b.writeUB4(options);
@@ -907,6 +915,9 @@ class _DecodeState {
   /// Implicit result-set cursors (`DBMS_SQL.RETURN_RESULT`, TTC msg 27): each
   /// is a (cursorId, columns) pair the caller FETCH-drains.
   final List<NativeImplicitResult> implicitResults = [];
+
+  /// Per-row errors from an array-DML `executeMany(batchErrors: true)` call.
+  List<NativeBatchError> batchErrors = const [];
 }
 
 /// Decodes a concatenated OALL8 response body ([body] = all DATA-packet TTC
@@ -971,6 +982,7 @@ NativeExecuteResponse decodeExecuteResponse(
     refCursorColumns: s.refCursorColumns,
     outBindValues: s.outBindValues,
     implicitResults: s.implicitResults,
+    batchErrors: s.batchErrors,
   );
 }
 
@@ -1485,14 +1497,32 @@ double _decodeBinaryFloat(List<int> raw) {
   return ByteData.sublistView(bytes).getFloat64(0);
 }
 
+/// A per-row error from an array-DML `executeMany(batchErrors: true)` call.
+class NativeBatchError {
+  NativeBatchError(this.offset, this.code, this.message);
+
+  /// 0-based input-row index that failed.
+  final int offset;
+
+  /// Oracle error code (e.g. 1 for ORA-00001 unique-constraint).
+  final int code;
+  final String message;
+
+  @override
+  String toString() => 'row $offset: ORA-${code.toString().padLeft(5, '0')} '
+      '${message.trim()}';
+}
+
 /// Decoded header fields of a TTC ERROR message, shared by the EXECUTE and LOB
 /// response decoders.
 class _TtcError {
-  _TtcError(this.num, this.message, this.cursorId, this.rowCount);
+  _TtcError(this.num, this.message, this.cursorId, this.rowCount,
+      [this.batchErrors = const []]);
   final int num;
   final String? message;
   final int cursorId;
   final int? rowCount;
+  final List<NativeBatchError> batchErrors;
 }
 
 /// Walks a TTC ERROR body (after the message-type byte) and returns its fields.
@@ -1523,30 +1553,36 @@ _TtcError _readTtcErrorBody(ReadBuffer buf, int ttcFieldVersion) {
   buf.skipUB4(); // success iters
   final oerrddLen = buf.readUB4();
   if (oerrddLen > 0) buf.readBytesWithLength();
+  // Per-row batch errors (array-DML executeMany with batchErrors): three
+  // parallel arrays — codes, 0-based input-row offsets, messages.
+  final batchCodes = <int>[];
   final numErrs = buf.readUB2();
   if (numErrs > 0) {
     final firstByte = buf.readUint8();
     for (var i = 0; i < numErrs; i++) {
       if (firstByte == 0xFE) buf.skipUB4();
-      buf.readUB2();
+      batchCodes.add(buf.readUB2());
     }
     if (firstByte == 0xFE) buf.skip(1);
   }
+  final batchOffsets = <int>[];
   final numOff = buf.readUB4();
   if (numOff > 0) {
     final firstByte = buf.readUint8();
     for (var i = 0; i < numOff; i++) {
       if (firstByte == 0xFE) buf.skipUB4();
-      buf.readUB4();
+      batchOffsets.add(buf.readUB4());
     }
     if (firstByte == 0xFE) buf.skip(1);
   }
+  final batchMessages = <String>[];
   final errMsgArr = buf.readUB2();
   if (errMsgArr > 0) {
     buf.skip(1);
     for (var i = 0; i < errMsgArr; i++) {
       buf.skipUB2();
-      buf.readBytesWithLength();
+      batchMessages.add(
+          utf8.decode(buf.readBytesWithLength(), allowMalformed: true).trim());
       buf.skip(2);
     }
   }
@@ -1564,7 +1600,12 @@ _TtcError _readTtcErrorBody(ReadBuffer buf, int ttcFieldVersion) {
     message =
         utf8.decode(buf.readBytesWithLength(), allowMalformed: true).trim();
   }
-  return _TtcError(num, message, cursorId, rowCount);
+  final batchErrors = <NativeBatchError>[
+    for (var i = 0; i < batchCodes.length; i++)
+      NativeBatchError(i < batchOffsets.length ? batchOffsets[i] : 0,
+          batchCodes[i], i < batchMessages.length ? batchMessages[i] : ''),
+  ];
+  return _TtcError(num, message, cursorId, rowCount, batchErrors);
 }
 
 void _processError(ReadBuffer buf, _DecodeState s) {
@@ -1574,6 +1615,16 @@ void _processError(ReadBuffer buf, _DecodeState s) {
   s.errorNum = num;
   if (num != 0) {
     s.errorMessage = err.message;
+  }
+  if (err.batchErrors.isNotEmpty) {
+    // Array-DML executeMany(batchErrors: true): the server applied the valid
+    // rows and returned per-row errors under a statement-level ORA-24381. This
+    // is a SUCCESS returning row errors as data — clear the statement error.
+    s.batchErrors = err.batchErrors;
+    s.errorNum = 0;
+    s.errorMessage = null;
+    if (!s.isQuery) s.rowsAffected = err.rowCount;
+    return;
   }
   if (s.isQuery && num == 1403) {
     s.errorNum = 0;

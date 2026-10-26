@@ -390,6 +390,50 @@ void main() {
       }
     });
 
+    test('array DML batch errors report per-row failures', () async {
+      final host = env['ORACLE_HOST'] ?? '127.0.0.1';
+      final port = int.tryParse(env['ORACLE_PORT'] ?? '1521') ?? 1521;
+      final user = env['ORACLE_USER'] ?? 'system';
+      final pass = env['ORACLE_PASSWORD'] ?? 'TestPw1234';
+      final service = env['ORACLE_SERVICE'] ?? 'FREEPDB1';
+
+      final client = await OracleThickClient.connect(port, host: host);
+      try {
+        await client.loginReal(
+          username: user,
+          password: pass,
+          serviceName: service,
+        );
+        await client
+            .executeDml('DROP TABLE t_thick_batch PURGE')
+            .catchError((_) => 0);
+        await client.executeDml('CREATE TABLE t_thick_batch '
+            '(id NUMBER PRIMARY KEY, v VARCHAR2(20))');
+        try {
+          // Rows 2 and 4 duplicate earlier ids → per-row ORA-00001; the rest
+          // still apply.
+          final r = await client
+              .executeBatch('INSERT INTO t_thick_batch VALUES (:1, :2)', [
+            [1, 'a'],
+            [2, 'b'],
+            [1, 'dup'],
+            [3, 'c'],
+            [2, 'dup2'],
+          ]);
+          expect(r.rowsAffected, 3);
+          expect(r.batchErrors.map((e) => e.offset).toList(), [2, 4]);
+          expect(r.batchErrors.every((e) => e.code == 1), isTrue);
+          final cnt =
+              await client.queryReal('SELECT COUNT(*) FROM t_thick_batch');
+          expect(cnt.rows.first.first, 3);
+        } finally {
+          await client.executeDml('DROP TABLE t_thick_batch PURGE');
+        }
+      } finally {
+        await client.close();
+      }
+    });
+
     test('DML, array DML, and RETURNING against real Oracle', () async {
       final host = env['ORACLE_HOST'] ?? '127.0.0.1';
       final port = int.tryParse(env['ORACLE_PORT'] ?? '1521') ?? 1521;
