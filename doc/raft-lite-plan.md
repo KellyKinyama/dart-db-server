@@ -78,8 +78,10 @@ Tasks:
   backward-compatible) and `OpLog.truncateAbove(maxLsn)` (byte-trims the
   straddling segment, deletes segments above, survives reopen).
   Tests in `test/oplog_test.dart`.
-- [ ] **Persist `currentTerm`/`votedFor`.** fsync to `<db>.raft/state.json`
-  before replying to any RPC that depends on them (R5 wiring).
+- [x] **Persist `currentTerm`/`votedFor`.** `RaftStore` (`raft_store.dart`)
+  with `FileRaftStore` (atomic temp+fsync+rename) and `InMemoryRaftStore`;
+  `RaftNode` routes term/vote mutations through it so a restart reloads them
+  (no double vote in a term). Tests: `test/raft_store_test.dart`. LANDED.
 - [ ] **Generalize the fence.** `currentTerm` subsumes `ClusterEpoch`; keep
   `ClusterEpoch` as the single-node fallback but have Raft own the term.
 

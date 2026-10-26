@@ -5,6 +5,7 @@ import 'dart:math';
 
 import 'config.dart';
 import 'raft_log.dart';
+import 'raft_store.dart';
 import 'rpc.dart';
 import 'transport.dart';
 
@@ -19,9 +20,8 @@ class RaftNode implements RaftHandlers {
   final RaftTransport transport;
   final RaftLog log;
 
-  // --- Persistent state (must survive restarts; R5 fsyncs these). ---
-  int currentTerm = 0;
-  String? votedFor;
+  /// Durable `currentTerm` / `votedFor` (persisted before RPC replies).
+  final RaftStore _store;
 
   // --- Volatile state. ---
   RaftRole role = RaftRole.follower;
@@ -36,16 +36,24 @@ class RaftNode implements RaftHandlers {
   /// driver can decide whether to start an election on the next tick.
   bool heardFromLeader = false;
 
-  RaftNode(this.config, this.transport, {RaftLog? log})
-      : log = log ?? RaftLog();
+  RaftNode(this.config, this.transport, {RaftLog? log, RaftStore? store})
+      : log = log ?? RaftLog(),
+        _store = store ?? InMemoryRaftStore();
 
   String get nodeId => config.nodeId;
   bool get isLeader => role == RaftRole.leader;
 
+  /// Persistent term (durable across restarts).
+  int get currentTerm => _store.currentTerm;
+  set currentTerm(int t) => _store.save(t, _store.votedFor);
+
+  /// Persistent vote for the current term (durable across restarts).
+  String? get votedFor => _store.votedFor;
+  set votedFor(String? v) => _store.save(_store.currentTerm, v);
+
   void _becomeFollower(int term) {
     if (term > currentTerm) {
-      currentTerm = term;
-      votedFor = null;
+      _store.save(term, null); // new term ⇒ fresh vote, persisted atomically
     }
     role = RaftRole.follower;
   }
@@ -66,8 +74,7 @@ class RaftNode implements RaftHandlers {
   Future<void> onElectionTimeout() async {
     if (role == RaftRole.leader) return;
     role = RaftRole.candidate;
-    currentTerm++;
-    votedFor = nodeId;
+    _store.save(currentTerm + 1, nodeId); // new term + self-vote, atomically
     leaderId = null;
     final electionTerm = currentTerm;
     var votes = 1; // self
