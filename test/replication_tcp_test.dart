@@ -1,6 +1,7 @@
 library;
 
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:dart_db_server/dart_db_server.dart';
@@ -203,6 +204,34 @@ void main() {
       } finally {
         await primary.close();
         await replica.close();
+      }
+    });
+
+    test('HealthServer serves /health JSON for a node', () async {
+      final primary = await Database.open(_tmp('health_p'));
+      await primary.enableOpLog();
+      await primary.execute('CREATE TABLE t(id INTEGER PRIMARY KEY)');
+      final health = HealthServer(primary);
+      final port = await health.start();
+      final httpClient = HttpClient();
+      try {
+        final req =
+            await httpClient.get('127.0.0.1', port, '/health');
+        final resp = await req.close();
+        expect(resp.statusCode, 200);
+        final body = await resp.transform(utf8.decoder).join();
+        expect(body, contains('"role":"primary"'));
+        expect(body, contains('"log_last_lsn":1'));
+
+        // Unknown path → 404.
+        final req2 = await httpClient.get('127.0.0.1', port, '/nope');
+        final resp2 = await req2.close();
+        expect(resp2.statusCode, 404);
+        await resp2.drain<void>();
+      } finally {
+        httpClient.close(force: true);
+        await health.stop();
+        await primary.close();
       }
     });
   });

@@ -119,6 +119,40 @@ class PrimaryProbe {
   }
 }
 
+/// Serves `GET /health` (JSON of [Database.haStatus]) over HTTP so a load
+/// balancer, orchestrator, or operator can poll a node's role, epoch, and
+/// replication position. Any other path returns 404.
+class HealthServer {
+  final Database node;
+  HttpServer? _server;
+
+  HealthServer(this.node);
+
+  /// The bound port (0 before [start]).
+  int get port => _server?.port ?? 0;
+
+  Future<int> start({String host = '127.0.0.1', int port = 0}) async {
+    final s = await HttpServer.bind(host, port);
+    _server = s;
+    s.listen((req) {
+      if (req.uri.path == '/health') {
+        req.response
+          ..headers.contentType = ContentType.json
+          ..write(jsonEncode(node.haStatus().toJson()));
+      } else {
+        req.response.statusCode = HttpStatus.notFound;
+      }
+      req.response.close();
+    }, onError: (_) {});
+    return s.port;
+  }
+
+  Future<void> stop() async {
+    await _server?.close(force: true);
+    _server = null;
+  }
+}
+
 /// Connects a replica [Database] to a [ReplicationServer], streaming op-log
 /// records from the replica's current `appliedLsn` and applying each in order.
 class ReplicationClient {

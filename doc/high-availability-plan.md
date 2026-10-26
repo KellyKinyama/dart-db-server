@@ -217,7 +217,9 @@ Tasks:
   (role / epoch / appliedLsn / logLastLsn / fenced). `PrimaryProbe(host, port)`
   is a TCP liveness check that backs `FailoverController.isPrimaryAlive` for
   real heartbeat-driven failover (test: "probe-driven FailoverController
-  promotes when primary is down"). A `/health` HTTP endpoint is still TODO.
+  promotes when primary is down"). `HealthServer(node)` serves `GET /health`
+  as JSON over HTTP for load balancers / orchestrators. Primary↔replica
+  push heartbeats are still TODO.
 - [ ] **Fencing.** An epoch/term token bumped on every promotion; the old
   primary refuses writes once it sees a higher epoch (STONITH-lite). This gate
   **must** land before any automation.
