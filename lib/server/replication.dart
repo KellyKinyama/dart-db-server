@@ -42,6 +42,12 @@ class Replica {
     return lag < 0 ? 0 : lag;
   }
 
+  /// Promote this replica to a writable primary (failover). Accepts client
+  /// writes again and seeds its op-log above [appliedLsn] so new commits keep
+  /// LSNs monotonic for downstream replicas. The caller is responsible for
+  /// fencing the old primary (single-coordinator assumption in v1).
+  Future<void> promote() => target.promoteToPrimary();
+
   /// Continuously follow [source], polling every [interval] until [stop]
   /// completes, then drain once more so no tail record is missed.
   Future<void> follow(

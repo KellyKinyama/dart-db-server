@@ -279,6 +279,22 @@ class Database implements SequenceProvider {
     await _persist();
   }
 
+  /// Promote this replica to a writable primary: accept client writes again and
+  /// start (or continue) its own op-log seeded above the LSN already applied,
+  /// so new commits keep LSNs monotonic for any downstream replicas.
+  ///
+  /// v1 assumes a single coordinator drives promotion. Split-brain fencing
+  /// (refusing writes once a higher epoch is observed) arrives with the
+  /// coordinator in Phase 4 — do not automate promotion before it.
+  Future<void> promoteToPrimary() async {
+    _replicaReadOnly = false;
+    if (path != null && _oplog == null) {
+      final log = OpLog('$path.oplog');
+      await log.open(seedLsn: _appliedLsn);
+      _oplog = log;
+    }
+  }
+
   /// The durable op-log, or null when not enabled. Exposed for replication and
   /// tests.
   OpLog? get opLog => _oplog;

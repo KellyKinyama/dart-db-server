@@ -91,8 +91,10 @@ class OpLog {
 
   /// Open (creating [dir] if needed), rebuild the segment index by scanning
   /// every segment, truncate a torn final frame, and ready the newest segment
-  /// for appends.
-  Future<void> open() async {
+  /// for appends. [seedLsn] floors [lastLsn] (used on promotion, so a new
+  /// primary's first append continues monotonically above the LSN it had
+  /// already applied as a replica).
+  Future<void> open({int seedLsn = 0}) async {
     if (_open) return;
     final d = Directory(dir);
     if (!await d.exists()) await d.create(recursive: true);
@@ -107,6 +109,7 @@ class OpLog {
       _segments.add(seg);
       if (seg.lastLsn > _lastLsn) _lastLsn = seg.lastLsn;
     }
+    if (seedLsn > _lastLsn) _lastLsn = seedLsn;
 
     if (_segments.isEmpty) {
       final first = '$dir${Platform.pathSeparator}${_segName(1)}';

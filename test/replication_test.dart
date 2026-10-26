@@ -112,5 +112,32 @@ void main() {
         await replica.close();
       }
     });
+
+    test('promote makes a replica writable with monotonic LSNs', () async {
+      final primary = await Database.open(_tmp('p_fail'));
+      await primary.enableOpLog();
+      final replica = await Database.open(_tmp('r_fail'));
+      final r = Replica(replica);
+      try {
+        await primary.execute('CREATE TABLE t(id INTEGER PRIMARY KEY)');
+        await primary.execute('INSERT INTO t VALUES (1),(2)');
+        await r.catchUp(primary.opLog!);
+        expect(replica.appliedLsn, 2);
+
+        // Primary "fails"; promote the replica.
+        await primary.close();
+        await r.promote();
+
+        // Now accepts writes, and its op-log continues above the applied LSN.
+        await replica.execute('INSERT INTO t VALUES (3)');
+        expect(replica.opLog!.lastLsn, 3);
+        final rr = await replica.execute('SELECT COUNT(*) FROM t');
+        expect(rr.rows, [
+          [3],
+        ]);
+      } finally {
+        await replica.close();
+      }
+    });
   });
 }

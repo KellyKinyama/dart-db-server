@@ -166,20 +166,25 @@ Tasks:
 
 ---
 
-## Phase 3 — Health, promotion & manual failover  ·  Status: TODO
+## Phase 3 — Health, promotion & manual failover  ·  Status: WIP
 
 **Goal:** detect primary failure and **promote** a replica with operator action
 (no auto-magic yet), without split-brain.
 
 Tasks:
+- [x] **Manual promote (mechanics).** `Replica.promote()` →
+  `Database.promoteToPrimary()`: clears read-only, opens the node's own op-log
+  seeded at `appliedLsn` (`OpLog.open(seedLsn:)`) so post-promotion commits keep
+  LSNs monotonic. Test: `test/replication_test.dart` → "promote makes a replica
+  writable with monotonic LSNs". *v1 assumes a single coordinator;* cross-node
+  fencing is still required before this is safe to automate (below).
 - [ ] **Heartbeat & health.** Primary↔replica heartbeats; `GET /health`
   exposing role, `appliedLsn`, lag, and uptime.
 - [ ] **Fencing.** An epoch/term token bumped on every promotion; the old
   primary refuses writes once it sees a higher epoch (STONITH-lite). This gate
   **must** land before any automation.
-- [ ] **Manual promote.** `PROMOTE` admin command: pick the most-caught-up
-  replica (highest `appliedLsn`), bump epoch, flip to writable, repoint others
-  to the new primary.
+- [ ] **Pick-most-caught-up.** On promote, select the replica with the highest
+  `appliedLsn`.
 - [ ] **Connection redirect.** A thin front-door (VIP or `dbr`-style router)
   that routes writes→primary, reads→replicas, and surfaces the current primary
   so clients/ORMs reconnect after promotion.
