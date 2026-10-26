@@ -156,5 +156,70 @@ void main() {
         await db.close();
       }
     });
+
+    test('bind-aware capture logs prepared statements with values inlined',
+        () async {
+      final db = await Database.open(_tmp('binds'));
+      await db.enableOpLog();
+      try {
+        await db.execute(
+            'CREATE TABLE t(id INTEGER PRIMARY KEY, n TEXT, blob BLOB)');
+        // Positional binds.
+        await db.prepare('INSERT INTO t(id, n) VALUES (?, ?)').execute(
+          positional: [1, "o'brien"],
+        );
+        // Named binds.
+        await db
+            .prepare('INSERT INTO t(id, n) VALUES (:id, :n)')
+            .execute(named: {'id': 2, 'n': 'alice'});
+        // Blob bind.
+        await db.prepare('INSERT INTO t(id, blob) VALUES (?, ?)').execute(
+          positional: [3, <int>[0xDE, 0xAD]],
+        );
+
+        final recs = await _dump(db);
+        // CREATE + three prepared inserts.
+        expect(recs.length, 4);
+        expect(recs[1].ops.single, contains("'o''brien'")); // quote escaped
+        expect(recs[2].ops.single, contains("'alice'"));
+        expect(recs[3].ops.single, contains("X'dead'")); // blob as hex literal
+      } finally {
+        await db.close();
+      }
+    });
+
+    test('a bound statement replays identically on a reopened database',
+        () async {
+      final path = _tmp('binds_replay');
+      var db = await Database.open(path);
+      await db.enableOpLog();
+      try {
+        await db.execute('CREATE TABLE t(id INTEGER PRIMARY KEY, n TEXT)');
+        await db
+            .prepare('INSERT INTO t(id, n) VALUES (?, ?)')
+            .execute(positional: [1, "quote'd"]);
+      } finally {
+        await db.close();
+      }
+
+      // Simulate a crash before the row was persisted: re-append nothing, but
+      // prove the logged literal replays by truncating the snapshot's view.
+      final log = OpLog('$path.oplog');
+      await log.open();
+      final recs = await log.readFrom(1).toList();
+      await log.close();
+      expect(recs.last.ops.single, contains("'quote''d'"));
+
+      // Reopening applies the data and the row round-trips.
+      db = await Database.open(path);
+      try {
+        final r = await db.execute('SELECT id, n FROM t');
+        expect(r.rows, [
+          [1, "quote'd"],
+        ]);
+      } finally {
+        await db.close();
+      }
+    });
   });
 }

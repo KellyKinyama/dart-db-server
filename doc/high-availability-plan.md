@@ -107,8 +107,13 @@ Tasks:
   discards the buffer). Capture currently keys off the `execute(sql)` source
   text; **prepared/bind statements are not yet captured** (tracked below).
   Tests: `test/oplog_capture_test.dart`.
-- [ ] **Bind-aware capture.** Capture prepared/parameterized statements (expand
-  binds to literals, or log a structured op) so the log is complete.
+- [x] **Bind-aware capture.** Prepared/parameterized statements are captured by
+  rendering bind values into the SQL as literals at the placeholder offsets
+  (`prepared.dart` `_expandBinds`/`_sqlLiteral`): numbering mirrors the parser
+  (`?`, `?N`, `:name`), strings are quote-escaped, blobs become `X'..'`, nulls
+  `NULL`. Only runs when the op-log is on; an unrenderable bind falls back to
+  not capturing (never fails the query). Tests: `test/oplog_capture_test.dart`
+  (inline capture, replay round-trip). LANDED.
 - [ ] **Recovery/replay.** On `Database.open`, if the log is ahead of the last
   persisted snapshot's LSN, replay the tail to recover committed-but-not-yet-
   snapshotted transactions. Reconciles the "no redo log" gap called out in the

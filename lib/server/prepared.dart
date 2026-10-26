@@ -9,6 +9,7 @@ library;
 
 import 'database.dart';
 import 'expression.dart';
+import 'lexer.dart';
 import 'result.dart';
 import 'statement.dart';
 
@@ -82,7 +83,19 @@ class PreparedStatement {
     final scope = BindScope(positional: positional, named: normalisedNamed);
     BindParamExpr.scopeStack.add(scope);
     try {
-      return await _db.executeStmt(_stmt);
+      // Bind-aware op-log capture: when the op-log is on, log the statement
+      // with its bound values spliced in as literals so it replays faithfully.
+      // Best-effort — an unrenderable bind falls back to not capturing (the
+      // prior behavior) rather than failing the user's query.
+      String? sourceSql;
+      if (_db.opLog != null) {
+        try {
+          sourceSql = _expandBinds(sql, scope);
+        } catch (_) {
+          sourceSql = null;
+        }
+      }
+      return await _db.executeStmt(_stmt, sourceSql: sourceSql);
     } finally {
       BindParamExpr.scopeStack.removeLast();
     }
@@ -92,3 +105,53 @@ class PreparedStatement {
   String toString() =>
       'PreparedStatement(${sql.length > 60 ? '${sql.substring(0, 60)}...' : sql})';
 }
+
+/// Render [sql] with every bind placeholder replaced by the SQL literal of its
+/// value in [scope], so the result is a standalone statement the op-log can
+/// replay. Placeholder numbering mirrors the parser: bare `?` auto-increments,
+/// `?N` is explicit, `:name`/`@name`/`$name` resolve by name.
+String _expandBinds(String sql, BindScope scope) {
+  final tokens = Lexer(sql).tokenize();
+  final buf = StringBuffer();
+  var cursor = 0;
+  var paramCount = 0;
+  for (final tok in tokens) {
+    if (tok.type != TokType.param) continue;
+    buf.write(sql.substring(cursor, tok.offset));
+    final spelling = tok.text;
+    Object? value;
+    if (spelling == '?') {
+      paramCount++;
+      value = scope.lookupPositional(paramCount, spelling);
+    } else if (spelling.startsWith('?')) {
+      final n = int.parse(spelling.substring(1));
+      if (n > paramCount) paramCount = n;
+      value = scope.lookupPositional(n, spelling);
+    } else {
+      value = scope.lookupNamed(spelling.substring(1), spelling);
+    }
+    buf.write(_sqlLiteral(value));
+    cursor = tok.offset + spelling.length;
+  }
+  buf.write(sql.substring(cursor));
+  return buf.toString();
+}
+
+/// Render a bound value as a SQL literal for op-log capture.
+String _sqlLiteral(Object? v) {
+  if (v == null) return 'NULL';
+  if (v is bool) return v ? '1' : '0';
+  if (v is int) return v.toString();
+  if (v is double) return (v.isNaN || v.isInfinite) ? 'NULL' : v.toString();
+  if (v is List<int>) {
+    final sb = StringBuffer("X'");
+    for (final b in v) {
+      sb.write((b & 0xFF).toRadixString(16).padLeft(2, '0'));
+    }
+    sb.write("'");
+    return sb.toString();
+  }
+  final s = v is String ? v : v.toString();
+  return "'${s.replaceAll("'", "''")}'";
+}
+
