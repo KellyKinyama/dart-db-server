@@ -118,5 +118,28 @@ void main() {
       expect(c['n1'].commitIndex, 1);
       expect(c['n2'].log.lastIndex, 1);
     });
+
+    test('committed entries are delivered to onCommit once, in order',
+        () async {
+      final c = _cluster(['n1', 'n2', 'n3']);
+      final leaderApplied = <String>[];
+      final followerApplied = <String>[];
+      c['n1'].onCommit = (e) => leaderApplied.add(e.ops.single);
+      c['n2'].onCommit = (e) => followerApplied.add(e.ops.single);
+
+      await c['n1'].onElectionTimeout();
+      c['n1'].clientAppend(['A']);
+      c['n1'].clientAppend(['B']);
+      await c['n1'].sendHeartbeats(); // replicate + leader commits
+      await c['n1'].sendHeartbeats(); // carry commit to followers
+
+      expect(leaderApplied, ['A', 'B']);
+      expect(followerApplied, ['A', 'B']);
+
+      // Idempotent: another heartbeat does not re-deliver committed entries.
+      await c['n1'].sendHeartbeats();
+      expect(leaderApplied, ['A', 'B']);
+      expect(followerApplied, ['A', 'B']);
+    });
   });
 }

@@ -28,6 +28,13 @@ class RaftNode implements RaftHandlers {
   String? leaderId;
   int commitIndex = 0;
 
+  /// Highest log index handed to [onCommit] (the state machine).
+  int lastApplied = 0;
+
+  /// Invoked once per committed entry, in strictly increasing index order —
+  /// the hook the engine wires to `Database.applyReplicated`.
+  void Function(RaftEntry entry)? onCommit;
+
   // --- Leader state (reinitialized on election). ---
   final Map<String, int> _nextIndex = {};
   final Map<String, int> _matchIndex = {};
@@ -169,6 +176,16 @@ class RaftNode implements RaftHandlers {
         break;
       }
     }
+    _applyCommitted();
+  }
+
+  /// Deliver newly-committed entries to [onCommit] in order, exactly once.
+  void _applyCommitted() {
+    while (lastApplied < commitIndex) {
+      lastApplied++;
+      final e = log.at(lastApplied);
+      if (e != null) onCommit?.call(e);
+    }
   }
 
   @override
@@ -201,6 +218,7 @@ class RaftNode implements RaftHandlers {
 
     if (args.leaderCommit > commitIndex) {
       commitIndex = min(args.leaderCommit, log.lastIndex);
+      _applyCommitted();
     }
     return AppendEntriesReply(
         term: currentTerm, success: true, matchIndex: log.lastIndex);

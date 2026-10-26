@@ -120,8 +120,12 @@ Tasks:
   `matchIndex` belonging to the **current term** (§5.4.2); followers adopt
   `leaderCommit`. Tests: `test/raft_election_test.dart` (commit on majority,
   no commit without majority).
-- [ ] **Apply loop.** Apply committed-but-unapplied entries via
-  `Database.applyReplicated` up to `commitIndex` (R5 wiring).
+- [x] **Apply loop.** `RaftNode.onCommit` fires once per committed entry in
+  strict index order (tracked by `lastApplied`), advanced from both the leader
+  commit path and a follower adopting `leaderCommit` — the hook the engine wires
+  to `Database.applyReplicated`. Test: `test/raft_election_test.dart`
+  ("committed entries are delivered to onCommit once, in order"). The
+  `Database` wiring itself is the remaining R5 step.
 - [ ] **Leader write path.** Withhold the `COMMIT` ack until the entry is
   committed (majority), reusing `configureSemiSync` backed by commitIndex (R5).
 
