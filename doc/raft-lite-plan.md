@@ -175,8 +175,11 @@ Tasks:
   heartbeat and a randomized election timeout that fires only when no leader was
   heard that cycle — turning the explicit-tick node into an autonomous,
   self-electing one. Tests: `test/raft_driver_test.dart` (one stable leader
-  emerges; a new leader is elected after the current one stops). The `dart:io`
-  TCP `RaftTransport` (for cross-host clusters) is still TODO.
+  emerges; a new leader is elected after the current one stops).
+  *TCP transport LANDED:* `RaftRpcServer` + `TcpRaftTransport`
+  (`raft_rpc_server.dart`) carry `RequestVote`/`AppendEntries` over TCP
+  (one request/response per connection). Test: `test/raft_tcp_test.dart` — a
+  3-node cluster elects and replicates over real sockets.
 - [ ] **Bootstrap/catch-up.** A far-behind follower seeds via
   `Replica.bootstrap` (snapshot) then resumes AppendEntries — no InstallSnapshot
   RPC needed in v1.
