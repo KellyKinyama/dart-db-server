@@ -125,10 +125,14 @@ round-tripped on real Oracle in `test/oracle_real_login_test.dart`.
 - [ ] (follow-up) `LOB WRITE` / temporary-LOB binds, large (>252 byte) scalar
   binds (chunked ROW_DATA encoding), `BFILE`.
 
-## Phase T5 — Cursors & multiple results  ·  Status: TODO
-- [ ] **REF CURSOR** OUT binds (describe + fetch the nested cursor).
-- [ ] **Nested cursors** in a row; **implicit result sets**
-  (`DBMS_SQL.RETURN_RESULT`).
+## Phase T5 — Cursors & multiple results  ·  Status: PARTIAL (REF CURSOR OUT bind landed)
+- [x] **REF CURSOR OUT binds**: PL/SQL execute (`buildPlsqlRefCursor`) with one
+  OUT cursor bind, IO_VECTOR parse, embedded-cursor describe decode, server
+  cursor id extraction, and FETCH-drain via `openRefCursor`. LOB cells in cursor
+  rows are materialized. Gated test (`BEGIN OPEN :1 FOR … CONNECT BY …; END;`)
+  passes vs 26ai.
+- [ ] Nested cursors in a row; implicit result sets (`DBMS_SQL.RETURN_RESULT`,
+  TTC msg 27); multiple / non-cursor OUT binds (NUMBER/VARCHAR2 OUT).
 
 ## Phase T6 — Bulk & RETURNING  ·  Status: TODO
 - [ ] **Array DML** (`executeMany`) with per-row batch errors.

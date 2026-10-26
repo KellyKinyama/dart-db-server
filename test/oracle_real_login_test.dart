@@ -208,5 +208,39 @@ void main() {
         await client.close();
       }
     });
+
+    test('REF CURSOR OUT bind drains rows from real Oracle', () async {
+      final host = env['ORACLE_HOST'] ?? '127.0.0.1';
+      final port = int.tryParse(env['ORACLE_PORT'] ?? '1521') ?? 1521;
+      final user = env['ORACLE_USER'] ?? 'system';
+      final pass = env['ORACLE_PASSWORD'] ?? 'TestPw1234';
+      final service = env['ORACLE_SERVICE'] ?? 'FREEPDB1';
+
+      final client = await OracleThickClient.connect(port, host: host);
+      try {
+        await client.loginReal(
+          username: user,
+          password: pass,
+          serviceName: service,
+        );
+        final r = await client.openRefCursor('''
+          BEGIN
+            OPEN :1 FOR
+              SELECT level AS n, 'row' || level AS label
+              FROM dual CONNECT BY level <= 5;
+          END;
+        ''');
+        expect(r.columns.map((c) => c.name).toList(), ['N', 'LABEL']);
+        expect(r.rows, [
+          [1, 'row1'],
+          [2, 'row2'],
+          [3, 'row3'],
+          [4, 'row4'],
+          [5, 'row5'],
+        ]);
+      } finally {
+        await client.close();
+      }
+    });
   }, skip: enabled ? false : 'set RUN_ORACLE_TESTS=true to run (needs Oracle)');
 }

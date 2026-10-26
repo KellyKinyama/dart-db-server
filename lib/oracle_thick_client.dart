@@ -876,6 +876,64 @@ class OracleThickClient {
     }
   }
 
+  /// Executes a PL/SQL block that opens a single OUT `SYS_REFCURSOR`
+  /// (`BEGIN OPEN :1 FOR <query>; END;`) against a **real Oracle** server and
+  /// returns the cursor's columns + fully-drained rows. Requires a prior
+  /// [loginReal]. Throws [OracleThickException] on an `ORA-xxxxx` error.
+  Future<ex.NativeExecuteResponse> openRefCursor(String plsql,
+      {int prefetch = 100}) async {
+    _socket.add(_wrapData(
+        ex.buildPlsqlRefCursor(plsql),
+        dataFlags: _realDataFlags));
+    final open = await _readRealResponse(isQuery: false);
+    if (!open.isSuccess) {
+      throw OracleThickException(
+          open.errorNum ?? -1,
+          'ORA-${(open.errorNum ?? 0).toString().padLeft(5, '0')}: '
+          '${open.errorMessage ?? ''}');
+    }
+    final cursorId = open.refCursorId;
+    final columns = open.refCursorColumns ?? const <ex.NativeColumn>[];
+    if (cursorId == null) {
+      throw OracleThickException(-1, 'PL/SQL block did not open a REF CURSOR');
+    }
+    // Drain the opened cursor with FETCH rounds.
+    final rows = <List<Object?>>[];
+    var seq = 4;
+    var more = true;
+    var cid = cursorId;
+    while (more) {
+      _socket.add(_wrapData(
+          ex.buildFetch(cid, prefetch, sequence: seq++),
+          dataFlags: _realDataFlags));
+      final fetch = await _readRealResponse(
+          isQuery: true, expectedColumns: columns);
+      rows.addAll(fetch.rows);
+      if (fetch.cursorId != 0) cid = fetch.cursorId;
+      if (!fetch.isSuccess) {
+        throw OracleThickException(
+            fetch.errorNum ?? -1,
+            'ORA-${(fetch.errorNum ?? 0).toString().padLeft(5, '0')}: '
+            '${fetch.errorMessage ?? ''}');
+      }
+      more = fetch.moreRows;
+    }
+    // Materialize any LOB cells in the cursor rows.
+    for (final row in rows) {
+      for (var i = 0; i < row.length; i++) {
+        final cell = row[i];
+        if (cell is ex.NativeLob) row[i] = await _readLob(cell);
+      }
+    }
+    return ex.NativeExecuteResponse(
+      columns: columns,
+      rows: rows,
+      cursorId: cid,
+      moreRows: false,
+      complete: true,
+    );
+  }
+
   /// Runs [sql] (optionally parameterised by [binds], one value per `:name`
   /// placeholder in wire order) and returns the describe/DML result. Throws an
   /// [OracleThickException] on an `ORA-xxxxx` error.

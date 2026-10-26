@@ -110,6 +110,8 @@ class NativeExecuteResponse {
     this.rowsAffected,
     this.errorNum,
     this.errorMessage,
+    this.refCursorId,
+    this.refCursorColumns,
   });
 
   final List<NativeColumn> columns;
@@ -127,6 +129,13 @@ class NativeExecuteResponse {
   final int? rowsAffected;
   final int? errorNum;
   final String? errorMessage;
+
+  /// A REF CURSOR OUT bind's server cursor id (SYS_REFCURSOR), when the
+  /// executed statement opened one. FETCH from this id to drain its rows.
+  final int? refCursorId;
+
+  /// The REF CURSOR's column metadata, decoded from its embedded describe.
+  final List<NativeColumn>? refCursorColumns;
 
   bool get isSuccess => errorNum == null || errorNum == 0;
 }
@@ -422,6 +431,127 @@ Uint8List buildFetch(
   return b.toBytes();
 }
 
+const int _execOptionPlSqlBind = 0x400;
+const int _oraTypeCursor = 102;
+
+/// Builds a PL/SQL OALL8 EXECUTE for a block with a single OUT `SYS_REFCURSOR`
+/// bind — the `BEGIN OPEN :1 FOR <query>; END;` shape. The server runs the
+/// block, opens the cursor, and returns its id + describe in the OUT bind;
+/// FETCH from that id drains the rows.
+Uint8List buildPlsqlRefCursor(
+  String plsql, {
+  int ttcFieldVersion = _fieldVersion23_4,
+  int sequence = 1,
+}) {
+  final b = WriteBuffer();
+  b.writeUint8(_msgTypeFunction);
+  b.writeUint8(_funcExecute);
+  b.writeUint8(sequence & 0xFF);
+  if (ttcFieldVersion >= _fieldVersion23_1Ext1) {
+    b.writeUB8(0); // token number
+  }
+
+  final sqlBytes = utf8.encode(plsql);
+  // PL/SQL, fresh parse, one OUT cursor bind.
+  final options = _execOptionParse |
+      _execOptionExecute |
+      _execOptionBind |
+      _execOptionPlSqlBind;
+  final dmlOptions = _execOptionImplicitResultset;
+
+  b.writeUB4(options);
+  b.writeUB4(0); // cursor id (0 = fresh parse)
+
+  b.writeUint8(1); // ptr to SQL
+  b.writeUB4(sqlBytes.length);
+
+  b.writeUint8(1); // al8i4 vector pointer
+  b.writeUB4(13); // al8i4 array length
+
+  b.writeUint8(0); // al8o4
+  b.writeUint8(0); // al8o4l
+  b.writeUint8(0); // prefetch buffer size
+  b.writeUB4(1); // prefetch num rows (1 for PL/SQL)
+  b.writeUB4(_maxLongLength); // maximum long size
+
+  b.writeUint8(1); // numParams present
+  b.writeUB4(1); // one bind
+
+  b.writeUint8(0); // al8pp
+  b.writeUint8(0); // al8txn
+  b.writeUint8(0); // al8txl
+  b.writeUint8(0); // al8kv
+  b.writeUint8(0); // al8kvl
+
+  b.writeUint8(0); // defines absent
+  b.writeUB4(0);
+
+  b.writeUB4(0); // registration id
+
+  b.writeUint8(0); // al8objlist
+  b.writeUint8(0); // al8objlen
+  b.writeUint8(0); // al8blv
+  b.writeUB4(0); // al8blv
+  b.writeUint8(0); // al8dnam
+  b.writeUB4(0); // al8dnaml
+  b.writeUB4(0); // al8regid_msb
+
+  b.writeUint8(0); // array dml row counts absent
+  b.writeUB4(0);
+  b.writeUint8(0);
+
+  if (ttcFieldVersion >= _fieldVersion12_2) {
+    b.writeUint8(0); // al8sqlsig
+    b.writeUB4(0);
+    b.writeUint8(0); // sql id
+    b.writeUB4(0);
+    b.writeUint8(0); // length of sql id
+    b.writeUint8(0); // chunk ids
+    b.writeUB4(0);
+  }
+
+  b.writeBytesWithLength(Uint8List.fromList(sqlBytes));
+  b.writeUB4(1); // al8i4[0] parse
+
+  b.writeUB4(1); // al8i4[1] execution count (1 for PL/SQL)
+  b.writeUB4(0); // al8i4[2]
+  b.writeUB4(0); // al8i4[3]
+  b.writeUB4(0); // al8i4[4]
+  b.writeUB4(0); // al8i4[5] SCN p1
+  b.writeUB4(0); // al8i4[6] SCN p2
+  b.writeUB4(0); // al8i4[7] (not a query)
+  b.writeUB4(0); // al8i4[8]
+  b.writeUB4(dmlOptions); // al8i4[9]
+  b.writeUB4(0); // al8i4[10]
+  b.writeUB4(0); // al8i4[11]
+  b.writeUB4(0); // al8i4[12]
+
+  // Bind metadata: one cursor OUT bind.
+  b.writeUint8(_oraTypeCursor);
+  b.writeUint8(_bindUseIndicators);
+  b.writeUint8(0); // precision
+  b.writeUint8(0); // scale
+  b.writeUB4(1); // maxSize
+  b.writeUB4(0); // max num elements
+  b.writeUB4(0); // cont flags
+  b.writeUB4(0); // OID
+  b.writeUB2(0); // version
+  b.writeUB2(0); // charset field
+  b.writeUint8(0); // csfrm
+  b.writeUB4(0); // LOB prefetch length
+  if (ttcFieldVersion >= _fieldVersion12_2) {
+    b.writeUB4(0); // oaccolid
+  }
+
+  // ROW_DATA with the cursor placeholder (length 1, cursor id 0).
+  b.writeUint8(_msgTypeRowData);
+  b.writeUint8(1);
+  b.writeUint8(0);
+
+  return b.toBytes();
+}
+
+
 // --- response decode -------------------------------------------------------
 
 class _DecodeState {
@@ -437,6 +567,15 @@ class _DecodeState {
   int? errorNum;
   String? errorMessage;
   Uint8List? bitVector;
+
+  /// OUT bind positions reported by the IO_VECTOR (PL/SQL OUT binds).
+  final List<int> outBindIndices = [];
+
+  /// A REF CURSOR OUT bind's server cursor id + its column metadata, decoded
+  /// from the OUT-bind ROW_DATA. Null until seen.
+  int? refCursorId;
+  List<NativeColumn>? refCursorColumns;
+  bool outBindsDecoded = false;
 }
 
 /// Decodes a concatenated OALL8 response body ([body] = all DATA-packet TTC
@@ -460,7 +599,6 @@ NativeExecuteResponse decodeExecuteResponse(
       _dispatch(buf.readUint8(), buf, s);
     }
   } on OracleBufferUnderflow {
-    // Response is split across more packets — caller reads another frame.
     // Response is split across more packets — caller reads another frame.
     return NativeExecuteResponse(
       columns: s.columns,
@@ -486,6 +624,8 @@ NativeExecuteResponse decodeExecuteResponse(
     rowsAffected: s.rowsAffected,
     errorNum: s.errorNum,
     errorMessage: s.errorMessage,
+    refCursorId: s.refCursorId,
+    refCursorColumns: s.refCursorColumns,
   );
 }
 
@@ -639,6 +779,14 @@ void _processRowHeader(ReadBuffer buf, _DecodeState s) {
 }
 
 void _processRowData(ReadBuffer buf, _DecodeState s) {
+  // A PL/SQL response ships OUT bind values in ROW_DATA after the IO_VECTOR.
+  if (!s.isQuery && s.outBindIndices.isNotEmpty) {
+    if (!s.outBindsDecoded) {
+      _decodeOutBinds(buf, s);
+      s.outBindsDecoded = true;
+    }
+    return;
+  }
   final row = <Object?>[];
   for (var i = 0; i < s.columns.length; i++) {
     if (_isDuplicate(s.bitVector, i)) {
@@ -652,6 +800,46 @@ void _processRowData(ReadBuffer buf, _DecodeState s) {
   s.bitVector = null;
 }
 
+/// Decodes one OUT-bind ROW_DATA. This increment supports a single REF CURSOR
+/// OUT bind (SYS_REFCURSOR) — the cursor's embedded describe + server cursor
+/// id — which is the common `BEGIN OPEN :1 FOR ...; END;` shape.
+void _decodeOutBinds(ReadBuffer buf, _DecodeState s) {
+  for (final _ in s.outBindIndices) {
+    // Cursor OUT value: UInt8 length (0 / 0xFF = NULL), embedded describe,
+    // then UB2 server cursor id.
+    final numBytes = buf.readUint8();
+    if (numBytes == 0 || numBytes == 0xFF) continue;
+    final columns = _readEmbeddedCursorDescribe(buf, s.ttcFieldVersion);
+    final cursorId = buf.readUB2();
+    s.refCursorColumns = columns;
+    s.refCursorId = cursorId;
+    // An OUT value carries an SB4 "actual num bytes" trailer after the value.
+    buf.readSB4();
+  }
+}
+
+/// Reads an embedded cursor describe block (a DESCRIBE_INFO without the leading
+/// version-bytes preamble).
+List<NativeColumn> _readEmbeddedCursorDescribe(
+    ReadBuffer buf, int ttcFieldVersion) {
+  buf.skipUB4(); // max row size
+  final numCols = buf.readUB4();
+  if (numCols > 0) buf.skipUB1();
+  final columns = <NativeColumn>[];
+  for (var i = 0; i < numCols; i++) {
+    columns.add(_processColumnInfo(buf, ttcFieldVersion));
+  }
+  final dateBytes = buf.readUB4();
+  if (dateBytes > 0) buf.readBytesWithLength();
+  buf.skipUB4(); // dcbflag
+  buf.skipUB4(); // dcbmdbz
+  buf.skipUB4(); // dcbmnpr
+  buf.skipUB4(); // dcbmxpr
+  final tailBytes = buf.readUB4();
+  if (tailBytes > 0) buf.readBytesWithLength();
+  return columns;
+}
+
 void _processBitVector(ReadBuffer buf, _DecodeState s) {
   final numColsSent = buf.readUB2();
   var numBytes = (s.columns.length / 8).floor();
@@ -661,9 +849,22 @@ void _processBitVector(ReadBuffer buf, _DecodeState s) {
 }
 
 void _processIoVector(ReadBuffer buf, _DecodeState s) {
-  // No binds in this increment; a query never ships an IO_VECTOR. Treat its
-  // presence as an unsupported shape rather than guessing the byte walk.
-  throw NativeUnsupportedTypeException(-_msgTypeIoVector);
+  buf.skipUB1(); // flag
+  final temp16 = buf.readUB2();
+  final temp32 = buf.readUB4();
+  final numBinds = temp32 * 256 + temp16;
+  buf.skipUB4(); // num iters this time
+  buf.skipUB2(); // uac buffer length
+  final fastFetchLen = buf.readUB2();
+  if (fastFetchLen > 0) buf.skip(fastFetchLen);
+  final rowidLen = buf.readUB2();
+  if (rowidLen > 0) buf.skip(rowidLen);
+  s.outBindIndices.clear();
+  for (var i = 0; i < numBinds; i++) {
+    final dir = buf.readUint8();
+    // 16 = IN, 32 = OUT, 48 = IN OUT. OUT/IN OUT binds carry return values.
+    if (dir != 16) s.outBindIndices.add(i);
+  }
 }
 
 bool _isDuplicate(Uint8List? bitVector, int colIndex) {
