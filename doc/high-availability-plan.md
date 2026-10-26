@@ -134,17 +134,24 @@ durability contract. Idempotent replay (LSN-guarded) is a hard requirement.
 
 ---
 
-## Phase 2 — Streaming replication & read replicas  ·  Status: TODO
+## Phase 2 — Streaming replication & read replicas  ·  Status: WIP
 
 **Goal:** one primary streams the op-log to N replicas; replicas apply it and
 serve **read-only** traffic (hot standby + read scaling).
 
 Tasks:
+- [x] **Replica apply loop.** `lib/server/replication.dart` → `Replica`:
+  `catchUp(source)` applies every source record with `lsn > appliedLsn` via
+  `Database.applyReplicated` (no re-capture), `lagFrom(source)` reports record
+  lag, and `follow(...)` polls continuously. The target is marked read-only
+  (`Database.markReplica` — client mutations throw), and `appliedLsn` is
+  persisted (`applied_lsn` in the snapshot) so a restarted replica resumes.
+  Tests: `test/replication_test.dart` (catch-up, read parity, write rejection,
+  incremental/idempotent apply, restart resume). v1 pulls from a source `OpLog`
+  (in-process or shared-FS). LANDED.
 - [ ] **Replication protocol.** A stream endpoint on the server: replica sends
   its last applied `LSN`, primary streams subsequent frames and tails live
   commits. Reuse the existing TCP/line transport with a new message type.
-- [ ] **Replica apply loop.** Read-only `Database` mode that rejects client
-  writes, applies op-log frames in LSN order, and tracks `appliedLsn`.
 - [ ] **Bootstrap.** New replica seeds from a `dbr` snapshot (or a primary
   base-image stream), records the snapshot LSN, then catches up via the stream.
 - [ ] **Lag & backpressure.** Expose `replicationLag` (LSN gap + wall-clock);

@@ -249,6 +249,36 @@ class Database implements SequenceProvider {
   /// per-statement persist so replay is idempotent and converges once at the end.
   bool _replaying = false;
 
+  /// True when this database is a read-only replica: client mutations are
+  /// rejected; the only writes come through [applyReplicated].
+  bool _replicaReadOnly = false;
+
+  /// The highest op-log LSN this database has applied (as a replica).
+  int _appliedLsn = 0;
+
+  /// The highest op-log LSN applied as a replica (0 when not following).
+  int get appliedLsn => _appliedLsn;
+
+  /// Mark this database as a read-only replica (see [_replicaReadOnly]).
+  void markReplica() => _replicaReadOnly = true;
+
+  /// Apply a replicated op-log [record] to this replica without re-capturing
+  /// it, then advance [appliedLsn] and persist. Idempotent: records at or below
+  /// the current [appliedLsn] are ignored.
+  Future<void> applyReplicated(OpLogRecord record) async {
+    if (record.lsn <= _appliedLsn) return;
+    _replaying = true;
+    try {
+      for (final op in record.ops) {
+        await execute(op);
+      }
+    } finally {
+      _replaying = false;
+    }
+    _appliedLsn = record.lsn;
+    await _persist();
+  }
+
   /// The durable op-log, or null when not enabled. Exposed for replication and
   /// tests.
   OpLog? get opLog => _oplog;
@@ -2272,6 +2302,9 @@ class Database implements SequenceProvider {
         throw StateError(
           'Cannot mutate inside a read-only snapshot transaction',
         );
+      }
+      if (_replicaReadOnly && !_replaying && _isMutation(stmt)) {
+        throw StateError('Cannot mutate a read-only replica');
       }
       final cb = authorizer;
       if (cb != null) {
@@ -18298,6 +18331,7 @@ class Database implements SequenceProvider {
             _vectorIndexToJson(e.key, e.value),
         ],
       if (_oplog != null) 'oplog_lsn': _oplog!.lastLsn,
+      if (_appliedLsn > 0) 'applied_lsn': _appliedLsn,
     };
     _persistedOpLogLsn = _oplog?.lastLsn ?? _persistedOpLogLsn;
     await _atomicWriteBytes(
@@ -18863,6 +18897,7 @@ class Database implements SequenceProvider {
     final data = jsonDecode(text);
     if (data is Map && data['__schema__'] == 2) {
       _persistedOpLogLsn = (data['oplog_lsn'] as num?)?.toInt() ?? 0;
+      _appliedLsn = (data['applied_lsn'] as num?)?.toInt() ?? 0;
       final tables = (data['tables'] as Map).cast<String, Object?>();
       for (final e in tables.entries) {
         final t = Table.fromJson((e.value as Map).cast<String, Object?>());
