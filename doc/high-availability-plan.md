@@ -278,6 +278,13 @@ Tasks:
   rolling-restart acceptance tests asserting no lost acked writes and bounded
   RTO.
 
+  *Partially LANDED:* `test/ha_chaos_test.dart` stands up a 3-node cluster
+  (primary + two TCP-streaming replicas, router, probe, quorum controller),
+  runs a workload, crashes the primary, and asserts probe-driven epoch-fenced
+  failover with **no loss of replicated writes**, old-primary fencing, and
+  continued writes on the promoted node. Network-partition / rolling-restart
+  variants are still TODO.
+
 **Delivers:** unattended HA with a quorum-safe failover path.
 
 ---
