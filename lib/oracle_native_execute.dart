@@ -429,17 +429,27 @@ class _EncodedBind {
   final bool isLobLocator;
 }
 
-/// A pre-created temporary CLOB locator used as a bind value — the vehicle for
-/// binding a String larger than the 32767-byte VARCHAR2 limit. Create one via
-/// `OracleThickClient` oversized-bind handling; it binds as a CLOB locator.
+/// A pre-created temporary LOB locator used as a bind value — the vehicle for
+/// binding a String/`Uint8List` larger than the 32767-byte VARCHAR2/RAW limit.
+/// Create one via `OracleThickClient` oversized-bind handling; it binds as a
+/// CLOB (112) or BLOB (113) locator.
 class NativeClobBindValue {
-  NativeClobBindValue(this.locator);
+  NativeClobBindValue(this.locator,
+      {this.oraType = _oraTypeClob, this.csfrm = _csfrmImplicit});
+
+  /// A temporary BLOB locator bind (raw bytes, no charset form).
+  NativeClobBindValue.blob(this.locator)
+      : oraType = _oraTypeBlob,
+        csfrm = 0;
+
   final Uint8List locator;
+  final int oraType;
+  final int csfrm;
 }
 
 /// Maps a Dart value to its Oracle bind wire type + encoded bytes. Supports
 /// NUMBER (num), VARCHAR2 (String), RAW (Uint8List), TIMESTAMP (DateTime),
-/// CLOB locator ([NativeClobBindValue]), and NULL; other types throw
+/// CLOB/BLOB locator ([NativeClobBindValue]), and NULL; other types throw
 /// [NativeUnsupportedTypeException].
 _EncodedBind _encodeBind(Object? value) {
   if (value == null) {
@@ -449,9 +459,9 @@ _EncodedBind _encodeBind(Object? value) {
   }
   if (value is NativeClobBindValue) {
     return _EncodedBind(
-        oraType: _oraTypeClob,
+        oraType: value.oraType,
         maxSize: _lobLocatorBindBufferSize,
-        csfrm: _csfrmImplicit,
+        csfrm: value.csfrm,
         contFlags: _lobPrefetchFlag,
         bytes: value.locator,
         isLobLocator: true);
@@ -1729,9 +1739,11 @@ Uint8List _buildLobOp(
   return b.toBytes();
 }
 
-/// Builds a LOB CREATE_TEMP request for a temporary CLOB ([csfrm] 1 = CLOB,
-/// 2 = NCLOB). The response's `updatedLocator` is the real temp-LOB locator.
+/// Builds a LOB CREATE_TEMP request for a temporary LOB. [oraType] is CLOB
+/// (112) or BLOB (113); [csfrm] 1 = CLOB, 2 = NCLOB, 0 = BLOB. The response's
+/// `updatedLocator` is the real temp-LOB locator.
 Uint8List buildLobCreateTemp({
+  int oraType = _oraTypeClob,
   int csfrm = 1,
   int ttcFieldVersion = _fieldVersion23_4,
   int sequence = 1,
@@ -1757,7 +1769,7 @@ Uint8List buildLobCreateTemp({
   b.writeUint8(0); // SCN pointer
   b.writeUint8(0); // SCN array length
   b.writeUB8(csfrm); // source offset carries the charset form
-  b.writeUB8(_oraTypeClob); // dest offset carries the Oracle type
+  b.writeUB8(oraType); // dest offset carries the Oracle type
   b.writeUint8(0); // amount pointer
   for (var i = 0; i < 3; i++) {
     b.writeUint16BE(0);

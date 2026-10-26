@@ -502,5 +502,42 @@ void main() {
         await client.close();
       }
     });
+
+    test('oversized Uint8List bind routes through a temporary BLOB', () async {
+      final host = env['ORACLE_HOST'] ?? '127.0.0.1';
+      final port = int.tryParse(env['ORACLE_PORT'] ?? '1521') ?? 1521;
+      final user = env['ORACLE_USER'] ?? 'system';
+      final pass = env['ORACLE_PASSWORD'] ?? 'TestPw1234';
+      final service = env['ORACLE_SERVICE'] ?? 'FREEPDB1';
+
+      final client = await OracleThickClient.connect(port, host: host);
+      try {
+        await client.loginReal(
+          username: user,
+          password: pass,
+          serviceName: service,
+        );
+        final big =
+            Uint8List.fromList(List.generate(60000, (i) => i % 256));
+        await client
+            .executeDml('DROP TABLE t_thick_blob PURGE')
+            .catchError((_) => 0);
+        await client
+            .executeDml('CREATE TABLE t_thick_blob (id NUMBER, data BLOB)');
+        try {
+          expect(
+              await client.executeDml('INSERT INTO t_thick_blob VALUES (:1, :2)',
+                  binds: [1, big]),
+              1);
+          final back = await client
+              .queryReal('SELECT data FROM t_thick_blob WHERE id = 1');
+          expect(back.rows.first.first, big);
+        } finally {
+          await client.executeDml('DROP TABLE t_thick_blob PURGE');
+        }
+      } finally {
+        await client.close();
+      }
+    });
   }, skip: enabled ? false : 'set RUN_ORACLE_TESTS=true to run (needs Oracle)');
 }

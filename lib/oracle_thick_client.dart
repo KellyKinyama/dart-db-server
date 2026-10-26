@@ -935,8 +935,29 @@ class OracleThickClient {
     return written.updatedLocator ?? locator;
   }
 
-  /// Replaces any String bind larger than the 32767-byte VARCHAR2 limit with a
-  /// temporary-CLOB locator so it can be bound as a CLOB.
+  /// Creates a temporary BLOB and writes [value] (raw bytes), returning its
+  /// server locator — the vehicle for binding a Uint8List past the 32767-byte
+  /// RAW limit.
+  Future<Uint8List> _createTempBlob(Uint8List value) async {
+    _send(ex.buildLobCreateTemp(oraType: 113, csfrm: 0)); // 113 = BLOB
+    final created = await _readLobResponse(40, isCreateTemp: true);
+    final locator = created.updatedLocator;
+    if (!created.isSuccess || locator == null) {
+      throw OracleThickException(
+          created.errorNum ?? -1, 'temp BLOB create failed');
+    }
+    _send(ex.buildLobWrite(locator, 1, value));
+    final written =
+        await _readLobResponse(locator.length, sendAmount: false);
+    if (!written.isSuccess) {
+      throw OracleThickException(
+          written.errorNum ?? -1, 'temp BLOB write failed');
+    }
+    return written.updatedLocator ?? locator;
+  }
+
+  /// Replaces any String/`Uint8List` bind larger than the 32767-byte
+  /// VARCHAR2/RAW limit with a temporary-CLOB/BLOB locator.
   Future<List<Object?>> _prepareBinds(List<Object?> binds) async {
     List<Object?>? out;
     for (var i = 0; i < binds.length; i++) {
@@ -944,6 +965,9 @@ class OracleThickClient {
       if (v is String && utf8.encode(v).length > 32767) {
         out ??= List.of(binds);
         out[i] = ex.NativeClobBindValue(await _createTempClob(v));
+      } else if (v is Uint8List && v.length > 32767) {
+        out ??= List.of(binds);
+        out[i] = ex.NativeClobBindValue.blob(await _createTempBlob(v));
       }
     }
     return out ?? binds;

@@ -174,6 +174,9 @@ round-tripped on real Oracle in `test/oracle_real_login_test.dart`.
   String past the VARCHAR2 limit, CREATE_TEMP a CLOB, WRITE it (UTF-16BE on this
   server), and bind the locator (CLOB wire shape + LOB-prefetch cont flag).
   50000-char round-trip verified vs 26ai.
+- [x] **Oversized `Uint8List` binds (> 32767 bytes) via temporary BLOBs**: same
+  path with a BLOB temp LOB (raw bytes, no charset). 60000-byte round-trip
+  verified vs 26ai.
 - [ ] Statement-cache reuse; cursor close/CLOSE_ALL.
 - [ ] Session settings (NLS date/number formats, time zone) that affect decode.
 - [ ] A behavioral parity pass vs `reference/node-oracledb` / the thin
