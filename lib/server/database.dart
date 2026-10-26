@@ -377,6 +377,19 @@ class Database implements SequenceProvider {
   /// tests.
   OpLog? get opLog => _oplog;
 
+  /// Garbage-collect op-log segments that every consumer has moved past.
+  /// Keeps records at or above `min(snapshot LSN, slowestReplicaLsn)` so both
+  /// crash replay and any lagging replica can still be served. No-op when the
+  /// op-log is disabled.
+  Future<void> gcOpLog(int slowestReplicaLsn) async {
+    final log = _oplog;
+    if (log == null) return;
+    final safe = slowestReplicaLsn < _persistedOpLogLsn
+        ? slowestReplicaLsn
+        : _persistedOpLogLsn;
+    await log.truncateBelow(safe);
+  }
+
   /// Test/diagnostics hook: returns the in-process RW lock so callers
   /// can assert serialization properties.
   AsyncRwLock get rwLock => _lock;

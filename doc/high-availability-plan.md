@@ -124,6 +124,12 @@ Tasks:
 - [ ] **Checkpoint/truncation.** Persist a full snapshot periodically, stamp it
   with its LSN, and GC log segments fully below the min(snapshot LSN, slowest
   replica LSN).
+
+  *Partially LANDED:* `Database.gcOpLog(slowestReplicaLsn)` drops op-log
+  segments below `min(snapshot LSN, slowestReplicaLsn)` (the active segment and
+  any record a lagging replica still needs are retained). Test:
+  `test/oplog_capture_test.dart` → "gcOpLog bounds log growth …". Periodic
+  auto-checkpoint scheduling is still TODO.
 - [ ] **PITR.** `restore to <timestamp|LSN>` = restore a `dbr` base image, then
   replay the op-log up to the target LSN.
 - [ ] **Tunable durability.** `PRAGMA synchronous = OFF|NORMAL|FULL` to trade

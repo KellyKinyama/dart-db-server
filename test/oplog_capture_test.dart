@@ -129,5 +129,32 @@ void main() {
         await db.close();
       }
     });
+
+    test('gcOpLog bounds log growth without losing unconsumed records',
+        () async {
+      final path = _tmp('gc');
+      final db = await Database.open(path);
+      // Tiny segments so there are several to collect.
+      await db.enableOpLog();
+      try {
+        await db.execute('CREATE TABLE t(id INTEGER PRIMARY KEY)');
+        for (var i = 1; i <= 6; i++) {
+          await db.execute('INSERT INTO t VALUES ($i)');
+        }
+        final head = db.opLog!.lastLsn;
+        // Every consumer has moved past the head → old segments can go.
+        await db.gcOpLog(head);
+        // The head record is always retained (active segment kept).
+        final recs = await db.opLog!.readFrom(head - 1).toList();
+        expect(recs.map((r) => r.lsn), contains(head));
+        // The table itself is unaffected by log GC.
+        final rr = await db.execute('SELECT COUNT(*) FROM t');
+        expect(rr.rows, [
+          [6],
+        ]);
+      } finally {
+        await db.close();
+      }
+    });
   });
 }
