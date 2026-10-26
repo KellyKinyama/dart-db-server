@@ -834,15 +834,8 @@ class OracleThickClient {
           'ORA-${(resp.errorNum ?? 0).toString().padLeft(5, '0')}: '
           '${resp.errorMessage ?? ''}');
     }
-    // Materialize any CLOB/BLOB locators into String / Uint8List.
-    for (final row in rows) {
-      for (var i = 0; i < row.length; i++) {
-        final cell = row[i];
-        if (cell is ex.NativeLob) {
-          row[i] = await _readLob(cell);
-        }
-      }
-    }
+    // Materialize any CLOB/BLOB locators and nested cursors.
+    await _materializeRows(rows);
     return ex.NativeExecuteResponse(
       columns: columns,
       rows: rows,
@@ -850,6 +843,21 @@ class OracleThickClient {
       moreRows: false,
       complete: true,
     );
+  }
+
+  /// Replaces LOB-locator cells with their materialized value and nested-cursor
+  /// cells with the cursor's fully-fetched rows.
+  Future<void> _materializeRows(List<List<Object?>> rows) async {
+    for (final row in rows) {
+      for (var i = 0; i < row.length; i++) {
+        final cell = row[i];
+        if (cell is ex.NativeLob) {
+          row[i] = await _readLob(cell);
+        } else if (cell is ex.NativeNestedCursor) {
+          row[i] = await _drainCursor(cell.cursorId, cell.columns);
+        }
+      }
+    }
   }
 
   /// Reads a CLOB/BLOB locator fully and returns its materialized value: a
@@ -1140,12 +1148,7 @@ class OracleThickClient {
       }
       more = fetch.moreRows;
     }
-    for (final row in rows) {
-      for (var i = 0; i < row.length; i++) {
-        final cell = row[i];
-        if (cell is ex.NativeLob) row[i] = await _readLob(cell);
-      }
-    }
+    await _materializeRows(rows);
     return rows;
   }
 

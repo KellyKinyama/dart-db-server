@@ -289,6 +289,15 @@ class NativeLob {
   bool get isClob => oracleType == _oraTypeClob;
 }
 
+/// A nested `CURSOR(SELECT …)` column value: its server cursor id + column
+/// metadata. `OracleThickClient.queryReal` fetches it and replaces the cell
+/// with the cursor's rows (`List<List<Object?>>`).
+class NativeNestedCursor {
+  NativeNestedCursor(this.cursorId, this.columns);
+  final int cursorId;
+  final List<NativeColumn> columns;
+}
+
 /// Builds an OALL8 EXECUTE for a row-returning [sql] with no binds. [numIters]
 /// is the prefetch row window. A fresh parse always uses cursor id 0.
 /// Builds an OALL8 EXECUTE for a row-returning [sql], optionally parameterised
@@ -1360,6 +1369,15 @@ Object? _decodeColumnValue(ReadBuffer buf, NativeColumn col) {
         chunkSize: 0,
         isNChar: col.csfrm == _csfrmNChar,
       );
+    case _oraTypeCursor:
+      // Nested CURSOR(SELECT …) column: UInt8 length (0 / 0xFF = NULL), an
+      // embedded describe, then the UB2 server cursor id. id 0 = NULL cursor.
+      final numBytes = buf.readUint8();
+      if (numBytes == 0 || numBytes == 0xFF) return null;
+      final columns = _readEmbeddedCursorDescribe(buf, _fieldVersion23_4);
+      final cursorId = buf.readUB2();
+      if (cursorId == 0) return null;
+      return NativeNestedCursor(cursorId, columns);
     case _oraTypeLong:
     case _oraTypeLongRaw:
     case _oraTypeURowid:

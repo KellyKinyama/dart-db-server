@@ -390,6 +390,44 @@ void main() {
       }
     });
 
+    test('nested CURSOR() columns materialize to inner rows', () async {
+      final host = env['ORACLE_HOST'] ?? '127.0.0.1';
+      final port = int.tryParse(env['ORACLE_PORT'] ?? '1521') ?? 1521;
+      final user = env['ORACLE_USER'] ?? 'system';
+      final pass = env['ORACLE_PASSWORD'] ?? 'TestPw1234';
+      final service = env['ORACLE_SERVICE'] ?? 'FREEPDB1';
+
+      final client = await OracleThickClient.connect(port, host: host);
+      try {
+        await client.loginReal(
+          username: user,
+          password: pass,
+          serviceName: service,
+        );
+        final r = await client.queryReal('''
+          SELECT d.n AS dept,
+                 CURSOR(SELECT d.n * 10 + lvl AS emp
+                        FROM (SELECT LEVEL lvl FROM dual
+                              CONNECT BY LEVEL <= 3)) AS emps
+          FROM (SELECT LEVEL n FROM dual CONNECT BY LEVEL <= 2) d
+        ''');
+        expect(r.columns.map((c) => c.name).toList(), ['DEPT', 'EMPS']);
+        expect(r.rows[0][0], 1);
+        expect(r.rows[0][1], [
+          [11],
+          [12],
+          [13]
+        ]);
+        expect(r.rows[1][1], [
+          [21],
+          [22],
+          [23]
+        ]);
+      } finally {
+        await client.close();
+      }
+    });
+
     test('array DML batch errors report per-row failures', () async {
       final host = env['ORACLE_HOST'] ?? '127.0.0.1';
       final port = int.tryParse(env['ORACLE_PORT'] ?? '1521') ?? 1521;
