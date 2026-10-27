@@ -1165,7 +1165,8 @@ void _processRowData(ReadBuffer buf, _DecodeState s) {
       row.add(prior != null && i < prior.length ? prior[i] : null);
       continue;
     }
-    row.add(_decodeColumnValue(buf, s.columns[i]));
+    row.add(_decodeColumnValue(buf, s.columns[i],
+        ttcFieldVersion: s.ttcFieldVersion));
   }
   s.rows.add(row);
   s.bitVector = null;
@@ -1198,7 +1199,8 @@ void _decodeOutBinds(ReadBuffer buf, _DecodeState s) {
     final oraType = bind?.oraType ?? _oraTypeVarchar;
     final col = NativeColumn(
         name: '', oracleType: oraType, maxLength: 0, csfrm: bind?.csfrm ?? 0);
-    final value = _decodeColumnValue(buf, col);
+    final value = _decodeColumnValue(buf, col,
+        ttcFieldVersion: s.ttcFieldVersion);
     buf.readSB4();
     s.outBindValues.add(value);
   }
@@ -1239,7 +1241,8 @@ void _decodeReturningBinds(ReadBuffer buf, _DecodeState s) {
     final col = NativeColumn(
         name: '', oracleType: oraType, maxLength: 0, csfrm: bind?.csfrm ?? 0);
     for (var j = 0; j < numRows; j++) {
-      values.add(_decodeColumnValue(buf, col));
+      values.add(_decodeColumnValue(buf, col,
+          ttcFieldVersion: s.ttcFieldVersion));
       buf.readSB4();
     }
     result.add(values);
@@ -1298,7 +1301,8 @@ bool _isDuplicate(Uint8List? bitVector, int colIndex) {
   return (bitVector[byteNum] & (1 << bitNum)) == 0;
 }
 
-Object? _decodeColumnValue(ReadBuffer buf, NativeColumn col) {
+Object? _decodeColumnValue(ReadBuffer buf, NativeColumn col,
+    {int ttcFieldVersion = _fieldVersion23_4}) {
   switch (col.oracleType) {
     case _oraTypeVarchar:
     case _oraTypeVarchar2:
@@ -1376,7 +1380,7 @@ Object? _decodeColumnValue(ReadBuffer buf, NativeColumn col) {
       // embedded describe, then the UB2 server cursor id. id 0 = NULL cursor.
       final numBytes = buf.readUint8();
       if (numBytes == 0 || numBytes == 0xFF) return null;
-      final columns = _readEmbeddedCursorDescribe(buf, _fieldVersion23_4);
+      final columns = _readEmbeddedCursorDescribe(buf, ttcFieldVersion);
       final cursorId = buf.readUB2();
       if (cursorId == 0) return null;
       return NativeNestedCursor(cursorId, columns);
