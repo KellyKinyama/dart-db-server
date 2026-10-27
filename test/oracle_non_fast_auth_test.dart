@@ -77,5 +77,31 @@ void main() {
       // A lone type-8 byte without the required keys is not a challenge.
       expect(parseAuthChallenge(Uint8List.fromList([8, 0, 0])), isNull);
     });
+
+    test('parseProtocolFieldVersion extracts the server compile-caps[7]', () {
+      Uint8List protocolResponse(int fieldVersion) {
+        final b = BytesBuilder();
+        b.addByte(ttcMsgTypeProtocol); // 1
+        b.addByte(6); // server version
+        b.addByte(0); // reserved
+        b.add(utf8.encode('Oracle Database')); // banner
+        b.addByte(0); // banner terminator
+        b.add([0x01, 0x00]); // charset id (LE16)
+        b.addByte(0); // server flags
+        b.add([0x00, 0x00]); // numElem (LE16) = 0
+        b.add([0x00, 0x00]); // fdo length (BE16) = 0
+        final caps = List<int>.filled(20, 0)..[7] = fieldVersion;
+        b.addByte(caps.length);
+        b.add(caps);
+        b.addByte(0); // runtime caps length
+        return b.toBytes();
+      }
+
+      expect(parseProtocolFieldVersion(protocolResponse(12)), 12);
+      expect(parseProtocolFieldVersion(protocolResponse(24)), 24);
+      // Not a PROTOCOL response, or out-of-range, falls back to 0.
+      expect(parseProtocolFieldVersion(Uint8List.fromList([8, 0, 0])), 0);
+      expect(parseProtocolFieldVersion(protocolResponse(99)), 0);
+    });
   });
 }

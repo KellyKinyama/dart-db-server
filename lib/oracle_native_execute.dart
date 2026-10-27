@@ -1633,6 +1633,11 @@ void _processError(ReadBuffer buf, _DecodeState s) {
   final num = err.num;
   s.cursorId = err.cursorId;
   s.errorNum = num;
+  // The ERROR (RXH) message carries the final RPC status and terminates the
+  // response. On 23ai a trailing END_OF_RESPONSE repeats this, but pre-23ai
+  // servers (no END_OF_RESPONSE capability) send nothing after it — so this is
+  // the authoritative end-of-response marker for both.
+  s.endOfResponse = true;
   if (num != 0) {
     s.errorMessage = err.message;
   }

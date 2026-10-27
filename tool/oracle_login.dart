@@ -79,6 +79,34 @@ Future<void> main() async {
       if (dbname != null) stdout.writeln('  database: $dbname');
       final ver = result.params['AUTH_VERSION_NO'];
       if (ver != null) stdout.writeln('  version no: $ver');
+
+      // Read-only end-to-end validation of the execute/fetch path.
+      final queries = <String>[
+        'SELECT USER, SYSDATE FROM dual',
+        "SELECT banner FROM v\$version WHERE ROWNUM <= 5",
+      ];
+      final custom = env['ORACLE_QUERY'];
+      if (custom != null && custom.isNotEmpty) {
+        queries
+          ..clear()
+          ..add(custom);
+      }
+      for (final sql in queries) {
+        stdout.writeln('\n> $sql');
+        try {
+          final resp = await client
+              .queryReal(sql, prefetch: 50)
+              .timeout(const Duration(seconds: 20));
+          stdout.writeln(
+              '  columns: ${resp.columns.map((c) => c.name).join(', ')}');
+          for (final row in resp.rows.take(10)) {
+            stdout.writeln('  ${row.join(' | ')}');
+          }
+          stdout.writeln('  (${resp.rows.length} row(s))');
+        } catch (e) {
+          stdout.writeln('  query failed: $e');
+        }
+      }
     } else {
       final err = result.params['error'];
       stdout.writeln('NOT authenticated'

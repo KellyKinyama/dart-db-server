@@ -330,6 +330,36 @@ void skipDataTypesResponse(ReadBuffer r) {
   if (runtimeLen > 0) r.skip(runtimeLen);
 }
 
+/// Reads the server's negotiated TTC field version (compile-caps byte 7) from a
+/// PROTOCOL response [body] (type 1). Returns 0 when it cannot be read or is
+/// out of the plausible range, so the caller keeps its default.
+int parseProtocolFieldVersion(Uint8List body) {
+  if (body.isEmpty || body[0] != ttcMsgTypeProtocol) return 0;
+  final r = ReadBuffer(body);
+  try {
+    r.readUint8(); // msg type (1)
+    r.readUint8(); // server version
+    r.skip(1);
+    while (r.hasRemaining) {
+      if (r.readUint8() == 0) break; // banner terminator
+    }
+    r.readUint16LE(); // charset id
+    r.readUint8(); // server flags
+    final numElem = r.readUint16LE();
+    if (numElem > 0) r.skip(numElem * 5);
+    final fdoLen = r.readUint16BE();
+    if (fdoLen > 0) r.skip(fdoLen);
+    if (!r.hasRemaining) return 0;
+    final compileLen = r.readUint8();
+    if (compileLen <= 7) return 0;
+    final caps = r.readBytes(compileLen);
+    final fv = caps[7];
+    return (fv >= 6 && fv <= 30) ? fv : 0;
+  } catch (_) {
+    return 0;
+  }
+}
+
 /// Locates and parses the AUTH parameter message (type 8) within a bundled
 /// FAST_AUTH response [body], starting the search after the PROTOCOL response.
 /// Returns null when no valid auth challenge is present.

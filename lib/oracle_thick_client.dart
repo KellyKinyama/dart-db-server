@@ -693,6 +693,12 @@ class OracleThickClient {
   /// packets by [_send]. Set from the ACCEPT in [loginReal].
   int _sdu = 8192;
 
+  /// Negotiated TTC field version (compile-caps byte 7), set from the server's
+  /// DATA-TYPES response. Gates version-dependent fields in the OALL8 execute /
+  /// fetch / LOB wire shape (e.g. the 23ai token is written only when >= 18).
+  /// Defaults to the 23.4 value; lowered for pre-23ai servers (12c/19c).
+  int _ttcFieldVersion = 24;
+
   // Temporary CLOB/BLOB locators created for oversized binds are session-
   // duration and reclaimed when the connection closes. Eager freeing via a
   // free-temp piggyback is a follow-up.
@@ -963,9 +969,11 @@ class OracleThickClient {
     String? alterSession,
   }) async {
     _send(hs.buildProtocolMessage());
-    await _frames.next(); // PROTOCOL response (type 1)
+    final protoResp = _ttcBody(await _frames.next()); // PROTOCOL response
+    final sfv = hs.parseProtocolFieldVersion(protoResp);
+    if (sfv > 0 && sfv < _ttcFieldVersion) _ttcFieldVersion = sfv;
     _send(hs.buildDataTypesMessage(endOfRequest: endOfRequest));
-    await _frames.next(); // DATA-TYPES response (type 2)
+    await _frames.next(); // DATA-TYPES response
 
     _send(hs.buildAuthPhaseOneMessage(username: username));
     final challengeBody = _ttcBody(await _frames.next());
@@ -1020,14 +1028,18 @@ class OracleThickClient {
   Future<ex.NativeExecuteResponse> queryReal(String sql,
       {List<Object?> binds = const [], int prefetch = 100}) async {
     final prepared = await _prepareBinds(binds);
-    _send(ex.buildQueryExecute(sql, binds: prepared, numIters: prefetch));
+    _send(ex.buildQueryExecute(sql,
+        binds: prepared,
+        numIters: prefetch,
+        ttcFieldVersion: _ttcFieldVersion));
     var resp = await _readRealResponse(isQuery: true);
     final columns = resp.columns;
     final rows = <List<Object?>>[...resp.rows];
     var cursorId = resp.cursorId;
     var seq = 3;
     while (resp.moreRows) {
-      _send(ex.buildFetch(cursorId, prefetch, sequence: seq++));
+      _send(ex.buildFetch(cursorId, prefetch,
+          sequence: seq++, ttcFieldVersion: _ttcFieldVersion));
       resp = await _readRealResponse(isQuery: true, expectedColumns: columns);
       rows.addAll(resp.rows);
       if (resp.cursorId != 0) cursorId = resp.cursorId;
@@ -1077,7 +1089,8 @@ class OracleThickClient {
     var remaining = len;
     var guard = 0;
     while (remaining > 0 && guard++ < 100000) {
-      _send(ex.buildLobRead(lob.locator, offset, remaining));
+      _send(ex.buildLobRead(lob.locator, offset, remaining,
+          ttcFieldVersion: _ttcFieldVersion));
       final resp = await _readLobResponse(lob.locator.length);
       if (!resp.isSuccess) {
         throw OracleThickException(
@@ -1101,7 +1114,8 @@ class OracleThickClient {
   /// Issues a LOB GET_LENGTH and returns the length (characters for CLOB,
   /// bytes for BLOB).
   Future<int> _lobGetLength(ex.NativeLob lob) async {
-    _send(ex.buildLobGetLength(lob.locator));
+    _send(ex.buildLobGetLength(lob.locator,
+        ttcFieldVersion: _ttcFieldVersion));
     final resp = await _readLobResponse(lob.locator.length);
     if (!resp.isSuccess) {
       throw OracleThickException(
@@ -1120,7 +1134,8 @@ class OracleThickClient {
       final resp = ex.decodeLobReadResponse(acc.toBytes(),
           sourceLocatorLength: locatorLen,
           isCreateTemp: isCreateTemp,
-          sendAmount: sendAmount);
+          sendAmount: sendAmount,
+          ttcFieldVersion: _ttcFieldVersion);
       if (resp.complete) return resp;
     }
   }
@@ -1129,7 +1144,7 @@ class OracleThickClient {
   /// locator — the vehicle for binding a String past the 32767-byte VARCHAR2
   /// limit.
   Future<Uint8List> _createTempClob(String value) async {
-    _send(ex.buildLobCreateTemp());
+    _send(ex.buildLobCreateTemp(ttcFieldVersion: _ttcFieldVersion));
     final created = await _readLobResponse(40, isCreateTemp: true);
     final locator = created.updatedLocator;
     if (!created.isSuccess || locator == null) {
@@ -1138,7 +1153,8 @@ class OracleThickClient {
     }
     // This server's CLOBs are UTF-16BE on the wire (reads return UCS-2), so the
     // WRITE payload is UTF-16BE too.
-    _send(ex.buildLobWrite(locator, 1, _encodeUtf16Be(value)));
+    _send(ex.buildLobWrite(locator, 1, _encodeUtf16Be(value),
+        ttcFieldVersion: _ttcFieldVersion));
     final written =
         await _readLobResponse(locator.length, sendAmount: false);
     if (!written.isSuccess) {
@@ -1152,14 +1168,16 @@ class OracleThickClient {
   /// server locator — the vehicle for binding a Uint8List past the 32767-byte
   /// RAW limit.
   Future<Uint8List> _createTempBlob(Uint8List value) async {
-    _send(ex.buildLobCreateTemp(oraType: 113, csfrm: 0)); // 113 = BLOB
+    _send(ex.buildLobCreateTemp(
+        oraType: 113, csfrm: 0, ttcFieldVersion: _ttcFieldVersion)); // BLOB
     final created = await _readLobResponse(40, isCreateTemp: true);
     final locator = created.updatedLocator;
     if (!created.isSuccess || locator == null) {
       throw OracleThickException(
           created.errorNum ?? -1, 'temp BLOB create failed');
     }
-    _send(ex.buildLobWrite(locator, 1, value));
+    _send(ex.buildLobWrite(locator, 1, value,
+        ttcFieldVersion: _ttcFieldVersion));
     final written =
         await _readLobResponse(locator.length, sendAmount: false);
     if (!written.isSuccess) {
@@ -1243,6 +1261,7 @@ class OracleThickClient {
         expectedColumns: expectedColumns,
         binds: binds,
         dmlReturning: dmlReturning,
+        ttcFieldVersion: _ttcFieldVersion,
       );
       if (resp.complete) return resp;
     }
@@ -1280,7 +1299,8 @@ class OracleThickClient {
         ? preparedBulk.first
         : preparedBinds;
     final nativeBinds = [for (final v in templateRow) ex.NativeBind.value(v)];
-    _send(ex.buildDmlExecute(sql, nativeBinds, bulkRows: preparedBulk));
+    _send(ex.buildDmlExecute(sql, nativeBinds,
+        bulkRows: preparedBulk, ttcFieldVersion: _ttcFieldVersion));
     final resp = await _readRealResponse(isQuery: false, binds: nativeBinds);
     if (!resp.isSuccess) {
       throw OracleThickException(
@@ -1301,7 +1321,9 @@ class OracleThickClient {
     final template = prepared.isEmpty ? const <Object?>[] : prepared.first;
     final nativeBinds = [for (final v in template) ex.NativeBind.value(v)];
     _send(ex.buildDmlExecute(sql, nativeBinds,
-        bulkRows: prepared, batchErrors: true));
+        bulkRows: prepared,
+        batchErrors: true,
+        ttcFieldVersion: _ttcFieldVersion));
     final resp = await _readRealResponse(isQuery: false, binds: nativeBinds);
     if (!resp.isSuccess) {
       throw OracleThickException(
@@ -1319,7 +1341,8 @@ class OracleThickClient {
   Future<ex.NativeExecuteResponse> executeReturning(
       String sql, List<ex.NativeBind> binds) async {
     final prepared = await _prepareNativeBinds(binds);
-    _send(ex.buildDmlExecute(sql, prepared, returning: true));
+    _send(ex.buildDmlExecute(sql, prepared,
+        returning: true, ttcFieldVersion: _ttcFieldVersion));
     final resp = await _readRealResponse(
         isQuery: false, binds: prepared, dmlReturning: true);
     if (!resp.isSuccess) {
@@ -1340,7 +1363,8 @@ class OracleThickClient {
     var more = true;
     var cid = cursorId;
     while (more) {
-      _send(ex.buildFetch(cid, prefetch, sequence: seq++));
+      _send(ex.buildFetch(cid, prefetch,
+          sequence: seq++, ttcFieldVersion: _ttcFieldVersion));
       final fetch = await _readRealResponse(
           isQuery: true, expectedColumns: columns);
       rows.addAll(fetch.rows);
@@ -1364,7 +1388,8 @@ class OracleThickClient {
   Future<ex.NativeExecuteResponse> callPlsql(
       String plsql, List<ex.NativeBind> binds) async {
     final prepared = await _prepareNativeBinds(binds);
-    _send(ex.buildPlsqlExecute(plsql, prepared));
+    _send(ex.buildPlsqlExecute(plsql, prepared,
+        ttcFieldVersion: _ttcFieldVersion));
     final resp = await _readRealResponse(isQuery: false, binds: prepared);
     if (!resp.isSuccess) {
       throw OracleThickException(
