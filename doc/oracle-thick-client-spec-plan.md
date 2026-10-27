@@ -195,7 +195,11 @@ round-tripped on real Oracle in `test/oracle_real_login_test.dart`.
 - [x] **Oversized `Uint8List` binds (> 32767 bytes) via temporary BLOBs**: same
   path with a BLOB temp LOB (raw bytes, no charset). 60000-byte round-trip
   verified vs 26ai.
-- [ ] Statement-cache reuse; cursor close/CLOSE_ALL.
+- [x] **Statement-cache reuse** (opt-in `statementCacheEnabled`): `queryReal`
+  caches each statement's open cursor + describe and re-executes a repeated SQL
+  without PARSE (cursor id reused, SQL text not re-sent, describe served from
+  cache; a stale cursor falls back to a fresh parse). Verified live on 19c and
+  23ai (gated test) plus a no-DB encoding test. Cursor close/CLOSE_ALL remains.
 - [ ] Session settings (NLS date/number formats, time zone) that affect decode.
 - [ ] A behavioral parity pass vs `reference/node-oracledb` / the thin
   `../dart-oracledb` driver for the above.

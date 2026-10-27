@@ -131,7 +131,7 @@ Future<void> main() async {
           ('bind reuse / order', 'SELECT :1 x, :2 y FROM dual WHERE :2 = :1',
               [7, 7]),
         ]);
-      } else if (mode != 'v5' && mode != 'v6') {
+      } else if (mode != 'v5' && mode != 'v6' && mode != 'cache') {
         battery.add(('smoke', 'SELECT USER, SYSDATE FROM dual', []));
         battery
             .add(('version', "SELECT banner FROM v\$version WHERE ROWNUM <= 5", []));
@@ -144,6 +144,7 @@ Future<void> main() async {
       }
       if (mode == 'v5') await _validatePlsql(client);
       if (mode == 'v6') await _validateCursors(client);
+      if (mode == 'cache') await _validateStatementCache(client);
       for (final (label, sql, binds) in battery) {
         stdout.writeln('\n[$label] $sql'
             '${binds.isEmpty ? '' : '  binds=$binds'}');
@@ -176,6 +177,29 @@ Future<void> main() async {
 
 String _fmtRow(List<Object?> row) =>
     row.map((v) => '${v?.runtimeType ?? 'Null'}=$v').join(' | ');
+
+/// Statement-cache smoke test: run the same query twice with caching on; the
+/// second run re-executes the cached cursor (no re-parse) and must match.
+Future<void> _validateStatementCache(OracleThickClient client) async {
+  client.statementCacheEnabled = true;
+  const sql = 'SELECT object_name FROM all_objects WHERE ROWNUM <= 3';
+  stdout.writeln('\n[statement cache] $sql');
+  try {
+    final first = await client.queryReal(sql).timeout(
+        const Duration(seconds: 20));
+    final second = await client.queryReal(sql).timeout(
+        const Duration(seconds: 20));
+    stdout.writeln('  run1: ${first.rows.length} row(s), '
+        'cursor=${first.cursorId}');
+    stdout.writeln('  run2: ${second.rows.length} row(s), '
+        'cursor=${second.cursorId}');
+    final same = first.rows.length == second.rows.length &&
+        first.cursorId == second.cursorId;
+    stdout.writeln('  reused same cursor + equal row count: $same');
+  } catch (e) {
+    stdout.writeln('  FAILED: $e');
+  }
+}
 
 /// Phase V5 — PL/SQL with OUT/IN OUT binds (compute-only, no data changes).
 Future<void> _validatePlsql(OracleThickClient client) async {

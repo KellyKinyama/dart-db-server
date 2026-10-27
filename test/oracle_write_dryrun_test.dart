@@ -8,6 +8,7 @@
 // write encoding without connecting to any server — safe for prod-only targets.
 library;
 
+import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:dart_db_server/oracle_native_execute.dart';
@@ -36,6 +37,29 @@ int _options12(Uint8List msg) {
   r.readUint8(); // function
   r.readUint8(); // sequence
   return r.readUB4(); // options
+}
+
+/// Reads (options, cursorId) from a field-12 execute request.
+(int, int) _optsAndCursor12(Uint8List msg) {
+  final r = ReadBuffer(msg);
+  r.readUint8();
+  r.readUint8();
+  r.readUint8();
+  return (r.readUB4(), r.readUB4());
+}
+
+bool _contains(Uint8List haystack, List<int> needle) {
+  for (var i = 0; i + needle.length <= haystack.length; i++) {
+    var ok = true;
+    for (var j = 0; j < needle.length; j++) {
+      if (haystack[i + j] != needle[j]) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) return true;
+  }
+  return false;
 }
 
 void main() {
@@ -149,6 +173,25 @@ void main() {
       final p24 = buildPlsqlExecute('BEGIN :1 := 1; END;',
           [NativeBind.outNumber()], ttcFieldVersion: 24);
       _expectTokenInvariant(p12, p24);
+    });
+
+    test('statement-cache re-execute omits PARSE and the SQL text', () {
+      const sql = 'SELECT id FROM employees';
+      final fresh = buildQueryExecute(sql, ttcFieldVersion: 12);
+      final reuse = buildQueryExecute(sql, ttcFieldVersion: 12, cursorId: 42);
+
+      // Fresh parse: PARSE option bit (0x01) set, cursor id 0, SQL present.
+      final (fOpts, fCursor) = _optsAndCursor12(fresh);
+      expect(fOpts & 0x01, 0x01);
+      expect(fCursor, 0);
+      expect(_contains(fresh, utf8.encode(sql)), isTrue);
+
+      // Re-execute: PARSE cleared, cursor id carried, SQL text not re-sent.
+      final (rOpts, rCursor) = _optsAndCursor12(reuse);
+      expect(rOpts & 0x01, 0);
+      expect(rCursor, 42);
+      expect(_contains(reuse, utf8.encode(sql)), isFalse);
+      expect(reuse.length, lessThan(fresh.length));
     });
   });
 }

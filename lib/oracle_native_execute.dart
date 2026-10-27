@@ -310,6 +310,7 @@ Uint8List buildQueryExecute(
   int numIters = 100,
   int ttcFieldVersion = _fieldVersion23_4,
   int sequence = 1,
+  int cursorId = 0,
 }) {
   final encodedBinds = [for (final v in binds) _encodeBind(v)];
   final numParams = encodedBinds.length;
@@ -322,17 +323,23 @@ Uint8List buildQueryExecute(
   }
 
   final sqlBytes = utf8.encode(sql);
-  // Query, fresh parse; add the bind flag when binds are present.
-  var options =
-      _execOptionParse | _execOptionExecute | _execOptionFetch;
+  // Query; parse only on a fresh cursor. A cached cursor (cursorId != 0) re-
+  // executes without PARSE and without re-sending the SQL text.
+  var options = _execOptionExecute | _execOptionFetch;
+  if (cursorId == 0) options |= _execOptionParse;
   if (numParams > 0) options |= _execOptionBind;
   final dmlOptions = _execOptionImplicitResultset;
 
   b.writeUB4(options);
-  b.writeUB4(0); // cursor id (0 = fresh parse)
+  b.writeUB4(cursorId);
 
-  b.writeUint8(1); // ptr to SQL
-  b.writeUB4(sqlBytes.length);
+  if (cursorId == 0) {
+    b.writeUint8(1); // ptr to SQL
+    b.writeUB4(sqlBytes.length);
+  } else {
+    b.writeUint8(0);
+    b.writeUB4(0);
+  }
 
   b.writeUint8(1); // pointer (al8i4 vector)
   b.writeUB4(13); // al8i4 array length
@@ -386,9 +393,14 @@ Uint8List buildQueryExecute(
     }
   }
 
-  // SQL bytes + al8i4[0] parse flag.
-  b.writeBytesWithLength(Uint8List.fromList(sqlBytes));
-  b.writeUB4(1); // al8i4[0] parse
+  // SQL bytes + al8i4[0] parse flag — only on a fresh cursor; a cached cursor
+  // omits the SQL text and sets the parse slot to 0.
+  if (cursorId == 0) {
+    b.writeBytesWithLength(Uint8List.fromList(sqlBytes));
+    b.writeUB4(1); // al8i4[0] parse
+  } else {
+    b.writeUB4(0); // al8i4[0]
+  }
 
   b.writeUB4(0); // al8i4[1] execution count (0 for fresh query parse)
   b.writeUB4(0); // al8i4[2]

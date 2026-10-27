@@ -699,6 +699,12 @@ class OracleThickClient {
   /// Defaults to the 23.4 value; lowered for pre-23ai servers (12c/19c).
   int _ttcFieldVersion = 24;
 
+  /// When true, [queryReal] caches each statement's open server cursor and
+  /// describe, re-executing repeated SQL without re-parsing. Opt-in (off by
+  /// default); a server-invalidated cursor falls back to a fresh parse.
+  bool statementCacheEnabled = false;
+  final Map<String, (int, List<ex.NativeColumn>)> _stmtCache = {};
+
   // Temporary CLOB/BLOB locators created for oversized binds are session-
   // duration and reclaimed when the connection closes. Eager freeing via a
   // free-temp piggyback is a follow-up.
@@ -1028,14 +1034,28 @@ class OracleThickClient {
   Future<ex.NativeExecuteResponse> queryReal(String sql,
       {List<Object?> binds = const [], int prefetch = 100}) async {
     final prepared = await _prepareBinds(binds);
+    final cached = statementCacheEnabled ? _stmtCache[sql] : null;
     _send(ex.buildQueryExecute(sql,
         binds: prepared,
         numIters: prefetch,
+        cursorId: cached?.$1 ?? 0,
         ttcFieldVersion: _ttcFieldVersion));
-    var resp = await _readRealResponse(isQuery: true);
+    var resp = await _readRealResponse(
+        isQuery: true, expectedColumns: cached?.$2);
+    // A cached cursor can be closed server-side; on failure drop it and retry
+    // once with a fresh parse.
+    if (cached != null && !resp.isSuccess) {
+      _stmtCache.remove(sql);
+      _send(ex.buildQueryExecute(sql,
+          binds: prepared,
+          numIters: prefetch,
+          ttcFieldVersion: _ttcFieldVersion));
+      resp = await _readRealResponse(isQuery: true);
+    }
     final columns = resp.columns;
     final rows = <List<Object?>>[...resp.rows];
-    var cursorId = resp.cursorId;
+    // On a cache hit the cursor id is not re-sent; keep the cached one.
+    var cursorId = resp.cursorId != 0 ? resp.cursorId : (cached?.$1 ?? 0);
     var seq = 3;
     while (resp.moreRows) {
       _send(ex.buildFetch(cursorId, prefetch,
@@ -1050,6 +1070,9 @@ class OracleThickClient {
           resp.errorNum ?? -1,
           'ORA-${(resp.errorNum ?? 0).toString().padLeft(5, '0')}: '
           '${resp.errorMessage ?? ''}');
+    }
+    if (statementCacheEnabled && cursorId != 0 && columns.isNotEmpty) {
+      _stmtCache[sql] = (cursorId, columns);
     }
     // Materialize any CLOB/BLOB locators and nested cursors.
     await _materializeRows(rows);

@@ -224,6 +224,20 @@ final ret = await client.executeReturning(
 final ids = ret.outBindValues[0] as List;   // e.g. [1, 2]
 ```
 
+## Statement caching
+
+Set `statementCacheEnabled = true` to have `queryReal` reuse a repeated
+statement's open server cursor and cached describe, re-executing without a
+re-parse (opt-in; off by default). A server-invalidated cursor transparently
+falls back to a fresh parse.
+
+```dart
+client.statementCacheEnabled = true;
+await client.queryReal('SELECT id FROM employees WHERE dept = :1', binds: [10]);
+await client.queryReal('SELECT id FROM employees WHERE dept = :1', binds: [20]);
+// ^ second call re-executes the cached cursor (no PARSE, SQL text not re-sent).
+```
+
 ## Error handling
 
 - Login problems: `loginReal` returns `NativeLoginResult(authenticated: false,

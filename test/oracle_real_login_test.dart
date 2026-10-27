@@ -168,6 +168,36 @@ void main() {
       }
     });
 
+    test('statement cache re-executes a repeated query via its cursor',
+        () async {
+      final host = env['ORACLE_HOST'] ?? '127.0.0.1';
+      final port = int.tryParse(env['ORACLE_PORT'] ?? '1521') ?? 1521;
+      final user = env['ORACLE_USER'] ?? 'system';
+      final pass = env['ORACLE_PASSWORD'] ?? 'TestPw1234';
+      final service = env['ORACLE_SERVICE'] ?? 'FREEPDB1';
+
+      final client = await OracleThickClient.connect(port, host: host);
+      try {
+        await client.loginReal(
+            username: user, password: pass, serviceName: service);
+        client.statementCacheEnabled = true;
+        const sql = "SELECT 'cached' AS g, 7 AS n FROM dual";
+        final first = await client.queryReal(sql);
+        final second = await client.queryReal(sql);
+        // Both runs return the same rows; the second reuses the open cursor
+        // (no re-parse) and the describe is served from the cache.
+        expect(first.rows, [
+          ['cached', 7]
+        ]);
+        expect(second.rows, first.rows);
+        expect(second.columns.map((c) => c.name).toList(), ['G', 'N']);
+        expect(second.cursorId, first.cursorId);
+        expect(first.cursorId, isNonZero);
+      } finally {
+        await client.close();
+      }
+    });
+
     test('scalar type decoders round-trip from real Oracle', () async {
       final host = env['ORACLE_HOST'] ?? '127.0.0.1';
       final port = int.tryParse(env['ORACLE_PORT'] ?? '1521') ?? 1521;
