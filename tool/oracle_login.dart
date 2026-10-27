@@ -81,30 +81,57 @@ Future<void> main() async {
       if (ver != null) stdout.writeln('  version no: $ver');
 
       // Read-only end-to-end validation of the execute/fetch path.
-      final queries = <String>[
-        'SELECT USER, SYSDATE FROM dual',
-        "SELECT banner FROM v\$version WHERE ROWNUM <= 5",
-      ];
-      final custom = env['ORACLE_QUERY'];
-      if (custom != null && custom.isNotEmpty) {
-        queries
-          ..clear()
-          ..add(custom);
+      // ORACLE_VALIDATE=v1 runs the SELECT-decode battery (Phase V1); otherwise
+      // a couple of smoke queries, overridable with ORACLE_QUERY.
+      final battery = <(String, String)>[];
+      if ((env['ORACLE_VALIDATE'] ?? '').toLowerCase() == 'v1') {
+        battery.addAll(const [
+          ('NUMBER', 'SELECT 1, -2, 3.5, 123456789012 FROM dual'),
+          ('VARCHAR2/CHAR', "SELECT 'abc', CAST('x' AS CHAR(3)) FROM dual"),
+          ('NCHAR/NVARCHAR2',
+              "SELECT N'uni', CAST(N'y' AS NVARCHAR2(3)) FROM dual"),
+          ('DATE/TIMESTAMP', 'SELECT SYSDATE, SYSTIMESTAMP FROM dual'),
+          ('TSTZ',
+              "SELECT CAST(SYSTIMESTAMP AS TIMESTAMP WITH TIME ZONE) FROM dual"),
+          ('TS LTZ',
+              "SELECT CAST(SYSTIMESTAMP AS TIMESTAMP WITH LOCAL TIME ZONE) FROM dual"),
+          ('INTERVAL DS', "SELECT INTERVAL '2 03:04:05' DAY TO SECOND FROM dual"),
+          ('INTERVAL YM', "SELECT INTERVAL '3-6' YEAR TO MONTH FROM dual"),
+          ('BINARY_FLOAT/DOUBLE',
+              'SELECT CAST(1.5 AS BINARY_FLOAT), CAST(2.5 AS BINARY_DOUBLE) FROM dual'),
+          ('RAW', "SELECT HEXTORAW('DEADBEEF') FROM dual"),
+          ('ROWID', 'SELECT ROWID FROM dual'),
+          ('NULLs', 'SELECT NULL, CAST(NULL AS NUMBER) FROM dual'),
+          ('multi-row',
+              'SELECT LEVEL AS n FROM dual CONNECT BY LEVEL <= 5'),
+        ]);
+      } else {
+        battery.add(('smoke', 'SELECT USER, SYSDATE FROM dual'));
+        battery.add(('version', "SELECT banner FROM v\$version WHERE ROWNUM <= 5"));
+        final custom = env['ORACLE_QUERY'];
+        if (custom != null && custom.isNotEmpty) {
+          battery
+            ..clear()
+            ..add(('custom', custom));
+        }
       }
-      for (final sql in queries) {
-        stdout.writeln('\n> $sql');
+      for (final (label, sql) in battery) {
+        stdout.writeln('\n[$label] $sql');
         try {
           final resp = await client
               .queryReal(sql, prefetch: 50)
               .timeout(const Duration(seconds: 20));
           stdout.writeln(
               '  columns: ${resp.columns.map((c) => c.name).join(', ')}');
-          for (final row in resp.rows.take(10)) {
-            stdout.writeln('  ${row.join(' | ')}');
+          for (final row in resp.rows.take(6)) {
+            final cells = row
+                .map((v) => '${v?.runtimeType ?? 'Null'}=$v')
+                .join(' | ');
+            stdout.writeln('  $cells');
           }
           stdout.writeln('  (${resp.rows.length} row(s))');
         } catch (e) {
-          stdout.writeln('  query failed: $e');
+          stdout.writeln('  FAILED: $e');
         }
       }
     } else {

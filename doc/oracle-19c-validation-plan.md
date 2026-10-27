@@ -38,20 +38,29 @@ A disposable table the later phases read/write, so no production data is touched
 
 Expected: table created and dropped cleanly; no ORA error.
 
-## Phase V1 — SELECT decode coverage  ·  Status: TODO
+## Phase V1 — SELECT decode coverage  ·  Status: DONE (19c, all types pass; one edge-case noted)
 Read-only, no table needed. Confirms each scalar decoder on field version 12.
 
-- [ ] NUMBER: `SELECT 1, -2, 3.5, 123456789012 FROM dual` → `num` values exact.
-- [ ] VARCHAR2 / CHAR: `SELECT 'abc', CAST('x' AS CHAR(3)) FROM dual`.
-- [ ] DATE / TIMESTAMP: `SELECT SYSDATE, SYSTIMESTAMP FROM dual` → `DateTime`.
-- [ ] TIMESTAMP WITH TIME ZONE: `SELECT SYSTIMESTAMP AT TIME ZONE 'UTC' ...`.
-- [ ] INTERVAL: `SELECT INTERVAL '2' DAY, INTERVAL '3' YEAR FROM dual`.
-- [ ] BINARY_FLOAT / BINARY_DOUBLE: `SELECT 1.5f, 2.5d FROM dual`.
-- [ ] RAW: `SELECT HEXTORAW('DEADBEEF') FROM dual` → `Uint8List`.
-- [ ] ROWID: `SELECT ROWID FROM dual`.
-- [ ] NULLs: `SELECT NULL, CAST(NULL AS NUMBER) FROM dual` → `null`.
+- [x] NUMBER: `SELECT 1, -2, 3.5, 123456789012 FROM dual` → `int`/`double` exact.
+- [x] VARCHAR2 / CHAR: `'abc'`, `CAST('x' AS CHAR(3))` → `String` (CHAR padded).
+- [x] NCHAR / NVARCHAR2 → `String`.
+- [x] DATE / TIMESTAMP: `SYSDATE`, `SYSTIMESTAMP` → `DateTime`.
+- [x] TIMESTAMP WITH TIME ZONE → `DateTime` (UTC instant).
+- [x] TIMESTAMP WITH LOCAL TIME ZONE → `DateTime`.
+- [x] INTERVAL DAY TO SECOND → `Duration`; INTERVAL YEAR TO MONTH → `OracleYearMonth`.
+- [x] BINARY_FLOAT / BINARY_DOUBLE → `double`.
+- [x] RAW: `HEXTORAW('DEADBEEF')` → `Uint8List [222,173,190,239]`.
+- [x] ROWID → `String`.
+- [x] **Typed** NULLs: `CAST(NULL AS NUMBER)` / `CAST(NULL AS VARCHAR2)` → `null`.
+- [x] Multi-row fetch (`CONNECT BY LEVEL <= 5`) → 5 rows.
+- [ ] **KNOWN LIMITATION:** a bare **untyped literal** `SELECT NULL FROM dual`
+      (no CAST) fails with `Unknown TTC message type: 46` — Oracle assigns the
+      literal a special internal type whose describe/row shape the decoder
+      mis-reads on field version 12. Not a real-world pattern (typed NULLs are
+      fine); tracked as a low-priority decode-robustness fix.
 
-Expected: every column decodes to the documented Dart type (see usage-doc table).
+Result: every documented type decodes correctly on real 19c; only the untyped
+`NULL` literal edge case is open.
 
 ## Phase V2 — Positional binds  ·  Status: TODO
 Confirms the bind-metadata + ROW_DATA encode path on field version 12.
