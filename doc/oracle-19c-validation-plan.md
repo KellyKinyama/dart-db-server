@@ -28,7 +28,7 @@ dropped at the end — nothing touches existing data.
 
 ---
 
-## Phase V0 — Scratch sandbox  ·  Status: DEFERRED (writes not permitted on target)
+## Phase V0 — Scratch sandbox  ·  Status: DONE (live on local 21c XE)
 A disposable table the later phases read/write, so no production data is touched.
 
 - [ ] `CREATE TABLE tc_probe (id NUMBER, name VARCHAR2(100), amt NUMBER(12,2), created DATE, note CLOB, blob_col BLOB)`
@@ -90,15 +90,15 @@ Result: positional binds encode/decode correctly on real 19c for every normal
 pattern. The one failing combination is proven (byte-level) to be an Oracle-side
 numbered-bind quirk, not a driver defect.
 
-## Phase V3 — DML + array DML + RETURNING  ·  Status: DRY-RUN VERIFIED (live writes deferred)
-Uses `tc_probe`. Confirms the non-query execute path and row counts.
+## Phase V3 — DML + array DML + RETURNING  ·  Status: DONE (live on local 21c XE, field version 16)
+Confirms the non-query execute path and row counts.
 
-Live writes are deferred (prod target), but the **encoding is dry-run verified**
-with no DB in [test/oracle_write_dryrun_test.dart](../test/oracle_write_dryrun_test.dart):
-the field-12 (19c) request for single INSERT, array DML, RETURNING, and
-batch-errors DML is byte-identical to the 23ai-proven field-24 request minus the
-token byte (and the batch-errors option flag is present). Combined with the live
-23ai DML gated tests, this validates the pre-23ai DML encoding.
+Validated live against a disposable local **Oracle 21c XE** container (pre-23ai,
+non-fast-auth, field version 16) via `tool/oracle_login.dart ORACLE_VALIDATE=write`
+(gated by `ORACLE_ALLOW_WRITES=yes`): single INSERT → 1 row, array DML (3 rows)
+→ 3, UPDATE → 2, `RETURNING id INTO` → `[[1]]`, and batch errors (duplicate PK)
+→ 2 applied + `off1:ORA-1`. The write encoding is also dry-run-proven
+byte-identical to the 23ai-proven path minus the token.
 
 - [ ] Single INSERT via `executeDml` → rows affected = 1.
 - [ ] Array DML (`bulkRows`, ~5 rows) → rows affected = 5.
@@ -109,14 +109,14 @@ token byte (and the batch-errors option flag is present). Combined with the live
 
 Expected: counts correct; batch errors carry offset + ORA code.
 
-## Phase V4 — LOBs (CLOB / BLOB)  ·  Status: DRY-RUN VERIFIED (live writes deferred)
-Uses `tc_probe`. Confirms temp-LOB create/write + LOB read on field version 12.
+## Phase V4 — LOBs (CLOB / BLOB)  ·  Status: DONE (live on local 21c XE)
+Confirms temp-LOB create/write + LOB read on field version 16.
 
-Live writes deferred, but the temp-CLOB/BLOB **create** and **write** requests
-are dry-run verified (token invariant) in
-[test/oracle_write_dryrun_test.dart](../test/oracle_write_dryrun_test.dart). LOB
-*reads* are already live-verified by V1 (CLOB/BLOB materialization is covered
-once a row carrying a locator is fetched).
+Validated live on the local 21c XE container: an oversized **CLOB** bind (40000
+chars) and **BLOB** bind (50000 bytes) each route through a temporary LOB
+(CREATE_TEMP + WRITE) and read back equal (`match=true`). Required a fix: the
+LOB-op response decoder now treats the ERROR message as terminal on pre-23ai
+(it previously read past it into garbage).
 
 - [ ] Oversized CLOB bind (> 32767 chars) via temp CLOB → stored, read back equal.
 - [ ] Oversized BLOB bind (> 32767 bytes) via temp BLOB → stored, read back equal.
@@ -148,13 +148,22 @@ Confirms the embedded describe (no version preamble) + fetch loop on 19c.
 Result: REF CURSOR, nested cursor columns, implicit results, and multi-cursor
 OUT binds all work on real 19c.
 
-## Phase V7 — Teardown & write-up  ·  Status: PARTIAL (read-only phases done; writes deferred)
-- [ ] `DROP TABLE tc_probe PURGE` (only if V0/V3/V4 are later run).
+## Phase V7 — Teardown & write-up  ·  Status: DONE
+- [x] `DROP TABLE tc_probe PURGE` (run by the write battery on the local 21c XE).
 - [x] Verified matrix recorded in
       [oracle-thick-client-spec-plan.md](oracle-thick-client-spec-plan.md)
-      Phase T8 (read surface verified on 19c; three edge cases resolved).
-- [x] Field-version-12 findings recorded (one fix: nested `CURSOR()` column;
-      two proven Oracle-side quirks).
+      Phase T8 (read + write surface verified on pre-23ai; edge cases resolved).
+- [x] Field-version findings recorded.
+
+## Local pre-23ai container (how the write phases ran)
+A disposable **Oracle 21c XE** container (`container-registry.oracle.com/database/
+express:21.3.0-xe`, pre-23ai, non-fast-auth, field version 16) on `localhost:1522`
+stood in for the prod 19c target for the write phases — never touching production.
+It surfaced two fixes a 19c-read-only pass had missed:
+- the zero-size-NULL guard was too broad (a 21c `NUMBER` literal describes with
+  size 0 yet carries a value) → restricted to character types;
+- the LOB-op response decoder didn't terminate on the ERROR message on pre-23ai
+  → fixed, unblocking oversized CLOB/BLOB binds.
 
 ## Out of scope here (tracked separately)
 - True pre-12c 11g accounts (legacy O5LOGON-only verifier).
