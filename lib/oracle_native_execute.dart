@@ -2006,6 +2006,9 @@ NativeLobReadResponse decodeLobReadResponse(
           final err = _readTtcErrorBody(buf, ttcFieldVersion);
           errorNum = err.num;
           if (err.num != 0) errorMessage = err.message;
+          // The ERROR (RXH) message carries the final status and terminates the
+          // response; pre-23ai sends nothing after it (no STATUS/END_OF_RESPONSE).
+          endOfResponse = true;
           break;
         case _msgTypeWarning:
           _skipWarning(buf);
