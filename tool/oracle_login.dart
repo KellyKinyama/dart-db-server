@@ -131,7 +131,8 @@ Future<void> main() async {
           ('bind reuse / order', 'SELECT :1 x, :2 y FROM dual WHERE :2 = :1',
               [7, 7]),
         ]);
-      } else if (mode != 'v5' && mode != 'v6' && mode != 'cache') {
+      } else if (mode != 'v5' && mode != 'v6' && mode != 'cache' &&
+          mode != 'write') {
         battery.add(('smoke', 'SELECT USER, SYSDATE FROM dual', []));
         battery
             .add(('version', "SELECT banner FROM v\$version WHERE ROWNUM <= 5", []));
@@ -145,6 +146,17 @@ Future<void> main() async {
       if (mode == 'v5') await _validatePlsql(client);
       if (mode == 'v6') await _validateCursors(client);
       if (mode == 'cache') await _validateStatementCache(client);
+      if (mode == 'write') {
+        if ((env['ORACLE_ALLOW_WRITES'] ?? '').toLowerCase() != 'yes') {
+          stdout.writeln('\nWRITE mode refused: set ORACLE_ALLOW_WRITES=yes in '
+              '.env and point at a DISPOSABLE (non-production) database first.');
+        } else {
+          stdout.writeln('\nWRITE validation against $target on $host:$port — '
+              'creates/drops a throwaway tc_probe table. Ensure this is NOT '
+              'production.');
+          await _validateWrites(client);
+        }
+      }
       for (final (label, sql, binds) in battery) {
         stdout.writeln('\n[$label] $sql'
             '${binds.isEmpty ? '' : '  binds=$binds'}');
@@ -199,6 +211,87 @@ Future<void> _validateStatementCache(OracleThickClient client) async {
   } catch (e) {
     stdout.writeln('  FAILED: $e');
   }
+}
+
+/// Phase V0/V3/V4/V7 — write-path validation against a DISPOSABLE database
+/// (gated by ORACLE_ALLOW_WRITES=yes). Creates a throwaway tc_probe table,
+/// exercises DML / array DML / RETURNING / batch errors / oversized LOBs, then
+/// drops it. Never run against production.
+Future<void> _validateWrites(OracleThickClient client) async {
+  Future<void> step(String label, Future<Object?> Function() fn) async {
+    stdout.write('  $label ... ');
+    try {
+      final r = await fn().timeout(const Duration(seconds: 30));
+      stdout.writeln('OK ${r ?? ''}');
+    } catch (e) {
+      stdout.writeln('FAILED: $e');
+    }
+  }
+
+  // V0 — sandbox table (drop any leftover first).
+  try {
+    await client.executeDml('DROP TABLE tc_probe PURGE');
+  } catch (_) {}
+  await step('V0 create table', () => client.executeDml(
+      'CREATE TABLE tc_probe (id NUMBER PRIMARY KEY, name VARCHAR2(100), '
+      'amt NUMBER(12,2), created DATE, note CLOB, blob_col BLOB)'));
+
+  // V3 — DML, array DML, RETURNING, batch errors.
+  await step('V3 single insert -> rows', () => client.executeDml(
+      'INSERT INTO tc_probe (id, name, amt, created) VALUES (:1, :2, :3, :4)',
+      binds: [1, 'alice', 12.50, DateTime.utc(2026, 1, 2)]));
+  await step('V3 array insert (3) -> rows', () => client.executeDml(
+      'INSERT INTO tc_probe (id, name) VALUES (:1, :2)',
+      bulkRows: [
+        [2, 'bob'],
+        [3, 'carol'],
+        [4, 'dave'],
+      ]));
+  await step('V3 update -> rows', () => client.executeDml(
+      'UPDATE tc_probe SET amt = :1 WHERE id <= :2', binds: [9.99, 2]));
+  await step('V3 returning id', () async {
+    final r = await client.executeReturning(
+        'UPDATE tc_probe SET name = :1 WHERE id = :2 RETURNING id INTO :3',
+        [NativeBind.value('updated'), NativeBind.value(1),
+            NativeBind.outNumber()]);
+    return '-> ${r.outBindValues}';
+  });
+  await step('V3 batch errors (dup id 2)', () async {
+    final r = await client.executeBatch(
+        'INSERT INTO tc_probe (id, name) VALUES (:1, :2)', [
+      [10, 'e'],
+      [2, 'dup'], // duplicate PK -> batch error at offset 1
+      [11, 'f'],
+    ]);
+    return '-> applied=${r.rowsAffected} '
+        'batchErrors=${r.batchErrors.map((e) => 'off${e.offset}:ORA-${e.code}').toList()}';
+  });
+
+  // V4 — oversized LOB binds (temp CLOB/BLOB swap) + read-back.
+  await step('V4 oversized CLOB (40000 chars)', () async {
+    final big = 'x' * 40000;
+    await client.executeDml('UPDATE tc_probe SET note = :1 WHERE id = :2',
+        binds: [big, 1]);
+    final q =
+        await client.queryReal('SELECT note FROM tc_probe WHERE id = 1');
+    final got = q.rows.first.first as String;
+    return '-> stored=${big.length} read=${got.length} match=${got == big}';
+  });
+  await step('V4 oversized BLOB (50000 bytes)', () async {
+    final big = Uint8List.fromList(
+        List<int>.generate(50000, (i) => i % 256));
+    await client.executeDml('UPDATE tc_probe SET blob_col = :1 WHERE id = :2',
+        binds: [big, 1]);
+    final q =
+        await client.queryReal('SELECT blob_col FROM tc_probe WHERE id = 1');
+    final got = q.rows.first.first as Uint8List;
+    return '-> stored=${big.length} read=${got.length} '
+        'match=${got.length == big.length && got[49999] == big[49999]}';
+  });
+
+  // V7 — teardown.
+  await step('V7 drop table', () => client.executeDml(
+      'DROP TABLE tc_probe PURGE'));
 }
 
 /// Phase V5 — PL/SQL with OUT/IN OUT binds (compute-only, no data changes).
