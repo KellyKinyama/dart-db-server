@@ -10,6 +10,8 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:dart_db_server/oracle_thick_client.dart';
+import 'package:dart_db_server/oracle_native_execute.dart'
+    show NativeBind, NativeNestedCursor;
 
 Map<String, String> _loadDotEnv(File file) {
   final env = <String, String>{};
@@ -129,7 +131,7 @@ Future<void> main() async {
           ('bind reuse / order', 'SELECT :1 x, :2 y FROM dual WHERE :2 = :1',
               [7, 7]),
         ]);
-      } else {
+      } else if (mode != 'v5' && mode != 'v6') {
         battery.add(('smoke', 'SELECT USER, SYSDATE FROM dual', []));
         battery
             .add(('version', "SELECT banner FROM v\$version WHERE ROWNUM <= 5", []));
@@ -140,6 +142,8 @@ Future<void> main() async {
             ..add(('custom', custom, []));
         }
       }
+      if (mode == 'v5') await _validatePlsql(client);
+      if (mode == 'v6') await _validateCursors(client);
       for (final (label, sql, binds) in battery) {
         stdout.writeln('\n[$label] $sql'
             '${binds.isEmpty ? '' : '  binds=$binds'}');
@@ -169,3 +173,92 @@ Future<void> main() async {
     await client.close();
   }
 }
+
+String _fmtRow(List<Object?> row) =>
+    row.map((v) => '${v?.runtimeType ?? 'Null'}=$v').join(' | ');
+
+/// Phase V5 — PL/SQL with OUT/IN OUT binds (compute-only, no data changes).
+Future<void> _validatePlsql(OracleThickClient client) async {
+  Future<void> call(
+      String label, String sql, List<NativeBind> binds) async {
+    stdout.writeln('\n[$label] $sql');
+    try {
+      final r = await client.callPlsql(sql, binds).timeout(
+          const Duration(seconds: 20));
+      stdout.writeln('  out: ${_fmtRow(r.outBindValues)}');
+    } catch (e) {
+      stdout.writeln('  FAILED: $e');
+    }
+  }
+
+  await call('scalar OUT (num*10 + timestamp)',
+      'BEGIN :1 := :2 * 10; :3 := SYSTIMESTAMP; END;',
+      [NativeBind.outNumber(), NativeBind.value(7), NativeBind.outTimestamp()]);
+  await call('OUT varchar',
+      "BEGIN :1 := 'hello ' || :2; END;",
+      [NativeBind.outVarchar(), NativeBind.value('19c')]);
+  await call('IN OUT',
+      "BEGIN :1 := :1 || '_x'; END;", [NativeBind.inOut('hi')]);
+  await call('OUT date', 'BEGIN :1 := SYSDATE; END;', [NativeBind.outDate()]);
+}
+
+/// Phase V6 — REF CURSOR / nested cursor / implicit results (all SELECT-based).
+Future<void> _validateCursors(OracleThickClient client) async {
+  stdout.writeln('\n[REF CURSOR]');
+  try {
+    final rc = await client.openRefCursor(
+        "BEGIN OPEN :1 FOR SELECT LEVEL AS n, 'row'||LEVEL AS label "
+        "FROM dual CONNECT BY LEVEL <= 5; END;");
+    stdout.writeln('  columns: ${rc.columns.map((c) => c.name).join(', ')}');
+    for (final row in rc.rows.take(6)) {
+      stdout.writeln('  ${_fmtRow(row)}');
+    }
+    stdout.writeln('  (${rc.rows.length} row(s))');
+  } catch (e) {
+    stdout.writeln('  FAILED: $e');
+  }
+
+  stdout.writeln('\n[nested CURSOR() column]');
+  try {
+    final resp = await client.queryReal(
+        'SELECT 1 AS id, '
+        'CURSOR(SELECT LEVEL FROM dual CONNECT BY LEVEL <= 3) AS c FROM dual');
+    for (final row in resp.rows) {
+      stdout.writeln('  id=${row[0]} inner=${row[1]}');
+    }
+  } catch (e) {
+    stdout.writeln('  FAILED: $e');
+  }
+
+  stdout.writeln('\n[implicit result set]');
+  try {
+    final resp = await client.callPlsql(
+        'DECLARE c SYS_REFCURSOR; '
+        "BEGIN OPEN c FOR SELECT 1 AS a, 'x' AS b FROM dual; "
+        'DBMS_SQL.RETURN_RESULT(c); END;',
+        const []);
+    for (final ir in resp.implicitResults) {
+      final rows = await client.fetchImplicitResult(ir);
+      stdout.writeln('  result rows: ${rows.map(_fmtRow).join(' ; ')}');
+    }
+  } catch (e) {
+    stdout.writeln('  FAILED: $e');
+  }
+
+  stdout.writeln('\n[multiple REF CURSOR OUT binds]');
+  try {
+    final resp = await client.callPlsql(
+        'BEGIN OPEN :1 FOR SELECT 1 FROM dual; '
+        'OPEN :2 FOR SELECT 2 FROM dual UNION ALL SELECT 3 FROM dual; END;',
+        [NativeBind.outCursor(), NativeBind.outCursor()]);
+    for (final v in resp.outBindValues) {
+      if (v is NativeNestedCursor) {
+        final rows = await client.fetchCursor(v);
+        stdout.writeln('  cursor rows: ${rows.map(_fmtRow).join(' ; ')}');
+      }
+    }
+  } catch (e) {
+    stdout.writeln('  FAILED: $e');
+  }
+}
+
