@@ -90,8 +90,15 @@ Result: positional binds encode/decode correctly on real 19c for every normal
 pattern. The one failing combination is proven (byte-level) to be an Oracle-side
 numbered-bind quirk, not a driver defect.
 
-## Phase V3 — DML + array DML + RETURNING  ·  Status: DEFERRED (writes not permitted on target)
+## Phase V3 — DML + array DML + RETURNING  ·  Status: DRY-RUN VERIFIED (live writes deferred)
 Uses `tc_probe`. Confirms the non-query execute path and row counts.
+
+Live writes are deferred (prod target), but the **encoding is dry-run verified**
+with no DB in [test/oracle_write_dryrun_test.dart](../test/oracle_write_dryrun_test.dart):
+the field-12 (19c) request for single INSERT, array DML, RETURNING, and
+batch-errors DML is byte-identical to the 23ai-proven field-24 request minus the
+token byte (and the batch-errors option flag is present). Combined with the live
+23ai DML gated tests, this validates the pre-23ai DML encoding.
 
 - [ ] Single INSERT via `executeDml` → rows affected = 1.
 - [ ] Array DML (`bulkRows`, ~5 rows) → rows affected = 5.
@@ -102,8 +109,14 @@ Uses `tc_probe`. Confirms the non-query execute path and row counts.
 
 Expected: counts correct; batch errors carry offset + ORA code.
 
-## Phase V4 — LOBs (CLOB / BLOB)  ·  Status: DEFERRED (writes not permitted on target)
+## Phase V4 — LOBs (CLOB / BLOB)  ·  Status: DRY-RUN VERIFIED (live writes deferred)
 Uses `tc_probe`. Confirms temp-LOB create/write + LOB read on field version 12.
+
+Live writes deferred, but the temp-CLOB/BLOB **create** and **write** requests
+are dry-run verified (token invariant) in
+[test/oracle_write_dryrun_test.dart](../test/oracle_write_dryrun_test.dart). LOB
+*reads* are already live-verified by V1 (CLOB/BLOB materialization is covered
+once a row carrying a locator is fetched).
 
 - [ ] Oversized CLOB bind (> 32767 chars) via temp CLOB → stored, read back equal.
 - [ ] Oversized BLOB bind (> 32767 bytes) via temp BLOB → stored, read back equal.
