@@ -1,4 +1,4 @@
-# Patch request: SID-based connect for `loginReal` (OMS ISDTRAIN)
+# Patch request: SID-based connect for `loginReal` (OMS ORCLSID)
 
 **From:** zdms_portal integration side · **Date:** 2026-10-26
 **Target:** `lib/oracle_thick_client.dart` (`OracleThickClient`)
@@ -10,23 +10,23 @@ service-based:
 
 | Target | Value |
 |---|---|
-| Host:port | `10.1.101.127:1521` (confirmed reachable via raw TCP) |
-| Connect data | **`SID=ISDTRAIN`** (`OMS_DB_DATABASE=ISDTRAIN`, `OMS_DB_SERVICE_NAME` empty) |
-| User | `AWARENESS` |
+| Host:port | `db.example.internal:1521` (confirmed reachable via raw TCP) |
+| Connect data | **`SID=ORCLSID`** (`OMS_DB_DATABASE=ORCLSID`, `OMS_DB_SERVICE_NAME` empty) |
+| User | `APPUSER` |
 | Server version | **11g** (per Laravel `config/oracle.php` → `server_version => '11g'`) |
 
-`oci8` connects with `(DESCRIPTION=(ADDRESS=...)(CONNECT_DATA=(SID=ISDTRAIN)))`.
+`oci8` connects with `(DESCRIPTION=(ADDRESS=...)(CONNECT_DATA=(SID=ORCLSID)))`.
 The thin `package:oracledb` can't (EZ-connect/service only) → `ORA-12514`.
 
 ## What I observed (one live attempt, 2026-10-26)
-`loginReal(serviceName: 'ISDTRAIN')` against the real listener:
+`loginReal(serviceName: 'ORCLSID')` against the real listener:
 ```
 TCP + TNS socket: connected
 ATTEMPT ERROR: Bad state: timed out waiting for a TNS frame
 ```
 The socket connects, the CONNECT is sent, but the listener never returns a usable
 ACCEPT. No credentials were transmitted (the stall is at `parseAccept`, before
-O8LOGON), so **no failed-login hit the `AWARENESS` account** — zero lockout risk.
+O8LOGON), so **no failed-login hit the `APPUSER` account** — zero lockout risk.
 
 Root cause = the two gaps below.
 
@@ -45,8 +45,8 @@ Future<NativeLoginResult> loginReal({
   ...
 ```
 
-With `serviceName: 'ISDTRAIN'` this sends `SERVICE_NAME=ISDTRAIN`; the listener
-has no such **service** (ISDTRAIN is a **SID**) → refuses at CONNECT.
+With `serviceName: 'ORCLSID'` this sends `SERVICE_NAME=ORCLSID`; the listener
+has no such **service** (ORCLSID is a **SID**) → refuses at CONNECT.
 
 ### Requested change
 Let the caller specify a SID (or a full connect-data override). Suggested
@@ -90,13 +90,13 @@ negotiation may differ on 11g. Please treat first real-11g contact as its own
 checkpoint.
 
 ## Acceptance criteria
-1. `loginReal(sid: 'ISDTRAIN', ...)` emits `(CONNECT_DATA=(SID=ISDTRAIN)...)`.
+1. `loginReal(sid: 'ORCLSID', ...)` emits `(CONNECT_DATA=(SID=ORCLSID)...)`.
 2. A wrong connect-string yields a clean `ORA-xxxxx` (no timeout/hang).
 3. Existing `serviceName:` callers and the gated 8-test real-Oracle suite stay green.
-4. (Stretch) a documented result of a real 11g login attempt against ISDTRAIN.
+4. (Stretch) a documented result of a real 11g login attempt against ORCLSID.
 
 ## How I'll re-verify (read-only, my side)
-A one-shot probe: `OracleThickClient.connect(1521, host:'10.1.101.127')` →
-`loginReal(username:'AWARENESS', password: <from .env>, sid:'ISDTRAIN')` →
+A one-shot probe: `OracleThickClient.connect(1521, host:'db.example.internal')` →
+`loginReal(username:'APPUSER', password: <from .env>, sid:'ORCLSID')` →
 `queryReal('SELECT 1 FROM dual')`. Single attempt only (lockout-safe); creds read
 from `.env`, never logged.

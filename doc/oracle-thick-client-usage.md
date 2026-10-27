@@ -49,8 +49,8 @@ otherwise):
 await client.loginReal(username: u, password: p, serviceName: 'FREEPDB1');
 
 // SID-based — reaches the instance / CDB root; required for pre-12c DBs that
-// only register a SID (e.g. OMS `ISDTRAIN`):
-await client.loginReal(username: u, password: p, sid: 'ISDTRAIN');
+// only register a SID (e.g. OMS `ORCLSID`):
+await client.loginReal(username: u, password: p, sid: 'ORCLSID');
 ```
 
 | Connect data | Descriptor sent | Reaches |
@@ -97,7 +97,7 @@ is safe to point at an account with a lockout policy. It returns the listener's
 negotiated capabilities, or an `ORA-xxxxx` on REFUSE:
 
 ```dart
-final info = await client.probeConnect(sid: 'ISDTRAIN');
+final info = await client.probeConnect(sid: 'ORCLSID');
 // info.accepted, info.version, info.supportsFastAuth, info.sdu
 ```
 
@@ -250,8 +250,8 @@ stays green:
 RUN_ORACLE_TESTS=true dart test test/oracle_real_login_test.dart
 
 # Override target (host/port/user/password/service or SID):
-RUN_ORACLE_TESTS=true ORACLE_HOST=10.1.101.127 ORACLE_SID=ISDTRAIN \
-  ORACLE_USER=AWARENESS ORACLE_PASSWORD=*** dart test test/oracle_real_login_test.dart
+RUN_ORACLE_TESTS=true ORACLE_HOST=db.example.internal ORACLE_SID=ORCLSID \
+  ORACLE_USER=APPUSER ORACLE_PASSWORD=*** dart test test/oracle_real_login_test.dart
 ```
 
 ## One-off login runner (`tool/oracle_login.dart`)
@@ -264,9 +264,9 @@ of read-only validation queries. It never prints the password.
 ```bash
 # .env (gitignored) — fill in the values:
 #   RUN_ORACLE_LOGIN=true
-#   ORACLE_HOST=10.1.101.127
+#   ORACLE_HOST=db.example.internal
 #   ORACLE_PORT=1521
-#   ORACLE_SID=ISDTRAIN          # or ORACLE_SERVICE=...
+#   ORACLE_SID=ORCLSID          # or ORACLE_SERVICE=...
 #   ORACLE_USER=...
 #   ORACLE_PASSWORD=...
 #   ORACLE_QUERY=SELECT ...      # optional: override the validation query

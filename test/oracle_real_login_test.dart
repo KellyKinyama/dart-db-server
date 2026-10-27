@@ -63,7 +63,7 @@ void main() {
     test('SID-based login authenticates against a real listener', () async {
       // The gvenzl/oracle-free listener registers its CDB instance as a SID
       // ('FREE'), so (CONNECT_DATA=(SID=FREE)) resolves. Override with
-      // ORACLE_SID for other databases (e.g. the OMS ISDTRAIN instance).
+      // ORACLE_SID for other databases (e.g. the OMS ORCLSID instance).
       final host = env['ORACLE_HOST'] ?? '127.0.0.1';
       final port = int.tryParse(env['ORACLE_PORT'] ?? '1521') ?? 1521;
       final user = env['ORACLE_USER'] ?? 'system';
