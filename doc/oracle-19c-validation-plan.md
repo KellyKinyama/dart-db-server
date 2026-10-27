@@ -28,7 +28,7 @@ dropped at the end — nothing touches existing data.
 
 ---
 
-## Phase V0 — Scratch sandbox  ·  Status: TODO
+## Phase V0 — Scratch sandbox  ·  Status: DEFERRED (writes not permitted on target)
 A disposable table the later phases read/write, so no production data is touched.
 
 - [ ] `CREATE TABLE tc_probe (id NUMBER, name VARCHAR2(100), amt NUMBER(12,2), created DATE, note CLOB, blob_col BLOB)`
@@ -81,7 +81,7 @@ Confirms the bind-metadata + ROW_DATA encode path on field version 12.
 Result: positional binds encode/decode correctly on real 19c for every normal
 pattern; only the select-bind-reuse-plus-where-first-bind combination is open.
 
-## Phase V3 — DML + array DML + RETURNING  ·  Status: TODO
+## Phase V3 — DML + array DML + RETURNING  ·  Status: DEFERRED (writes not permitted on target)
 Uses `tc_probe`. Confirms the non-query execute path and row counts.
 
 - [ ] Single INSERT via `executeDml` → rows affected = 1.
@@ -93,7 +93,7 @@ Uses `tc_probe`. Confirms the non-query execute path and row counts.
 
 Expected: counts correct; batch errors carry offset + ORA code.
 
-## Phase V4 — LOBs (CLOB / BLOB)  ·  Status: TODO
+## Phase V4 — LOBs (CLOB / BLOB)  ·  Status: DEFERRED (writes not permitted on target)
 Uses `tc_probe`. Confirms temp-LOB create/write + LOB read on field version 12.
 
 - [ ] Oversized CLOB bind (> 32767 chars) via temp CLOB → stored, read back equal.
@@ -128,8 +128,8 @@ Confirms the embedded describe (no version preamble) + fetch loop on 19c.
 Result: REF CURSOR, implicit results, and multi-cursor OUT binds work on real
 19c; only the inline `CURSOR()`-column variant is open.
 
-## Phase V7 — Teardown & write-up  ·  Status: TODO
-- [ ] `DROP TABLE tc_probe PURGE`.
+## Phase V7 — Teardown & write-up  ·  Status: PARTIAL (read-only phases done; writes deferred)
+- [ ] `DROP TABLE tc_probe PURGE` (only if V0/V3/V4 are later run).
 - [ ] Mark the verified matrix in
       [oracle-thick-client-spec-plan.md](oracle-thick-client-spec-plan.md)
       Phase T8 (which paths are now 19c-verified).
