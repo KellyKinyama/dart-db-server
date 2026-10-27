@@ -910,6 +910,16 @@ class OracleThickClient {
     _realDataFlags = accept.supportsEndOfRequest ? hs.tnsDataFlagsEndOfRpc : 0;
     _sdu = accept.sdu;
 
+    // Pre-23ai listeners (11g/12c/19c without FAST_AUTH, ACCEPT flag2 clear)
+    // negotiate PROTOCOL / DATA-TYPES / AUTH as separate round trips.
+    if (!accept.supportsFastAuth) {
+      return _loginNonFastAuth(
+          username: username,
+          password: password,
+          endOfRequest: accept.supportsEndOfRequest,
+          alterSession: alterSession);
+    }
+
     _send(hs.buildFastAuthMessage(
         username: username, endOfRequest: accept.supportsEndOfRequest));
     final bundle = _ttcBody(await _frames.next());
@@ -932,6 +942,68 @@ class OracleThickClient {
     final ora = RegExp(r'ORA-\d{5}').firstMatch(txt);
     if (ora != null) {
       return NativeLoginResult(authenticated: false, params: {'error': ora.group(0)!});
+    }
+    final params = hs.parseAuthParams(ReadBuffer(resp2)).pairs;
+    return NativeLoginResult(
+      authenticated: o8.verifyServerResponse(params['AUTH_SVR_RESPONSE']),
+      params: params,
+    );
+  }
+
+  /// The pre-23ai login path for listeners that do not advertise FAST_AUTH
+  /// (e.g. Oracle 11g/12c/19c): PROTOCOL, DATA-TYPES and AUTH_PHASE_ONE/TWO are
+  /// exchanged as separate round trips rather than one bundled message. Uses the
+  /// same canonical O8LOGON (12c PBKDF2) proof; the server must therefore expose
+  /// a 12c verifier (an 11g-only verifier yields an `AUTH_PBKDF2`-less challenge,
+  /// surfaced as an error rather than a wrong-password lockout attempt).
+  Future<NativeLoginResult> _loginNonFastAuth({
+    required String username,
+    required String password,
+    required bool endOfRequest,
+    String? alterSession,
+  }) async {
+    _send(hs.buildProtocolMessage());
+    await _frames.next(); // PROTOCOL response (type 1)
+    _send(hs.buildDataTypesMessage(endOfRequest: endOfRequest));
+    await _frames.next(); // DATA-TYPES response (type 2)
+
+    _send(hs.buildAuthPhaseOneMessage(username: username));
+    final challengeBody = _ttcBody(await _frames.next());
+    final oraOne = RegExp(r'ORA-\d{5}').firstMatch(
+        String.fromCharCodes(challengeBody.where((b) => b >= 32 && b < 127)));
+    if (oraOne != null) {
+      return NativeLoginResult(
+          authenticated: false, params: {'error': oraOne.group(0)!});
+    }
+    final challenge = hs.parseAuthChallenge(challengeBody);
+    if (challenge == null) {
+      return NativeLoginResult(authenticated: false, params: const {
+        'error': 'no AUTH challenge in phase-one response'
+      });
+    }
+    if (!challenge.pairs.containsKey('AUTH_PBKDF2_VGEN_COUNT')) {
+      return NativeLoginResult(authenticated: false, params: const {
+        'error': 'server offered only a pre-12c (O5LOGON) verifier, '
+            'which this client does not implement'
+      });
+    }
+
+    final o8 = hs.computeO8Logon(password, challenge.pairs);
+    final tz = alterSession ?? "ALTER SESSION SET TIME_ZONE='+00:00'\u0000";
+    _send(hs.buildAuthPhaseTwoMessage(
+      username: username,
+      sessionKeyHex: o8.sessionKeyHex,
+      authPasswordHex: o8.authPasswordHex,
+      speedyKeyHex: o8.speedyKeyHex,
+      alterSession: tz,
+      includeToken: false, // pre-23ai: no fast-auth token field
+    ));
+    final resp2 = _ttcBody(await _frames.next());
+    final txt = String.fromCharCodes(resp2.where((b) => b >= 32 && b < 127));
+    final ora = RegExp(r'ORA-\d{5}').firstMatch(txt);
+    if (ora != null) {
+      return NativeLoginResult(
+          authenticated: false, params: {'error': ora.group(0)!});
     }
     final params = hs.parseAuthParams(ReadBuffer(resp2)).pairs;
     return NativeLoginResult(

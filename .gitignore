@@ -10,6 +10,11 @@ memory.lock
 *.log
 mydatabase.json
 
+# Local credentials (NEVER commit)
+.env
+.env.*
+!.env.example
+
 
 # Runtime vector-store data
 kb_vectors.json

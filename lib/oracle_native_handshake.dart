@@ -166,11 +166,7 @@ Uint8List buildFastAuthMessage({
   b.writeUint8(0); // flag2
 
   // Embedded PROTOCOL (with msg-type prefix, per thin driver).
-  b.writeUint8(ttcMsgTypeProtocol);
-  b.writeUint8(ttcProtocolVersion);
-  b.writeUint8(0);
-  b.writeBytes(Uint8List.fromList(utf8.encode(clientDriverName)));
-  b.writeUint8(0);
+  _writeProtocol(b);
 
   // Server charset fields (unused in client message).
   b.writeUint16BE(0);
@@ -179,6 +175,47 @@ Uint8List buildFastAuthMessage({
   b.writeUint8(fastAuthFieldVersion);
 
   // Embedded DATA-TYPES.
+  _writeDataTypes(b, endOfRequest);
+
+  // Embedded AUTH_PHASE_ONE.
+  _writeAuthPhaseOne(b, username, sequence);
+  return b.toBytes();
+}
+
+/// Standalone PROTOCOL negotiation message (type 1) for the non-fast-auth
+/// (pre-23ai) handshake, where PROTOCOL / DATA-TYPES / AUTH are sent as
+/// separate round trips instead of one bundled FAST_AUTH message.
+Uint8List buildProtocolMessage() {
+  final b = WriteBuffer();
+  _writeProtocol(b);
+  return b.toBytes();
+}
+
+/// Standalone DATA-TYPES message (type 2) for the non-fast-auth handshake.
+Uint8List buildDataTypesMessage({bool endOfRequest = false}) {
+  final b = WriteBuffer();
+  _writeDataTypes(b, endOfRequest);
+  return b.toBytes();
+}
+
+/// Standalone AUTH_PHASE_ONE message (type 3 / func 0x76) for the non-fast-auth
+/// handshake — requests the O8LOGON challenge for [username].
+Uint8List buildAuthPhaseOneMessage(
+    {required String username, int sequence = 1}) {
+  final b = WriteBuffer();
+  _writeAuthPhaseOne(b, username, sequence);
+  return b.toBytes();
+}
+
+void _writeProtocol(WriteBuffer b) {
+  b.writeUint8(ttcMsgTypeProtocol);
+  b.writeUint8(ttcProtocolVersion);
+  b.writeUint8(0);
+  b.writeBytes(Uint8List.fromList(utf8.encode(clientDriverName)));
+  b.writeUint8(0);
+}
+
+void _writeDataTypes(WriteBuffer b, bool endOfRequest) {
   b.writeUint8(ttcMsgTypeDataTypes);
   b.writeUint16LE(ttcCharsetUtf8);
   b.writeUint16LE(ttcCharsetUtf8);
@@ -196,10 +233,6 @@ Uint8List buildFastAuthMessage({
     b.writeUint16BE(0);
   }
   b.writeUint16BE(0); // terminator
-
-  // Embedded AUTH_PHASE_ONE.
-  _writeAuthPhaseOne(b, username, sequence);
-  return b.toBytes();
 }
 
 void _writeAuthPhaseOne(WriteBuffer b, String username, int sequence) {
@@ -227,12 +260,13 @@ Uint8List buildAuthPhaseTwoMessage({
   String? speedyKeyHex,
   required String alterSession,
   int sequence = 2,
+  bool includeToken = true,
 }) {
   final b = WriteBuffer();
   b.writeUint8(ttcMsgTypeFunction);
   b.writeUint8(ttcAuthPhaseTwo);
   b.writeUint8(sequence & 0xFF);
-  b.writeUB8(0); // token number (23ai fast-auth)
+  if (includeToken) b.writeUB8(0); // token number (23ai fast-auth only)
   const authMode = ttcAuthModeLogon | ttcAuthModeWithPassword;
   final user = Uint8List.fromList(utf8.encode(username));
   b.writeUint8(user.isNotEmpty ? 1 : 0);
@@ -303,6 +337,23 @@ AuthParams? findAuthChallenge(Uint8List body) {
   final r = ReadBuffer(body);
   skipProtocolResponse(r);
   for (var p = r.position; p < body.length; p++) {
+    if (body[p] != 8) continue;
+    try {
+      final ap = parseAuthParams(ReadBuffer(Uint8List.sublistView(body, p)));
+      if (ap.pairs.containsKey('AUTH_VFR_DATA') &&
+          ap.pairs.containsKey('AUTH_SESSKEY')) {
+        return ap;
+      }
+    } catch (_) {/* not the auth message */}
+  }
+  return null;
+}
+
+/// Locates and parses a standalone AUTH parameter message (type 8) anywhere in
+/// a non-fast-auth AUTH_PHASE_ONE response [body] (no PROTOCOL prefix to skip).
+/// Returns null when no valid auth challenge is present.
+AuthParams? parseAuthChallenge(Uint8List body) {
+  for (var p = 0; p < body.length; p++) {
     if (body[p] != 8) continue;
     try {
       final ap = parseAuthParams(ReadBuffer(Uint8List.sublistView(body, p)));
