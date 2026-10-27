@@ -193,5 +193,40 @@ void main() {
       expect(_contains(reuse, utf8.encode(sql)), isFalse);
       expect(reuse.length, lessThan(fresh.length));
     });
+
+    test('fresh query parse (cursorId 0) sets PARSE and embeds the SQL', () {
+      const sql = 'SELECT a FROM t';
+      final fresh = buildQueryExecute(sql, ttcFieldVersion: 12);
+      final (opts, cursor) = _optsAndCursor12(fresh);
+      expect(opts & 0x01, 0x01); // PARSE
+      expect(opts & 0x20, 0x20); // EXECUTE
+      expect(cursor, 0);
+      expect(_contains(fresh, utf8.encode(sql)), isTrue);
+    });
+
+    test('cached re-execute still re-sends bind metadata and values', () {
+      const sql = 'SELECT :1 FROM dual';
+      final reuseNoBind =
+          buildQueryExecute(sql, cursorId: 7, ttcFieldVersion: 12);
+      final reuseWithBind = buildQueryExecute(sql,
+          binds: [1], cursorId: 7, ttcFieldVersion: 12);
+      // The bound re-execute carries the extra bind metadata + ROW_DATA block
+      // (new values are sent on every execute, cached cursor or not) and sets
+      // the BIND option bit.
+      expect(reuseWithBind.length, greaterThan(reuseNoBind.length));
+      expect(_options12(reuseWithBind) & 0x08, 0x08); // BIND
+      expect(_options12(reuseNoBind) & 0x08, 0);
+    });
+
+    test('token appears iff field version >= 18 (the 23.1-ext1 threshold)', () {
+      const sql = 'SELECT 1 FROM dual';
+      final v17 = buildQueryExecute(sql, ttcFieldVersion: 17);
+      final v18 = buildQueryExecute(sql, ttcFieldVersion: 18);
+      // 17 < 18: no token. 18 >= 18: a single UB8(0) token byte at offset 3.
+      expect(v18.length, v17.length + 1);
+      expect(v18[3], 0);
+      expect(Uint8List.fromList([...v18.sublist(0, 3), ...v18.sublist(4)]),
+          equals(v17));
+    });
   });
 }
