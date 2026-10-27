@@ -204,9 +204,9 @@ round-tripped on real Oracle in `test/oracle_real_login_test.dart`.
 - [ ] A behavioral parity pass vs `reference/node-oracledb` / the thin
   `../dart-oracledb` driver for the above.
 
-## Phase T8 — Pre-23ai (12c/18c/19c) compatibility  ·  Status: LANDED (login + query, works vs real 19c)
-Validated end-to-end against a live Oracle **19c** listener (SID connect,
-authenticate, query/fetch). Three pieces were needed beyond the 23ai path:
+## Phase T8 — Pre-23ai (12c/18c/19c/21c) compatibility  ·  Status: LANDED (read + write, works vs real 19c & 21c)
+Validated end-to-end against a live Oracle **19c** listener (reads) and a local
+**21c XE** container (reads + writes). Pieces needed beyond the 23ai path:
 - [x] **SID connect + TNS RESEND / REDIRECT** (`_connectAndRead`): older
   listeners answer the first CONNECT with a RESEND (resend the identical
   CONNECT) and may REDIRECT to another host:port. Also fixes the SDU framing —
@@ -240,12 +240,31 @@ authenticate, query/fetch). Three pieces were needed beyond the 23ai path:
   - REF CURSOR, nested `CURSOR()` columns, implicit results, multi-cursor OUT.
 - [x] **Nested `CURSOR()` column on pre-23ai**: `_decodeColumnValue` hardcoded
   field version 24 for the embedded describe; now uses the negotiated version.
-- Three edge cases found; one fixed (nested cursor), two proven *not* driver
-  bugs: a bare untyped `SELECT NULL` (degenerate VARCHAR2(0)) and a numbered
-  select-list bind reused in WHERE with a WHERE-first bind (byte-identical
-  request to a passing query → Oracle-side quirk).
-- [ ] DML / LOBs against 19c (write phases deferred — no writes on the prod
-  target; implemented and 23ai-proven).
+- [x] **Untyped `NULL` / `''` literal**: Oracle types it as a degenerate
+  VARCHAR2(0) that carries no row-data bytes; the decoder now treats a zero-size
+  *character* column as null (a NUMBER literal also describes size 0 on 21c but
+  carries a value, so the guard is char-type-only).
+- [x] **DML / LOBs live-validated on a local Oracle 21c XE** container (pre-23ai,
+  field version 16): DDL, INSERT, array DML, UPDATE, RETURNING, batch errors,
+  and oversized CLOB/BLOB temp-LOB binds all round-trip. Surfaced the LOB
+  response ERROR-termination fix for pre-23ai.
+- Remaining edge case proven *not* a driver bug: a numbered select-list bind
+  reused in WHERE with a WHERE-first bind (`ORA-01008`) — byte-identical request
+  to a passing query, and reproduces on both 19c and 21c (Oracle-side quirk).
+
+### Cross-version validation matrix
+| Capability | 23ai/26ai | 21c XE (fv16) | 19c ISDTRAIN (fv12) |
+|---|---|---|---|
+| Non-fast-auth / FAST_AUTH login (SID + service) | FAST_AUTH | non-fast-auth ✓ | non-fast-auth ✓ |
+| SELECT decode (all scalar types) | ✓ | ✓ | ✓ |
+| Positional binds | ✓ | ✓ | ✓ |
+| Multi-fetch pagination | ✓ | ✓ | ✓ |
+| PL/SQL IN/OUT/IN OUT | ✓ | ✓ | ✓ |
+| REF CURSOR / nested / implicit / multi-cursor | ✓ | ✓ | ✓ |
+| Statement cache (cursor reuse) | ✓ (gated) | — | ✓ |
+| DML / array DML / RETURNING / batch errors | ✓ (gated) | ✓ (live) | dry-run + encoding |
+| Oversized CLOB/BLOB binds (temp LOB) | ✓ (gated) | ✓ (live) | dry-run |
+
 - [ ] Legacy (pre-12c, O5LOGON-only) verifier support for true 11g accounts.
 
 ## Test harness
