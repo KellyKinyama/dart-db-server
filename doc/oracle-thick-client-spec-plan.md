@@ -226,8 +226,22 @@ authenticate, query/fetch). Three pieces were needed beyond the 23ai path:
   final RPC status (`ORA-01403` = end of fetch, or 0) and terminates the
   response; 23ai repeats it with END_OF_RESPONSE but pre-23ai sends nothing
   after, so `_processError` now sets `endOfResponse` (correct for both).
-- [ ] Verify binds / NUMBER decode / DML / LOBs / PL/SQL / REF CURSOR against
-  19c (implemented and 23ai-proven; field-version-12 paths unverified there).
+- [x] **Read-surface verified on live 19c** (field version 12), via
+  `tool/oracle_login.dart` — see
+  [oracle-19c-validation-plan.md](oracle-19c-validation-plan.md):
+  - SELECT decode: NUMBER, VARCHAR2/CHAR, NCHAR, DATE/TS/TSTZ/LTZ, INTERVAL
+    DS/YM, BINARY_FLOAT/DOUBLE, RAW, ROWID, typed NULLs, multi-row.
+  - Positional binds (scalars, RAW, arithmetic, WHERE-only, reuse).
+  - PL/SQL IN / OUT / IN OUT binds.
+  - REF CURSOR, nested `CURSOR()` columns, implicit results, multi-cursor OUT.
+- [x] **Nested `CURSOR()` column on pre-23ai**: `_decodeColumnValue` hardcoded
+  field version 24 for the embedded describe; now uses the negotiated version.
+- Three edge cases found; one fixed (nested cursor), two proven *not* driver
+  bugs: a bare untyped `SELECT NULL` (degenerate VARCHAR2(0)) and a numbered
+  select-list bind reused in WHERE with a WHERE-first bind (byte-identical
+  request to a passing query → Oracle-side quirk).
+- [ ] DML / LOBs against 19c (write phases deferred — no writes on the prod
+  target; implemented and 23ai-proven).
 - [ ] Legacy (pre-12c, O5LOGON-only) verifier support for true 11g accounts.
 
 ## Test harness

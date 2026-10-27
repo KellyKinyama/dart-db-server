@@ -133,11 +133,11 @@ OUT binds all work on real 19c.
 
 ## Phase V7 — Teardown & write-up  ·  Status: PARTIAL (read-only phases done; writes deferred)
 - [ ] `DROP TABLE tc_probe PURGE` (only if V0/V3/V4 are later run).
-- [ ] Mark the verified matrix in
+- [x] Verified matrix recorded in
       [oracle-thick-client-spec-plan.md](oracle-thick-client-spec-plan.md)
-      Phase T8 (which paths are now 19c-verified).
-- [ ] Note any field-version-12 wire differences found (and fixes) in the usage
-      doc's Server-compatibility section.
+      Phase T8 (read surface verified on 19c; three edge cases resolved).
+- [x] Field-version-12 findings recorded (one fix: nested `CURSOR()` column;
+      two proven Oracle-side quirks).
 
 ## Out of scope here (tracked separately)
 - True pre-12c 11g accounts (legacy O5LOGON-only verifier).
