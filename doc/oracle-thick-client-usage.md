@@ -5,8 +5,8 @@ speaks the Oracle TTC wire protocol directly (connect, O8LOGON auth, OALL8
 execute/fetch, LOB ops) with no OCI/Instant Client and no external packages. It
 is the counterpart to the thin `package:oracledb` driver, and is validated
 against real Oracle across versions — the FAST_AUTH path on **23ai/26ai**
-(Docker `gvenzl/oracle-free`) and the classic non-fast-auth path on a live
-**19c** server (SID connect, login, and query/fetch). See
+(Docker `gvenzl/oracle-free`) and the classic non-fast-auth path on **21c XE**
+(reads + writes) and a live **19c** server (SID connect, reads). See
 [oracle-thick-client-spec-plan.md](oracle-thick-client-spec-plan.md) for the
 protocol details and phase history.
 
@@ -78,7 +78,7 @@ no version flag is needed:
 
 - **23ai / 26ai** advertise FAST_AUTH: PROTOCOL, DATA-TYPES and AUTH_PHASE_ONE
   are bundled into one round trip.
-- **Pre-23ai (12c/18c/19c)** do not advertise FAST_AUTH: the client sends
+- **Pre-23ai (12c/18c/19c/21c)** do not advertise FAST_AUTH: the client sends
   PROTOCOL, DATA-TYPES and AUTH_PHASE_ONE/TWO as separate round trips, and
   resends the CONNECT if the listener asks for it (TNS RESEND). Both paths use
   the same O8LOGON (12c PBKDF2) proof, so the account needs a 12c verifier
@@ -87,8 +87,17 @@ no version flag is needed:
 
 The **TTC field version** is negotiated from the server's PROTOCOL response and
 bounds the OALL8 execute/fetch/LOB wire shape, so the same `queryReal` /
-`executeDml` / `callPlsql` calls work unchanged against a 19c server
-(field version 12) and a 26ai server (field version 24).
+`executeDml` / `callPlsql` calls work unchanged across versions — a 19c server
+(field version 12), a 21c server (field version 16), and a 26ai server
+(field version 24).
+
+> **Validated versions.** Read *and* write paths are exercised against real
+> Oracle on three releases: **23ai/26ai** (FAST_AUTH, gated suite), **21c XE**
+> (non-fast-auth, reads + writes live), and **19c** (non-fast-auth over SID,
+> reads live). See
+> [oracle-19c-validation-plan.md](oracle-19c-validation-plan.md) and the
+> cross-version matrix in
+> [oracle-thick-client-spec-plan.md](oracle-thick-client-spec-plan.md).
 
 ### Probing a listener without credentials
 
