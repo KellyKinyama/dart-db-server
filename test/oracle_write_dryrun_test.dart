@@ -67,6 +67,22 @@ void main() {
       _expectTokenInvariant(v12, v24);
     });
 
+    test('array DML emits exactly one ROW_DATA iteration per bulk row', () {
+      final template = [NativeBind.value(0)];
+      Uint8List build(int n) => buildDmlExecute(
+          'INSERT INTO t (id) VALUES (:1)', template,
+          // Identical value per row so each ROW_DATA block is the same size;
+          // the only length change between N and M rows is the iteration count.
+          bulkRows: [for (var i = 0; i < n; i++) const [5]],
+          ttcFieldVersion: 12);
+      final one = build(1);
+      final three = build(3);
+      final seven = build(7);
+      // Linear growth: 6 extra rows add exactly 3x the bytes of 2 extra rows.
+      expect(three.length, greaterThan(one.length));
+      expect(seven.length - one.length, 3 * (three.length - one.length));
+    });
+
     test('DML RETURNING keeps the invariant', () {
       final binds = [NativeBind.value('x'), NativeBind.outNumber()];
       final v12 = buildDmlExecute(
