@@ -38,7 +38,9 @@ const int _tnsHeaderSize = 8;
 const int _tnsPacketConnect = 1;
 const int _tnsPacketAccept = 2;
 const int _tnsPacketRefuse = 4;
+const int _tnsPacketRedirect = 5;
 const int _tnsPacketData = 6;
+const int _tnsPacketResend = 11;
 const int _tnsPacketMarker = 12;
 const int _ttcMsgTypeFunction = 3;
 const int _ttcAuthPhaseOne = 0x76;
@@ -213,10 +215,9 @@ class _FrameReader {
       final len = _largeSdu
           ? (_buf[0] << 24) | (_buf[1] << 16) | (_buf[2] << 8) | _buf[3]
           : (_buf[0] << 8) | _buf[1];
-      if (_buf.length < len) break;
+      if (len <= 0 || _buf.length < len) break;
       final frame = Uint8List.fromList(Uint8List.sublistView(_buf, 0, len));
       _buf = Uint8List.fromList(Uint8List.sublistView(_buf, len));
-      _largeSdu = true; // the ACCEPT is the only 2-byte reply
       if (_waiters.isNotEmpty) {
         _waiters.removeAt(0).complete(frame);
       } else {
@@ -224,6 +225,11 @@ class _FrameReader {
       }
     }
   }
+
+  /// Switches to 4-byte large-SDU framing for DATA packets. The CONNECT
+  /// handshake (CONNECT/ACCEPT/RESEND/REDIRECT) is always 2-byte framed; only
+  /// servers that negotiated version >= 315 use large SDU for DATA afterwards.
+  void enableLargeSdu() => _largeSdu = true;
 
   Future<Uint8List> next() {
     if (_queue.isNotEmpty) return Future.value(_queue.removeAt(0));
@@ -418,6 +424,43 @@ class NativeLoginResult {
 
   /// The session parameters the server returned on success (empty on failure).
   final Map<String, String> params;
+}
+
+/// The outcome of [OracleThickClient.probeConnect] — the listener's reply to a
+/// credential-free CONNECT (lockout-safe).
+class NativeConnectInfo {
+  NativeConnectInfo({
+    required this.accepted,
+    this.version,
+    this.supportsFastAuth = false,
+    this.supportsEndOfRequest = false,
+    this.sdu,
+    this.error,
+  });
+
+  /// Whether the listener returned an ACCEPT (vs a REFUSE/other).
+  final bool accepted;
+
+  /// Negotiated TNS protocol version (e.g. 319 for 23ai+).
+  final int? version;
+
+  /// Whether the server advertised FAST_AUTH (bundled auth; 23ai+).
+  final bool supportsFastAuth;
+
+  /// Whether the server advertised the END_OF_REQUEST capability (23.4+).
+  final bool supportsEndOfRequest;
+
+  /// Negotiated SDU.
+  final int? sdu;
+
+  /// The `ORA-xxxxx` (or a short message) when [accepted] is false.
+  final String? error;
+
+  @override
+  String toString() => accepted
+      ? 'ACCEPT version=$version fastAuth=$supportsFastAuth '
+          'endOfRequest=$supportsEndOfRequest sdu=$sdu'
+      : 'REFUSE error=$error';
 }
 
 /// An `ORA-xxxxx` error surfaced by a native EXECUTE.
@@ -637,8 +680,9 @@ int _readRow(Uint8List body, int pos, int ncols, List<bool> isNumber,
 class OracleThickClient {
   OracleThickClient._(this._socket, this._frames);
 
-  final Socket _socket;
-  final _FrameReader _frames;
+  // Reassigned on a CONNECT REDIRECT (reconnect to the redirected host:port).
+  Socket _socket;
+  _FrameReader _frames;
 
   /// Data flags applied to each DATA packet after a real-Oracle [loginReal]
   /// (0x0800 END_OF_RPC on 23ai+). 0 for the dart-db-server flow.
@@ -706,7 +750,8 @@ class OracleThickClient {
     if (!inlineDescriptor) {
       _socket.add(buildDescriptorPacket(descriptor: descriptor));
     }
-    await _frames.next(); // ACCEPT
+    final acceptFrame = await _frames.next(); // ACCEPT
+    if (hs.parseAccept(acceptFrame).useLargeSdu) _frames.enableLargeSdu();
     _socket.add(buildResetMarker());
     await _frames.next(); // RESET reply
     _socket.add(_wrapData(
@@ -738,6 +783,91 @@ class OracleThickClient {
     );
   }
 
+  /// Sends the inline CONNECT for [descriptor] and returns the listener's first
+  /// real reply (ACCEPT / REFUSE / …), handling TNS **RESEND** packets (the
+  /// listener — common on older servers — asks the client to resend the
+  /// CONNECT) and following one **REDIRECT** to a new host:port.
+  Future<Uint8List> _connectAndRead(String descriptor) async {
+    final connect = buildNativeConnect(
+        descriptor: descriptor, inline: true, versionDesired: 319);
+    _socket.add(connect);
+    var frame = await _frames.next();
+    var guard = 0;
+    while (guard++ < 8) {
+      final type = frame.length > 4 ? frame[4] : 0;
+      if (type == _tnsPacketResend) {
+        _socket.add(connect); // resend the identical CONNECT
+        frame = await _frames.next();
+        continue;
+      }
+      if (type == _tnsPacketRedirect) {
+        // REDIRECT body is the new (DESCRIPTION=(ADDRESS=…)) — reconnect there.
+        final body = String.fromCharCodes(
+            Uint8List.sublistView(frame, _tnsHeaderSize)
+                .where((b) => b >= 32 && b < 127));
+        final redirect = await _followRedirect(body, descriptor);
+        if (redirect != null) {
+          frame = redirect;
+          continue;
+        }
+      }
+      return frame;
+    }
+    return frame;
+  }
+
+  /// Reconnects to the host:port in a REDIRECT [body] and sends the CONNECT
+  /// there, returning that listener's reply. Returns null if no address is
+  /// parseable.
+  Future<Uint8List?> _followRedirect(String body, String descriptor) async {
+    final host = RegExp(r'HOST=([^)]+)').firstMatch(body)?.group(1);
+    final port = int.tryParse(
+        RegExp(r'PORT=(\d+)').firstMatch(body)?.group(1) ?? '');
+    if (host == null || port == null) return null;
+    await _frames.cancel();
+    await _socket.close();
+    _socket = await Socket.connect(host, port);
+    _frames = _FrameReader(_socket);
+    final connect = buildNativeConnect(
+        descriptor: descriptor, inline: true, versionDesired: 319);
+    _socket.add(connect);
+    return _frames.next();
+  }
+
+  /// Sends only the CONNECT and reads the listener's reply — **no credentials
+  /// are transmitted**, so this is a lockout-safe reachability/negotiation
+  /// probe. Returns the negotiated protocol version + capabilities on ACCEPT,
+  /// or the embedded `ORA-xxxxx` on a listener REFUSE (wrong service/SID).
+  ///
+  /// Pass exactly one of [serviceName] or [sid]. After this probe the socket
+  /// has only completed CONNECT; open a fresh client for a real [loginReal].
+  Future<NativeConnectInfo> probeConnect(
+      {String? serviceName, String? sid}) async {
+    if ((serviceName == null) == (sid == null)) {
+      throw ArgumentError('pass exactly one of serviceName / sid');
+    }
+    final connectData = sid != null ? 'SID=$sid' : 'SERVICE_NAME=$serviceName';
+    final descriptor = '(DESCRIPTION=(CONNECT_DATA=($connectData)'
+        '(CID=(PROGRAM=dart-thick)(HOST=localhost)(USER=probe))))';
+    final frame = await _connectAndRead(descriptor);
+    final type = frame.length > 4 ? frame[4] : 0;
+    if (type == _tnsPacketRefuse) {
+      return NativeConnectInfo(accepted: false, error: _refuseError(frame));
+    }
+    if (type != _tnsPacketAccept) {
+      return NativeConnectInfo(
+          accepted: false, error: 'unexpected TNS packet type $type');
+    }
+    final accept = hs.parseAccept(frame);
+    return NativeConnectInfo(
+      accepted: true,
+      version: accept.version,
+      supportsFastAuth: accept.supportsFastAuth,
+      supportsEndOfRequest: accept.supportsEndOfRequest,
+      sdu: accept.sdu,
+    );
+  }
+
   /// Authenticates against a **real Oracle** listener (19c+/21c/23ai/26ai) using
   /// the inline CONNECT + FAST_AUTH flow and the canonical O8LOGON proof — the
   /// path a genuine OCI/thin client uses, distinct from the dart-db-server
@@ -761,9 +891,7 @@ class OracleThickClient {
     final connectData = sid != null ? 'SID=$sid' : 'SERVICE_NAME=$serviceName';
     final descriptor = '(DESCRIPTION=(CONNECT_DATA=($connectData)'
         '(CID=(PROGRAM=dart-thick)(HOST=localhost)(USER=$username))))';
-    _socket.add(
-        buildNativeConnect(descriptor: descriptor, inline: true, versionDesired: 319));
-    final firstFrame = await _frames.next();
+    final firstFrame = await _connectAndRead(descriptor);
     final frameType = firstFrame.length > 4 ? firstFrame[4] : 0;
     if (frameType == _tnsPacketRefuse) {
       // The listener refused the CONNECT (e.g. ORA-12514 unknown service,
@@ -778,6 +906,7 @@ class OracleThickClient {
       });
     }
     final accept = hs.parseAccept(firstFrame);
+    if (accept.useLargeSdu) _frames.enableLargeSdu();
     _realDataFlags = accept.supportsEndOfRequest ? hs.tnsDataFlagsEndOfRpc : 0;
     _sdu = accept.sdu;
 

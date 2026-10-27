@@ -98,6 +98,32 @@ void main() {
       }
     });
 
+    test('probeConnect reports ACCEPT negotiation without sending credentials',
+        () async {
+      final host = env['ORACLE_HOST'] ?? '127.0.0.1';
+      final port = int.tryParse(env['ORACLE_PORT'] ?? '1521') ?? 1521;
+      final service = env['ORACLE_SERVICE'] ?? 'FREEPDB1';
+
+      final good = await OracleThickClient.connect(port, host: host);
+      try {
+        final info = await good.probeConnect(serviceName: service);
+        expect(info.accepted, isTrue);
+        expect(info.version, greaterThan(0));
+      } finally {
+        await good.close();
+      }
+
+      // An unknown SID is refused with an ORA code, not accepted.
+      final bad = await OracleThickClient.connect(port, host: host);
+      try {
+        final refused = await bad.probeConnect(sid: 'NOSUCHSID');
+        expect(refused.accepted, isFalse);
+        expect(refused.error, startsWith('ORA-'));
+      } finally {
+        await bad.close();
+      }
+    });
+
     test('canonical OALL8 query returns rows from real Oracle', () async {
       final host = env['ORACLE_HOST'] ?? '127.0.0.1';
       final port = int.tryParse(env['ORACLE_PORT'] ?? '1521') ?? 1521;
