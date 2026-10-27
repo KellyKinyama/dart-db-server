@@ -53,11 +53,12 @@ Read-only, no table needed. Confirms each scalar decoder on field version 12.
 - [x] ROWID → `String`.
 - [x] **Typed** NULLs: `CAST(NULL AS NUMBER)` / `CAST(NULL AS VARCHAR2)` → `null`.
 - [x] Multi-row fetch (`CONNECT BY LEVEL <= 5`) → 5 rows.
-- [ ] **KNOWN LIMITATION:** a bare **untyped literal** `SELECT NULL FROM dual`
-      (no CAST) fails with `Unknown TTC message type: 46` — Oracle assigns the
-      literal a special internal type whose describe/row shape the decoder
-      mis-reads on field version 12. Not a real-world pattern (typed NULLs are
-      fine); tracked as a low-priority decode-robustness fix.
+- [ ] **KNOWN LIMITATION (won't-fix / niche):** a bare **untyped literal**
+      `SELECT NULL FROM dual` (no CAST) fails with `Unknown TTC message type`.
+      Root cause: Oracle types the bare literal as a degenerate **VARCHAR2(0)**
+      column, whose row-data shape the decoder mis-reads on field version 12.
+      Not a real-world pattern (every typed NULL works); left as-is to avoid
+      special-casing a degenerate type.
 
 Result: every documented type decodes correctly on real 19c; only the untyped
 `NULL` literal edge case is open.
