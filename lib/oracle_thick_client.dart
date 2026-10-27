@@ -649,6 +649,10 @@ class OracleThickClient {
   /// packets by [_send]. Set from the ACCEPT in [loginReal].
   int _sdu = 8192;
 
+  // Temporary CLOB/BLOB locators created for oversized binds are session-
+  // duration and reclaimed when the connection closes. Eager freeing via a
+  // free-temp piggyback is a follow-up.
+
   /// Fragments a TTC request across DATA packets no larger than the negotiated
   /// SDU. Per Oracle's framing, intermediate packets carry data flags 0x0000
   /// and only the FINAL packet carries [dataFlags] (END_OF_RPC on 23ai+).
