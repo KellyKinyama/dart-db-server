@@ -53,6 +53,10 @@ Read-only, no table needed. Confirms each scalar decoder on field version 12.
 - [x] ROWID → `String`.
 - [x] **Typed** NULLs: `CAST(NULL AS NUMBER)` / `CAST(NULL AS VARCHAR2)` → `null`.
 - [x] Multi-row fetch (`CONNECT BY LEVEL <= 5`) → 5 rows.
+- [x] **Multi-fetch pagination:** 500-row `CONNECT BY` (prefetch 50 → ~10 FETCH
+      round-trips with cursor continuation) → 500 rows.
+- [x] **Real dictionary table:** `SELECT object_name, object_type, created FROM
+      all_objects WHERE ROWNUM <= 250` → 250 rows (VARCHAR2 + DATE) decoded.
 - [ ] **KNOWN LIMITATION (won't-fix / niche):** a bare **untyped literal**
       `SELECT NULL FROM dual` (no CAST) fails with `Unknown TTC message type`.
       Root cause: Oracle types the bare literal as a degenerate **VARCHAR2(0)**
