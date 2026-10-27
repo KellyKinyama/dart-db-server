@@ -4,7 +4,9 @@
 speaks the Oracle TTC wire protocol directly (connect, O8LOGON auth, OALL8
 execute/fetch, LOB ops) with no OCI/Instant Client and no external packages. It
 is the counterpart to the thin `package:oracledb` driver, and is validated
-against real Oracle (Docker `gvenzl/oracle-free`, 26ai) — see
+against real Oracle across versions — the FAST_AUTH path on **23ai/26ai**
+(Docker `gvenzl/oracle-free`) and the classic non-fast-auth path on a live
+**19c** server (SID connect, login, and query/fetch). See
 [oracle-thick-client-spec-plan.md](oracle-thick-client-spec-plan.md) for the
 protocol details and phase history.
 
@@ -69,9 +71,37 @@ final r = await client.loginReal(username: u, password: p, sid: 'NOSUCHSID');
 // r.authenticated == false, r.params['error'] == 'ORA-12505'
 ```
 
-`loginReal` is validated on 19c+/21c/23ai/26ai. Pre-12c servers (11g) may
-negotiate a lower protocol version or an older verifier — treat first 11g
-contact as its own checkpoint.
+## Server compatibility (handshake negotiation)
+
+`loginReal` adapts to the server automatically from the TNS **ACCEPT** packet —
+no version flag is needed:
+
+- **23ai / 26ai** advertise FAST_AUTH: PROTOCOL, DATA-TYPES and AUTH_PHASE_ONE
+  are bundled into one round trip.
+- **Pre-23ai (12c/18c/19c)** do not advertise FAST_AUTH: the client sends
+  PROTOCOL, DATA-TYPES and AUTH_PHASE_ONE/TWO as separate round trips, and
+  resends the CONNECT if the listener asks for it (TNS RESEND). Both paths use
+  the same O8LOGON (12c PBKDF2) proof, so the account needs a 12c verifier
+  (`SEC_CASE_SENSITIVE_LOGON` on by default in 12c+); a server offering only a
+  legacy verifier is reported as an error rather than retried.
+
+The **TTC field version** is negotiated from the server's PROTOCOL response and
+bounds the OALL8 execute/fetch/LOB wire shape, so the same `queryReal` /
+`executeDml` / `callPlsql` calls work unchanged against a 19c server
+(field version 12) and a 26ai server (field version 24).
+
+### Probing a listener without credentials
+
+`probeConnect` performs a **CONNECT-only** handshake (no password sent), so it
+is safe to point at an account with a lockout policy. It returns the listener's
+negotiated capabilities, or an `ORA-xxxxx` on REFUSE:
+
+```dart
+final info = await client.probeConnect(sid: 'ISDTRAIN');
+// info.accepted, info.version, info.supportsFastAuth, info.sdu
+```
+
+Open a fresh client per probe (a listener expects one CONNECT per connection).
 
 ## Queries
 
@@ -223,3 +253,23 @@ RUN_ORACLE_TESTS=true dart test test/oracle_real_login_test.dart
 RUN_ORACLE_TESTS=true ORACLE_HOST=10.1.101.127 ORACLE_SID=ISDTRAIN \
   ORACLE_USER=AWARENESS ORACLE_PASSWORD=*** dart test test/oracle_real_login_test.dart
 ```
+
+## One-off login runner (`tool/oracle_login.dart`)
+
+For a quick manual check against a real listener, `tool/oracle_login.dart`
+reads credentials from a **gitignored `.env`** and performs exactly **one**
+login (so a wrong password cannot be retried into a lockout), then runs a couple
+of read-only validation queries. It never prints the password.
+
+```bash
+# .env (gitignored) — fill in the values:
+#   RUN_ORACLE_LOGIN=true
+#   ORACLE_HOST=10.1.101.127
+#   ORACLE_PORT=1521
+#   ORACLE_SID=ISDTRAIN          # or ORACLE_SERVICE=...
+#   ORACLE_USER=...
+#   ORACLE_PASSWORD=...
+#   ORACLE_QUERY=SELECT ...      # optional: override the validation query
+dart run tool/oracle_login.dart
+```
+

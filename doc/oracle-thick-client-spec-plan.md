@@ -20,6 +20,10 @@ full type system, typed binds, LOBs, cursors, and array DML — validated agains
   `orafree`, `localhost:1521`, service `FREEPDB1`, `system` / `TestPw1234`.
   Round-trip every type against the real DB. Gate these tests behind an env flag
   (e.g. `RUN_ORACLE_TESTS=true`) so CI without a DB stays green.
+- **Real Oracle (pre-23ai):** a live **19c** listener reached by SID (classic
+  non-fast-auth handshake, TTC field version 12) — see Phase T8. Exercised
+  manually via `tool/oracle_login.dart` with credentials from a gitignored
+  `.env`.
 
 ## Current state (baseline)
 - Native CONNECT/ACCEPT, break/reset, FAST_AUTH decline, DATA-TYPES negotiation,
@@ -195,6 +199,36 @@ round-tripped on real Oracle in `test/oracle_real_login_test.dart`.
 - [ ] Session settings (NLS date/number formats, time zone) that affect decode.
 - [ ] A behavioral parity pass vs `reference/node-oracledb` / the thin
   `../dart-oracledb` driver for the above.
+
+## Phase T8 — Pre-23ai (12c/18c/19c) compatibility  ·  Status: LANDED (login + query, works vs real 19c)
+Validated end-to-end against a live Oracle **19c** listener (SID connect,
+authenticate, query/fetch). Three pieces were needed beyond the 23ai path:
+- [x] **SID connect + TNS RESEND / REDIRECT** (`_connectAndRead`): older
+  listeners answer the first CONNECT with a RESEND (resend the identical
+  CONNECT) and may REDIRECT to another host:port. Also fixes the SDU framing —
+  large-SDU (4-byte) framing is enabled only when the ACCEPT negotiates version
+  ≥ 315; pre-315 servers stay 2-byte framed for DATA.
+- [x] **Credential-free probe** (`probeConnect` → `NativeConnectInfo`): a
+  CONNECT-only handshake that reports the listener's negotiated version /
+  FAST_AUTH / SDU without sending a password (lockout-safe).
+- [x] **Non-fast-auth login** (`_loginNonFastAuth`): when the ACCEPT clears the
+  FAST_AUTH flag, PROTOCOL / DATA-TYPES / AUTH_PHASE_ONE/TWO are sent as
+  separate round trips. Same O8LOGON (12c PBKDF2) proof; the 23ai token field is
+  omitted (gated on field version). A legacy-only verifier is surfaced as an
+  error (no lockout-risking retry).
+- [x] **TTC field-version negotiation**: the OALL8 execute/fetch/LOB wire shape
+  is gated on the field version, parsed from the server's PROTOCOL response
+  compile-caps (`parseProtocolFieldVersion`) as `min(24, server)`. A 19c server
+  negotiates 12, so the UB8 token (field ≥ 18) is not sent — sending it caused
+  `ORA-03120 two-task conversion: integer overflow`. Threaded through every
+  encode/decode call site.
+- [x] **Pre-23ai response completion**: the ERROR (RXH) message carries the
+  final RPC status (`ORA-01403` = end of fetch, or 0) and terminates the
+  response; 23ai repeats it with END_OF_RESPONSE but pre-23ai sends nothing
+  after, so `_processError` now sets `endOfResponse` (correct for both).
+- [ ] Verify binds / NUMBER decode / DML / LOBs / PL/SQL / REF CURSOR against
+  19c (implemented and 23ai-proven; field-version-12 paths unverified there).
+- [ ] Legacy (pre-12c, O5LOGON-only) verifier support for true 11g accounts.
 
 ## Test harness
 - A `TestTarget` abstraction yielding a connected+authenticated client for
