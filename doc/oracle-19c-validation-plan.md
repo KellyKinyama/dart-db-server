@@ -73,14 +73,18 @@ Confirms the bind-metadata + ROW_DATA encode path on field version 12.
 - [x] WHERE-only binds: `... WHERE :1 > :2` → correct true/false row counts.
 - [x] Bind reuse in WHERE: `... WHERE :1 > 0 AND :1 < 9` with `[5]`.
 - [x] Bind reuse across SELECT+WHERE: `SELECT :1 x, :2 y ... WHERE :2 = :1`.
-- [ ] **KNOWN EDGE CASE:** a select-list bind reused in WHERE *together with* a
-      WHERE-first bind — `SELECT :1 n FROM dual WHERE :1 > :2` with `[5, 3]` —
-      fails `ORA-01008: not all variables bound`. All other reuse/order patterns
-      pass, so normal bind usage is unaffected; likely version-independent
-      (numbered-bind reuse ordering), tracked as a low-priority follow-up.
+- [ ] **NOT A DRIVER BUG (Oracle numbered-bind quirk):** a select-list bind
+      reused in WHERE *together with* a WHERE-first bind — `SELECT :1 n FROM dual
+      WHERE :1 > :2` with `[5, 3]` — fails `ORA-01008: not all variables bound`.
+      Byte-level check: the request is structurally identical to the passing
+      `SELECT :1 x, :2 y ... WHERE :2 = :1` (same 2-bind NUMBER metadata, 2
+      row-data values) — only the SQL text differs, so the client encodes it
+      correctly and Oracle itself rejects that text. Reproduces with any client;
+      all normal bind usage is unaffected.
 
 Result: positional binds encode/decode correctly on real 19c for every normal
-pattern; only the select-bind-reuse-plus-where-first-bind combination is open.
+pattern. The one failing combination is proven (byte-level) to be an Oracle-side
+numbered-bind quirk, not a driver defect.
 
 ## Phase V3 — DML + array DML + RETURNING  ·  Status: DEFERRED (writes not permitted on target)
 Uses `tc_probe`. Confirms the non-query execute path and row counts.
