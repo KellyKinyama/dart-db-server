@@ -27,7 +27,9 @@ Map<String, String> _loadDotEnv(File file) {
 }
 
 Future<void> main() async {
-  final env = _loadDotEnv(File('.env'));
+  // ENV_FILE overrides the default .env path (e.g. a disposable local test
+  // database) so the user's real credentials file is never touched.
+  final env = _loadDotEnv(File(Platform.environment['ENV_FILE'] ?? '.env'));
 
   final enabled = env['RUN_ORACLE_LOGIN']?.toLowerCase();
   if (enabled != 'true' && enabled != '1' && enabled != 'yes') {

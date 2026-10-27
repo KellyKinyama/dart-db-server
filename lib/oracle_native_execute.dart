@@ -1177,9 +1177,16 @@ void _processRowData(ReadBuffer buf, _DecodeState s) {
       row.add(prior != null && i < prior.length ? prior[i] : null);
       continue;
     }
-    // A zero-size describe column (Oracle types an untyped NULL / '' literal as
-    // VARCHAR2(0)) carries no row-data bytes — it is intrinsically null.
-    if (s.columns[i].maxLength == 0) {
+    // Oracle types an untyped NULL / '' literal as a degenerate VARCHAR2(0)
+    // (a character type with size 0) that carries no row-data bytes — it is
+    // intrinsically null. Other types (e.g. a NUMBER literal) can also describe
+    // with size 0 yet still carry a value, so this is limited to char types.
+    final c = s.columns[i];
+    if (c.maxLength == 0 &&
+        (c.oracleType == _oraTypeVarchar ||
+            c.oracleType == _oraTypeString ||
+            c.oracleType == _oraTypeVarchar2 ||
+            c.oracleType == _oraTypeChar)) {
       row.add(null);
       continue;
     }
