@@ -1177,6 +1177,12 @@ void _processRowData(ReadBuffer buf, _DecodeState s) {
       row.add(prior != null && i < prior.length ? prior[i] : null);
       continue;
     }
+    // A zero-size describe column (Oracle types an untyped NULL / '' literal as
+    // VARCHAR2(0)) carries no row-data bytes — it is intrinsically null.
+    if (s.columns[i].maxLength == 0) {
+      row.add(null);
+      continue;
+    }
     row.add(_decodeColumnValue(buf, s.columns[i],
         ttcFieldVersion: s.ttcFieldVersion));
   }

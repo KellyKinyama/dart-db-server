@@ -57,12 +57,12 @@ Read-only, no table needed. Confirms each scalar decoder on field version 12.
       round-trips with cursor continuation) → 500 rows.
 - [x] **Real dictionary table:** `SELECT object_name, object_type, created FROM
       all_objects WHERE ROWNUM <= 250` → 250 rows (VARCHAR2 + DATE) decoded.
-- [ ] **KNOWN LIMITATION (won't-fix / niche):** a bare **untyped literal**
-      `SELECT NULL FROM dual` (no CAST) fails with `Unknown TTC message type`.
-      Root cause: Oracle types the bare literal as a degenerate **VARCHAR2(0)**
-      column, whose row-data shape the decoder mis-reads on field version 12.
-      Not a real-world pattern (every typed NULL works); left as-is to avoid
-      special-casing a degenerate type.
+- [x] **Bare untyped `SELECT NULL`** (no CAST) now decodes to `null`. Oracle
+      types the literal as a degenerate **VARCHAR2(0)**, which carries **no**
+      row-data bytes (it is intrinsically null); the decoder now treats a
+      zero-size describe column as null without consuming bytes. Fixed and
+      locked by a no-DB fixture test built from real 19c response bytes
+      ([test/oracle_decode_fixtures_test.dart](../test/oracle_decode_fixtures_test.dart)).
 
 Result: every documented type decodes correctly on real 19c; only the untyped
 `NULL` literal edge case is open.
