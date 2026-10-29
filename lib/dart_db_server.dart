@@ -4,6 +4,7 @@ library;
 export 'server/client.dart';
 export 'server/concurrency.dart';
 export 'server/database.dart';
+export 'server/admin_api.dart';
 export 'server/blob.dart';
 export 'server/session.dart';
 export 'server/expression.dart' show Expr;

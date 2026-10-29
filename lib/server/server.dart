@@ -26,6 +26,9 @@ class DbServer {
   DbServer(this.db, {InternetAddress? address, this.port = 4555})
       : address = address ?? InternetAddress.loopbackIPv4;
 
+  /// Number of currently connected native (TCP) clients.
+  int get connectionCount => _clients.length;
+
   Future<void> start() async {
     _socket = await ServerSocket.bind(address, port);
     _log('listening on ${address.address}:$port');

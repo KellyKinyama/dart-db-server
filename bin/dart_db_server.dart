@@ -24,6 +24,8 @@ Future<void> main(List<String> args) async {
   String host = '127.0.0.1';
   bool repl = false;
   bool memory = false;
+  int adminPort = 0;
+  String? adminToken;
   final oracleUsers = <String, String>{};
   final oraclePbkdf2Users = <String, String>{};
 
@@ -64,6 +66,12 @@ Future<void> main(List<String> args) async {
       case '--host':
         host = next() ?? host;
         break;
+      case '--admin-port':
+        adminPort = int.parse(next() ?? '$adminPort');
+        break;
+      case '--admin-token':
+        adminToken = next();
+        break;
       case '--repl':
         repl = true;
         break;
@@ -98,10 +106,22 @@ Future<void> main(List<String> args) async {
     await oracleServer.start();
   }
 
+  AdminApiServer? adminServer;
+  if (adminPort > 0) {
+    adminServer = AdminApiServer(db,
+        address: InternetAddress(host),
+        port: adminPort,
+        token: adminToken,
+        nativeConnections: () => server?.connectionCount ?? 0);
+    await adminServer.start();
+    stdout.writeln('admin API on http://$host:${adminServer.boundPort}/api');
+  }
+
   ProcessSignal.sigint.watch().listen((_) async {
     stdout.writeln('\nshutting down...');
     await server?.stop();
     await oracleServer?.stop();
+    await adminServer?.stop();
     await db.flush();
     exit(0);
   });
@@ -110,6 +130,7 @@ Future<void> main(List<String> args) async {
     await _runRepl(db);
     await server?.stop();
     await oracleServer?.stop();
+    await adminServer?.stop();
     await db.flush();
   } else {
     // Block forever (server is running in the background).
