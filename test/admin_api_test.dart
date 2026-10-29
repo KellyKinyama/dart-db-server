@@ -141,6 +141,36 @@ void main() {
       expect(r.json['viewCount'], 1);
     });
 
+    test('GET /api/vector/indexes lists registered vector indexes', () async {
+      await post('/api/query', {
+        'sql': 'CREATE TABLE docs (id INTEGER PRIMARY KEY, '
+            'embedding BLOB VECTOR(dim=2, kind=hnsw, metric=cosine, m=8));',
+      });
+      final r = await get('/api/vector/indexes');
+      expect(r.status, 200);
+      final indexes = r.json['indexes'] as Map;
+      expect(indexes['columns'],
+          containsAll(['tbl', 'col', 'dim', 'kind', 'metric']));
+      final rows = indexes['rows'] as List;
+      expect(rows.length, 1);
+      expect((rows.first as List).take(2), ['docs', 'embedding']);
+    });
+
+    test('GET /api/vector/stats returns binding stats after warm', () async {
+      await post('/api/query', {
+        'sql': 'CREATE TABLE docs (id INTEGER PRIMARY KEY, '
+            'embedding BLOB VECTOR(dim=2, kind=flat, metric=l2));'
+            "INSERT INTO docs VALUES (1, VEC('[1,0]')),(2, VEC('[2,0]'));",
+      });
+      // Exercise the index so stats materialize.
+      await post('/api/query', {
+        'sql': "SELECT rowid FROM vec_search('docs','embedding', VEC('[0,0]'), 1);",
+      });
+      final r = await get('/api/vector/stats');
+      expect(r.status, 200);
+      expect(r.json['stats'], isNotNull);
+    });
+
     test('GET /api/sessions reports native connections', () async {
       final r = await get('/api/sessions');
       expect(r.json['nativeConnections'], 7);

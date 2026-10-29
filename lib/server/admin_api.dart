@@ -130,6 +130,14 @@ class AdminApiServer {
         await _json(res, HttpStatus.ok, await _views());
         return;
       }
+      if (req.method == 'GET' && path == '/api/vector/indexes') {
+        await _json(res, HttpStatus.ok, await _vectorIndexes());
+        return;
+      }
+      if (req.method == 'GET' && path == '/api/vector/stats') {
+        await _json(res, HttpStatus.ok, await _vectorStats());
+        return;
+      }
       if (req.method == 'GET' && path.startsWith('/api/tables/')) {
         await _tableColumns(res, Uri.decodeComponent(path.substring('/api/tables/'.length)));
         return;
@@ -156,6 +164,8 @@ class AdminApiServer {
     {'method': 'GET', 'path': '/api/tables', 'description': 'List table names'},
     {'method': 'GET', 'path': '/api/tables/{name}', 'description': 'Columns of a table'},
     {'method': 'GET', 'path': '/api/views', 'description': 'List view names'},
+    {'method': 'GET', 'path': '/api/vector/indexes', 'description': 'Registered vector indexes (PRAGMA vector_index_list)'},
+    {'method': 'GET', 'path': '/api/vector/stats', 'description': 'Vector index stats (PRAGMA vector_index_stats)'},
     {
       'method': 'POST',
       'path': '/api/echo',
@@ -199,6 +209,16 @@ class AdminApiServer {
         'nativeConnections': nativeConnections?.call(),
         'eventSubscribers': _eventClients.length,
       };
+
+  Future<Map<String, Object?>> _vectorIndexes() async {
+    final results = await db.executeScript('PRAGMA vector_index_list');
+    return {'indexes': results.isEmpty ? null : results.first.toJson()};
+  }
+
+  Future<Map<String, Object?>> _vectorStats() async {
+    final results = await db.executeScript('PRAGMA vector_index_stats');
+    return {'stats': results.isEmpty ? null : results.first.toJson()};
+  }
 
   Future<void> _echo(HttpRequest req, HttpResponse res) async {
     final body = await utf8.decoder.bind(req).join();
