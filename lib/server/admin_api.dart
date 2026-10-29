@@ -135,6 +135,16 @@ class AdminApiServer {
         await _addOracleUser(req, res);
         return;
       }
+      if (req.method == 'GET' && path == '/api/oplog') {
+        await _json(res, HttpStatus.ok, await _oplog(req));
+        return;
+      }
+      if (req.method == 'POST' && path == '/api/oplog/enable') {
+        await db.enableOpLog();
+        await _json(res, HttpStatus.ok,
+            {'enabled': db.opLog != null, 'lastLsn': db.opLog?.lastLsn ?? 0});
+        return;
+      }
       if (req.method == 'POST' && path == '/api/echo') {
         await _echo(req, res);
         return;
@@ -186,6 +196,8 @@ class AdminApiServer {
       'description': 'Add an Oracle user',
       'sampleBody': {'username': 'scott', 'password': 'tiger', 'pbkdf2': true},
     },
+    {'method': 'GET', 'path': '/api/oplog', 'description': 'Recent op-log records (?limit=N)'},
+    {'method': 'POST', 'path': '/api/oplog/enable', 'description': 'Enable the op-log'},
     {'method': 'GET', 'path': '/api/tables', 'description': 'List table names'},
     {'method': 'GET', 'path': '/api/tables/{name}', 'description': 'Columns of a table'},
     {'method': 'GET', 'path': '/api/views', 'description': 'List view names'},
@@ -279,6 +291,22 @@ class AdminApiServer {
       'ok': true,
       'users': o.userStore.usernames.toList(),
     });
+  }
+
+  Future<Map<String, Object?>> _oplog(HttpRequest req) async {
+    final log = db.opLog;
+    if (log == null) {
+      return {'enabled': false, 'lastLsn': 0, 'records': <Object?>[]};
+    }
+    final limit =
+        int.tryParse(req.uri.queryParameters['limit'] ?? '100') ?? 100;
+    final after = (log.lastLsn - limit).clamp(0, log.lastLsn);
+    final records = await log.readFrom(after).toList();
+    return {
+      'enabled': true,
+      'lastLsn': log.lastLsn,
+      'records': [for (final r in records) r.toJson()],
+    };
   }
 
   Future<Map<String, Object?>> _vectorIndexes() async {

@@ -177,6 +177,37 @@ void main() {
       expect(r.json['eventSubscribers'], 0);
     });
 
+    test('op-log is disabled until enabled, then returns records', () async {
+      // Op-log requires a file-backed database.
+      final dir = Directory.systemTemp.createTempSync('ddbs_admin_oplog_');
+      final fdb = await Database.open('${dir.path}/db.json');
+      final fapi = AdminApiServer(fdb, port: 0);
+      await fapi.start();
+      final forigin = 'http://127.0.0.1:${fapi.boundPort}';
+      try {
+        final before = await _request('GET', '$forigin/api/oplog');
+        expect(before.json['enabled'], false);
+
+        final enable = await _request('POST', '$forigin/api/oplog/enable');
+        expect(enable.status, 200);
+        expect(enable.json['enabled'], true);
+
+        // Op-log captures single-statement execute() (the wire-protocol path).
+        await fdb.execute('CREATE TABLE t(id INTEGER)');
+        await fdb.execute('INSERT INTO t VALUES (1)');
+        await fdb.execute('INSERT INTO t VALUES (2)');
+
+        final after = await _request('GET', '$forigin/api/oplog?limit=10');
+        expect(after.json['enabled'], true);
+        expect(after.json['lastLsn'], greaterThan(0));
+        expect((after.json['records'] as List), isNotEmpty);
+      } finally {
+        await fapi.stop();
+        await fdb.close();
+        dir.deleteSync(recursive: true);
+      }
+    });
+
     test('GET /api/metrics tracks request counters', () async {
       await get('/api/health');
       await get('/api/health');
