@@ -85,6 +85,9 @@ class OracleServer {
   int _nextId = 1;
   void Function(String msg)? onLog;
 
+  /// Number of currently connected Oracle wire clients.
+  int get connectionCount => _conns.length;
+
   Future<void> start() async {
     _socket = await ServerSocket.bind(address, port);
     final tls = securityContext != null;

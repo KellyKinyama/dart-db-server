@@ -149,6 +149,9 @@ class OracleUserStore {
 
   OracleVerifier? lookup(String username) => _byUser[username.toUpperCase()];
 
+  /// Registered usernames (upper-cased), for admin introspection.
+  Iterable<String> get usernames => _byUser.keys;
+
   bool get isEmpty => _byUser.isEmpty;
 }
 

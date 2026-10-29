@@ -216,6 +216,60 @@ void main() {
       await ws.close();
     });
 
+    group('Oracle endpoints', () {
+      late Database odb;
+      late OracleServer oracle;
+      late AdminApiServer oapi;
+      late String oorigin;
+
+      setUp(() async {
+        odb = await Database.open();
+        oracle = OracleServer(odb, port: 0, users: {'admin': 'admin'});
+        oapi = AdminApiServer(odb, port: 0, oracleServer: oracle);
+        await oapi.start();
+        oorigin = 'http://127.0.0.1:${oapi.boundPort}';
+      });
+
+      tearDown(() async {
+        await oapi.stop();
+        await odb.close();
+      });
+
+      test('GET /api/oracle reports enabled + user count', () async {
+        final r = await _request('GET', '$oorigin/api/oracle');
+        expect(r.status, 200);
+        expect(r.json['enabled'], true);
+        expect(r.json['userCount'], 1);
+      });
+
+      test('GET /api/oracle/users lists seeded users', () async {
+        final r = await _request('GET', '$oorigin/api/oracle/users');
+        expect((r.json['users'] as List), contains('ADMIN'));
+      });
+
+      test('POST /api/oracle/users adds a user', () async {
+        final r = await _request('POST', '$oorigin/api/oracle/users',
+            body: {'username': 'scott', 'password': 'tiger', 'pbkdf2': true});
+        expect(r.status, 200);
+        expect((r.json['users'] as List), containsAll(['ADMIN', 'SCOTT']));
+      });
+
+      test('POST /api/oracle/users rejects missing fields', () async {
+        final r = await _request('POST', '$oorigin/api/oracle/users',
+            body: {'username': 'x'});
+        expect(r.status, 400);
+      });
+
+      test('oracle endpoints 503 when wire disabled', () async {
+        final r = await _request('GET', '$origin/api/oracle');
+        expect(r.status, 200);
+        expect(r.json['enabled'], false);
+        final add = await _request('POST', '$origin/api/oracle/users',
+            body: {'username': 'x', 'password': 'y'});
+        expect(add.status, 503);
+      });
+    });
+
     group('with --admin-token', () {
       late Database tdb;
       late AdminApiServer tapi;

@@ -112,7 +112,8 @@ Future<void> main(List<String> args) async {
         address: InternetAddress(host),
         port: adminPort,
         token: adminToken,
-        nativeConnections: () => server?.connectionCount ?? 0);
+        nativeConnections: () => server?.connectionCount ?? 0,
+        oracleServer: oracleServer);
     await adminServer.start();
     stdout.writeln('admin API on http://$host:${adminServer.boundPort}/api');
   }

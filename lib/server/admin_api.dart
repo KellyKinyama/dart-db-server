@@ -11,6 +11,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'database.dart';
+import 'oracle_wire.dart';
 
 /// Management API version (independent of the engine package version).
 const String adminApiVersion = '0.1.0';
@@ -23,6 +24,7 @@ class AdminApiServer {
     this.port = 8088,
     this.token,
     this.nativeConnections,
+    this.oracleServer,
   }) : address = address ?? InternetAddress.loopbackIPv4;
 
   final Database db;
@@ -34,6 +36,9 @@ class AdminApiServer {
 
   /// Optional probe for the native TCP server's live connection count.
   final int Function()? nativeConnections;
+
+  /// Optional Oracle wire server, enabling the `/api/oracle*` endpoints.
+  final OracleServer? oracleServer;
 
   HttpServer? _server;
 
@@ -118,6 +123,18 @@ class AdminApiServer {
         await _json(res, HttpStatus.ok, _sessions());
         return;
       }
+      if (req.method == 'GET' && path == '/api/oracle') {
+        await _json(res, HttpStatus.ok, _oracle());
+        return;
+      }
+      if (req.method == 'GET' && path == '/api/oracle/users') {
+        await _json(res, HttpStatus.ok, _oracleUsers());
+        return;
+      }
+      if (req.method == 'POST' && path == '/api/oracle/users') {
+        await _addOracleUser(req, res);
+        return;
+      }
       if (req.method == 'POST' && path == '/api/echo') {
         await _echo(req, res);
         return;
@@ -161,6 +178,14 @@ class AdminApiServer {
     {'method': 'GET', 'path': '/api/metrics', 'description': 'Admin API uptime + request counters'},
     {'method': 'GET', 'path': '/api/stats', 'description': 'Table / view counts'},
     {'method': 'GET', 'path': '/api/sessions', 'description': 'Active connection counts'},
+    {'method': 'GET', 'path': '/api/oracle', 'description': 'Oracle wire status (enabled, port, connections, users)'},
+    {'method': 'GET', 'path': '/api/oracle/users', 'description': 'List Oracle users'},
+    {
+      'method': 'POST',
+      'path': '/api/oracle/users',
+      'description': 'Add an Oracle user',
+      'sampleBody': {'username': 'scott', 'password': 'tiger', 'pbkdf2': true},
+    },
     {'method': 'GET', 'path': '/api/tables', 'description': 'List table names'},
     {'method': 'GET', 'path': '/api/tables/{name}', 'description': 'Columns of a table'},
     {'method': 'GET', 'path': '/api/views', 'description': 'List view names'},
@@ -209,6 +234,52 @@ class AdminApiServer {
         'nativeConnections': nativeConnections?.call(),
         'eventSubscribers': _eventClients.length,
       };
+
+  Map<String, Object?> _oracle() {
+    final o = oracleServer;
+    return {
+      'enabled': o != null,
+      'port': o?.boundPort,
+      'connections': o?.connectionCount,
+      'userCount': o?.userStore.usernames.length,
+    };
+  }
+
+  Map<String, Object?> _oracleUsers() {
+    final o = oracleServer;
+    return {'users': o == null ? <String>[] : o.userStore.usernames.toList()};
+  }
+
+  Future<void> _addOracleUser(HttpRequest req, HttpResponse res) async {
+    final o = oracleServer;
+    if (o == null) {
+      await _json(res, HttpStatus.serviceUnavailable,
+          {'error': 'oracle wire not enabled'});
+      return;
+    }
+    final body = await utf8.decoder.bind(req).join();
+    final decoded = body.isEmpty ? null : jsonDecode(body);
+    final username = decoded is Map ? decoded['username'] : null;
+    final password = decoded is Map ? decoded['password'] : null;
+    if (username is! String ||
+        username.trim().isEmpty ||
+        password is! String ||
+        password.isEmpty) {
+      await _json(res, HttpStatus.badRequest,
+          {'error': 'username and password required'});
+      return;
+    }
+    final pbkdf2 = decoded is Map && decoded['pbkdf2'] == true;
+    if (pbkdf2) {
+      o.userStore.addPbkdf2User(username.trim(), password);
+    } else {
+      o.userStore.addUser(username.trim(), password);
+    }
+    await _json(res, HttpStatus.ok, {
+      'ok': true,
+      'users': o.userStore.usernames.toList(),
+    });
+  }
 
   Future<Map<String, Object?>> _vectorIndexes() async {
     final results = await db.executeScript('PRAGMA vector_index_list');
